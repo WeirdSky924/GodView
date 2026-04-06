@@ -1,0 +1,80 @@
+# Application Settings
+app:
+  name: "Godview"
+  version: "0.1.0"
+  env: "development"
+  log_level: "DEBUG"
+
+# Model Configuration
+models:
+  default: "claude-sonnet-4-6-20250929"
+
+  # 模型路由配置
+  routing:
+    enabled: false
+    # 逻辑推演类任务使用高性能模型
+    reasoning:
+      - "claude-opus-4-6"
+      - "claude-sonnet-4-6-20250929"
+    # 日常对话生成使用成本较低的模型
+    dialogue:
+      - "gpt-4o"
+      - "claude-sonnet-4-6-20250929"
+    # 本地/备用模型
+    fallback:
+      - "claude-sonnet-4-6-20250929"
+
+  # 各 Agent 的模型配置 (可覆盖默认路由)
+  agents:
+    master_plotter: "claude-sonnet-4-6-20250929"
+    summarizer: "claude-sonnet-4-6-20250929"
+    hook_manager: "claude-sonnet-4-6-20250929"
+    writer: "claude-sonnet-4-6-20250929"
+    character: "claude-sonnet-4-6-20250929"
+    procgen: "claude-sonnet-4-6-20250929"
+    evaluator: "claude-sonnet-4-6-20250929"
+    ooc_reviewer: "claude-sonnet-4-6-20250929"
+
+# Agent 配置
+agents:
+  # 交互超时阈值 (轮次)
+  max_interaction_turns: 5
+  # 无信息增量判定阈值
+  info_gain_threshold: 0.3
+  # 角色台词样本库大小
+  character_voice_samples: 10
+  # OOC 审查相似度阈值 (低于此值判定为 OOC)
+  ooc_similarity_threshold: 0.75
+
+# 数据库配置
+database:
+  postgresql:
+    host: "localhost"
+    port: 5432
+    name: "godview_db"
+    user: "godview_user"
+    pool_size: 10
+    pool_recycle: 3600
+
+  nebulagraph:
+    host: "127.0.0.1"
+    port: 9669
+    user: "root"
+    password: "nebula"
+    space_name: "godview_space"
+    timeout_ms: 10000
+
+  qdrant:
+    url: "http://localhost:6333"
+    collection_name: "godview_memory"
+    vector_size: 1536
+
+# LangSmith 配置
+langsmith:
+  tracing_enabled: true
+  project_name: "godview"
+
+# WebSocket 配置
+websocket:
+  ping_interval: 30
+  ping_timeout: 10
