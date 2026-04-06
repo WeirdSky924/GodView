@@ -33,6 +33,31 @@ GodView 是一个基于多 Agent 协同的小说自动/半自动生成系统，�
 
 ### 安装步骤
 
+#### 方式一：Conda（推荐）
+
+```bash
+# 1. 克隆项目
+git clone <repo-url>
+cd godview
+
+# 2. 创建 conda 环境
+conda create -n godview python=3.11 -y
+conda activate godview
+
+# 3. 安装依赖
+pip install -r requirements.txt
+
+# 4. 配置环境变量
+copy .env.example .env   # Windows
+# cp .env.example .env   # Linux/Mac
+# 编辑 .env 文件，配置数据库连接和 API Key
+
+# 5. 启动服务
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
+```
+
+#### 方式二：venv 虚拟环境
+
 ```bash
 # 1. 克隆项目
 git clone <repo-url>
@@ -46,7 +71,8 @@ source venv/bin/activate  # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
 # 4. 配置环境变量
-cp .env.example .env
+copy .env.example .env   # Windows
+# cp .env.example .env   # Linux/Mac
 # 编辑 .env 文件，配置数据库连接和 API Key
 
 # 5. 启动服务
