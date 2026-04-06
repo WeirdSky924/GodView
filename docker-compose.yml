@@ -1,0 +1,82 @@
+"""
+Docker Compose 配置
+用于快速启动开发环境（PostgreSQL + NebulaGraph + Qdrant）
+"""
+
+version: '3.8'
+
+services:
+  # PostgreSQL
+  postgres:
+    image: postgres:15-alpine
+    container_name: godview-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: godview
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # NebulaGraph Graphd
+  graphd:
+    image: vesoft/graphd-nebula-v3.6.0
+    container_name: godview-graphd
+    depends_on:
+      - metastore
+      - storaged
+    environment:
+      - META_SERVER_ADDRESSES=metad0:9559
+      - LOGTOSTDERR=true
+    ports:
+      - "9669:9669"
+      - "19669:19669"
+    command: --minloglevel=2
+
+  # NebulaGraph Metastore
+  metastore:
+    image: vesoft/metad-nebula-v3.6.0
+    container_name: godview-metad
+    depends_on:
+      - storaged
+    environment:
+      - SERVERS_ONLINE=false
+      - LOGTOSTDERR=true
+    ports:
+      - "9559:9559"
+      - "19559:19559"
+    command: --minloglevel=2
+
+  # NebulaGraph Storage
+  storaged:
+    image: vesoft/storaged-nebula-v3.6.0
+    container_name: godview-storaged
+    environment:
+      - LOGTOSTDERR=true
+    ports:
+      - "9779:9779"
+      - "19779:19779"
+    command: --minloglevel=2
+
+  # Qdrant
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: godview-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    environment:
+      - QDRANT__SERVICE__HTTP_PORT=6333
+      - QDRANT__SERVICE__GRPC_PORT=6334
+
+volumes:
+  postgres_data:
+  qdrant_storage:

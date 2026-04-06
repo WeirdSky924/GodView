@@ -1,100 +1,117 @@
 """
-Configuration Management for Godview
+应用配置
 """
 
 import os
-from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
-import yaml
+from pydantic_settings import BaseSettings
 from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
-
-
-def get_project_root() -> Path:
-    """获取项目根目录"""
-    return Path(__file__).parent.parent
-
-
-def load_yaml_config(config_path: str) -> dict:
-    """加载 YAML 配置文件"""
-    full_path = get_project_root() / config_path
-    if full_path.exists():
-        with open(full_path, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f)
-    return {}
 
 
 class Settings(BaseSettings):
     """应用配置"""
 
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        case_sensitive=False,
-        extra="ignore",
+    # 应用基本信息
+    app_name: str = "Godview"
+    app_version: str = "1.0.0"
+    debug: bool = False
+    log_level: str = "INFO"
+
+    # 数据库配置
+    database_url: Optional[str] = Field(
+        default=os.getenv("DATABASE_URL", "postgresql+asyncpg://localhost:5432/godview"),
+        description="PostgreSQL 连接 URL",
     )
 
-    # 应用配置
-    app_name: str = Field(default="Godview", description="应用名称")
-    app_version: str = Field(default="0.1.0", description="应用版本")
-    app_env: str = Field(default="development", description="运行环境")
-    log_level: str = Field(default="DEBUG", description="日志级别")
-
-    # API Keys
-    anthropic_api_key: str = Field(default="", description="Anthropic API Key")
-    openai_api_key: str = Field(default="", description="OpenAI API Key")
-
-    # 数据库配置 - PostgreSQL
-    database_url: str = Field(default="", description="PostgreSQL 连接 URL")
-    async_database_url: str = Field(default="", description="PostgreSQL 异步连接 URL")
-
-    # 数据库配置 - NebulaGraph
-    nebula_host: str = Field(default="127.0.0.1", description="NebulaGraph 主机")
-    nebula_port: int = Field(default=9669, description="NebulaGraph 端口")
-    nebula_user: str = Field(default="root", description="NebulaGraph 用户名")
-    nebula_password: str = Field(default="nebula", description="NebulaGraph 密码")
-
-    # 数据库配置 - Qdrant
-    qdrant_url: str = Field(default="http://localhost:6333", description="Qdrant URL")
-
-    # LangSmith 配置
-    langchain_tracing_v2: bool = Field(default=True, description="是否启用 LangSmith 追踪")
-    langsmith_api_key: str = Field(default="", description="LangSmith API Key")
-    langchain_project: str = Field(default="godview", description="LangSmith 项目名称")
-
-    # 模型配置
-    default_model: str = Field(
-        default="claude-sonnet-4-6-20250929", description="默认模型"
+    # NebulaGraph 配置
+    nebula_host: Optional[str] = Field(
+        default=os.getenv("NEBULA_HOST", "127.0.0.1"),
+        description="NebulaGraph 主机地址",
+    )
+    nebula_port: int = Field(
+        default=int(os.getenv("NEBULA_PORT", 9669)),
+        description="NebulaGraph 端口",
+    )
+    nebula_user: str = Field(
+        default=os.getenv("NEBULA_USER", "root"),
+        description="NebulaGraph 用户名",
+    )
+    nebula_password: str = Field(
+        default=os.getenv("NEBULA_PASSWORD", "nebula"),
+        description="NebulaGraph 密码",
     )
 
-    # WebSocket 配置
-    ws_ping_interval: int = Field(default=30, description="WebSocket Ping 间隔")
-    ws_ping_timeout: int = Field(default=10, description="WebSocket Ping 超时")
+    # Qdrant 配置
+    qdrant_url: Optional[str] = Field(
+        default=os.getenv("QDRANT_URL", "http://localhost:6333"),
+        description="Qdrant 服务 URL",
+    )
 
-    @property
-    def project_root(self) -> Path:
-        """获取项目根目录"""
-        return get_project_root()
+    # LLM 配置
+    llm_provider: str = Field(
+        default=os.getenv("LLM_PROVIDER", "openai"),
+        description="LLM 提供商 (openai/anthropic/azure)",
+    )
+    llm_api_key: Optional[str] = Field(
+        default=os.getenv("LLM_API_KEY", ""),
+        description="LLM API Key",
+    )
+    llm_base_url: Optional[str] = Field(
+        default=os.getenv("LLM_BASE_URL", ""),
+        description="LLM API 基础 URL（用于代理或自部署）",
+    )
+    llm_model: str = Field(
+        default=os.getenv("LLM_MODEL", "gpt-4o"),
+        description="LLM 模型名称",
+    )
+    llm_temperature: float = Field(
+        default=float(os.getenv("LLM_TEMPERATURE", 0.7)),
+        description="LLM 温度参数",
+    )
+    llm_max_tokens: int = Field(
+        default=int(os.getenv("LLM_MAX_TOKENS", 4096)),
+        description="LLM 最大 token 数",
+    )
 
-    @property
-    def config_path(self) -> Path:
-        """获取配置文件目录"""
-        return self.project_root / "config"
+    # Embedding 配置
+    embedding_provider: str = Field(
+        default=os.getenv("EMBEDDING_PROVIDER", "openai"),
+        description="Embedding 提供商",
+    )
+    embedding_model: str = Field(
+        default=os.getenv("EMBEDDING_MODEL", "text-embedding-3-small"),
+        description="Embedding 模型名称",
+    )
+    embedding_dimension: int = Field(
+        default=int(os.getenv("EMBEDDING_DIMENSION", 1536)),
+        description="Embedding 向量维度",
+    )
 
-    def load_agent_config(self) -> dict:
-        """加载 Agent 配置"""
-        return load_yaml_config("config/settings.yaml")
+    # 导演系统配置
+    max_turns_threshold: int = Field(
+        default=int(os.getenv("MAX_TURNS_THRESHOLD", 5)),
+        description="单交互最大轮次阈值",
+    )
+    target_word_count_per_intent: int = Field(
+        default=int(os.getenv("TARGET_WORD_COUNT_PER_INTENT", 200)),
+        description="每个意图的目标字数",
+    )
+    min_chapter_word_count: int = Field(
+        default=int(os.getenv("MIN_CHAPTER_WORD_COUNT", 2000)),
+        description="章节最小字数",
+    )
 
-    def load_prompts(self) -> dict:
-        """加载 Prompt 模板"""
-        return load_yaml_config("config/prompts/prompts.yaml")
+    # CORS 配置
+    cors_origins: List[str] = Field(
+        default=["*"],
+        description="允许的 CORS 来源",
+    )
+
+    class Config:
+        env_file = ".env"
+        case_sensitive = True
 
 
 # 全局配置实例
 settings = Settings()
-
-
-def get_settings() -> Settings:
-    """获取配置实例"""
-    return settings

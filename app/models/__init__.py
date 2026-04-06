@@ -2,21 +2,17 @@
 数据模型包
 """
 
-from app.models.character import Character, CharacterVoiceSample, Relationship
-from app.models.world import World, Region, WorldRule
-from app.models.plot import Plot, Hook, Chapter, EventSummary
-from app.models.snapshot import WorldSnapshot
+from app.models.character import Character, CharacterStatus, CharacterRole
+from app.models.world import World, Region
+from app.models.plot import Chapter, Hook, Plot
 
 __all__ = [
     "Character",
-    "CharacterVoiceSample",
-    "Relationship",
+    "CharacterStatus",
+    "CharacterRole",
     "World",
     "Region",
-    "WorldRule",
-    "Plot",
-    "Hook",
     "Chapter",
-    "EventSummary",
-    "WorldSnapshot",
+    "Hook",
+    "Plot",
 ]
