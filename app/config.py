@@ -77,11 +77,19 @@ class Settings(BaseSettings):
     # Embedding 配置
     embedding_provider: str = Field(
         default=os.getenv("EMBEDDING_PROVIDER", "openai"),
-        description="Embedding 提供商",
+        description="Embedding 提供商 (openai / sentence_transformers / ollama)",
     )
     embedding_model: str = Field(
         default=os.getenv("EMBEDDING_MODEL", "text-embedding-3-small"),
         description="Embedding 模型名称",
+    )
+    embedding_api_key: Optional[str] = Field(
+        default=os.getenv("EMBEDDING_API_KEY", ""),
+        description="Embedding API Key（仅 openai 需要）",
+    )
+    embedding_base_url: str = Field(
+        default=os.getenv("EMBEDDING_BASE_URL", "https://api.openai.com/v1"),
+        description="Embedding 基础 URL（openai 用默认，ollama 填 http://localhost:11434）",
     )
     embedding_dimension: int = Field(
         default=int(os.getenv("EMBEDDING_DIMENSION", 1536)),

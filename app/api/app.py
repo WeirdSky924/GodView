@@ -4,7 +4,7 @@ FastAPI 应用创建
 
 import logging
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,6 +13,7 @@ from app.config import settings
 from app.database.postgres import PostgresDatabase
 from app.database.nebulagraph import NebulaGraphDatabase
 from app.database.qdrant import QdrantDatabase
+from app.services.embedding_service import EmbeddingService, create_embedding_service
 
 # 配置日志
 logging.basicConfig(
@@ -23,9 +24,21 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # 全局数据库实例
-postgres_db: PostgresDatabase = None
-nebula_db: NebulaGraphDatabase = None
-qdrant_db: QdrantDatabase = None
+postgres_db: Optional[PostgresDatabase] = None
+nebula_db: Optional[NebulaGraphDatabase] = None
+qdrant_db: Optional[QdrantDatabase] = None
+_embedding_service: Optional[EmbeddingService] = None
+
+
+def get_embedding_service() -> Optional[EmbeddingService]:
+    """获取全局 Embedding 服务实例"""
+    return _embedding_service
+
+
+def set_embedding_service(service: EmbeddingService):
+    """设置全局 Embedding 服务实例"""
+    global _embedding_service
+    _embedding_service = service
 
 
 @asynccontextmanager
@@ -39,7 +52,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     Yields:
         None
     """
-    global postgres_db, nebula_db, qdrant_db
+    global postgres_db, nebula_db, qdrant_db, _embedding_service
 
     # 启动时初始化
     logger.info("正在初始化数据库连接...")
@@ -66,9 +79,26 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         except Exception as e:
             logger.warning(f"NebulaGraph 连接失败：{e}")
 
+    # Embedding Service
+    try:
+        _embedding_service = create_embedding_service(
+            provider=settings.embedding_provider,
+            model=settings.embedding_model,
+            api_key=settings.embedding_api_key,
+            base_url=settings.embedding_base_url,
+            dimension=settings.embedding_dimension,
+        )
+        logger.info(f"Embedding 服务初始化：{settings.embedding_provider} ({settings.embedding_model})")
+    except Exception as e:
+        logger.warning(f"Embedding 服务初始化失败：{e}")
+
     # Qdrant
     if settings.qdrant_url:
-        qdrant_db = QdrantDatabase(url=settings.qdrant_url)
+        qdrant_db = QdrantDatabase(
+            url=settings.qdrant_url,
+            vector_size=settings.embedding_dimension,
+            embedding_service=_embedding_service,
+        )
         try:
             await qdrant_db.connect()
             await qdrant_db.init_collection()
@@ -115,12 +145,13 @@ def create_app() -> FastAPI:
     )
 
     # 注册路由
-    from app.api.routes import characters, worlds, plots, websocket
+    from app.api.routes import characters, worlds, plots, websocket, config
 
     app.include_router(characters.router, prefix="/api/characters", tags=["角色管理"])
     app.include_router(worlds.router, prefix="/api/worlds", tags=["世界管理"])
     app.include_router(plots.router, prefix="/api/plots", tags=["剧情管理"])
     app.include_router(websocket.router, prefix="/api/ws", tags=["WebSocket"])
+    app.include_router(config.router, prefix="/api/config", tags=["配置管理"])
 
     # 健康检查
     @app.get("/health")
