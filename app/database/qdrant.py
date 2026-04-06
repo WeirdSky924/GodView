@@ -397,13 +397,27 @@ class QdrantDatabase:
         Returns:
             List: 台词样本列表
         """
-        results = await self.search_similar(
-            query_vector=[0.0] * self.vector_size,
+        all_points, _ = self._client.scroll(
+            collection_name=self.collection_name,
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(key="character_id", match=MatchValue(value=character_id)),
+                    FieldCondition(key="type", match=MatchValue(value="voice_sample")),
+                ]
+            ),
             limit=limit,
-            filter_conditions={"character_id": character_id, "type": "voice_sample"},
+            with_payload=True,
+            with_vectors=False,
         )
 
-        return results
+        return [
+            {
+                "id": point.id,
+                "score": 1.0,
+                "payload": point.payload,
+            }
+            for point in all_points
+        ]
 
     # ==================== 记忆嵌入管理 ====================
 

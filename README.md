@@ -1,333 +1,642 @@
-# GodView - AI 驱动的小说生成系统 (导演模式)
+# GodView - 新手可直接照着做的启动说明
 
-## 项目简介
+这份说明按**从零开始**写。你只要按顺序执行，不需要先理解全部代码。
 
-GodView 是一个基于多 Agent 协同的小说自动/半自动生成系统。采用"导演模式"工作流，多个 AI Agent 各司其职（角色演绎、伏笔管理、剧情推进、文本生成），实现长篇小说的连贯性生成。
-
-## 系统组件一览
-
-本项目由 **4 个组件** 构成，你可以根据需要选择全部或仅启动核心服务：
-
-| 组件 | 作用 | 是否必须 |
-|------|------|---------|
-| **FastAPI 后端** | 核心服务，提供 API 和 WebSocket | ✅ 必须 |
-| **PostgreSQL** | 存储角色、剧情、章节等结构化数据 | 推荐 |
-| **Qdrant** | 向量数据库，用于语义搜索和角色声音一致性 | 推荐 |
-| **NebulaGraph** | 图数据库，存储人物关系和记忆关联 | 可选 |
-
-> **小白提示**：即使不安装任何数据库，后端也能正常启动（会显示部分功能不可用）。建议至少安装 Docker 并用 `docker compose` 一键启动 PostgreSQL + Qdrant。
+如果你只是想先把项目跑起来，请直接从下面的 **第 1 步** 开始。
 
 ---
 
-## 快速开始（从零开始）
+## 0. 这个项目现在能做什么
 
-### 前置准备
+当前项目已经具备这些主要页面和能力：
 
-安装以下软件（全部免费）：
+- 前端管理界面
+- Director 导演模式页面
+- 小说章节编辑 / 保存
+- 章节评估
+- 读者模拟
+- Diff 对比工具
+- 可视化工作台
+- 干预日志与效果评估
 
-| 软件 | 下载链接 | 用途 |
-|------|---------|------|
-| **Python 3.10+** | https://www.python.org/downloads/ | 运行后端 |
-| **Git** | https://git-scm.com/ | 下载代码 |
-| **Docker Desktop** | https://www.docker.com/products/docker-desktop/ | 一键启动数据库 |
+目前最适合的使用方式是：
+
+1. 先启动后端
+2. 再启动前端
+3. 通过网页逐页验证功能
 
 ---
 
-### 第 1 步：下载项目
+## 1. 你需要先安装的软件
+
+请先安装下面 4 个软件：
+
+### 1.1 Python 3.11
+
+下载地址：
+
+- https://www.python.org/downloads/
+
+安装时请勾选：
+
+- `Add python.exe to PATH`
+
+安装完成后，在终端执行：
 
 ```bash
-git clone <repo-url>
+python --version
+```
+
+如果能看到类似下面的输出，就表示成功：
+
+```bash
+Python 3.11.x
+```
+
+---
+
+### 1.2 Git
+
+下载地址：
+
+- https://git-scm.com/downloads
+
+安装完成后执行：
+
+```bash
+git --version
+```
+
+---
+
+### 1.3 Node.js 20+
+
+下载地址：
+
+- https://nodejs.org/
+
+安装完成后执行：
+
+```bash
+node --version
+npm --version
+```
+
+---
+
+### 1.4 Docker Desktop
+
+下载地址：
+
+- https://www.docker.com/products/docker-desktop/
+
+安装完成后，先启动 Docker Desktop，再执行：
+
+```bash
+docker --version
+docker compose version
+```
+
+---
+
+## 2. 获取项目代码
+
+如果你还没有代码，请执行：
+
+```bash
+git clone <你的仓库地址>
 cd Godview
 ```
 
----
+如果你已经有代码，只要进入项目根目录即可。项目根目录应该能看到这些文件：
 
-### 第 2 步：配置 Python 环境（三选一）
-
-#### 方式 A：Conda（推荐）
-
-```bash
-# 创建环境（Python 3.11）
-conda create -n godview python=3.11 -y
-
-# 激活环境
-conda activate godview
-
-# 安装依赖
-pip install -r requirements.txt
-```
-
-#### 方式 B：venv 虚拟环境
-
-```bash
-# 创建虚拟环境
-python -m venv venv
-
-# 激活（Windows）
-venv\Scripts\activate
-
-# 激活（Linux/Mac）
-source venv/bin/activate
-
-# 安装依赖
-pip install -r requirements.txt
-```
-
-#### 方式 C：全局安装（不推荐，但最简单）
-
-```bash
-pip install -r requirements.txt
-```
+- `main.py`
+- `scripts.py`
+- `requirements.txt`
+- `docker-compose.yml`
+- `frontend/`
 
 ---
 
-### 第 3 步：配置环境变量
+## 3. 配置 Python 虚拟环境
+
+下面是 **Windows 最推荐方式**。
+
+### 3.1 创建虚拟环境
 
 ```bash
-# 复制模板
-copy .env.example .env        # Windows
-cp .env.example .env          # Linux/Mac
+python -m venv .venv
 ```
 
-用文本编辑器打开 `.env`，至少修改以下内容：
+### 3.2 激活虚拟环境
 
-| 配置项 | 说明 | 示例值 |
-|--------|------|--------|
-| `LLM_API_KEY` | 大模型 API Key | `sk-xxxxxxxx` |
-| `EMBEDDING_PROVIDER` | Embedding 模式 | `sentence_transformers` |
+Windows PowerShell：
 
-#### Embedding 模式说明（三选一）
+```bash
+.venv\Scripts\Activate.ps1
+```
 
-| 模式 | 配置值 | 需要 API Key？ | 需要联网？ | 适合谁？ |
-|------|--------|:---:|:---:|---------|
-| **OpenAI API** | `openai` | ✅ 是 | ✅ 是 | 有 OpenAI/兼容 API Key 的用户 |
-| **Sentence-Transformers** | `sentence_transformers` | ❌ 否 | 首次需要 | 最省事，首次运行自动下载模型（约 80MB） |
-| **Ollama** | `ollama` | ❌ 否 | 不需要 | 已安装 Ollama 的用户 |
+Windows CMD：
 
-**最简单的配置**（适合新手）：
+```bash
+.venv\Scripts\activate.bat
+```
+
+激活成功后，你的命令行前面通常会出现：
+
+```bash
+(.venv)
+```
+
+### 3.3 安装后端依赖
+
+```bash
+pip install -r requirements.txt
+```
+
+### 3.4 检查依赖是否正常
+
+```bash
+python scripts.py check
+```
+
+看到类似下面内容即可：
+
+```bash
+[OK] 核心依赖已安装
+```
+
+---
+
+## 4. 配置前端依赖
+
+进入前端目录：
+
+```bash
+cd frontend
+```
+
+安装依赖：
+
+```bash
+npm install
+```
+
+安装完成后先不要关闭这个项目目录，后面还要继续使用。
+
+然后回到项目根目录：
+
+```bash
+cd ..
+```
+
+---
+
+## 5. 配置环境变量
+
+### 5.1 复制模板文件
+
+Windows：
+
+```bash
+copy .env.example .env
+```
+
+如果 `copy` 不可用，也可以手动复制 `.env.example`，并重命名为 `.env`。
+
+### 5.2 修改 `.env`
+
+用记事本或 VS Code 打开 `.env`。
+
+优先确认下面这些配置：
+
+```ini
+DATABASE_URL=postgresql+asyncpg://postgres:password@localhost:5432/godview
+QDRANT_URL=http://localhost:6333
+EMBEDDING_PROVIDER=sentence_transformers
+EMBEDDING_MODEL=all-MiniLM-L6-v2
+LLM_PROVIDER=openai
+LLM_API_KEY=your-api-key-here
+LLM_MODEL=gpt-4o
+```
+
+### 5.3 新手最简单建议
+
+如果你只是先跑通项目，建议先保持：
+
 ```ini
 EMBEDDING_PROVIDER=sentence_transformers
 EMBEDDING_MODEL=all-MiniLM-L6-v2
 ```
-无需任何 API Key，首次运行时自动下载模型到本地。
+
+这样 embedding 不需要额外 API Key。
+
+但是：
+
+- `LLM_API_KEY` 你仍然需要自己填写真实值
+- 不填真实大模型 Key 时，涉及生成内容的功能可能不可用
 
 ---
 
-### 第 4 步：启动数据库（Docker 方式）
+## 6. 启动数据库
 
-确保已安装并启动 Docker Desktop，然后在项目根目录执行：
+先确保 Docker Desktop 已经打开。
+
+在项目根目录执行：
+
+### 6.1 推荐最小启动方式
 
 ```bash
-# 启动 PostgreSQL + Qdrant（推荐）
 docker compose up -d postgres qdrant
+```
 
-# 或启动全部组件（含 NebulaGraph）
+这是当前最推荐的启动方式，因为项目的主要链路主要依赖：
+
+- PostgreSQL
+- Qdrant
+
+### 6.2 如果你也想把图数据库一起启动
+
+```bash
 docker compose up -d
 ```
 
-等待 1-2 分钟，验证服务状态：
+### 6.3 检查容器状态
+
 ```bash
 docker compose ps
 ```
 
-看到所有服务状态为 `Up` 即可。
+你至少应该看到：
 
-#### 不使用 Docker 的手动安装
+- `godview-postgres`
+- `godview-qdrant`
 
-如果你不想用 Docker，也可以手动安装：
+状态最好是 `Up`。
 
-**PostgreSQL**
+---
+
+## 7. 初始化数据库表
+
+第一次运行时执行：
+
 ```bash
-# Windows: 从 https://www.postgresql.org/download/windows/ 下载安装包
-# 安装后执行：
-createdb -U postgres godview
+python scripts.py init-db
 ```
 
-**Qdrant**
-```bash
-# 下载：https://qdrant.tech/documentation/quickstart/
-# 或直接用 Docker：
-docker run -d -p 6333:6333 qdrant/qdrant
-```
+如果成功，会看到类似：
 
-**NebulaGraph**（可选）
 ```bash
-# 参考：https://docs.nebula-graph.io/3.6.0/
-# 或使用 Docker Compose：
-docker compose up -d storaged metastore graphd
+[OK] 数据库初始化完成
 ```
 
 ---
 
-### 第 5 步：启动后端服务
+## 8. 启动后端
+
+在项目根目录执行：
 
 ```bash
-# 初始化数据库表（首次运行）
-python scripts.py init-db
-
-# 启动服务（开发模式，自动热重载）
 python scripts.py start --reload
 ```
 
-或者直接：
-```bash
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
-```
+如果成功，你会看到类似输出：
 
-看到类似输出说明启动成功：
-```
+```bash
 INFO:     Uvicorn running on http://0.0.0.0:8000
 INFO:     Application startup complete.
 ```
 
----
+**这一窗口不要关掉。**
 
-### 第 6 步：验证
+后端默认地址：
 
-浏览器打开以下地址：
-
-| 地址 | 说明 |
-|------|------|
-| http://localhost:8000/ | 根页面 |
-| http://localhost:8000/health | 健康检查 |
-| http://localhost:8000/docs | API 文档（Swagger UI） |
-| http://localhost:8000/redoc | API 文档（ReDoc） |
-
-测试 Embedding 配置接口：
-```bash
-# 查看支持的 Embedding Provider
-curl http://localhost:8000/api/config/embedding/providers
-
-# 查看当前配置
-curl http://localhost:8000/api/config/embedding
-
-# 测试连接
-curl -X POST http://localhost:8000/api/config/embedding/test
-```
+- http://localhost:8000
 
 ---
 
-## 配置管理 API
+## 9. 启动前端
 
-运行时可通过 API 动态切换 Embedding 模式，无需重启服务：
+新开一个终端窗口。
 
-### 获取支持的 Provider 列表
+进入项目前端目录：
+
 ```bash
-GET /api/config/embedding/providers
+cd frontend
 ```
 
-### 切换 Embedding 模式
-```bash
-PUT /api/config/embedding
-Content-Type: application/json
+启动前端开发服务器：
 
-{
-  "provider": "ollama",
-  "model": "nomic-embed-text",
-  "base_url": "http://localhost:11434"
-}
+```bash
+npm run dev
 ```
 
-### 测试连接
+如果成功，通常会看到类似：
+
 ```bash
-POST /api/config/embedding/test
+Local:   http://localhost:5173/
 ```
+
+**这一窗口也不要关掉。**
+
+前端默认地址：
+
+- http://localhost:5173
+
+前端已经配置了代理，请求 `/api` 时会自动转发到后端 `http://localhost:8000`。
 
 ---
 
-## 项目结构
+## 10. 先做最基础的启动验证
 
-```
-Godview/
-├── app/
-│   ├── api/              # FastAPI 路由
-│   │   ├── routes/       # 具体路由模块
-│   │   │   ├── characters.py   # 角色管理
-│   │   │   ├── worlds.py       # 世界管理
-│   │   │   ├── plots.py        # 剧情管理
-│   │   │   ├── websocket.py    # WebSocket 实时交互
-│   │   │   └── config.py       # 配置管理
-│   │   └── app.py        # 应用创建
-│   ├── agents/           # Agent 系统
-│   │   ├── director/     # 导演系统 Agents
-│   │   │   ├── summarizer.py     # 剧情总结员
-│   │   │   ├── master_plotter.py # 总编剧
-│   │   │   ├── hook_manager.py   # 伏笔管理员
-│   │   │   └── writer.py         # 内容执行官
-│   │   ├── base.py       # Agent 基类
-│   │   └── character.py  # 角色 Agent
-│   ├── database/         # 数据库层
-│   │   ├── postgres.py   # PostgreSQL 操作
-│   │   ├── nebulagraph.py # NebulaGraph 操作
-│   │   └── qdrant.py     # Qdrant 操作
-│   ├── models/           # 数据模型
-│   ├── services/         # 业务服务
-│   │   ├── director.py           # 导演系统核心
-│   │   ├── embedding_service.py  # Embedding 服务抽象层
-│   │   └── novel_file_manager.py # 小说文件管理
-│   └── config.py         # 应用配置
-├── tests/                # 测试代码
-├── schema/               # 数据库 Schema
-├── main.py               # 应用入口
-├── scripts.py            # 命令行工具
-├── docker-compose.yml    # Docker 编排
-├── requirements.txt      # 依赖列表
-└── .env.example          # 环境变量模板
-```
+请按顺序打开下面这些地址：
+
+### 10.1 后端检查
+
+浏览器打开：
+
+- http://localhost:8000/health
+- http://localhost:8000/docs
+
+如果能打开，说明后端基本正常。
+
+### 10.2 前端检查
+
+浏览器打开：
+
+- http://localhost:5173
+
+如果能看到前端界面，说明前端基本正常。
 
 ---
 
-## 常用命令
+## 11. 按页面顺序验证项目
+
+下面是推荐的验证顺序。你不需要一次全测完，但建议按这个顺序看。
+
+### 11.1 小说编辑页
+
+重点确认：
+
+- 能看到章节列表
+- 能新建章节
+- 能修改章节标题和正文
+- 能保存章节
+
+这是最基础的一条链路。
+
+### 11.2 章节评估页
+
+重点确认：
+
+- 能读取章节
+- 能触发评估
+- 页面不会因为章节接口报错而空白
+
+### 11.3 读者模拟页
+
+重点确认：
+
+- 能读取章节列表
+- 能执行模拟
+
+### 11.4 Director 页面
+
+重点确认：
+
+- 页面能打开
+- 能建立会话
+- 工作流日志能显示
+- 运行时面板能刷新
+
+如果你的 `LLM_API_KEY` 没填真实值，这一页的生成类能力可能无法正常使用。
+
+### 11.5 Diff 工具页
+
+重点确认：
+
+- 页面能打开
+- 能选择对比模式
+- 快照对比接口能正常返回
+
+### 11.6 可视化工作台
+
+重点确认：
+
+- 页面能打开
+- 能选择世界
+- 能看到工作流 / 剧情树 / 版本树
+
+### 11.7 干预日志页
+
+重点确认：
+
+- 能加载干预记录
+- 能选择快照并创建干预
+- 能填写效果评分和备注并保存
+
+---
+
+## 12. 你可以直接用的常用命令
+
+### 12.1 后端相关
 
 ```bash
-# 启动服务
-python scripts.py start --reload
-
-# 初始化数据库
-python scripts.py init-db
-
-# 检查依赖
 python scripts.py check
+python scripts.py init-db
+python scripts.py start --reload
+```
 
-# Docker 启动全部数据库
+### 12.2 前端相关
+
+```bash
+cd frontend
+npm install
+npm run dev
+npm run build
+```
+
+### 12.3 Docker 相关
+
+```bash
+docker compose up -d postgres qdrant
 docker compose up -d
-
-# Docker 停止数据库
+docker compose ps
 docker compose down
-
-# Docker 查看日志
-docker compose logs -f postgres
 ```
 
 ---
 
-## 常见问题
+## 13. 如果你只是想最快跑起来
 
-### Q: `sentence_transformers` 下载模型很慢？
-模型约 80MB，首次运行自动从 HuggingFace 下载。如果网络不佳，可临时改用 `openai` 模式或手动下载模型到本地。
+你可以只执行下面这组命令：
 
-### Q: Ollama 连接失败？
-确保 Ollama 已启动且运行了 embedding 模型：
+### 终端 1：项目根目录
+
 ```bash
-ollama pull nomic-embed-text
-ollama serve
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+copy .env.example .env
+python scripts.py init-db
+docker compose up -d postgres qdrant
+python scripts.py start --reload
 ```
 
-### Q: PostgreSQL 连接失败？
-确认数据库已启动且端口 5432 未被占用：
+### 终端 2：项目根目录
+
 ```bash
-docker compose ps postgres
+cd frontend
+npm install
+npm run dev
+```
+
+然后打开：
+
+- http://localhost:8000/docs
+- http://localhost:5173
+
+---
+
+## 14. 常见问题
+
+### 14.1 `python` 命令不可用
+
+说明 Python 没有加入 PATH。
+
+处理方式：
+
+- 重新安装 Python，并勾选 `Add python.exe to PATH`
+- 或者重开终端后再试
+
+### 14.2 `docker compose` 失败
+
+通常是 Docker Desktop 没启动。
+
+先打开 Docker Desktop，等它完全启动后再执行：
+
+```bash
+docker compose ps
+```
+
+### 14.3 `python scripts.py init-db` 失败
+
+先检查：
+
+```bash
+docker compose ps
+```
+
+确认 PostgreSQL 已启动。
+
+再检查 `.env` 里的：
+
+```ini
+DATABASE_URL=postgresql+asyncpg://postgres:password@localhost:5432/godview
+```
+
+### 14.4 `npm run dev` 失败
+
+先确认你在 `frontend` 目录下。
+
+然后重新执行：
+
+```bash
+npm install
+npm run dev
+```
+
+### 14.5 页面能打开，但生成功能不能用
+
+这通常表示：
+
+- `LLM_API_KEY` 没填真实值
+- 或者模型服务不可用
+
+请检查 `.env` 中的：
+
+```ini
+LLM_PROVIDER=openai
+LLM_API_KEY=你的真实Key
+LLM_MODEL=gpt-4o
 ```
 
 ---
 
-## 开发计划
+## 15. 当前项目目录结构（简化版）
 
-- [ ] 完善 Agent 实现
-- [ ] 添加更多剧情模式
-- [ ] 前端界面开发
-- [ ] 性能优化
+```text
+Godview/
+├── app/                  # 后端代码
+├── frontend/             # 前端代码
+├── main.py               # FastAPI 入口
+├── scripts.py            # 启动/检查/初始化命令
+├── docker-compose.yml    # Docker 数据库服务
+├── requirements.txt      # 后端依赖
+├── .env.example          # 环境变量模板
+└── README.md             # 当前说明文档
+```
 
-## License
+---
+
+## 16. 推荐你每次启动项目的顺序
+
+以后你再次启动项目，建议固定按下面顺序：
+
+### 第一步：打开 Docker
+
+```bash
+docker compose up -d postgres qdrant
+```
+
+### 第二步：启动后端
+
+```bash
+python scripts.py start --reload
+```
+
+### 第三步：启动前端
+
+```bash
+cd frontend
+npm run dev
+```
+
+### 第四步：打开页面
+
+- 前端：http://localhost:5173
+- 后端文档：http://localhost:8000/docs
+
+---
+
+## 17. 停止项目
+
+### 停止前端
+
+在前端终端按：
+
+```bash
+Ctrl + C
+```
+
+### 停止后端
+
+在后端终端按：
+
+```bash
+Ctrl + C
+```
+
+### 停止 Docker 容器
+
+在项目根目录执行：
+
+```bash
+docker compose down
+```
+
+---
+
+## 18. 许可证
 
 MIT License

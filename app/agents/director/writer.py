@@ -235,7 +235,7 @@ class WriterAgent(BaseAgent):
 {atmosphere}
 
 【感官细节】
-{sensor y_details if sensory_details else '自由发挥'}
+{sensory_details if sensory_details else '自由发挥'}
 
 要求：
 - 调动多种感官（视觉、听觉、嗅觉、触觉）

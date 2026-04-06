@@ -217,6 +217,17 @@ class PostgresDatabase:
         results = await self.execute_query(query, {"id": world_id})
         return results[0] if results else None
 
+    async def delete_world(self, world_id: str) -> bool:
+        """删除世界"""
+        query = "DELETE FROM worlds WHERE id = :id"
+        await self.execute_query(query, {"id": world_id})
+        return True
+
+    async def get_all_worlds(self) -> List[Dict[str, Any]]:
+        """获取所有世界"""
+        query = "SELECT * FROM worlds ORDER BY created_at DESC"
+        return await self.execute_query(query)
+
     # ==================== 区域相关操作 ====================
 
     async def save_region(self, region_data: Dict[str, Any]) -> str:
@@ -306,13 +317,20 @@ class PostgresDatabase:
 
     async def update_hook_status(self, hook_id: str, status: str) -> bool:
         """更新伏笔状态"""
-        query = "UPDATE hooks SET status = :status, updated_at = :updated_at WHERE id = :id"
-        await self.execute_query(query, {
-            "id": hook_id,
-            "status": status,
-            "updated_at": datetime.utcnow().isoformat(),
-        })
+        query = "UPDATE hooks SET status = :status WHERE id = :id"
+        await self.execute_query(query, {"id": hook_id, "status": status})
         return True
+
+    async def delete_hook(self, hook_id: str) -> bool:
+        """删除伏笔"""
+        query = "DELETE FROM hooks WHERE id = :id"
+        await self.execute_query(query, {"id": hook_id})
+        return True
+
+    async def get_all_hooks(self) -> List[Dict[str, Any]]:
+        """获取所有伏笔"""
+        query = "SELECT * FROM hooks ORDER BY priority DESC, created_at DESC"
+        return await self.execute_query(query)
 
     # ==================== 章节相关操作 ====================
 
@@ -422,10 +440,27 @@ class PostgresDatabase:
         await self.execute_query(query, intervention_data)
         return intervention_data.get("id", "")
 
-    async def get_intervention_logs(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """获取干预日志"""
-        query = "SELECT * FROM intervention_logs ORDER BY created_at DESC LIMIT :limit"
-        return await self.execute_query(query, {"limit": limit})
+    async def update_intervention_evaluation(
+        self,
+        intervention_id: str,
+        outcome_rating: Optional[float] = None,
+        outcome_notes: Optional[str] = None,
+    ) -> None:
+        """更新干预效果评估"""
+        query = """
+        UPDATE intervention_logs
+        SET outcome_rating = :outcome_rating,
+            outcome_notes = :outcome_notes
+        WHERE id = :id
+        """
+        await self.execute_query(
+            query,
+            {
+                "id": intervention_id,
+                "outcome_rating": outcome_rating,
+                "outcome_notes": outcome_notes,
+            },
+        )
 
     # ==================== 初始化表结构 ====================
 

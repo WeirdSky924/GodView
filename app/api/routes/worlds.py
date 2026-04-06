@@ -16,22 +16,48 @@ router = APIRouter()
 
 @router.get("", response_model=List[Dict[str, Any]])
 async def list_worlds(limit: int = Query(default=100, le=1000)):
-    """
-    获取世界列表
-
-    Args:
-        limit: 返回数量限制
-
-    Returns:
-        List: 世界列表
-    """
+    """获取世界列表"""
     from app.api.app import postgres_db
 
     if not postgres_db:
         raise HTTPException(status_code=503, detail="数据库未连接")
 
-    # 简单实现：查询所有世界（需要根据实际表结构）
-    return []
+    worlds = await postgres_db.get_all_worlds()
+    return worlds[:limit]
+
+
+@router.put("/{world_id}", response_model=Dict[str, Any])
+async def update_world(world_id: str, world: World):
+    """更新世界数据"""
+    from app.api.app import postgres_db
+
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+
+    existing = await postgres_db.get_world(world_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="世界不存在")
+
+    world_data = world.model_dump(mode="json")
+
+    try:
+        await postgres_db.save_world(world_data)
+        return {"success": True, "id": world_id, "message": f"世界 '{world.name}' 更新成功"}
+    except Exception as e:
+        logger.error(f"更新世界失败：{e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/{world_id}", response_model=Dict[str, Any])
+async def delete_world(world_id: str):
+    """删除世界"""
+    from app.api.app import postgres_db
+
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+
+    await postgres_db.delete_world(world_id)
+    return {"success": True, "message": f"世界 {world_id} 已删除"}
 
 
 @router.get("/{world_id}", response_model=Dict[str, Any])

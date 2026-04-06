@@ -194,7 +194,23 @@ class Chapter(BaseModel):
         }
 
 
-class Plot(BaseModel):
+class CreateChapterDTO(BaseModel):
+    """创建章节请求模型"""
+
+    title: str = Field(..., description="章节标题")
+    world_id: str = Field(default="default_world", description="所属世界 ID")
+    content: Optional[str] = Field(default="", description="章节正文")
+    status: ChapterStatus = Field(default=ChapterStatus.DRAFT, description="章节状态")
+
+
+class UpdateChapterDTO(BaseModel):
+    """更新章节请求模型"""
+
+    title: Optional[str] = Field(default=None, description="章节标题")
+    world_id: Optional[str] = Field(default=None, description="所属世界 ID")
+    content: Optional[str] = Field(default=None, description="章节正文")
+    status: Optional[ChapterStatus] = Field(default=None, description="章节状态")
+
     """剧情模型（用于追踪整体剧情线）"""
 
     id: str = Field(..., description="剧情线 ID")

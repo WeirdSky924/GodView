@@ -48,6 +48,25 @@ EMBEDDING_PROVIDERS = [
     },
 ]
 
+LLM_PROVIDERS = [
+    {
+        "id": "openai",
+        "name": "OpenAI API（在线）",
+        "description": "调用 OpenAI 兼容聊天模型接口",
+        "default_model": "gpt-4o",
+        "default_url": "https://api.openai.com/v1",
+        "requires_api_key": True,
+    },
+    {
+        "id": "anthropic",
+        "name": "Anthropic Claude（在线）",
+        "description": "调用 Claude 聊天模型接口",
+        "default_model": "claude-3-5-sonnet-latest",
+        "default_url": "https://api.anthropic.com",
+        "requires_api_key": True,
+    },
+]
+
 
 class EmbeddingConfig(BaseModel):
     """Embedding 配置"""
@@ -56,6 +75,16 @@ class EmbeddingConfig(BaseModel):
     api_key: str = ""
     base_url: str = ""
     dimension: int = 0
+
+
+class LLMConfig(BaseModel):
+    """LLM 配置"""
+    provider: str
+    model: str = ""
+    api_key: str = ""
+    base_url: str = ""
+    temperature: float = 0.7
+    max_tokens: int = 4096
 
 
 class AppConfig(BaseModel):
@@ -100,7 +129,6 @@ async def update_embedding_config(config: EmbeddingConfig) -> Dict[str, Any]:
     from app.config import settings
     from app.services.embedding_service import create_embedding_service
 
-    # 验证 provider
     valid_providers = [p["id"] for p in EMBEDDING_PROVIDERS]
     if config.provider not in valid_providers:
         raise HTTPException(
@@ -108,13 +136,11 @@ async def update_embedding_config(config: EmbeddingConfig) -> Dict[str, Any]:
             detail=f"不支持的 provider: {config.provider}，可选：{valid_providers}"
         )
 
-    # 填充默认值
     provider_info = next(p for p in EMBEDDING_PROVIDERS if p["id"] == config.provider)
     model = config.model or provider_info["default_model"]
     base_url = config.base_url or provider_info["default_url"]
     dimension = config.dimension or provider_info["default_dimension"]
 
-    # 更新 settings
     settings.embedding_provider = config.provider
     settings.embedding_model = model
     if config.api_key:
@@ -122,7 +148,6 @@ async def update_embedding_config(config: EmbeddingConfig) -> Dict[str, Any]:
     settings.embedding_base_url = base_url
     settings.embedding_dimension = dimension
 
-    # 测试新配置
     try:
         service = create_embedding_service(
             provider=config.provider,
@@ -134,7 +159,6 @@ async def update_embedding_config(config: EmbeddingConfig) -> Dict[str, Any]:
         success, message = await service.test_connection()
 
         if success:
-            # 更新全局 embedding 服务
             from app.api.app import set_embedding_service
             set_embedding_service(service)
 
@@ -199,6 +223,123 @@ async def test_embedding_config(config: Optional[EmbeddingConfig] = None) -> Dic
         return {
             "success": success,
             "message": message,
+            "config": {
+                "provider": provider,
+                "model": model,
+                "base_url": base_url,
+            },
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"测试失败：{str(e)}",
+        }
+
+
+@router.get("/llm/providers")
+async def get_llm_providers() -> List[Dict[str, Any]]:
+    """获取所有支持的 LLM Provider 信息"""
+    return LLM_PROVIDERS
+
+
+@router.get("/llm")
+async def get_llm_config() -> Dict[str, Any]:
+    """获取当前 LLM 配置"""
+    from app.config import settings
+
+    return {
+        "provider": settings.llm_provider,
+        "model": settings.llm_model,
+        "api_key": "***" if settings.llm_api_key else "",
+        "base_url": settings.llm_base_url,
+        "temperature": settings.llm_temperature,
+        "max_tokens": settings.llm_max_tokens,
+    }
+
+
+@router.put("/llm")
+async def update_llm_config(config: LLMConfig) -> Dict[str, Any]:
+    """更新 LLM 配置（运行时生效）"""
+    from app.config import settings
+    from app.services.model_router import create_llm
+
+    valid_providers = [p["id"] for p in LLM_PROVIDERS]
+    if config.provider not in valid_providers:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的 provider: {config.provider}，可选：{valid_providers}"
+        )
+
+    provider_info = next(p for p in LLM_PROVIDERS if p["id"] == config.provider)
+    model = config.model or provider_info["default_model"]
+    base_url = config.base_url or provider_info["default_url"]
+
+    settings.llm_provider = config.provider
+    settings.llm_model = model
+    if config.api_key:
+        settings.llm_api_key = config.api_key
+    settings.llm_base_url = base_url
+    settings.llm_temperature = config.temperature
+    settings.llm_max_tokens = config.max_tokens
+
+    try:
+        create_llm(
+            provider=config.provider,
+            model=model,
+            api_key=settings.llm_api_key,
+            base_url=base_url,
+            temperature=config.temperature,
+            max_tokens=config.max_tokens,
+        )
+        return {
+            "success": True,
+            "message": f"LLM 配置已更新：{config.provider} ({model})",
+            "config": {
+                "provider": config.provider,
+                "model": model,
+                "base_url": base_url,
+                "temperature": config.temperature,
+                "max_tokens": config.max_tokens,
+            },
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM 配置更新失败：{str(e)}")
+
+
+@router.post("/llm/test")
+async def test_llm_config(config: Optional[LLMConfig] = None) -> Dict[str, Any]:
+    """测试 LLM 连接"""
+    from app.config import settings
+    from app.services.model_router import create_llm
+
+    if config:
+        provider = config.provider
+        model = config.model
+        api_key = config.api_key or settings.llm_api_key
+        base_url = config.base_url
+        temperature = config.temperature
+        max_tokens = config.max_tokens
+    else:
+        provider = settings.llm_provider
+        model = settings.llm_model
+        api_key = settings.llm_api_key
+        base_url = settings.llm_base_url
+        temperature = settings.llm_temperature
+        max_tokens = settings.llm_max_tokens
+
+    try:
+        llm = create_llm(
+            provider=provider,
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        await llm.ainvoke([{"role": "user", "content": "请回复 test"}])
+        return {
+            "success": True,
+            "message": "LLM 连接测试成功",
             "config": {
                 "provider": provider,
                 "model": model,
