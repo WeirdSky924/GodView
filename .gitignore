@@ -30,3 +30,10 @@ htmlcov/
 
 # Qdrant 本地存储
 qdrant_storage/
+
+# GodView 设计文档
+/godView.md
+/godView_v2.md
+/godView_v3.md
+/godView_v4.md
+/godView_v5.md
