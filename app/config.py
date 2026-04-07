@@ -119,6 +119,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         case_sensitive = True
+        extra = "allow"  # 允许额外的环境变量
 
 
 # 全局配置实例

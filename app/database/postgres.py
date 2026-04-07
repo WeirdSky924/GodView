@@ -188,6 +188,113 @@ class PostgresDatabase:
 
     # ==================== 世界相关操作 ====================
 
+    # ==================== 项目相关操作 ====================
+
+    async def save_project(self, project_data: Dict[str, Any]) -> str:
+        """保存项目数据"""
+        query = """
+        INSERT INTO projects (id, name, description, user_id, status, world_id,
+                             created_at, updated_at, metadata)
+        VALUES (:id, :name, :description, :user_id, :status, :world_id,
+                :created_at, :updated_at, :metadata)
+        ON CONFLICT (id) DO UPDATE SET
+            name = EXCLUDED.name,
+            description = EXCLUDED.description,
+            user_id = EXCLUDED.user_id,
+            status = EXCLUDED.status,
+            world_id = EXCLUDED.world_id,
+            updated_at = EXCLUDED.updated_at,
+            metadata = EXCLUDED.metadata
+        """
+        await self.execute_query(query, project_data)
+        return project_data.get("id", "")
+
+    async def get_project(self, project_id: str) -> Optional[Dict[str, Any]]:
+        """获取项目数据"""
+        query = "SELECT * FROM projects WHERE id = :id"
+        results = await self.execute_query(query, {"id": project_id})
+        return results[0] if results else None
+
+    async def update_project(self, project_id: str, update_data: Dict[str, Any]) -> bool:
+        """更新项目数据"""
+        # 构建动态更新语句
+        set_clauses = []
+        params = {"id": project_id}
+
+        for key, value in update_data.items():
+            set_clauses.append(f"{key} = :{key}")
+            params[key] = value
+
+        if not set_clauses:
+            return False
+
+        # 添加更新时间
+        set_clauses.append("updated_at = CURRENT_TIMESTAMP")
+
+        query = f"UPDATE projects SET {', '.join(set_clauses)} WHERE id = :id"
+        await self.execute_query(query, params)
+        return True
+
+    async def delete_project(self, project_id: str) -> bool:
+        """删除项目"""
+        query = "DELETE FROM projects WHERE id = :id"
+        await self.execute_query(query, {"id": project_id})
+        return True
+
+    async def get_all_projects(
+        self,
+        status: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """获取所有项目（支持状态过滤和分页）"""
+        if status:
+            query = "SELECT * FROM projects WHERE status = :status ORDER BY created_at DESC LIMIT :limit OFFSET :offset"
+            return await self.execute_query(query, {"status": status, "limit": limit, "offset": offset})
+        else:
+            query = "SELECT * FROM projects ORDER BY created_at DESC LIMIT :limit OFFSET :offset"
+            return await self.execute_query(query, {"limit": limit, "offset": offset})
+
+    async def get_project_summaries(
+        self,
+        status: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """获取项目摘要列表（含角色和章节数量）"""
+        if status:
+            query = """
+            SELECT p.*,
+                   (SELECT COUNT(*) FROM characters c WHERE c.created_by = p.id) as character_count,
+                   (SELECT COUNT(*) FROM chapters c WHERE c.world_id = p.world_id) as chapter_count
+            FROM projects p
+            WHERE p.status = :status
+            ORDER BY p.created_at DESC
+            LIMIT :limit
+            """
+            return await self.execute_query(query, {"status": status, "limit": limit})
+        else:
+            query = """
+            SELECT p.*,
+                   (SELECT COUNT(*) FROM characters c WHERE c.created_by = p.id) as character_count,
+                   (SELECT COUNT(*) FROM chapters c WHERE c.world_id = p.world_id) as chapter_count
+            FROM projects p
+            ORDER BY p.created_at DESC
+            LIMIT :limit
+            """
+            return await self.execute_query(query, {"limit": limit})
+
+    async def get_project_summary(self, project_id: str) -> Optional[Dict[str, Any]]:
+        """获取项目摘要信息"""
+        query = """
+        SELECT p.*,
+               (SELECT COUNT(*) FROM characters c WHERE c.created_by = p.id) as character_count,
+               (SELECT COUNT(*) FROM chapters c WHERE c.world_id = p.world_id) as chapter_count
+        FROM projects p
+        WHERE p.id = :id
+        """
+        results = await self.execute_query(query, {"id": project_id})
+        return results[0] if results else None
+
     async def save_world(self, world_data: Dict[str, Any]) -> str:
         """保存世界数据"""
         query = """
@@ -489,6 +596,19 @@ class PostgresDatabase:
             current_location TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- 项目表 (v4 新增)
+        CREATE TABLE IF NOT EXISTS projects (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT,
+            user_id TEXT,
+            status TEXT DEFAULT 'draft',
+            world_id TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            metadata JSONB DEFAULT '{}'
         );
 
         -- 世界表

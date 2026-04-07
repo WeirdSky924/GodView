@@ -145,7 +145,7 @@ def create_app() -> FastAPI:
     )
 
     # 注册路由
-    from app.api.routes import characters, worlds, plots, websocket, config, time, simulation
+    from app.api.routes import characters, worlds, plots, websocket, config, time, simulation, projects, bootstrap
 
     app.include_router(characters.router, prefix="/api/characters", tags=["角色管理"])
     app.include_router(worlds.router, prefix="/api/worlds", tags=["世界管理"])
@@ -154,6 +154,8 @@ def create_app() -> FastAPI:
     app.include_router(config.router, prefix="/api/config", tags=["配置管理"])
     app.include_router(time.router, prefix="/api", tags=["时间系统"])
     app.include_router(simulation.router, prefix="/api", tags=["世界模拟"])
+    app.include_router(projects.router, prefix="/api/projects", tags=["项目管理"])
+    app.include_router(bootstrap.router, prefix="/api/bootstrap", tags=["Bootstrap 流程"])
 
     # 健康检查
     @app.get("/health")

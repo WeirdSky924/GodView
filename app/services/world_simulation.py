@@ -11,6 +11,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from app.services.time_system import TimeSystem, TimeUpdateResult
+from app.services.entity_system import EntitySystem
+from app.services.location_system import LocationSystem
+from app.services.event_system import EventSystem
+from app.services.memory_system import EnhancedMemorySystem
 
 
 class SimulationStatus(Enum):
@@ -111,6 +115,32 @@ class WorldSimulationEngine:
             await self._handle_time_update(result)
 
         self.time_system.register_time_update_callback(time_update_callback)
+
+        # 初始化实体系统
+        self.entity_system = EntitySystem(self.config.get("entity_config", {}))
+        if entities:
+            for entity_data in entities:
+                entity = self.entity_system.create_character_from_data(entity_data)
+                self.entity_system.add_entity(entity)
+
+        # 初始化位置系统
+        self.location_system = LocationSystem(self.config.get("location_config", {}))
+        if locations:
+            from app.models.world import Region
+            for location_data in locations:
+                region = Region(**location_data)
+                self.location_system.add_location(region)
+
+        # 初始化事件系统
+        self.event_system = EventSystem(self.config.get("event_config", {}))
+
+        # 初始化记忆系统
+        qdrant_db = self.config.get("qdrant_db")
+        nebula_db = self.config.get("nebula_db")
+        self.memory_system = EnhancedMemorySystem(qdrant_db, nebula_db)
+
+        self.status = SimulationStatus.STOPPED
+        self.logger.info("世界模拟引擎初始化完成")
 
         self.status = SimulationStatus.STOPPED
         self.logger.info("世界模拟引擎初始化完成")
@@ -263,37 +293,62 @@ class WorldSimulationEngine:
 
     async def _update_entities(self, time_delta: timedelta):
         """更新所有实体状态"""
-        # TODO: 实现实体系统后集成
-        # if self.entity_system:
-        #     await self.entity_system.update_all(time_delta)
-        pass
+        if self.entity_system:
+            await self.entity_system.update_all(time_delta)
 
     async def _process_locations(self, time_delta: timedelta):
         """处理位置系统"""
-        # TODO: 实现位置系统后集成
-        # if self.location_system:
-        #     await self.location_system.simulate_activity(time_delta)
-        pass
+        if self.location_system and self.entity_system:
+            await self.location_system.simulate_activity(time_delta, self.entity_system)
 
     async def _trigger_events(self, time_delta: timedelta):
         """触发事件"""
-        # TODO: 实现事件系统后集成
-        # if self.event_system:
-        #     await self.event_system.process_triggers(time_delta)
-        pass
+        if self.event_system:
+            world_state = await self._build_world_state()
+            await self.event_system.process_triggers(time_delta, world_state)
+            await self.event_system.update_active_events(time_delta)
 
     async def _update_memories(self, time_delta: timedelta):
         """更新记忆"""
-        # TODO: 实现记忆系统后集成
-        # if self.memory_system:
-        #     await self.memory_system.update_decay(time_delta)
-        pass
+        if self.memory_system:
+            await self.memory_system.update_decay(time_delta)
+
+            # 为实体添加记忆（基于世界状态）
+            if self.entity_system:
+                world_state = await self._build_world_state()
+                await self._generate_entity_memories(world_state)
 
     async def _handle_time_update(self, time_update: TimeUpdateResult):
         """处理时间更新"""
         # 可以在这里处理时间变化对世界的影响
         # 比如昼夜交替、季节变化等
         pass
+
+    async def _build_world_state(self) -> Dict[str, Any]:
+        """构建世界状态"""
+        time_info = self.time_system.get_time_info() if self.time_system else {}
+
+        entities = {}
+        if self.entity_system:
+            for entity_id, entity in self.entity_system.entities.items():
+                entities[entity_id] = {
+                    "name": entity.name,
+                    "type": entity.entity_type.value,
+                    "location": entity.current_location,
+                    "status": entity.status.value,
+                    "attributes": entity.attributes
+                }
+
+        world_state = {
+            "current_time": self.time_system.get_current_time() if self.time_system else None,
+            "time_phase": time_info.get("day_phase", "day"),
+            "entities": entities,
+            "total_entities": len(entities),
+            "simulation_status": self.status.value,
+            "current_tick": self.current_tick
+        }
+
+        return world_state
 
     async def _get_current_world_state(self) -> WorldState:
         """获取当前世界状态"""
@@ -378,9 +433,9 @@ class WorldSimulationEngine:
                 "time_scale": self.time_system.get_time_scale(),
                 "tick_count": self.time_system.tick_count
             } if self.time_system else None,
-            "entities": [],  # TODO: 从实体系统获取
-            "locations": [],  # TODO: 从位置系统获取
-            "active_events": [],  # TODO: 从事件系统获取
+            "entities": await self._get_entities_snapshot() if self.entity_system else [],
+            "locations": await self._get_locations_snapshot() if self.location_system else [],
+            "active_events": await self._get_events_snapshot() if self.event_system else [],
             "memory_snapshots": {},  # TODO: 从记忆系统获取
             "performance": self.get_performance_stats()
         }
@@ -421,3 +476,96 @@ class WorldSimulationEngine:
         """
         self.tick_interval = max(0.1, min(interval, 60.0))
         self.logger.info(f"设置时钟周期间隔: {self.tick_interval}秒")
+
+    async def _get_entities_snapshot(self) -> List[Dict[str, Any]]:
+        """获取实体快照"""
+        entities = []
+        for entity_id, entity in self.entity_system.entities.items():
+            entities.append({
+                "id": entity_id,
+                "name": entity.name,
+                "type": entity.entity_type.value,
+                "status": entity.status.value,
+                "location": entity.current_location,
+                "attributes": entity.attributes,
+                "current_action": entity.current_action.description if entity.current_action else None,
+                "current_goal": entity.current_goal.description if entity.current_goal else None
+            })
+        return entities
+
+    async def _get_locations_snapshot(self) -> List[Dict[str, Any]]:
+        """获取位置快照"""
+        locations = []
+        for location_id, location in self.location_system.locations.items():
+            locations.append({
+                "id": location_id,
+                "name": location.region.name,
+                "type": location.region.region_type.value,
+                "state": location.state.value,
+                "weather": location.weather,
+                "temperature": location.temperature,
+                "population": location.state_data.population,
+                "activity_level": location.state_data.activity_level
+            })
+        return locations
+
+    async def _get_events_snapshot(self) -> List[Dict[str, Any]]:
+        """获取事件快照"""
+        events = []
+        for event in self.event_system.active_events:
+            events.append({
+                "id": event.event_id,
+                "name": event.name,
+                "type": event.event_type.value,
+                "priority": event.priority.value,
+                "status": event.status.value,
+                "description": event.description,
+                "start_time": event.start_time.isoformat() if event.start_time else None,
+                "end_time": event.end_time.isoformat() if event.end_time else None,
+                "involved_entities": event.involved_entities,
+                "involved_locations": event.involved_locations
+            })
+        return events
+
+    async def _generate_entity_memories(self, world_state: Dict[str, Any]):
+        """为实体生成记忆"""
+        if not self.entity_system or not self.memory_system:
+            return
+
+        # 为每个活跃实体生成记忆
+        for entity_id, entity in self.entity_system.entities.items():
+            if entity.status.value != "active":
+                continue
+
+            # 基于当前状态生成记忆
+            current_context = self._build_entity_context(entity, world_state)
+
+            # 检查是否值得记录记忆
+            if self._is_memory_worth_recording(entity, world_state):
+                memory_content = f"在{entity.current_location}进行了相关活动，当前状态正常"
+                metadata = {
+                    "emotional_intensity": entity.mood if hasattr(entity, 'mood') else 0.5,
+                    "related_entities": self.entity_system.get_entities_in_location(entity.current_location) if entity.current_location else [],
+                    "related_locations": [entity.current_location] if entity.current_location else []
+                }
+
+                await self.memory_system.add_memory(entity_id, memory_content, metadata)
+
+    def _build_entity_context(self, entity, world_state: Dict[str, Any]) -> str:
+        """构建实体上下文"""
+        context_parts = []
+
+        if entity.current_location:
+            context_parts.append(f"当前位置: {entity.current_location}")
+
+        if hasattr(entity, 'mood'):
+            mood_desc = "愉快" if entity.mood > 0.6 else "平静" if entity.mood > 0.4 else "低落"
+            context_parts.append(f"情绪状态: {mood_desc}")
+
+        return ", ".join(context_parts)
+
+    def _is_memory_worth_recording(self, entity, world_state: Dict[str, Any]) -> bool:
+        """检查记忆是否值得记录"""
+        # 简化实现：随机决定
+        import random
+        return random.random() < 0.2  # 20%概率记录记忆

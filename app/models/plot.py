@@ -211,6 +211,8 @@ class UpdateChapterDTO(BaseModel):
     content: Optional[str] = Field(default=None, description="章节正文")
     status: Optional[ChapterStatus] = Field(default=None, description="章节状态")
 
+
+class Plot(BaseModel):
     """剧情模型（用于追踪整体剧情线）"""
 
     id: str = Field(..., description="剧情线 ID")

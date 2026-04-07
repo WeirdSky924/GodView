@@ -15,6 +15,9 @@ import NovelView from './pages/NovelView'
 import Settings from './pages/Settings'
 import DiffTool from './pages/DiffTool'
 import WorldView from './pages/WorldView'
+import Bootstrap from './pages/Bootstrap'
+import ProjectSetup from './pages/ProjectSetup'
+import ObservationMode from './pages/ObservationMode'
 
 function App() {
   return (
@@ -35,6 +38,10 @@ function App() {
         <Route path="/diff" element={<DiffTool />} />
         <Route path="/world-view" element={<WorldView />} />
         <Route path="/settings" element={<Settings />} />
+        <Route path="/bootstrap" element={<Bootstrap />} />
+        <Route path="/bootstrap/:sessionId" element={<Bootstrap />} />
+        <Route path="/project-setup" element={<ProjectSetup />} />
+        <Route path="/observation" element={<ObservationMode />} />
       </Routes>
     </Layout>
   )

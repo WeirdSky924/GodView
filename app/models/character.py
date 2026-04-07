@@ -18,6 +18,15 @@ class CharacterStatus(str, Enum):
     PAUSED = "paused"  # 暂停（用户干预）
 
 
+class CharacterRole(str, Enum):
+    """角色类型"""
+
+    MAIN = "main"  # 主角
+    SUPPORTING = "supporting"  # 配角
+    NPC = "npc"  # NPC
+    ANTAGONIST = "antagonist"  # 反派
+
+
 class PersonalityTrait(BaseModel):
     """性格特质"""
 
