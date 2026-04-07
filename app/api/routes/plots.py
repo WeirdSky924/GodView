@@ -17,6 +17,7 @@ router = APIRouter()
 
 @router.get("/hooks", response_model=List[Dict[str, Any]])
 async def list_hooks(
+    project_id: Optional[str] = Query(None, description="按项目 ID 过滤"),
     status: Optional[str] = None,
     hook_type: Optional[str] = None,
     limit: int = Query(default=100, le=1000),
@@ -25,6 +26,7 @@ async def list_hooks(
     获取伏笔列表
 
     Args:
+        project_id: 按项目 ID 过滤
         status: 按状态过滤
         hook_type: 按类型过滤
         limit: 返回数量限制
@@ -37,19 +39,17 @@ async def list_hooks(
     if not postgres_db:
         raise HTTPException(status_code=503, detail="数据库未连接")
 
-    hooks = []
-
-    if status:
-        hooks = await postgres_db.get_hooks_by_status(status)
-    else:
-        # 获取所有伏笔（简化实现）
-        pass
+    hooks = await postgres_db.get_all_hooks(
+        project_id=project_id,
+        status=status,
+        limit=limit,
+    )
 
     # 类型过滤
     if hook_type and hooks:
         hooks = [h for h in hooks if h.get("hook_type") == hook_type]
 
-    return hooks[:limit]
+    return hooks
 
 
 @router.get("/hooks/{hook_id}", response_model=Dict[str, Any])
@@ -136,6 +136,7 @@ async def update_hook_status(hook_id: str, status: str):
 
 @router.get("/chapters", response_model=List[Dict[str, Any]])
 async def list_chapters(
+    project_id: Optional[str] = Query(None, description="按项目 ID 过滤"),
     world_id: Optional[str] = None,
     status: Optional[str] = None,
     limit: int = Query(default=100, le=1000),
@@ -144,6 +145,7 @@ async def list_chapters(
     获取章节列表
 
     Args:
+        project_id: 按项目 ID 过滤
         world_id: 按世界过滤
         status: 按状态过滤
         limit: 返回数量限制
@@ -156,16 +158,23 @@ async def list_chapters(
     if not postgres_db:
         raise HTTPException(status_code=503, detail="数据库未连接")
 
-    if world_id:
+    if project_id:
+        chapters = await postgres_db.get_chapters_by_project(
+            project_id=project_id,
+            status=status,
+            limit=limit,
+        )
+    elif world_id:
         chapters = await postgres_db.get_chapters_by_world(world_id)
+        if status and chapters:
+            chapters = [c for c in chapters if c.get("status") == status]
     else:
         chapters = await postgres_db.execute_query(
             "SELECT * FROM chapters ORDER BY created_at ASC LIMIT :limit",
             {"limit": limit},
         )
-
-    if status and chapters:
-        chapters = [c for c in chapters if c.get("status") == status]
+        if status and chapters:
+            chapters = [c for c in chapters if c.get("status") == status]
 
     return chapters[:limit]
 

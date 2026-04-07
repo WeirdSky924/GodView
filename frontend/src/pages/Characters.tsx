@@ -16,7 +16,8 @@ import type {
   UpdateCharacterDTO,
   CharacterVoiceSampleSearchResult,
 } from '@/api/characters'
-import { Plus, Edit, Trash2, User, Mic, Search, RefreshCw } from 'lucide-react'
+import { Plus, Edit, Trash2, User, Mic, Search, RefreshCw, FolderOpen } from 'lucide-react'
+import { useProject } from '@/contexts/ProjectContext'
 
 function splitCsvInput(value: string) {
   return value
@@ -26,6 +27,7 @@ function splitCsvInput(value: string) {
 }
 
 export default function Characters() {
+  const { currentProject } = useProject()
   const [characters, setCharacters] = useState<Character[]>([])
   const [showModal, setShowModal] = useState(false)
   const [editingChar, setEditingChar] = useState<Character | null>(null)
@@ -53,8 +55,9 @@ export default function Characters() {
   const [voiceSamplesInput, setVoiceSamplesInput] = useState('')
 
   const loadCharacters = useCallback(async () => {
+    setLoading(true)
     try {
-      const data = await getCharacters()
+      const data = await getCharacters(currentProject?.id)
       setCharacters(data)
       setSelectedCharacterId((current) => current || data[0]?.id || '')
     } catch (error) {
@@ -62,7 +65,7 @@ export default function Characters() {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [currentProject?.id])
 
   const loadVoiceSamples = useCallback(async (characterId: string) => {
     if (!characterId) {
@@ -231,13 +234,18 @@ export default function Characters() {
     <div className="space-y-8">
       <div className="flex items-center justify-between">
         <h1 className="text-3xl font-bold text-gray-800">角色管理</h1>
-        <Button onClick={openCreateModal}>
+        <Button onClick={openCreateModal} disabled={!currentProject}>
           <Plus size={20} className="mr-2" />
           新增角色
         </Button>
       </div>
 
-      {loading ? (
+      {!currentProject ? (
+        <div className="text-center py-20 text-gray-500">
+          <FolderOpen size={48} className="mx-auto mb-4 opacity-50" />
+          <p>请先在侧边栏选择一个项目</p>
+        </div>
+      ) : loading ? (
         <p className="text-center text-gray-500 py-12">加载中...</p>
       ) : (
         <>

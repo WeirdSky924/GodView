@@ -18,6 +18,7 @@ router = APIRouter()
 
 @router.get("", response_model=List[Dict[str, Any]])
 async def list_characters(
+    project_id: Optional[str] = Query(None, description="按项目 ID 过滤"),
     status: Optional[CharacterStatus] = None,
     role: Optional[str] = None,
     limit: int = Query(default=100, le=1000),
@@ -26,6 +27,7 @@ async def list_characters(
     获取角色列表
 
     Args:
+        project_id: 按项目 ID 过滤
         status: 按状态过滤
         role: 按角色类型过滤
         limit: 返回数量限制
@@ -36,15 +38,14 @@ async def list_characters(
     if not postgres_db:
         raise HTTPException(status_code=503, detail="数据库未连接")
 
-    characters = await postgres_db.get_all_characters()
+    characters = await postgres_db.get_all_characters(
+        project_id=project_id,
+        status=status.value if status else None,
+        role=role,
+        limit=limit,
+    )
 
-    # 过滤
-    if status:
-        characters = [c for c in characters if c.get("status") == status.value]
-    if role:
-        characters = [c for c in characters if c.get("role") == role]
-
-    return characters[:limit]
+    return characters
 
 
 @router.get("/{character_id}", response_model=Dict[str, Any])

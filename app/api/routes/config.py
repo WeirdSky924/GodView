@@ -48,22 +48,180 @@ EMBEDDING_PROVIDERS = [
     },
 ]
 
+# LLM Provider 配置
+# 每个提供商包含基本信息和支持的模型列表
 LLM_PROVIDERS = [
     {
         "id": "openai",
-        "name": "OpenAI API（在线）",
-        "description": "调用 OpenAI 兼容聊天模型接口",
+        "name": "OpenAI",
+        "description": "GPT-4、GPT-3.5 等系列模型",
         "default_model": "gpt-4o",
         "default_url": "https://api.openai.com/v1",
         "requires_api_key": True,
+        "api_key_url": "https://platform.openai.com/api-keys",
+        "models": [
+            {"id": "gpt-4o", "name": "GPT-4o", "context_length": 128000, "description": "最新旗舰模型，综合能力最强"},
+            {"id": "gpt-4o-mini", "name": "GPT-4o Mini", "context_length": 128000, "description": "轻量版，速度快成本低"},
+            {"id": "gpt-4-turbo", "name": "GPT-4 Turbo", "context_length": 128000, "description": "GPT-4 增强版"},
+            {"id": "gpt-3.5-turbo", "name": "GPT-3.5 Turbo", "context_length": 16385, "description": "经济实惠"},
+        ],
     },
     {
         "id": "anthropic",
-        "name": "Anthropic Claude（在线）",
-        "description": "调用 Claude 聊天模型接口",
-        "default_model": "claude-3-5-sonnet-latest",
+        "name": "Anthropic Claude",
+        "description": "Claude 系列模型，擅长长文本和推理",
+        "default_model": "claude-sonnet-4-20250514",
         "default_url": "https://api.anthropic.com",
         "requires_api_key": True,
+        "api_key_url": "https://console.anthropic.com/",
+        "models": [
+            {"id": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4", "context_length": 200000, "description": "最新 Claude 模型"},
+            {"id": "claude-3-5-sonnet-latest", "name": "Claude 3.5 Sonnet", "context_length": 200000, "description": "Claude 3.5 系列主力"},
+            {"id": "claude-3-5-haiku-latest", "name": "Claude 3.5 Haiku", "context_length": 200000, "description": "快速响应版"},
+            {"id": "claude-3-opus-latest", "name": "Claude 3 Opus", "context_length": 200000, "description": "最强推理能力"},
+        ],
+    },
+    {
+        "id": "zhipu",
+        "name": "智谱AI (GLM)",
+        "description": "国产 GLM 系列大模型",
+        "default_model": "glm-4-plus",
+        "default_url": "https://open.bigmodel.cn/api/paas/v4",
+        "requires_api_key": True,
+        "api_key_url": "https://open.bigmodel.cn/",
+        "models": [
+            {"id": "glm-4-plus", "name": "GLM-4 Plus", "context_length": 128000, "description": "旗舰模型，综合能力最强"},
+            {"id": "glm-4-0520", "name": "GLM-4 0520", "context_length": 128000, "description": "高性价比版本"},
+            {"id": "glm-4-air", "name": "GLM-4 Air", "context_length": 128000, "description": "快速响应版"},
+            {"id": "glm-4-flash", "name": "GLM-4 Flash", "context_length": 128000, "description": "极速版，免费额度"},
+            {"id": "glm-4-long", "name": "GLM-4 Long", "context_length": 1000000, "description": "超长上下文"},
+        ],
+    },
+    {
+        "id": "qwen",
+        "name": "通义千问 (阿里云)",
+        "description": "阿里云 Qwen 系列大模型",
+        "default_model": "qwen-max",
+        "default_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "requires_api_key": True,
+        "api_key_url": "https://dashscope.console.aliyun.com/",
+        "models": [
+            {"id": "qwen-max", "name": "Qwen Max", "context_length": 32000, "description": "旗舰模型"},
+            {"id": "qwen-max-longcontext", "name": "Qwen Max 长文本", "context_length": 28000, "description": "长文本版本"},
+            {"id": "qwen-plus", "name": "Qwen Plus", "context_length": 128000, "description": "高性价比"},
+            {"id": "qwen-turbo", "name": "Qwen Turbo", "context_length": 128000, "description": "快速响应"},
+            {"id": "qwen-long", "name": "Qwen Long", "context_length": 1000000, "description": "超长上下文"},
+        ],
+    },
+    {
+        "id": "deepseek",
+        "name": "DeepSeek (深度求索)",
+        "description": "DeepSeek 系列，性价比高",
+        "default_model": "deepseek-chat",
+        "default_url": "https://api.deepseek.com",
+        "requires_api_key": True,
+        "api_key_url": "https://platform.deepseek.com/",
+        "models": [
+            {"id": "deepseek-chat", "name": "DeepSeek Chat", "context_length": 64000, "description": "对话模型"},
+            {"id": "deepseek-reasoner", "name": "DeepSeek Reasoner", "context_length": 64000, "description": "推理模型（R1）"},
+        ],
+    },
+    {
+        "id": "moonshot",
+        "name": "月之暗面 (Kimi)",
+        "description": "Kimi 系列，擅长长文本处理",
+        "default_model": "moonshot-v1-8k",
+        "default_url": "https://api.moonshot.cn/v1",
+        "requires_api_key": True,
+        "api_key_url": "https://platform.moonshot.cn/",
+        "models": [
+            {"id": "moonshot-v1-8k", "name": "Moonshot V1 8K", "context_length": 8192, "description": "标准版"},
+            {"id": "moonshot-v1-32k", "name": "Moonshot V1 32K", "context_length": 32768, "description": "长文本版"},
+            {"id": "moonshot-v1-128k", "name": "Moonshot V1 128K", "context_length": 131072, "description": "超长文本版"},
+        ],
+    },
+    {
+        "id": "baichuan",
+        "name": "百川智能",
+        "description": "Baichuan 系列大模型",
+        "default_model": "Baichuan4",
+        "default_url": "https://api.baichuan-ai.com/v1",
+        "requires_api_key": True,
+        "api_key_url": "https://platform.baichuan-ai.com/",
+        "models": [
+            {"id": "Baichuan4", "name": "Baichuan 4", "context_length": 128000, "description": "最新旗舰"},
+            {"id": "Baichuan3-Turbo", "name": "Baichuan 3 Turbo", "context_length": 32000, "description": "快速版"},
+            {"id": "Baichuan3-Turbo-128k", "name": "Baichuan 3 Turbo 128K", "context_length": 128000, "description": "长文本版"},
+        ],
+    },
+    {
+        "id": "wenxin",
+        "name": "百度文心一言",
+        "description": "ERNIE 系列大模型",
+        "default_model": "ernie-4.0-8k",
+        "default_url": "https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/chat",
+        "requires_api_key": True,
+        "api_key_url": "https://console.bce.baidu.com/qianfan/",
+        "models": [
+            {"id": "ernie-4.0-8k", "name": "ERNIE 4.0", "context_length": 8192, "description": "旗舰模型"},
+            {"id": "ernie-4.0-turbo-8k", "name": "ERNIE 4.0 Turbo", "context_length": 8192, "description": "快速版"},
+            {"id": "ernie-3.5-8k", "name": "ERNIE 3.5", "context_length": 8192, "description": "经济版"},
+            {"id": "ernie-speed-8k", "name": "ERNIE Speed", "context_length": 8192, "description": "极速版"},
+        ],
+    },
+    {
+        "id": "yi",
+        "name": "零一万物 (Yi)",
+        "description": "Yi 系列大模型",
+        "default_model": "yi-large",
+        "default_url": "https://api.lingyiwanwu.com/v1",
+        "requires_api_key": True,
+        "api_key_url": "https://platform.lingyiwanwu.com/",
+        "models": [
+            {"id": "yi-large", "name": "Yi Large", "context_length": 32000, "description": "旗舰模型"},
+            {"id": "yi-large-turbo", "name": "Yi Large Turbo", "context_length": 16384, "description": "快速版"},
+            {"id": "yi-medium", "name": "Yi Medium", "context_length": 16384, "description": "中等规格"},
+            {"id": "yi-spark", "name": "Yi Spark", "context_length": 16384, "description": "极速版"},
+        ],
+    },
+    {
+        "id": "minimax",
+        "name": "MiniMax",
+        "description": "MiniMax 系列大模型",
+        "default_model": "abab6.5-chat",
+        "default_url": "https://api.minimax.chat/v1",
+        "requires_api_key": True,
+        "api_key_url": "https://www.minimaxi.com/",
+        "models": [
+            {"id": "abab6.5-chat", "name": "ABAB 6.5", "context_length": 245000, "description": "旗舰模型"},
+            {"id": "abab6.5s-chat", "name": "ABAB 6.5S", "context_length": 245000, "description": "快速版"},
+            {"id": "abab5.5-chat", "name": "ABAB 5.5", "context_length": 16384, "description": "标准版"},
+        ],
+    },
+    {
+        "id": "openrouter",
+        "name": "OpenRouter (聚合网关)",
+        "description": "聚合多个 LLM 提供商的统一网关",
+        "default_model": "anthropic/claude-sonnet-4",
+        "default_url": "https://openrouter.ai/api/v1",
+        "requires_api_key": True,
+        "api_key_url": "https://openrouter.ai/keys",
+        "models": [
+            {"id": "anthropic/claude-sonnet-4", "name": "Claude Sonnet 4 (via OR)", "context_length": 200000, "description": "通过 OpenRouter"},
+            {"id": "openai/gpt-4o", "name": "GPT-4o (via OR)", "context_length": 128000, "description": "通过 OpenRouter"},
+            {"id": "google/gemini-pro-1.5", "name": "Gemini Pro 1.5 (via OR)", "context_length": 2800000, "description": "Google 长文本"},
+            {"id": "meta-llama/llama-3.1-405b", "name": "Llama 3.1 405B (via OR)", "context_length": 131072, "description": "开源最强"},
+        ],
+    },
+    {
+        "id": "custom",
+        "name": "自定义 (OpenAI 兼容)",
+        "description": "任意 OpenAI 兼容的 API 服务",
+        "default_model": "",
+        "default_url": "",
+        "requires_api_key": True,
+        "api_key_url": "",
+        "models": [],  # 用户自定义
     },
 ]
 
@@ -351,3 +509,25 @@ async def test_llm_config(config: Optional[LLMConfig] = None) -> Dict[str, Any]:
             "success": False,
             "message": f"测试失败：{str(e)}",
         }
+
+
+@router.get("/llm/providers/{provider_id}/models")
+async def get_provider_models(provider_id: str) -> Dict[str, Any]:
+    """
+    获取指定 Provider 支持的模型列表
+
+    返回模型 ID、名称、上下文长度等信息
+    """
+    provider = next((p for p in LLM_PROVIDERS if p["id"] == provider_id), None)
+    if not provider:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Provider not found: {provider_id}"
+        )
+
+    return {
+        "provider_id": provider_id,
+        "provider_name": provider["name"],
+        "models": provider.get("models", []),
+        "default_model": provider["default_model"],
+    }

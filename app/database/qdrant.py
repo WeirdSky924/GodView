@@ -23,6 +23,12 @@ logger = logging.getLogger(__name__)
 class QdrantDatabase:
     """Qdrant 向量数据库操作类"""
 
+    # 集合名称常量
+    COLLECTION_MEMORY = "godview_memory"
+    COLLECTION_LORE = "godview_lore"
+    COLLECTION_NARRATIVE = "godview_narrative"
+    COLLECTION_VOICE = "godview_voice"
+
     def __init__(
         self,
         url: str = "http://localhost:6333",
@@ -35,7 +41,7 @@ class QdrantDatabase:
 
         Args:
             url: Qdrant 服务 URL
-            collection_name: 集合名称
+            collection_name: 集合名称（默认集合）
             vector_size: 向量维度
             embedding_service: EmbeddingService 实例（可选，用于自动嵌入文本）
         """
@@ -77,6 +83,33 @@ class QdrantDatabase:
             logger.info(f"集合 '{self.collection_name}' 创建成功（维度：{self.vector_size}）")
         else:
             logger.info(f"集合 '{self.collection_name}' 已存在")
+
+    async def init_collections(self):
+        """初始化所有向量集合（双 RAG 架构）"""
+        if not self._client:
+            await self.connect()
+
+        collections_to_create = [
+            self.COLLECTION_MEMORY,
+            self.COLLECTION_LORE,
+            self.COLLECTION_NARRATIVE,
+            self.COLLECTION_VOICE,
+        ]
+
+        existing_collections = [c.name for c in self._client.get_collections().collections]
+
+        for collection_name in collections_to_create:
+            if collection_name not in existing_collections:
+                self._client.create_collection(
+                    collection_name=collection_name,
+                    vectors_config=VectorParams(
+                        size=self.vector_size,
+                        distance=Distance.COSINE,
+                    ),
+                )
+                logger.info(f"集合 '{collection_name}' 创建成功")
+            else:
+                logger.info(f"集合 '{collection_name}' 已存在")
 
     # ==================== 向量插入 ====================
 
@@ -598,3 +631,423 @@ class QdrantDatabase:
             "points_count": info.points_count,
             "status": info.status.value if hasattr(info.status, 'value') else str(info.status),
         }
+
+    # ==================== 静态设定 (Lore) RAG 操作 ====================
+
+    async def add_lore_entry(
+        self,
+        lore_id: str,
+        project_id: str,
+        title: str,
+        content: str,
+        category: str = "custom",
+        priority: str = "standard",
+        keywords: Optional[List[str]] = None,
+        embedding: Optional[List[float]] = None,
+    ) -> Optional[str]:
+        """
+        添加静态设定条目
+
+        Args:
+            lore_id: 设定 ID
+            project_id: 项目 ID
+            title: 设定标题
+            content: 设定内容
+            category: 设定类别
+            priority: 设定优先级
+            keywords: 关键词列表
+            embedding: 向量嵌入（如不提供则自动生成）
+
+        Returns:
+            str: 设定 ID
+        """
+        payload = {
+            "type": "lore",
+            "project_id": project_id,
+            "title": title,
+            "category": category,
+            "priority": priority,
+            "keywords": keywords or [],
+        }
+
+        if embedding:
+            return await self.insert_vector(embedding, payload, lore_id)
+        else:
+            return await self.insert_text(content, payload, lore_id)
+
+    async def search_lore(
+        self,
+        query_embedding: List[float],
+        project_id: str,
+        category: Optional[str] = None,
+        priority: Optional[str] = None,
+        limit: int = 10,
+        score_threshold: float = 0.6,
+    ) -> List[Dict[str, Any]]:
+        """
+        搜索静态设定
+
+        Args:
+            query_embedding: 查询向量
+            project_id: 项目 ID
+            category: 类别过滤
+            priority: 优先级过滤
+            limit: 返回数量
+            score_threshold: 分数阈值
+
+        Returns:
+            List: 搜索结果
+        """
+        filter_conditions = {
+            "type": "lore",
+            "project_id": project_id,
+        }
+        if category:
+            filter_conditions["category"] = category
+        if priority:
+            filter_conditions["priority"] = priority
+
+        return await self.search_similar(
+            query_vector=query_embedding,
+            limit=limit,
+            filter_conditions=filter_conditions,
+            score_threshold=score_threshold,
+        )
+
+    async def search_lore_by_text(
+        self,
+        query_text: str,
+        project_id: str,
+        category: Optional[str] = None,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """
+        通过文本搜索静态设定
+
+        Args:
+            query_text: 查询文本
+            project_id: 项目 ID
+            category: 类别过滤
+            limit: 返回数量
+
+        Returns:
+            List: 搜索结果
+        """
+        filter_conditions = {
+            "type": "lore",
+            "project_id": project_id,
+        }
+        if category:
+            filter_conditions["category"] = category
+
+        return await self.search_by_text(
+            query_text=query_text,
+            limit=limit,
+            filter_conditions=filter_conditions,
+        )
+
+    async def get_lore_by_keywords(
+        self,
+        project_id: str,
+        keywords: List[str],
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """
+        通过关键词获取设定
+
+        Args:
+            project_id: 项目 ID
+            keywords: 关键词列表
+            limit: 返回数量
+
+        Returns:
+            List: 设定列表
+        """
+        # 获取项目所有设定，然后按关键词过滤
+        all_points, _ = self._client.scroll(
+            collection_name=self.COLLECTION_LORE,
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(key="type", match=MatchValue(value="lore")),
+                    FieldCondition(key="project_id", match=MatchValue(value=project_id)),
+                ]
+            ),
+            limit=1000,
+            with_payload=True,
+            with_vectors=False,
+        )
+
+        results = []
+        for point in all_points:
+            point_keywords = point.payload.get("keywords", [])
+            # 检查是否有任何关键词匹配
+            if any(kw in point_keywords for kw in keywords):
+                results.append({
+                    "id": point.id,
+                    "score": 1.0,
+                    "payload": point.payload,
+                })
+                if len(results) >= limit:
+                    break
+
+        return results
+
+    async def delete_lore_entry(self, lore_id: str) -> bool:
+        """删除设定条目"""
+        result = self._client.delete(
+            collection_name=self.COLLECTION_LORE,
+            points_selector=[lore_id],
+        )
+        return result.status == "completed"
+
+    async def get_constitutional_rules(
+        self,
+        project_id: str,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """
+        获取宪法级规则（不可违反的核心设定）
+
+        Args:
+            project_id: 项目 ID
+            limit: 返回数量
+
+        Returns:
+            List: 宪法级规则列表
+        """
+        all_points, _ = self._client.scroll(
+            collection_name=self.COLLECTION_LORE,
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(key="type", match=MatchValue(value="lore")),
+                    FieldCondition(key="project_id", match=MatchValue(value=project_id)),
+                    FieldCondition(key="priority", match=MatchValue(value="constitutional")),
+                ]
+            ),
+            limit=limit,
+            with_payload=True,
+            with_vectors=False,
+        )
+
+        return [
+            {
+                "id": point.id,
+                "score": 1.0,
+                "payload": point.payload,
+            }
+            for point in all_points
+        ]
+
+    # ==================== 动态剧情 (Narrative) RAG 操作 ====================
+
+    async def add_narrative_entry(
+        self,
+        narrative_id: str,
+        project_id: str,
+        title: str,
+        summary: str,
+        entry_type: str = "event",
+        chapter_id: Optional[str] = None,
+        participants: Optional[List[str]] = None,
+        importance: float = 0.5,
+        embedding: Optional[List[float]] = None,
+    ) -> Optional[str]:
+        """
+        添加动态剧情条目
+
+        Args:
+            narrative_id: 叙事 ID
+            project_id: 项目 ID
+            title: 叙事标题
+            summary: 叙事摘要
+            entry_type: 条目类型
+            chapter_id: 所属章节
+            participants: 参与角色
+            importance: 重要程度
+            embedding: 向量嵌入
+
+        Returns:
+            str: 叙事 ID
+        """
+        payload = {
+            "type": "narrative",
+            "project_id": project_id,
+            "title": title,
+            "summary": summary,
+            "entry_type": entry_type,
+            "chapter_id": chapter_id,
+            "participants": participants or [],
+            "importance": importance,
+        }
+
+        if embedding:
+            return await self.insert_vector(embedding, payload, narrative_id)
+        else:
+            return await self.insert_text(summary, payload, narrative_id)
+
+    async def search_narrative(
+        self,
+        query_embedding: List[float],
+        project_id: str,
+        entry_type: Optional[str] = None,
+        chapter_id: Optional[str] = None,
+        limit: int = 10,
+        score_threshold: float = 0.6,
+    ) -> List[Dict[str, Any]]:
+        """
+        搜索动态剧情
+
+        Args:
+            query_embedding: 查询向量
+            project_id: 项目 ID
+            entry_type: 条目类型过滤
+            chapter_id: 章节过滤
+            limit: 返回数量
+            score_threshold: 分数阈值
+
+        Returns:
+            List: 搜索结果
+        """
+        filter_conditions = {
+            "type": "narrative",
+            "project_id": project_id,
+        }
+        if entry_type:
+            filter_conditions["entry_type"] = entry_type
+        if chapter_id:
+            filter_conditions["chapter_id"] = chapter_id
+
+        return await self.search_similar(
+            query_vector=query_embedding,
+            limit=limit,
+            filter_conditions=filter_conditions,
+            score_threshold=score_threshold,
+        )
+
+    async def search_narrative_by_text(
+        self,
+        query_text: str,
+        project_id: str,
+        entry_type: Optional[str] = None,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """
+        通过文本搜索动态剧情
+
+        Args:
+            query_text: 查询文本
+            project_id: 项目 ID
+            entry_type: 条目类型过滤
+            limit: 返回数量
+
+        Returns:
+            List: 搜索结果
+        """
+        filter_conditions = {
+            "type": "narrative",
+            "project_id": project_id,
+        }
+        if entry_type:
+            filter_conditions["entry_type"] = entry_type
+
+        return await self.search_by_text(
+            query_text=query_text,
+            limit=limit,
+            filter_conditions=filter_conditions,
+        )
+
+    async def get_recent_narratives(
+        self,
+        project_id: str,
+        limit: int = 20,
+        min_importance: float = 0.0,
+    ) -> List[Dict[str, Any]]:
+        """
+        获取最近的剧情条目
+
+        Args:
+            project_id: 项目 ID
+            limit: 返回数量
+            min_importance: 最小重要性
+
+        Returns:
+            List: 剧情条目列表
+        """
+        all_points, _ = self._client.scroll(
+            collection_name=self.COLLECTION_NARRATIVE,
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(key="type", match=MatchValue(value="narrative")),
+                    FieldCondition(key="project_id", match=MatchValue(value=project_id)),
+                ]
+            ),
+            limit=1000,
+            with_payload=True,
+            with_vectors=False,
+        )
+
+        results = []
+        for point in all_points:
+            importance = point.payload.get("importance", 0)
+            if importance >= min_importance:
+                results.append({
+                    "id": point.id,
+                    "score": 1.0,
+                    "payload": point.payload,
+                })
+                if len(results) >= limit:
+                    break
+
+        return results
+
+    async def get_narrative_by_character(
+        self,
+        project_id: str,
+        character_id: str,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """
+        获取角色相关的剧情
+
+        Args:
+            project_id: 项目 ID
+            character_id: 角色 ID
+            limit: 返回数量
+
+        Returns:
+            List: 剧情条目列表
+        """
+        all_points, _ = self._client.scroll(
+            collection_name=self.COLLECTION_NARRATIVE,
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(key="type", match=MatchValue(value="narrative")),
+                    FieldCondition(key="project_id", match=MatchValue(value=project_id)),
+                ]
+            ),
+            limit=500,
+            with_payload=True,
+            with_vectors=False,
+        )
+
+        results = []
+        for point in all_points:
+            participants = point.payload.get("participants", [])
+            if character_id in participants:
+                results.append({
+                    "id": point.id,
+                    "score": 1.0,
+                    "payload": point.payload,
+                })
+                if len(results) >= limit:
+                    break
+
+        return results
+
+    async def delete_narrative_entry(self, narrative_id: str) -> bool:
+        """删除剧情条目"""
+        result = self._client.delete(
+            collection_name=self.COLLECTION_NARRATIVE,
+            points_selector=[narrative_id],
+        )
+        return result.status == "completed"

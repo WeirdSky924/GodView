@@ -174,6 +174,75 @@ class BootstrapOrchestrator:
 
         return session
 
+    async def finalize_setting(
+        self,
+        session_id: str,
+    ) -> Dict[str, Any]:
+        """
+        结束设定阶段并强制提取 Seed
+
+        不依赖对话轮数阈值，直接从当前对话历史中提取结构化 seed
+
+        Args:
+            session_id: 会话 ID
+
+        Returns:
+            Dict: 包含 seed_data 和 session 的结果
+        """
+        session = self._sessions.get(session_id)
+        if not session:
+            raise ValueError(f"Session {session_id} not found")
+
+        # 检查是否有对话历史
+        if not session.setting_agent_history:
+            raise ValueError("没有对话历史，无法提取 seed")
+
+        # 强制提取 seed
+        from app.services.setting_agent import get_setting_agent
+        agent = get_setting_agent()
+
+        # 从历史提取 seed
+        seed_data = await agent.extract_seed_from_history(session)
+
+        if not seed_data:
+            # 如果提取失败，尝试生成一个基础 seed
+            seed_data = await self._generate_minimal_seed(session)
+
+        # 更新会话状态
+        session.extracted_seed = seed_data
+        session.current_stage = BootstrapStage.SEED_EXTRACTED
+        session.status = BootstrapStage.SEED_EXTRACTED
+        session.progress = 0.4
+        session.updated_at = datetime.now()
+
+        return {
+            "seed_data": seed_data,
+            "session": session.model_dump(mode="json"),
+        }
+
+    async def _generate_minimal_seed(self, session: BootstrapSession) -> Dict[str, Any]:
+        """
+        生成最小化 Seed
+
+        当无法从对话中提取完整 seed 时，生成一个基础的 seed 结构
+        """
+        return {
+            "world_setting": {
+                "name": "新世界",
+                "description": "待完善的世界设定",
+                "world_type": "fantasy",
+                "tone": "serious",
+            },
+            "world_rules": [],
+            "power_system": "",
+            "main_characters": [],
+            "supporting_characters": [],
+            "regions": [],
+            "plot_hooks": [],
+            "narrative_tone": "第三人称叙事",
+            "seed_type": "minimal",
+        }
+
     async def run_bootstrap(self, session_id: str) -> Dict[str, Any]:
         """
         执行 Bootstrap
@@ -246,6 +315,7 @@ class BootstrapOrchestrator:
     async def _bootstrap_world(self, session: BootstrapSession):
         """创建世界"""
         seed = session.confirmed_seed
+        project_id = session.project_id
 
         # 获取 world 数据
         world_setting = seed.get("world_setting", {})
@@ -263,6 +333,7 @@ class BootstrapOrchestrator:
             history=seed.get("history"),
             geography=seed.get("geography"),
             factions=seed.get("factions", []),
+            project_id=project_id,  # 关联项目 ID
         )
 
         # 添加世界规则
@@ -282,6 +353,9 @@ class BootstrapOrchestrator:
         from app.api.app import postgres_db
         if postgres_db:
             await postgres_db.save_world(world.model_dump(mode="json"))
+
+            # 更新项目的 world_id
+            await postgres_db.update_project(project_id, {"world_id": world_id})
 
         # 更新 seed 中的 world_id
         seed["world_id"] = world_id
@@ -319,6 +393,7 @@ class BootstrapOrchestrator:
         """创建角色"""
         seed = session.confirmed_seed
         world_id = seed.get("world_id")
+        project_id = session.project_id
 
         if not world_id:
             raise ValueError("World 尚未创建")
@@ -329,6 +404,8 @@ class BootstrapOrchestrator:
         all_characters = main_characters + supporting_characters
 
         from app.models.character import Character, CharacterStatus
+
+        created_character_ids = []
 
         for char_data in all_characters:
             character = Character(
@@ -342,11 +419,17 @@ class BootstrapOrchestrator:
                 speech_pattern=char_data.get("speech_pattern"),
                 goals=char_data.get("goals", []),
                 current_location=char_data.get("current_location"),
+                world_id=world_id,  # 关联世界 ID
+                project_id=project_id,  # 关联项目 ID
             )
 
             from app.api.app import postgres_db
             if postgres_db:
                 await postgres_db.save_character(character.model_dump(mode="json"))
+                created_character_ids.append(character.id)
+
+        # 更新 seed 中的角色 ID 列表
+        seed["character_ids"] = created_character_ids
 
     async def _create_initial_snapshot(self, session: BootstrapSession):
         """创建初始快照"""

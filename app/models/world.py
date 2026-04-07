@@ -79,6 +79,9 @@ class World(BaseModel):
     id: str = Field(..., description="世界唯一 ID")
     name: str = Field(..., description="世界名称")
 
+    # 项目归属
+    project_id: Optional[str] = Field(None, description="所属项目ID")
+
     # 基础设定
     description: Optional[str] = Field(None, description="世界描述")
     world_type: str = Field(default="fantasy", description="世界类型：fantasy/scifi/wuxia/etc")

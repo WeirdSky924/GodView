@@ -4,6 +4,7 @@ import Dashboard from './pages/Dashboard'
 import Characters from './pages/Characters'
 import CharacterVoice from './pages/CharacterVoice'
 import Worlds from './pages/Worlds'
+import Lore from './pages/Lore'
 import Plots from './pages/Plots'
 import Hooks from './pages/Hooks'
 import Interventions from './pages/Interventions'
@@ -18,6 +19,7 @@ import WorldView from './pages/WorldView'
 import Bootstrap from './pages/Bootstrap'
 import ProjectSetup from './pages/ProjectSetup'
 import ObservationMode from './pages/ObservationMode'
+import Skills from './pages/Skills'
 
 function App() {
   return (
@@ -27,6 +29,7 @@ function App() {
         <Route path="/characters" element={<Characters />} />
         <Route path="/character-voice" element={<CharacterVoice />} />
         <Route path="/worlds" element={<Worlds />} />
+        <Route path="/lore" element={<Lore />} />
         <Route path="/plots" element={<Plots />} />
         <Route path="/hooks" element={<Hooks />} />
         <Route path="/interventions" element={<Interventions />} />
@@ -42,6 +45,7 @@ function App() {
         <Route path="/bootstrap/:sessionId" element={<Bootstrap />} />
         <Route path="/project-setup" element={<ProjectSetup />} />
         <Route path="/observation" element={<ObservationMode />} />
+        <Route path="/skills" element={<Skills />} />
       </Routes>
     </Layout>
   )

@@ -19,6 +19,22 @@ export interface LLMProviderInfo {
   default_model: string
   default_url: string
   requires_api_key: boolean
+  api_key_url?: string
+  models?: LLMModelInfo[]
+}
+
+export interface LLMModelInfo {
+  id: string
+  name: string
+  context_length: number
+  description: string
+}
+
+export interface ProviderModelsResponse {
+  provider_id: string
+  provider_name: string
+  models: LLMModelInfo[]
+  default_model: string
 }
 
 export interface EmbeddingConfig {
@@ -80,5 +96,10 @@ export async function updateLLMConfig(config: LLMConfig): Promise<ConfigResult> 
 
 export async function testLLMConfig(config?: Partial<LLMConfig>): Promise<ConfigResult> {
   const response = await api.post<ConfigResult>('/config/llm/test', config || {})
+  return response.data
+}
+
+export async function getProviderModels(providerId: string): Promise<ProviderModelsResponse> {
+  const response = await api.get<ProviderModelsResponse>(`/config/llm/providers/${providerId}/models`)
   return response.data
 }

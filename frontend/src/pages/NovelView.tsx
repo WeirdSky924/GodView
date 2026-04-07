@@ -2,13 +2,15 @@ import { useState, useEffect, useCallback } from 'react'
 import { Card, Button, Input, Modal } from '@/components/ui'
 import {
   FileText, Download, ChevronLeft, ChevronRight, Save, Plus,
-  Edit3, Eye, Trash2, RefreshCw, FileDown
+  Edit3, Eye, Trash2, RefreshCw, FileDown, FolderOpen
 } from 'lucide-react'
 import { getChapters, createChapter, updateChapter, deleteChapter } from '@/api/chapters'
 import type { Chapter } from '@/api/chapters'
+import { useProject } from '@/contexts/ProjectContext'
 
 
 export default function NovelView() {
+  const { currentProject } = useProject()
   const [chapters, setChapters] = useState<Chapter[]>([])
   const [currentChapterIndex, setCurrentChapterIndex] = useState(-1)
   const [loading, setLoading] = useState(true)
@@ -22,8 +24,14 @@ export default function NovelView() {
 
   // 加载章节列表
   const loadChapters = useCallback(async () => {
+    if (!currentProject) {
+      setChapters([])
+      setLoading(false)
+      return
+    }
+    setLoading(true)
     try {
-      const data = await getChapters()
+      const data = await getChapters(currentProject.id)
       setChapters(data)
       if (data.length > 0 && currentChapterIndex === -1) {
         setCurrentChapterIndex(0)
@@ -33,7 +41,7 @@ export default function NovelView() {
     } finally {
       setLoading(false)
     }
-  }, [currentChapterIndex])
+  }, [currentProject, currentChapterIndex])
 
   useEffect(() => {
     loadChapters()
@@ -194,7 +202,7 @@ export default function NovelView() {
             </span>
           )}
           <div className="relative group">
-            <Button variant="secondary">
+            <Button variant="secondary" disabled={!currentProject}>
               <Download size={18} className="mr-2" />
               导出
             </Button>
@@ -219,14 +227,19 @@ export default function NovelView() {
               </button>
             </div>
           </div>
-          <Button onClick={() => setShowCreateModal(true)}>
+          <Button onClick={() => setShowCreateModal(true)} disabled={!currentProject}>
             <Plus size={18} className="mr-2" />
             新建章节
           </Button>
         </div>
       </div>
 
-      {loading ? (
+      {!currentProject ? (
+        <div className="text-center py-20 text-gray-500">
+          <FolderOpen size={48} className="mx-auto mb-4 opacity-50" />
+          <p>请先在侧边栏选择一个项目</p>
+        </div>
+      ) : loading ? (
         <div className="flex items-center justify-center py-20">
           <RefreshCw size={24} className="animate-spin mr-3" />
           <span className="text-gray-500">加载章节...</span>

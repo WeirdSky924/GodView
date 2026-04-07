@@ -2,9 +2,11 @@ import { useState, useEffect, useCallback } from 'react'
 import { Card, Button, Input, TextArea, Modal } from '@/components/ui'
 import { getChapters, createChapter, updateChapter, deleteChapter } from '@/api/chapters'
 import type { Chapter, CreateChapterDTO } from '@/api/chapters'
-import { Plus, Edit, Trash2, BookOpen } from 'lucide-react'
+import { Plus, Edit, Trash2, BookOpen, FolderOpen } from 'lucide-react'
+import { useProject } from '@/contexts/ProjectContext'
 
 export default function Plots() {
+  const { currentProject } = useProject()
   const [chapters, setChapters] = useState<Chapter[]>([])
   const [showModal, setShowModal] = useState(false)
   const [editingChapter, setEditingChapter] = useState<Chapter | null>(null)
@@ -18,15 +20,16 @@ export default function Plots() {
 
   // 加载章节列表
   const loadChapters = useCallback(async () => {
+    setLoading(true)
     try {
-      const data = await getChapters()
+      const data = await getChapters(currentProject?.id)
       setChapters(data)
     } catch (error) {
       console.error('Failed to load chapters:', error)
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [currentProject?.id])
 
   useEffect(() => {
     loadChapters()
@@ -104,13 +107,18 @@ export default function Plots() {
     <div>
       <div className="flex items-center justify-between mb-8">
         <h1 className="text-3xl font-bold text-gray-800">📖 剧情管理</h1>
-        <Button onClick={openCreateModal}>
+        <Button onClick={openCreateModal} disabled={!currentProject}>
           <Plus size={20} className="mr-2" />
           新增章节
         </Button>
       </div>
 
-      {loading ? (
+      {!currentProject ? (
+        <div className="text-center py-20 text-gray-500">
+          <FolderOpen size={48} className="mx-auto mb-4 opacity-50" />
+          <p>请先在侧边栏选择一个项目</p>
+        </div>
+      ) : loading ? (
         <div className="flex items-center justify-center py-12">
           <BookOpen size={24} className="animate-spin mr-3" />
           <span className="text-gray-500">加载章节...</span>

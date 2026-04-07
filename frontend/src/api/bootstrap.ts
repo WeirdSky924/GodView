@@ -110,3 +110,16 @@ export async function getSeed(sessionId: string): Promise<any> {
 export async function getBootstrapMessages(sessionId: string, limit: number = 50): Promise<any[]> {
   return client.get(`/bootstrap/${sessionId}/messages?limit=${limit}`)
 }
+
+/**
+ * 结束设定阶段并强制提取 Seed
+ * 不依赖对话轮数阈值，直接从当前对话历史中提取结构化 seed
+ */
+export async function finalizeSetting(sessionId: string): Promise<{
+  success: boolean
+  message: string
+  seed_data: SeedData
+  session: BootstrapSession
+}> {
+  return client.post(`/bootstrap/${sessionId}/finalize-setting`)
+}

@@ -41,6 +41,10 @@ class Character(BaseModel):
     id: str = Field(..., description="角色唯一 ID")
     name: str = Field(..., description="角色名称")
 
+    # 项目归属
+    project_id: Optional[str] = Field(None, description="所属项目ID")
+    world_id: Optional[str] = Field(None, description="所属世界ID")
+
     # 基础信息
     description: Optional[str] = Field(None, description="角色描述")
     role: str = Field(default="supporting", description="角色类型：main/supporting/npc")

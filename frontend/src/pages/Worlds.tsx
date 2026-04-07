@@ -2,9 +2,11 @@ import { useState, useEffect, useCallback } from 'react'
 import { Card, Button, Input, TextArea, Modal } from '@/components/ui'
 import { getWorlds, createWorld, updateWorld, deleteWorld } from '@/api/worlds'
 import type { World, CreateWorldDTO, UpdateWorldDTO } from '@/api/worlds'
-import { Plus, Edit, Trash2, Globe } from 'lucide-react'
+import { Plus, Edit, Trash2, Globe, FolderOpen } from 'lucide-react'
+import { useProject } from '@/contexts/ProjectContext'
 
 export default function Worlds() {
+  const { currentProject } = useProject()
   const [worlds, setWorlds] = useState<World[]>([])
   const [showModal, setShowModal] = useState(false)
   const [editingWorld, setEditingWorld] = useState<World | null>(null)
@@ -19,15 +21,16 @@ export default function Worlds() {
 
   // 加载世界列表
   const loadWorlds = useCallback(async () => {
+    setLoading(true)
     try {
-      const data = await getWorlds()
+      const data = await getWorlds(currentProject?.id)
       setWorlds(data)
     } catch (error) {
       console.error('Failed to load worlds:', error)
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [currentProject?.id])
 
   useEffect(() => {
     loadWorlds()
@@ -98,13 +101,18 @@ export default function Worlds() {
     <div>
       <div className="flex items-center justify-between mb-8">
         <h1 className="text-3xl font-bold text-gray-800">🌍 世界管理</h1>
-        <Button onClick={openCreateModal}>
+        <Button onClick={openCreateModal} disabled={!currentProject}>
           <Plus size={20} className="mr-2" />
           新建世界
         </Button>
       </div>
 
-      {loading ? (
+      {!currentProject ? (
+        <div className="text-center py-20 text-gray-500">
+          <FolderOpen size={48} className="mx-auto mb-4 opacity-50" />
+          <p>请先在侧边栏选择一个项目</p>
+        </div>
+      ) : loading ? (
         <div className="flex items-center justify-center py-20">
           <Globe size={24} className="animate-spin mr-3" />
           <span className="text-gray-500">加载世界...</span>

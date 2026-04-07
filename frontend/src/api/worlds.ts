@@ -30,8 +30,9 @@ export interface UpdateWorldDTO {
   tone?: string
 }
 
-export async function getWorlds() {
-  const response = await api.get<World[]>('/worlds')
+export async function getWorlds(projectId?: string) {
+  const params = projectId ? { project_id: projectId } : {}
+  const response = await api.get<World[]>('/worlds', { params })
   return response.data
 }
 

@@ -15,15 +15,27 @@ router = APIRouter()
 
 
 @router.get("", response_model=List[Dict[str, Any]])
-async def list_worlds(limit: int = Query(default=100, le=1000)):
-    """获取世界列表"""
+async def list_worlds(
+    project_id: Optional[str] = Query(None, description="按项目 ID 过滤"),
+    limit: int = Query(default=100, le=1000),
+):
+    """
+    获取世界列表
+
+    Args:
+        project_id: 按项目 ID 过滤
+        limit: 返回数量限制
+
+    Returns:
+        List: 世界列表
+    """
     from app.api.app import postgres_db
 
     if not postgres_db:
         raise HTTPException(status_code=503, detail="数据库未连接")
 
-    worlds = await postgres_db.get_all_worlds()
-    return worlds[:limit]
+    worlds = await postgres_db.get_all_worlds(project_id=project_id, limit=limit)
+    return worlds
 
 
 @router.put("/{world_id}", response_model=Dict[str, Any])

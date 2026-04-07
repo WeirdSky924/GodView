@@ -1,4 +1,5 @@
 import { BookOpen, Users, Globe, Sliders } from 'lucide-react'
+import TokenStats from '@/components/TokenStats'
 
 export default function Dashboard() {
   const stats = [
@@ -27,6 +28,12 @@ export default function Dashboard() {
             </div>
           </div>
         ))}
+      </div>
+
+      {/* Token 统计 */}
+      <div className="mb-8">
+        <h2 className="text-lg font-semibold text-gray-800 mb-4">📊 Token 消耗统计</h2>
+        <TokenStats />
       </div>
 
       {/* 快速入口 */}

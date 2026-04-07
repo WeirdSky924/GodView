@@ -58,8 +58,10 @@ export interface ChapterEvaluationResult {
   }
 }
 
-export async function getChapters(worldId?: string) {
-  const params = worldId ? { world_id: worldId } : {}
+export async function getChapters(projectId?: string, worldId?: string) {
+  const params: Record<string, string> = {}
+  if (projectId) params.project_id = projectId
+  if (worldId) params.world_id = worldId
   const response = await api.get<Chapter[]>('/plots/chapters', { params })
   return response.data
 }
@@ -94,8 +96,10 @@ export async function simulateReader(id: string) {
   return response.data
 }
 
-export async function getHooks(status?: string) {
-  const params = status ? { status } : {}
+export async function getHooks(projectId?: string, status?: string) {
+  const params: Record<string, string> = {}
+  if (projectId) params.project_id = projectId
+  if (status) params.status = status
   const response = await api.get<any[]>('/plots/hooks', { params })
   return response.data
 }

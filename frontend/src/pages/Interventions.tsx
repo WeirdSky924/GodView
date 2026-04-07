@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { Card, Button, Modal, TextArea } from '@/components/ui'
-import { GitCompare, Flag, Users, Edit3, Save, AlertCircle } from 'lucide-react'
+import { GitCompare, Flag, Users, Edit3, Save, AlertCircle, FolderOpen } from 'lucide-react'
 import {
   createIntervention,
   getInterventions,
@@ -8,8 +8,10 @@ import {
   updateInterventionEvaluation,
 } from '@/api/interventions'
 import type { Intervention, SnapshotOption } from '@/api/interventions'
+import { useProject } from '@/contexts/ProjectContext'
 
 export default function Interventions() {
+  const { currentProject } = useProject()
   const [interventions, setInterventions] = useState<Intervention[]>([])
   const [showModal, setShowModal] = useState(false)
   const [showImpactModal, setShowImpactModal] = useState(false)
@@ -27,9 +29,11 @@ export default function Interventions() {
   })
 
   useEffect(() => {
-    loadInterventions()
-    loadSnapshots()
-  }, [])
+    if (currentProject) {
+      loadInterventions()
+      loadSnapshots()
+    }
+  }, [currentProject])
 
   const loadInterventions = async () => {
     try {
@@ -136,13 +140,20 @@ export default function Interventions() {
     <div>
       <div className="flex items-center justify-between mb-8">
         <h1 className="text-3xl font-bold text-gray-800">🎛️ 干预日志</h1>
-        <Button onClick={() => setShowModal(true)}>
+        <Button onClick={() => setShowModal(true)} disabled={!currentProject}>
           <Save size={18} className="mr-2" />
           记录干预
         </Button>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+      {!currentProject ? (
+        <div className="text-center py-20 text-gray-500">
+          <FolderOpen size={48} className="mx-auto mb-4 opacity-50" />
+          <p>请先在侧边栏选择一个项目</p>
+        </div>
+      ) : (
+        <>
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
         <Card className="p-4">
           <div className="text-2xl font-bold text-blue-600">{interventions.length}</div>
           <div className="text-sm text-gray-500">总干预次数</div>
@@ -356,6 +367,8 @@ export default function Interventions() {
           </div>
         )}
       </Modal>
+        </>
+      )}
     </div>
   )
 }

@@ -220,7 +220,7 @@ class SettingAgent:
         # 对话超过 3 轮且尚未提取 seed，可以尝试提取
         if user_message_count >= 3 and not session.extracted_seed:
             # 尝试从历史对话中提取 seed
-            extracted = await self._extract_seed_from_history(session)
+            extracted = await self.extract_seed_from_history(session)
             if extracted:
                 session.extracted_seed = extracted
                 session.current_stage = BootstrapStage.SEED_EXTRACTED
@@ -229,8 +229,16 @@ class SettingAgent:
 
         return False
 
-    async def _extract_seed_from_history(self, session: BootstrapSession) -> Optional[Dict[str, Any]]:
-        """从对话历史中提取结构化 seed"""
+    async def extract_seed_from_history(self, session: BootstrapSession) -> Optional[Dict[str, Any]]:
+        """
+        从对话历史中提取结构化 seed（公共方法）
+
+        Args:
+            session: Bootstrap 会话
+
+        Returns:
+            Optional[Dict]: 提取的 seed 数据，失败返回 None
+        """
         # 构建提取 prompt
         history_text = "\n".join([
             f"{msg['role']}: {msg['content']}"

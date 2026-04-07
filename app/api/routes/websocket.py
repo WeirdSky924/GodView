@@ -203,6 +203,12 @@ async def websocket_connect(websocket: WebSocket, client_id: str):
                     await handle_rollback_snapshot(websocket, message, client_id)
                 elif message_type == "stop_session":
                     await handle_stop_session(websocket, message, client_id)
+                elif message_type == "add_character":
+                    await handle_add_character(websocket, message, client_id)
+                elif message_type == "remove_character":
+                    await handle_remove_character(websocket, message, client_id)
+                elif message_type == "get_characters":
+                    await handle_get_characters(websocket, message, client_id)
                 else:
                     await send_error(websocket, f"未知消息类型：{message_type}")
             except json.JSONDecodeError:
@@ -418,6 +424,137 @@ async def handle_stop_session(websocket: WebSocket, message: dict, client_id: st
         await send_agent_update(websocket, agent, "idle", f"{agent} 已停止", 0)
     await websocket.send_json({"type": "session_stopped", "status": "success"})
     await send_log(websocket, "导演会话已停止")
+
+
+async def handle_add_character(websocket: WebSocket, message: dict, client_id: str):
+    """
+    动态添加角色
+
+    消息格式:
+    {
+        "type": "add_character",
+        "character_data": {
+            "name": "角色名",
+            "description": "角色描述",
+            "role": "main/supporting",
+            "project_id": "项目ID",
+            "world_id": "世界ID",
+            ...
+        }
+    }
+    """
+    import uuid
+    from app.models.character import Character, CharacterStatus
+
+    director = get_or_create_director(client_id)
+    await send_agent_update(websocket, "Character Agent", "working", "正在添加角色", 30)
+
+    character_data = message.get("character_data", {})
+    project_id = character_data.get("project_id")
+    world_id = character_data.get("world_id", director.world_id)
+
+    # 生成角色 ID
+    character_id = character_data.get("id") or f"char_{uuid.uuid4().hex[:12]}"
+
+    # 创建角色对象
+    character = Character(
+        id=character_id,
+        name=character_data.get("name", "新角色"),
+        description=character_data.get("description"),
+        role=character_data.get("role", "supporting"),
+        status=CharacterStatus.ACTIVE,
+        appearance=character_data.get("appearance"),
+        background_story=character_data.get("background_story"),
+        speech_pattern=character_data.get("speech_pattern"),
+        goals=character_data.get("goals", []),
+        current_location=character_data.get("current_location"),
+        world_id=world_id,
+        project_id=project_id,
+        personality_traits=character_data.get("personality_traits", []),
+        skills=character_data.get("skills", []),
+    )
+
+    # 保存到数据库
+    if postgres_db:
+        await postgres_db.save_character(character.model_dump(mode="json"))
+
+    # 添加到 Director 系统
+    director.add_character(character.model_dump(mode="json"))
+
+    await send_agent_update(websocket, "Character Agent", "completed", "角色添加完成", 100)
+
+    await websocket.send_json({
+        "type": "character_added",
+        "status": "success",
+        "data": {
+            "character_id": character_id,
+            "name": character.name,
+            "role": character.role,
+        },
+    })
+    await send_log(websocket, f"角色 '{character.name}' 已添加")
+
+
+async def handle_remove_character(websocket: WebSocket, message: dict, client_id: str):
+    """
+    移除角色
+
+    消息格式:
+    {
+        "type": "remove_character",
+        "character_id": "角色ID"
+    }
+    """
+    director = get_or_create_director(client_id)
+    await send_agent_update(websocket, "Character Agent", "working", "正在移除角色", 30)
+
+    character_id = message.get("character_id")
+    if not character_id:
+        await send_error(websocket, "缺少 character_id")
+        return
+
+    # 从数据库删除
+    if postgres_db:
+        await postgres_db.delete_character(character_id)
+
+    # 从 Director 系统移除
+    director.remove_character(character_id)
+
+    await send_agent_update(websocket, "Character Agent", "completed", "角色移除完成", 100)
+
+    await websocket.send_json({
+        "type": "character_removed",
+        "status": "success",
+        "data": {"character_id": character_id},
+    })
+    await send_log(websocket, f"角色 {character_id} 已移除")
+
+
+async def handle_get_characters(websocket: WebSocket, message: dict, client_id: str):
+    """
+    获取角色列表
+
+    消息格式:
+    {
+        "type": "get_characters",
+        "project_id": "项目ID"  // 可选
+    }
+    """
+    director = get_or_create_director(client_id)
+
+    project_id = message.get("project_id")
+
+    # 从数据库获取角色
+    if postgres_db and project_id:
+        characters = await postgres_db.get_characters(project_id=project_id)
+    else:
+        characters = director.get_all_characters()
+
+    await websocket.send_json({
+        "type": "characters_list",
+        "status": "success",
+        "data": {"characters": characters, "count": len(characters)},
+    })
 
 
 async def send_error(websocket: WebSocket, error_message: str):

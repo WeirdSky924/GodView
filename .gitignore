@@ -41,3 +41,6 @@ qdrant_storage/
 # 实现状态追踪文档（本地使用，不提交）
 /IMPLEMENTATION_STATUS.md
 /godView_v5_implementation_summary.md
+
+# 测试追踪文档（本地使用，不提交）
+/TEST_REPORT.md

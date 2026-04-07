@@ -369,3 +369,37 @@ async def get_messages(session_id: str, limit: int = Query(default=50, le=200)):
     except Exception as e:
         logger.error(f"获取消息历史失败：{e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== 结束设定并提取 Seed ====================
+
+@router.post("/{session_id}/finalize-setting", response_model=Dict[str, Any])
+async def finalize_setting(session_id: str):
+    """
+    结束设定阶段并强制提取 Seed
+
+    不依赖对话轮数阈值，直接从当前对话历史中提取结构化 seed
+
+    Args:
+        session_id: 会话 ID
+
+    Returns:
+        Dict: 提取结果，包含 seed 数据
+    """
+    from app.services.bootstrap_orchestrator import get_bootstrap_orchestrator
+
+    try:
+        orchestrator = get_bootstrap_orchestrator()
+        result = await orchestrator.finalize_setting(session_id)
+
+        return {
+            "success": True,
+            "message": "设定阶段结束，Seed 已提取",
+            "seed_data": result.get("seed_data"),
+            "session": result.get("session"),
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"结束设定阶段失败：{e}")
+        raise HTTPException(status_code=500, detail=str(e))

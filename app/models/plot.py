@@ -37,6 +37,10 @@ class Hook(BaseModel):
     title: str = Field(..., description="伏笔标题")
     description: str = Field(..., description="伏笔描述")
 
+    # 项目归属
+    project_id: Optional[str] = Field(None, description="所属项目ID")
+    world_id: Optional[str] = Field(None, description="所属世界ID")
+
     # 伏笔类型
     hook_type: HookType = Field(default=HookType.CUSTOM, description="伏笔类型")
 
@@ -153,7 +157,10 @@ class Chapter(BaseModel):
 
     id: str = Field(..., description="章节唯一 ID")
     title: str = Field(..., description="章节标题")
-    world_id: str = Field(..., description="所属世界 ID")
+
+    # 项目归属
+    project_id: Optional[str] = Field(None, description="所属项目ID")
+    world_id: Optional[str] = Field(None, description="所属世界 ID")
 
     # 内容
     content: Optional[str] = Field(None, description="章节正文")
@@ -217,6 +224,9 @@ class Plot(BaseModel):
 
     id: str = Field(..., description="剧情线 ID")
     title: str = Field(..., description="剧情线标题")
+
+    # 项目归属
+    project_id: Optional[str] = Field(None, description="所属项目ID")
     world_id: str = Field(..., description="所属世界 ID")
 
     # 剧情类型

@@ -2,7 +2,9 @@ import { useEffect, useMemo, useState } from 'react'
 import { Card, Button, Input, TextArea, Modal } from '@/components/ui'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import { getDirectorState, getSnapshotTree, getWorkflowGraph } from '@/api/director'
-import { Play, Pause, RotateCcw, Zap, Target, BookOpen, MessageSquare, Map, GitBranch, RefreshCcw, Workflow, Mic, PenLine } from 'lucide-react'
+import { getCharacters } from '@/api/characters'
+import { Play, Pause, RotateCcw, Zap, Target, BookOpen, MessageSquare, Map, GitBranch, RefreshCcw, Workflow, Mic, PenLine, FolderOpen, UserPlus, UserMinus, Users } from 'lucide-react'
+import { useProject } from '@/contexts/ProjectContext'
 
 interface AgentStatus {
   name: string
@@ -110,6 +112,7 @@ function parseCharacterMoods(value: string) {
 }
 
 export default function Director() {
+  const { currentProject } = useProject()
   const [sessionId, setSessionId] = useState<string>('')
   const [isGenerating, setIsGenerating] = useState(false)
   const [selectedAgent, setSelectedAgent] = useState<string>('')
@@ -124,6 +127,7 @@ export default function Director() {
   const [rollbackSnapshotId, setRollbackSnapshotId] = useState('')
   const [dialoguePanel, setDialoguePanel] = useState<DialoguePanelState | null>(null)
   const [narrativePanel, setNarrativePanel] = useState<NarrativePanelState | null>(null)
+  const [availableCharacters, setAvailableCharacters] = useState<Array<{ id: string; name: string }>>([])
   const [dialogueForm, setDialogueForm] = useState({
     speakerId: 'narrator',
     context: '当前场景推进中',
@@ -131,6 +135,14 @@ export default function Director() {
     intents: '推进剧情',
     environment: '',
     characterMoods: '',
+  })
+  const [showAddCharacterModal, setShowAddCharacterModal] = useState(false)
+  const [newCharacterForm, setNewCharacterForm] = useState({
+    name: '',
+    description: '',
+    role: 'supporting',
+    background_story: '',
+    speech_pattern: '',
   })
 
   const addLog = (message: string) => {
@@ -172,6 +184,24 @@ export default function Director() {
       loadRuntimePanels()
     }
   }, [sessionId])
+
+  // 加载项目角色列表
+  useEffect(() => {
+    const loadCharacters = async () => {
+      if (!currentProject) {
+        setAvailableCharacters([])
+        return
+      }
+      try {
+        const chars = await getCharacters(currentProject.id)
+        setAvailableCharacters(chars.map((c: any) => ({ id: c.id, name: c.name })))
+      } catch (error) {
+        console.error('Failed to load characters:', error)
+        setAvailableCharacters([])
+      }
+    }
+    loadCharacters()
+  }, [currentProject])
 
   const { status: wsStatus, send } = useWebSocket(wsUrl, {
     onOpen: () => addLog('WebSocket 已连接'),
@@ -244,6 +274,27 @@ export default function Director() {
         case 'agent_command_result':
           addLog(`${data.data?.agent}: ${data.data?.result}`)
           break
+        case 'character_added':
+          addLog(`角色已添加: ${data.data?.name || data.data?.character_id}`)
+          // 刷新角色列表
+          if (currentProject) {
+            getCharacters(currentProject.id).then((chars: any[]) => {
+              setAvailableCharacters(chars.map((c) => ({ id: c.id, name: c.name })))
+            })
+          }
+          break
+        case 'character_removed':
+          addLog(`角色已移除: ${data.data?.character_id}`)
+          // 刷新角色列表
+          if (currentProject) {
+            getCharacters(currentProject.id).then((chars: any[]) => {
+              setAvailableCharacters(chars.map((c) => ({ id: c.id, name: c.name })))
+            })
+          }
+          break
+        case 'characters_list':
+          addLog(`角色列表: ${data.data?.count || 0} 个角色`)
+          break
         case 'error':
           addLog(`错误: ${data.message}`)
           break
@@ -258,8 +309,15 @@ export default function Director() {
       addLog('请输入会话 ID')
       return
     }
+    if (!currentProject) {
+      addLog('请先选择一个项目')
+      return
+    }
     setIsGenerating(true)
-    send({ type: 'start_session', world_id: 'default-world', character_ids: [] })
+    const worldId = currentProject.world_id || `project-${currentProject.id}`
+    const characterIds = availableCharacters.map((c) => c.id)
+    addLog(`启动会话: 项目 ${currentProject.name}, 世界 ${worldId}, 角色 ${characterIds.length} 个`)
+    send({ type: 'start_session', world_id: worldId, character_ids: characterIds })
   }
 
   const stopSession = () => {
@@ -325,6 +383,47 @@ export default function Director() {
     })
   }
 
+  const handleAddCharacter = () => {
+    if (!newCharacterForm.name.trim()) {
+      addLog('请输入角色名称')
+      return
+    }
+    if (!currentProject) {
+      addLog('请先选择项目')
+      return
+    }
+
+    send({
+      type: 'add_character',
+      character_data: {
+        name: newCharacterForm.name.trim(),
+        description: newCharacterForm.description,
+        role: newCharacterForm.role,
+        background_story: newCharacterForm.background_story,
+        speech_pattern: newCharacterForm.speech_pattern,
+        project_id: currentProject.id,
+      },
+    })
+
+    // 重置表单并关闭 Modal
+    setNewCharacterForm({
+      name: '',
+      description: '',
+      role: 'supporting',
+      background_story: '',
+      speech_pattern: '',
+    })
+    setShowAddCharacterModal(false)
+  }
+
+  const handleRemoveCharacter = (characterId: string) => {
+    if (!confirm('确定要移除这个角色吗？')) return
+    send({
+      type: 'remove_character',
+      character_id: characterId,
+    })
+  }
+
   const quickActions = [
     { icon: <Zap size={18} />, label: '推进剧情', command: 'advance_plot' },
     { icon: <Target size={18} />, label: '管理伏笔', command: 'manage_hooks' },
@@ -375,6 +474,11 @@ export default function Director() {
       <div className="flex items-center justify-between mb-8">
         <h1 className="text-3xl font-bold text-gray-800">导演模式</h1>
         <div className="flex items-center gap-4">
+          {currentProject && (
+            <span className="px-3 py-1 rounded-full text-sm bg-blue-100 text-blue-700">
+              📁 {currentProject.name}
+            </span>
+          )}
           <span
             className={`px-3 py-1 rounded-full text-sm ${
               wsStatus === 'connected'
@@ -389,20 +493,27 @@ export default function Director() {
         </div>
       </div>
 
-      <Card title="会话控制" className="mb-6">
-        <div className="flex gap-4 flex-wrap">
-          <Input placeholder="输入会话 ID" value={sessionId} onChange={(e) => setSessionId(e.target.value)} />
-          {!isGenerating ? (
-            <Button onClick={startSession}>
-              <Play size={18} className="mr-2" />开始生成
-            </Button>
-          ) : (
-            <Button variant="danger" onClick={stopSession}>
-              <Pause size={18} className="mr-2" />停止生成
-            </Button>
-          )}
-          <Button variant="secondary" onClick={resetAll}>
-            <RotateCcw size={18} className="mr-2" />重置
+      {!currentProject ? (
+        <div className="text-center py-20 text-gray-500">
+          <FolderOpen size={48} className="mx-auto mb-4 opacity-50" />
+          <p>请先在侧边栏选择一个项目</p>
+        </div>
+      ) : (
+        <>
+          <Card title="会话控制" className="mb-6">
+            <div className="flex gap-4 flex-wrap">
+              <Input placeholder="输入会话 ID" value={sessionId} onChange={(e) => setSessionId(e.target.value)} />
+              {!isGenerating ? (
+                <Button onClick={startSession} disabled={!currentProject}>
+                  <Play size={18} className="mr-2" />开始生成
+                </Button>
+              ) : (
+                <Button variant="danger" onClick={stopSession}>
+                  <Pause size={18} className="mr-2" />停止生成
+                </Button>
+              )}
+              <Button variant="secondary" onClick={resetAll}>
+                <RotateCcw size={18} className="mr-2" />重置
           </Button>
           <Button variant="secondary" onClick={loadRuntimePanels}>
             <RefreshCcw size={18} className="mr-2" />刷新状态
@@ -502,6 +613,50 @@ export default function Director() {
                   <span className="ml-2">{action.label}</span>
                 </Button>
               ))}
+            </div>
+          </Card>
+
+          <Card title="角色管理" className="mb-6">
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 text-gray-600">
+                  <Users size={18} />
+                  <span>当前角色 ({availableCharacters.length})</span>
+                </div>
+                <Button
+                  size="sm"
+                  onClick={() => setShowAddCharacterModal(true)}
+                  disabled={!isGenerating || wsStatus !== 'connected'}
+                >
+                  <UserPlus size={16} className="mr-1" /> 添加角色
+                </Button>
+              </div>
+
+              {availableCharacters.length === 0 ? (
+                <p className="text-sm text-gray-500 text-center py-4">暂无角色，请先在项目中创建角色</p>
+              ) : (
+                <div className="space-y-2 max-h-48 overflow-y-auto">
+                  {availableCharacters.map((char) => (
+                    <div
+                      key={char.id}
+                      className="flex items-center justify-between p-3 bg-gray-50 rounded-lg"
+                    >
+                      <div>
+                        <span className="font-medium text-gray-800">{char.name}</span>
+                        <span className="text-xs text-gray-500 ml-2">{char.id}</span>
+                      </div>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        onClick={() => handleRemoveCharacter(char.id)}
+                        disabled={!isGenerating || wsStatus !== 'connected'}
+                      >
+                        <UserMinus size={14} />
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           </Card>
 
@@ -759,6 +914,57 @@ export default function Director() {
           </div>
         </div>
       </Modal>
+
+      <Modal isOpen={showAddCharacterModal} onClose={() => setShowAddCharacterModal(false)} title="添加角色">
+        <div className="space-y-4">
+          <Input
+            label="角色名称 *"
+            value={newCharacterForm.name}
+            onChange={(e) => setNewCharacterForm({ ...newCharacterForm, name: e.target.value })}
+            placeholder="输入角色名称"
+          />
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">角色类型</label>
+            <select
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+              value={newCharacterForm.role}
+              onChange={(e) => setNewCharacterForm({ ...newCharacterForm, role: e.target.value })}
+            >
+              <option value="main">主角</option>
+              <option value="supporting">配角</option>
+              <option value="npc">NPC</option>
+            </select>
+          </div>
+          <TextArea
+            label="角色描述"
+            value={newCharacterForm.description}
+            onChange={(e) => setNewCharacterForm({ ...newCharacterForm, description: e.target.value })}
+            placeholder="描述角色的外貌、性格等"
+            rows={3}
+          />
+          <TextArea
+            label="背景故事"
+            value={newCharacterForm.background_story}
+            onChange={(e) => setNewCharacterForm({ ...newCharacterForm, background_story: e.target.value })}
+            placeholder="角色的背景故事"
+            rows={3}
+          />
+          <Input
+            label="说话风格"
+            value={newCharacterForm.speech_pattern}
+            onChange={(e) => setNewCharacterForm({ ...newCharacterForm, speech_pattern: e.target.value })}
+            placeholder="例如：说话带古风，喜欢用成语"
+          />
+          <div className="flex justify-end gap-3">
+            <Button variant="secondary" onClick={() => setShowAddCharacterModal(false)}>取消</Button>
+            <Button onClick={handleAddCharacter} disabled={!newCharacterForm.name.trim()}>
+              添加角色
+            </Button>
+          </div>
+        </div>
+      </Modal>
+        </>
+      )}
     </div>
   )
 }

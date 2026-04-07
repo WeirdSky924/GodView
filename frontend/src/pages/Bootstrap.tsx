@@ -6,7 +6,7 @@
 import React, { useState, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { Bot, FileText, Upload, CheckCircle, AlertCircle, Loader, MessageSquare, Globe } from 'lucide-react'
-import { startBootstrap, getBootstrapSession, sendBootstrapMessage, uploadOutline, confirmSeed, runBootstrap, getBootstrapStatus, type BootstrapSession, type SeedData } from '@/api/bootstrap'
+import { startBootstrap, getBootstrapSession, sendBootstrapMessage, uploadOutline, confirmSeed, runBootstrap, getBootstrapStatus, finalizeSetting, type BootstrapSession, type SeedData } from '@/api/bootstrap'
 import { getProjects, createProject, type Project } from '@/api/projects'
 import SeedConfirmDialog from '@/components/bootstrap/SeedConfirmDialog'
 
@@ -233,6 +233,25 @@ export default function BootstrapPage() {
     }
   }
 
+  const handleFinalizeSetting = async () => {
+    if (!session) return
+
+    setLoading(true)
+    try {
+      const result = await finalizeSetting(session.id)
+      if (result.success && result.seed_data) {
+        setSeedData(result.seed_data)
+        setSession(result.session)
+        setStage('seed_confirmation')
+      }
+    } catch (err) {
+      console.error('Failed to finalize setting:', err)
+      setError('结束设定失败')
+    } finally {
+      setLoading(false)
+    }
+  }
+
   const renderProjectSelect = () => (
     <div className="max-w-4xl mx-auto">
       <div className="text-center mb-10">
@@ -373,7 +392,14 @@ export default function BootstrapPage() {
         </div>
       </div>
 
-      <div className="text-center">
+      <div className="text-center space-x-4">
+        <button
+          onClick={handleFinalizeSetting}
+          disabled={loading || (session?.setting_agent_history?.length || 0) < 1}
+          className="px-6 py-3 bg-green-600 text-white font-medium rounded-lg hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {loading ? '处理中...' : '结束设定并提取 Seed'}
+        </button>
         <button
           onClick={() => setStage('outline_input')}
           className="px-6 py-3 border border-gray-300 text-gray-700 font-medium rounded-lg hover:bg-gray-50"

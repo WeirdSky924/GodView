@@ -130,16 +130,18 @@ class PostgresDatabase:
             str: 角色 ID
         """
         query = """
-        INSERT INTO characters (id, name, description, role, status, appearance, age, gender,
+        INSERT INTO characters (id, name, project_id, world_id, description, role, status, appearance, age, gender,
                                 personality_traits, background_story, speech_pattern, lexicon,
                                 forbidden_words, voice_samples, attributes, goals, inventory,
                                 current_location, created_at, updated_at)
-        VALUES (:id, :name, :description, :role, :status, :appearance, :age, :gender,
+        VALUES (:id, :name, :project_id, :world_id, :description, :role, :status, :appearance, :age, :gender,
                 :personality_traits, :background_story, :speech_pattern, :lexicon,
                 :forbidden_words, :voice_samples, :attributes, :goals, :inventory,
                 :current_location, :created_at, :updated_at)
         ON CONFLICT (id) DO UPDATE SET
             name = EXCLUDED.name,
+            project_id = EXCLUDED.project_id,
+            world_id = EXCLUDED.world_id,
             description = EXCLUDED.description,
             role = EXCLUDED.role,
             status = EXCLUDED.status,
@@ -175,10 +177,42 @@ class PostgresDatabase:
         results = await self.execute_query(query, {"id": character_id})
         return results[0] if results else None
 
-    async def get_all_characters(self) -> List[Dict[str, Any]]:
-        """获取所有角色"""
-        query = "SELECT * FROM characters ORDER BY created_at DESC"
-        return await self.execute_query(query)
+    async def get_all_characters(
+        self,
+        project_id: Optional[str] = None,
+        status: Optional[str] = None,
+        role: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """
+        获取角色列表，支持项目过滤
+
+        Args:
+            project_id: 项目 ID 过滤
+            status: 状态过滤
+            role: 角色类型过滤
+            limit: 返回数量限制
+
+        Returns:
+            List: 角色列表
+        """
+        conditions = []
+        params: Dict[str, Any] = {"limit": limit}
+
+        if project_id:
+            conditions.append("project_id = :project_id")
+            params["project_id"] = project_id
+        if status:
+            conditions.append("status = :status")
+            params["status"] = status
+        if role:
+            conditions.append("role = :role")
+            params["role"] = role
+
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        query = f"SELECT * FROM characters {where_clause} ORDER BY created_at DESC LIMIT :limit"
+
+        return await self.execute_query(query, params)
 
     async def delete_character(self, character_id: str) -> bool:
         """删除角色"""
@@ -298,12 +332,13 @@ class PostgresDatabase:
     async def save_world(self, world_data: Dict[str, Any]) -> str:
         """保存世界数据"""
         query = """
-        INSERT INTO worlds (id, name, description, world_type, tone, rules, power_system,
+        INSERT INTO worlds (id, name, project_id, description, world_type, tone, rules, power_system,
                            technology_level, history, geography, factions, created_at, updated_at)
-        VALUES (:id, :name, :description, :world_type, :tone, :rules, :power_system,
+        VALUES (:id, :name, :project_id, :description, :world_type, :tone, :rules, :power_system,
                 :technology_level, :history, :geography, :factions, :created_at, :updated_at)
         ON CONFLICT (id) DO UPDATE SET
             name = EXCLUDED.name,
+            project_id = EXCLUDED.project_id,
             description = EXCLUDED.description,
             world_type = EXCLUDED.world_type,
             tone = EXCLUDED.tone,
@@ -330,10 +365,27 @@ class PostgresDatabase:
         await self.execute_query(query, {"id": world_id})
         return True
 
-    async def get_all_worlds(self) -> List[Dict[str, Any]]:
-        """获取所有世界"""
-        query = "SELECT * FROM worlds ORDER BY created_at DESC"
-        return await self.execute_query(query)
+    async def get_all_worlds(
+        self,
+        project_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """
+        获取世界列表，支持项目过滤
+
+        Args:
+            project_id: 项目 ID 过滤
+            limit: 返回数量限制
+
+        Returns:
+            List: 世界列表
+        """
+        if project_id:
+            query = "SELECT * FROM worlds WHERE project_id = :project_id ORDER BY created_at DESC LIMIT :limit"
+            return await self.execute_query(query, {"project_id": project_id, "limit": limit})
+        else:
+            query = "SELECT * FROM worlds ORDER BY created_at DESC LIMIT :limit"
+            return await self.execute_query(query, {"limit": limit})
 
     # ==================== 区域相关操作 ====================
 
@@ -384,16 +436,18 @@ class PostgresDatabase:
     async def save_hook(self, hook_data: Dict[str, Any]) -> str:
         """保存伏笔数据"""
         query = """
-        INSERT INTO hooks (id, title, description, hook_type, status, related_characters,
+        INSERT INTO hooks (id, title, project_id, world_id, description, hook_type, status, related_characters,
                           related_locations, related_objects, plant_context, plant_chapter,
                           resolution_hint, resolution_context, resolution_chapter, priority,
                           created_at, resolved_at)
-        VALUES (:id, :title, :description, :hook_type, :status, :related_characters,
+        VALUES (:id, :title, :project_id, :world_id, :description, :hook_type, :status, :related_characters,
                 :related_locations, :related_objects, :plant_context, :plant_chapter,
                 :resolution_hint, :resolution_context, :resolution_chapter, :priority,
                 :created_at, :resolved_at)
         ON CONFLICT (id) DO UPDATE SET
             title = EXCLUDED.title,
+            project_id = EXCLUDED.project_id,
+            world_id = EXCLUDED.world_id,
             description = EXCLUDED.description,
             hook_type = EXCLUDED.hook_type,
             status = EXCLUDED.status,
@@ -417,10 +471,27 @@ class PostgresDatabase:
         results = await self.execute_query(query, {"id": hook_id})
         return results[0] if results else None
 
-    async def get_hooks_by_status(self, status: str) -> List[Dict[str, Any]]:
-        """根据状态获取伏笔"""
-        query = "SELECT * FROM hooks WHERE status = :status ORDER BY priority DESC"
-        return await self.execute_query(query, {"status": status})
+    async def get_hooks_by_status(
+        self,
+        status: str,
+        project_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        根据状态获取伏笔，支持项目过滤
+
+        Args:
+            status: 伏笔状态
+            project_id: 项目 ID 过滤
+
+        Returns:
+            List: 伏笔列表
+        """
+        if project_id:
+            query = "SELECT * FROM hooks WHERE status = :status AND project_id = :project_id ORDER BY priority DESC"
+            return await self.execute_query(query, {"status": status, "project_id": project_id})
+        else:
+            query = "SELECT * FROM hooks WHERE status = :status ORDER BY priority DESC"
+            return await self.execute_query(query, {"status": status})
 
     async def update_hook_status(self, hook_id: str, status: str) -> bool:
         """更新伏笔状态"""
@@ -434,24 +505,52 @@ class PostgresDatabase:
         await self.execute_query(query, {"id": hook_id})
         return True
 
-    async def get_all_hooks(self) -> List[Dict[str, Any]]:
-        """获取所有伏笔"""
-        query = "SELECT * FROM hooks ORDER BY priority DESC, created_at DESC"
-        return await self.execute_query(query)
+    async def get_all_hooks(
+        self,
+        project_id: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """
+        获取伏笔列表，支持项目过滤
+
+        Args:
+            project_id: 项目 ID 过滤
+            status: 状态过滤
+            limit: 返回数量限制
+
+        Returns:
+            List: 伏笔列表
+        """
+        conditions = []
+        params: Dict[str, Any] = {"limit": limit}
+
+        if project_id:
+            conditions.append("project_id = :project_id")
+            params["project_id"] = project_id
+        if status:
+            conditions.append("status = :status")
+            params["status"] = status
+
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        query = f"SELECT * FROM hooks {where_clause} ORDER BY priority DESC, created_at DESC LIMIT :limit"
+
+        return await self.execute_query(query, params)
 
     # ==================== 章节相关操作 ====================
 
     async def save_chapter(self, chapter_data: Dict[str, Any]) -> str:
         """保存章节数据"""
         query = """
-        INSERT INTO chapters (id, title, world_id, content, word_count, status, events,
+        INSERT INTO chapters (id, title, project_id, world_id, content, word_count, status, events,
                              hooks_planted, hooks_resolved, main_plot_progress, reader_scores,
                              created_at, updated_at, completed_at)
-        VALUES (:id, :title, :world_id, :content, :word_count, :status, :events,
+        VALUES (:id, :title, :project_id, :world_id, :content, :word_count, :status, :events,
                 :hooks_planted, :hooks_resolved, :main_plot_progress, :reader_scores,
                 :created_at, :updated_at, :completed_at)
         ON CONFLICT (id) DO UPDATE SET
             title = EXCLUDED.title,
+            project_id = EXCLUDED.project_id,
             world_id = EXCLUDED.world_id,
             content = EXCLUDED.content,
             word_count = EXCLUDED.word_count,
@@ -477,6 +576,35 @@ class PostgresDatabase:
         """获取世界的所有章节"""
         query = "SELECT * FROM chapters WHERE world_id = :world_id ORDER BY created_at ASC"
         return await self.execute_query(query, {"world_id": world_id})
+
+    async def get_chapters_by_project(
+        self,
+        project_id: str,
+        status: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """
+        获取项目的所有章节
+
+        Args:
+            project_id: 项目 ID
+            status: 状态过滤
+            limit: 返回数量限制
+
+        Returns:
+            List: 章节列表
+        """
+        conditions = ["project_id = :project_id"]
+        params: Dict[str, Any] = {"project_id": project_id, "limit": limit}
+
+        if status:
+            conditions.append("status = :status")
+            params["status"] = status
+
+        where_clause = f"WHERE {' AND '.join(conditions)}"
+        query = f"SELECT * FROM chapters {where_clause} ORDER BY created_at ASC LIMIT :limit"
+
+        return await self.execute_query(query, params)
 
     # ==================== 世界快照相关操作 ====================
 
@@ -578,6 +706,8 @@ class PostgresDatabase:
         CREATE TABLE IF NOT EXISTS characters (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
+            project_id TEXT REFERENCES projects(id),
+            world_id TEXT,
             description TEXT,
             role TEXT DEFAULT 'supporting',
             status TEXT DEFAULT 'active',
@@ -598,6 +728,8 @@ class PostgresDatabase:
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
+        CREATE INDEX IF NOT EXISTS idx_characters_project_id ON characters(project_id);
+
         -- 项目表 (v4 新增)
         CREATE TABLE IF NOT EXISTS projects (
             id TEXT PRIMARY KEY,
@@ -606,6 +738,8 @@ class PostgresDatabase:
             user_id TEXT,
             status TEXT DEFAULT 'draft',
             world_id TEXT,
+            total_tokens BIGINT DEFAULT 0,
+            total_cost DECIMAL(10, 6) DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             metadata JSONB DEFAULT '{}'
@@ -615,6 +749,7 @@ class PostgresDatabase:
         CREATE TABLE IF NOT EXISTS worlds (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
+            project_id TEXT REFERENCES projects(id),
             description TEXT,
             world_type TEXT DEFAULT 'fantasy',
             tone TEXT DEFAULT 'serious',
@@ -627,6 +762,8 @@ class PostgresDatabase:
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE INDEX IF NOT EXISTS idx_worlds_project_id ON worlds(project_id);
 
         -- 区域表
         CREATE TABLE IF NOT EXISTS regions (
@@ -654,6 +791,8 @@ class PostgresDatabase:
         CREATE TABLE IF NOT EXISTS hooks (
             id TEXT PRIMARY KEY,
             title TEXT NOT NULL,
+            project_id TEXT REFERENCES projects(id),
+            world_id TEXT,
             description TEXT,
             hook_type TEXT DEFAULT 'custom',
             status TEXT DEFAULT 'planted',
@@ -670,10 +809,14 @@ class PostgresDatabase:
             resolved_at TIMESTAMP
         );
 
+        CREATE INDEX IF NOT EXISTS idx_hooks_project_id ON hooks(project_id);
+        CREATE INDEX IF NOT EXISTS idx_hooks_status ON hooks(status);
+
         -- 章节表
         CREATE TABLE IF NOT EXISTS chapters (
             id TEXT PRIMARY KEY,
             title TEXT NOT NULL,
+            project_id TEXT REFERENCES projects(id),
             world_id TEXT REFERENCES worlds(id),
             content TEXT,
             word_count INTEGER DEFAULT 0,
@@ -687,6 +830,8 @@ class PostgresDatabase:
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             completed_at TIMESTAMP
         );
+
+        CREATE INDEX IF NOT EXISTS idx_chapters_project_id ON chapters(project_id);
 
         -- 世界快照表
         CREATE TABLE IF NOT EXISTS world_snapshots (
@@ -748,3 +893,201 @@ class PostgresDatabase:
             await session.commit()
 
         logger.info("数据库表结构初始化完成")
+
+    # ==================== Token 使用统计操作 ====================
+
+    async def save_token_usage(self, usage_data: Dict[str, Any]) -> str:
+        """
+        保存 Token 使用记录
+
+        Args:
+            usage_data: Token 使用数据
+
+        Returns:
+            str: 记录 ID
+        """
+        query = """
+        INSERT INTO token_usage (
+            id, project_id, input_tokens, output_tokens, total_tokens,
+            provider, model, category, agent_name, session_id,
+            chapter_id, character_id, estimated_cost, metadata, created_at
+        ) VALUES (
+            :id, :project_id, :input_tokens, :output_tokens, :total_tokens,
+            :provider, :model, :category, :agent_name, :session_id,
+            :chapter_id, :character_id, :estimated_cost, :metadata, :created_at
+        )
+        """
+        await self.execute_query(query, usage_data)
+        return usage_data.get("id", "")
+
+    async def _update_project_token_stats(
+        self,
+        project_id: str,
+        tokens: int,
+        cost: float
+    ) -> None:
+        """
+        更新项目的 Token 统计
+
+        Args:
+            project_id: 项目 ID
+            tokens: 新增 token 数
+            cost: 新增成本
+        """
+        query = """
+        UPDATE projects
+        SET total_tokens = COALESCE(total_tokens, 0) + :tokens,
+            total_cost = COALESCE(total_cost, 0) + :cost,
+            updated_at = NOW()
+        WHERE id = :project_id
+        """
+        await self.execute_query(query, {
+            "project_id": project_id,
+            "tokens": tokens,
+            "cost": cost,
+        })
+
+    async def get_token_usage_by_project(
+        self,
+        project_id: str,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """
+        获取项目的 Token 使用记录
+
+        Args:
+            project_id: 项目 ID
+            start_date: 开始日期
+            end_date: 结束日期
+            limit: 返回数量限制
+
+        Returns:
+            List: Token 使用记录列表
+        """
+        conditions = ["project_id = :project_id"]
+        params: Dict[str, Any] = {"project_id": project_id, "limit": limit}
+
+        if start_date:
+            conditions.append("created_at >= :start_date")
+            params["start_date"] = start_date
+        if end_date:
+            conditions.append("created_at <= :end_date")
+            params["end_date"] = end_date
+
+        where_clause = f"WHERE {' AND '.join(conditions)}"
+        query = f"SELECT * FROM token_usage {where_clause} ORDER BY created_at DESC LIMIT :limit"
+
+        return await self.execute_query(query, params)
+
+    async def get_token_stats_by_project(self, project_id: str) -> Dict[str, Any]:
+        """
+        获取项目的 Token 统计
+
+        Args:
+            project_id: 项目 ID
+
+        Returns:
+            Dict: 统计数据
+        """
+        query = """
+        SELECT
+            COALESCE(SUM(total_tokens), 0) as total_tokens,
+            COALESCE(SUM(input_tokens), 0) as input_tokens,
+            COALESCE(SUM(output_tokens), 0) as output_tokens,
+            COALESCE(SUM(estimated_cost), 0) as total_cost,
+            COUNT(*) as record_count
+        FROM token_usage
+        WHERE project_id = :project_id
+        """
+        results = await self.execute_query(query, {"project_id": project_id})
+        return results[0] if results else {}
+
+    async def get_token_stats_by_category(self, project_id: str) -> List[Dict[str, Any]]:
+        """
+        获取按场景分组的 Token 统计
+
+        Args:
+            project_id: 项目 ID
+
+        Returns:
+            List: 按场景分组的统计
+        """
+        query = """
+        SELECT category, SUM(total_tokens) as tokens
+        FROM token_usage
+        WHERE project_id = :project_id
+        GROUP BY category
+        ORDER BY tokens DESC
+        """
+        return await self.execute_query(query, {"project_id": project_id})
+
+    async def get_token_stats_by_model(self, project_id: str) -> List[Dict[str, Any]]:
+        """
+        获取按模型分组的 Token 统计
+
+        Args:
+            project_id: 项目 ID
+
+        Returns:
+            List: 按模型分组的统计
+        """
+        query = """
+        SELECT model, SUM(total_tokens) as tokens, SUM(estimated_cost) as cost
+        FROM token_usage
+        WHERE project_id = :project_id
+        GROUP BY model
+        ORDER BY tokens DESC
+        """
+        return await self.execute_query(query, {"project_id": project_id})
+
+    async def get_daily_token_stats(
+        self,
+        project_id: str,
+        days: int = 7,
+    ) -> List[Dict[str, Any]]:
+        """
+        获取每日 Token 统计
+
+        Args:
+            project_id: 项目 ID
+            days: 天数
+
+        Returns:
+            List: 每日统计
+        """
+        query = """
+        SELECT
+            DATE(created_at) as date,
+            COALESCE(SUM(total_tokens), 0) as total_tokens,
+            COALESCE(SUM(input_tokens), 0) as input_tokens,
+            COALESCE(SUM(output_tokens), 0) as output_tokens,
+            COALESCE(SUM(estimated_cost), 0) as cost,
+            COUNT(*) as record_count
+        FROM token_usage
+        WHERE project_id = :project_id
+          AND created_at >= NOW() - INTERVAL '%s days'
+        GROUP BY DATE(created_at)
+        ORDER BY date DESC
+        """ % days
+
+        return await self.execute_query(query, {"project_id": project_id})
+
+    async def get_all_project_token_stats(self) -> List[Dict[str, Any]]:
+        """
+        获取所有项目的 Token 统计
+
+        Returns:
+            List: 项目统计列表
+        """
+        query = """
+        SELECT
+            p.id as project_id,
+            p.name as project_name,
+            COALESCE(p.total_tokens, 0) as total_tokens,
+            COALESCE(p.total_cost, 0) as total_cost
+        FROM projects p
+        ORDER BY p.total_tokens DESC NULLS LAST
+        """
+        return await self.execute_query(query, {})

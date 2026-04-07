@@ -53,8 +53,9 @@ export interface CharacterVoiceSampleSearchResult {
   }
 }
 
-export async function getCharacters() {
-  const response = await api.get<Character[]>('/characters')
+export async function getCharacters(projectId?: string) {
+  const params = projectId ? { project_id: projectId } : {}
+  const response = await api.get<Character[]>('/characters', { params })
   return response.data
 }
 

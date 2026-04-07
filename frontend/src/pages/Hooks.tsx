@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Card, Button, Input, TextArea, Modal } from '@/components/ui'
 import { getHooks, createHook, updateHookStatus } from '@/api/chapters'
-import { Plus, Flag, CheckCircle, Clock, XCircle, Trash2, Edit } from 'lucide-react'
+import { Plus, Flag, CheckCircle, Clock, XCircle, Trash2, Edit, FolderOpen } from 'lucide-react'
+import { useProject } from '@/contexts/ProjectContext'
 
 interface Hook {
   id?: string
@@ -30,6 +31,7 @@ interface CreateHookDTO {
 }
 
 export default function Hooks() {
+  const { currentProject } = useProject()
   const [hooks, setHooks] = useState<Hook[]>([])
   const [showModal, setShowModal] = useState(false)
   const [editingHook, setEditingHook] = useState<Hook | null>(null)
@@ -44,15 +46,21 @@ export default function Hooks() {
   })
 
   const loadHooks = useCallback(async () => {
+    if (!currentProject) {
+      setHooks([])
+      setLoading(false)
+      return
+    }
+    setLoading(true)
     try {
-      const data = await getHooks(filterStatus === 'all' ? undefined : filterStatus)
+      const data = await getHooks(currentProject.id, filterStatus === 'all' ? undefined : filterStatus)
       setHooks(data)
     } catch (error) {
       console.error('Failed to load hooks:', error)
     } finally {
       setLoading(false)
     }
-  }, [filterStatus])
+  }, [currentProject, filterStatus])
 
   useEffect(() => {
     loadHooks()
@@ -162,36 +170,43 @@ export default function Hooks() {
     <div>
       <div className="flex items-center justify-between mb-8">
         <h1 className="text-3xl font-bold text-gray-800">🎯 伏笔管理</h1>
-        <Button onClick={openCreateModal}>
+        <Button onClick={openCreateModal} disabled={!currentProject}>
           <Plus size={20} className="mr-2" />
           新建伏笔
         </Button>
       </div>
 
-      {/* 状态筛选 */}
-      <div className="mb-6 flex gap-2 flex-wrap">
-        {[
-          { key: 'all', label: '全部' },
-          { key: 'planted', label: '已埋设' },
-          { key: 'triggered', label: '已触发' },
-          { key: 'resolved', label: '已回收' },
-          { key: 'dropped', label: '已废弃' },
-        ].map((s) => (
-          <button
-            key={s.key}
-            onClick={() => setFilterStatus(s.key)}
-            className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-              filterStatus === s.key
-                ? 'bg-blue-500 text-white'
-                : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
-            }`}
-          >
-            {s.label} ({statusCounts[s.key as keyof typeof statusCounts]})
-          </button>
-        ))}
-      </div>
+      {!currentProject ? (
+        <div className="text-center py-20 text-gray-500">
+          <FolderOpen size={48} className="mx-auto mb-4 opacity-50" />
+          <p>请先在侧边栏选择一个项目</p>
+        </div>
+      ) : (
+        <>
+          {/* 状态筛选 */}
+          <div className="mb-6 flex gap-2 flex-wrap">
+            {[
+              { key: 'all', label: '全部' },
+              { key: 'planted', label: '已埋设' },
+              { key: 'triggered', label: '已触发' },
+              { key: 'resolved', label: '已回收' },
+              { key: 'dropped', label: '已废弃' },
+            ].map((s) => (
+              <button
+                key={s.key}
+                onClick={() => setFilterStatus(s.key)}
+                className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+                  filterStatus === s.key
+                    ? 'bg-blue-500 text-white'
+                    : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                }`}
+              >
+                {s.label} ({statusCounts[s.key as keyof typeof statusCounts]})
+              </button>
+            ))}
+          </div>
 
-      {loading ? (
+          {loading ? (
         <div className="flex items-center justify-center py-20">
           <Flag size={24} className="animate-spin mr-3" />
           <span className="text-gray-500">加载伏笔...</span>
@@ -343,6 +358,8 @@ export default function Hooks() {
           </div>
         </div>
       </Modal>
+        </>
+      )}
     </div>
   )
 }

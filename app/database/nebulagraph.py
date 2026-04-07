@@ -244,6 +244,526 @@ class NebulaGraphDatabase:
 
         logger.info("NebulaGraph Schema 初始化完成")
 
+    async def init_lore_schema(self):
+        """
+        初始化 Lore（设定）相关的图 Schema
+
+        用于存储世界设定之间的层级关系和约束关系
+        """
+        await self.connect()
+
+        # Lore Tags - 按类别分组的设定节点
+        lore_tags = [
+            # 世界规则
+            """
+            CREATE TAG IF NOT EXISTS lore_world_rule (
+                title STRING,
+                content STRING,
+                priority STRING,
+                keywords STRING,
+                constraints STRING,
+                project_id STRING,
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP
+            )
+            """,
+            # 地理设定
+            """
+            CREATE TAG IF NOT EXISTS lore_geography (
+                title STRING,
+                content STRING,
+                priority STRING,
+                keywords STRING,
+                location_type STRING,
+                parent_location STRING,
+                project_id STRING,
+                created_at TIMESTAMP
+            )
+            """,
+            # 势力/组织
+            """
+            CREATE TAG IF NOT EXISTS lore_faction (
+                title STRING,
+                content STRING,
+                priority STRING,
+                keywords STRING,
+                faction_type STRING,
+                power_level STRING,
+                project_id STRING,
+                created_at TIMESTAMP
+            )
+            """,
+            # 种族
+            """
+            CREATE TAG IF NOT EXISTS lore_race (
+                title STRING,
+                content STRING,
+                priority STRING,
+                keywords STRING,
+                traits STRING,
+                project_id STRING,
+                created_at TIMESTAMP
+            )
+            """,
+            # 物品
+            """
+            CREATE TAG IF NOT EXISTS lore_item (
+                title STRING,
+                content STRING,
+                priority STRING,
+                keywords STRING,
+                item_type STRING,
+                rarity STRING,
+                project_id STRING,
+                created_at TIMESTAMP
+            )
+            """,
+        ]
+
+        for tag_sql in lore_tags:
+            result = self._session_pool.execute(tag_sql)
+            if result.is_succeeded():
+                tag_name = tag_sql.split()[5]  # 提取 Tag 名称
+                logger.info(f"Lore Tag 创建成功：{tag_name}")
+            else:
+                logger.warning(f"Lore Tag 可能已存在：{result.error_msg()}")
+
+        # Lore Edges - 设定之间的关系
+        lore_edges = [
+            # 父子关系（层级结构）
+            """
+            CREATE EDGE IF NOT EXISTS lore_parent_of (
+                relationship_type STRING,
+                created_at TIMESTAMP
+            )
+            """,
+            # 相互关联
+            """
+            CREATE EDGE IF NOT EXISTS lore_related_to (
+                relationship_strength FLOAT,
+                description STRING,
+                created_at TIMESTAMP
+            )
+            """,
+            # 约束关系
+            """
+            CREATE EDGE IF NOT EXISTS lore_constrains (
+                constraint_type STRING,
+                constraint_value STRING,
+                created_at TIMESTAMP
+            )
+            """,
+        ]
+
+        for edge_sql in lore_edges:
+            result = self._session_pool.execute(edge_sql)
+            if result.is_succeeded():
+                edge_name = edge_sql.split()[5]
+                logger.info(f"Lore Edge 创建成功：{edge_name}")
+            else:
+                logger.warning(f"Lore Edge 可能已存在：{result.error_msg()}")
+
+        logger.info("NebulaGraph Lore Schema 初始化完成")
+
+    async def init_narrative_schema(self):
+        """
+        初始化 Narrative（叙事）相关的图 Schema
+
+        用于追踪故事进展、角色状态变化和事件因果关系
+        """
+        await self.connect()
+
+        # Narrative Tags
+        narrative_tags = [
+            # 叙事事件
+            """
+            CREATE TAG IF NOT EXISTS narrative_event (
+                event_id STRING,
+                event_type STRING,
+                summary STRING,
+                chapter INT,
+                scene INT,
+                timestamp STRING,
+                importance FLOAT,
+                project_id STRING,
+                created_at TIMESTAMP
+            )
+            """,
+            # 状态变化
+            """
+            CREATE TAG IF NOT EXISTS narrative_state_change (
+                change_id STRING,
+                entity_type STRING,
+                entity_id STRING,
+                attribute STRING,
+                old_value STRING,
+                new_value STRING,
+                reason STRING,
+                project_id STRING,
+                created_at TIMESTAMP
+            )
+            """,
+            # 关系变化
+            """
+            CREATE TAG IF NOT EXISTS narrative_relationship_change (
+                change_id STRING,
+                character1_id STRING,
+                character2_id STRING,
+                relationship_type STRING,
+                old_strength FLOAT,
+                new_strength FLOAT,
+                reason STRING,
+                project_id STRING,
+                created_at TIMESTAMP
+            )
+            """,
+        ]
+
+        for tag_sql in narrative_tags:
+            result = self._session_pool.execute(tag_sql)
+            if result.is_succeeded():
+                tag_name = tag_sql.split()[5]
+                logger.info(f"Narrative Tag 创建成功：{tag_name}")
+            else:
+                logger.warning(f"Narrative Tag 可能已存在：{result.error_msg()}")
+
+        # Narrative Edges
+        narrative_edges = [
+            # 因果关系
+            """
+            CREATE EDGE IF NOT EXISTS causes (
+                causality_strength FLOAT,
+                description STRING
+            )
+            """,
+            # 参与事件
+            """
+            CREATE EDGE IF NOT EXISTS participates_in (
+                role STRING,
+                involvement_level STRING
+            )
+            """,
+            # 发生地点
+            """
+            CREATE EDGE IF NOT EXISTS occurs_at (
+                location_name STRING
+            )
+            """,
+            # 引用设定
+            """
+            CREATE EDGE IF NOT EXISTS references_lore (
+                reference_type STRING,
+                relevance FLOAT
+            )
+            """,
+        ]
+
+        for edge_sql in narrative_edges:
+            result = self._session_pool.execute(edge_sql)
+            if result.is_succeeded():
+                edge_name = edge_sql.split()[5]
+                logger.info(f"Narrative Edge 创建成功：{edge_name}")
+            else:
+                logger.warning(f"Narrative Edge 可能已存在：{result.error_msg()}")
+
+        logger.info("NebulaGraph Narrative Schema 初始化完成")
+
+    # ==================== Lore 图操作 ====================
+
+    async def add_lore_node(
+        self,
+        lore_id: str,
+        category: str,
+        properties: Dict[str, Any],
+    ) -> bool:
+        """
+        添加设定节点到图数据库
+
+        Args:
+            lore_id: 设定 ID
+            category: 设定类别 (world_rule, geography, faction, race, item)
+            properties: 节点属性
+
+        Returns:
+            bool: 是否成功
+        """
+        tag_map = {
+            "world_rule": "lore_world_rule",
+            "geography": "lore_geography",
+            "faction": "lore_faction",
+            "race": "lore_race",
+            "item": "lore_item",
+        }
+
+        tag_name = tag_map.get(category, "lore_world_rule")
+        now = datetime.utcnow().isoformat()
+
+        # 构建属性字符串
+        props = []
+        for key, value in properties.items():
+            if isinstance(value, str):
+                # 转义单引号
+                escaped_value = value.replace("'", "\\'")
+                props.append(f'{key}: "{escaped_value}"')
+            elif isinstance(value, (int, float)):
+                props.append(f"{key}: {value}")
+            elif isinstance(value, list):
+                props.append(f'{key}: "{str(value)}"')
+
+        props.append(f'created_at: "{now}"')
+        props_str = ", ".join(props)
+
+        query = f"""
+        INSERT VERTEX IF NOT EXISTS {tag_name} ({props_str})
+        VALUES "{lore_id}": ({props_str})
+        """
+
+        result = self._session_pool.execute(query)
+        return result.is_succeeded()
+
+    async def create_lore_relationship(
+        self,
+        lore_id_1: str,
+        lore_id_2: str,
+        relationship_type: str,
+        properties: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """
+        创建设定之间的关系
+
+        Args:
+            lore_id_1: 设定 1 ID
+            lore_id_2: 设定 2 ID
+            relationship_type: 关系类型 (parent_of, related_to, constrains)
+            properties: 边属性
+
+        Returns:
+            bool: 是否成功
+        """
+        edge_map = {
+            "parent_of": "lore_parent_of",
+            "related_to": "lore_related_to",
+            "constrains": "lore_constrains",
+        }
+
+        edge_name = edge_map.get(relationship_type, "lore_related_to")
+        now = datetime.utcnow().isoformat()
+
+        if properties:
+            props_str = ", ".join([
+                f'{k}: "{v}"' if isinstance(v, str) else f"{k}: {v}"
+                for k, v in properties.items()
+            ])
+            props_str += f', created_at: "{now}"'
+        else:
+            props_str = f'created_at: "{now}"'
+
+        query = f"""
+        INSERT EDGE IF NOT EXISTS {edge_name} ({props_str})
+        VALUES "{lore_id_1}" -> "{lore_id_2}": ({props_str})
+        """
+
+        result = self._session_pool.execute(query)
+        return result.is_succeeded()
+
+    async def get_lore_tree(
+        self,
+        root_lore_id: str,
+        max_depth: int = 3,
+    ) -> Dict[str, Any]:
+        """
+        获取设定的层级树结构
+
+        Args:
+            root_lore_id: 根设定 ID
+            max_depth: 最大遍历深度
+
+        Returns:
+            Dict: 树结构数据
+        """
+        query = f"""
+        GO {max_depth} STEPS FROM "{root_lore_id}" OVER lore_parent_of, lore_related_to
+        YIELD vertices AS v, edges AS e
+        """
+
+        result = self._session_pool.execute(query)
+        if not result.is_succeeded():
+            return {"nodes": [], "edges": []}
+
+        return self._parse_path(result.data)
+
+    # ==================== Narrative 图操作 ====================
+
+    async def add_narrative_event_node(
+        self,
+        event_id: str,
+        properties: Dict[str, Any],
+    ) -> bool:
+        """
+        添加叙事事件节点
+
+        Args:
+            event_id: 事件 ID
+            properties: 节点属性
+
+        Returns:
+            bool: 是否成功
+        """
+        now = datetime.utcnow().isoformat()
+
+        props = []
+        for key, value in properties.items():
+            if isinstance(value, str):
+                escaped_value = value.replace("'", "\\'")
+                props.append(f'{key}: "{escaped_value}"')
+            elif isinstance(value, (int, float)):
+                props.append(f"{key}: {value}")
+
+        props.append(f'created_at: "{now}"')
+        props_str = ", ".join(props)
+
+        query = f"""
+        INSERT VERTEX IF NOT EXISTS narrative_event ({props_str})
+        VALUES "{event_id}": ({props_str})
+        """
+
+        result = self._session_pool.execute(query)
+        return result.is_succeeded()
+
+    async def link_event_causality(
+        self,
+        cause_event_id: str,
+        effect_event_id: str,
+        strength: float = 1.0,
+        description: str = "",
+    ) -> bool:
+        """
+        建立事件因果关系
+
+        Args:
+            cause_event_id: 原因事件 ID
+            effect_event_id: 结果事件 ID
+            strength: 因果强度
+            description: 描述
+
+        Returns:
+            bool: 是否成功
+        """
+        query = f"""
+        INSERT EDGE IF NOT EXISTS causes (causality_strength, description)
+        VALUES "{cause_event_id}" -> "{effect_event_id}": ({strength}, "{description}")
+        """
+
+        result = self._session_pool.execute(query)
+        return result.is_succeeded()
+
+    async def link_event_to_character(
+        self,
+        event_id: str,
+        character_id: str,
+        role: str = "participant",
+        involvement_level: str = "direct",
+    ) -> bool:
+        """
+        将事件关联到角色
+
+        Args:
+            event_id: 事件 ID
+            character_id: 角色 ID
+            role: 角色在事件中的角色
+            involvement_level: 参与程度
+
+        Returns:
+            bool: 是否成功
+        """
+        query = f"""
+        INSERT EDGE IF NOT EXISTS participates_in (role, involvement_level)
+        VALUES "{character_id}" -> "{event_id}": ("{role}", "{involvement_level}")
+        """
+
+        result = self._session_pool.execute(query)
+        return result.is_succeeded()
+
+    async def link_event_to_lore(
+        self,
+        event_id: str,
+        lore_id: str,
+        reference_type: str = "mentioned",
+        relevance: float = 0.5,
+    ) -> bool:
+        """
+        将事件关联到设定
+
+        Args:
+            event_id: 事件 ID
+            lore_id: 设定 ID
+            reference_type: 引用类型
+            relevance: 相关性
+
+        Returns:
+            bool: 是否成功
+        """
+        query = f"""
+        INSERT EDGE IF NOT EXISTS references_lore (reference_type, relevance)
+        VALUES "{event_id}" -> "{lore_id}": ("{reference_type}", {relevance})
+        """
+
+        result = self._session_pool.execute(query)
+        return result.is_succeeded()
+
+    async def get_event_chain(
+        self,
+        event_id: str,
+        direction: str = "forward",
+        max_depth: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """
+        获取事件链
+
+        Args:
+            event_id: 起始事件 ID
+            direction: 方向 (forward/backward/both)
+            max_depth: 最大深度
+
+        Returns:
+            List: 事件链列表
+        """
+        if direction == "forward":
+            query = f"""
+            GO {max_depth} STEPS FROM "{event_id}" OVER causes
+            YIELD $$.narrative_event.event_id AS event_id,
+                  $$.narrative_event.summary AS summary,
+                  $$.narrative_event.chapter AS chapter
+            """
+        elif direction == "backward":
+            query = f"""
+            GO {max_depth} STEPS FROM "{event_id}" OVER causes REVERSELY
+            YIELD $$.narrative_event.event_id AS event_id,
+                  $$.narrative_event.summary AS summary,
+                  $$.narrative_event.chapter AS chapter
+            """
+        else:
+            query = f"""
+            GO {max_depth} STEPS FROM "{event_id}" OVER causes BIDIRECT
+            YIELD $$.narrative_event.event_id AS event_id,
+                  $$.narrative_event.summary AS summary,
+                  $$.narrative_event.chapter AS chapter
+            """
+
+        result = self._session_pool.execute(query)
+        if not result.is_succeeded():
+            return []
+
+        events = []
+        for row in result.data.rows():
+            events.append({
+                "event_id": str(row.values[0]),
+                "summary": str(row.values[1]),
+                "chapter": row.values[2].as_int() if row.values[2].is_int() else None,
+            })
+
+        return events
+
     # ==================== 角色相关操作 ====================
 
     async def insert_character(self, character_id: str, properties: Dict[str, Any]) -> bool:

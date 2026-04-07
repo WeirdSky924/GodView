@@ -795,3 +795,116 @@ class DirectorSystem:
             self.current_chapter["hooks_resolved"] = self.hooks_resolved
             self.current_chapter["main_plot_progress"] = self.main_plot_progress
             self.state_machine["phase"] = "chapter_completed"
+
+    # ==================== 动态角色管理 ====================
+
+    def add_character(self, character_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        动态添加角色到导演系统
+
+        Args:
+            character_data: 角色数据
+
+        Returns:
+            Dict: 添加结果
+        """
+        character_id = character_data.get("id")
+        if not character_id:
+            character_id = f"char_{uuid.uuid4().hex[:12]}"
+            character_data["id"] = character_id
+
+        # 检查是否已存在
+        if character_id in self.character_agents:
+            return {
+                "success": False,
+                "error": f"角色 {character_id} 已存在",
+            }
+
+        # 创建 CharacterAgent
+        agent = self._create_character_agent(character_data)
+        self.character_agents[character_id] = agent
+
+        logger.info(f"角色 '{character_data.get('name', character_id)}' 已添加到导演系统")
+
+        return {
+            "success": True,
+            "character_id": character_id,
+            "name": agent.character.name,
+        }
+
+    def remove_character(self, character_id: str) -> Dict[str, Any]:
+        """
+        从导演系统移除角色
+
+        Args:
+            character_id: 角色 ID
+
+        Returns:
+            Dict: 移除结果
+        """
+        if character_id not in self.character_agents:
+            return {
+                "success": False,
+                "error": f"角色 {character_id} 不存在",
+            }
+
+        agent = self.character_agents[character_id]
+        character_name = agent.character.name
+
+        del self.character_agents[character_id]
+
+        logger.info(f"角色 '{character_name}' 已从导演系统移除")
+
+        return {
+            "success": True,
+            "character_id": character_id,
+            "name": character_name,
+        }
+
+    def get_all_characters(self) -> List[Dict[str, Any]]:
+        """
+        获取所有角色列表
+
+        Returns:
+            List: 角色数据列表
+        """
+        characters = []
+        for character_id, agent in self.character_agents.items():
+            characters.append({
+                "id": character_id,
+                "name": agent.character.name,
+                "description": agent.character.description,
+                "role": agent.character.role,
+                "status": agent.character.status.value if hasattr(agent.character.status, 'value') else agent.character.status,
+                "current_location": agent.character.current_location,
+            })
+        return characters
+
+    def get_character(self, character_id: str) -> Optional[Dict[str, Any]]:
+        """
+        获取单个角色信息
+
+        Args:
+            character_id: 角色 ID
+
+        Returns:
+            Optional[Dict]: 角色数据
+        """
+        agent = self.character_agents.get(character_id)
+        if not agent:
+            return None
+
+        return {
+            "id": character_id,
+            "name": agent.character.name,
+            "description": agent.character.description,
+            "role": agent.character.role,
+            "status": agent.character.status.value if hasattr(agent.character.status, 'value') else agent.character.status,
+            "appearance": agent.character.appearance,
+            "background_story": agent.character.background_story,
+            "speech_pattern": agent.character.speech_pattern,
+            "goals": agent.character.goals,
+            "current_location": agent.character.current_location,
+            "personality_traits": agent.character.personality_traits,
+            "skills": agent.character.skills,
+        }

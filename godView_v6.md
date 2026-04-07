@@ -2432,6 +2432,2380 @@ async def init_tables():
 
 ---
 
+## Part 6: Agent Skill 系统
+
+### 6.1 概述
+
+Agent Skill 系统允许：
+1. **Skill 生成** - Agent 或用户可以创建新的 skill
+2. **Skill 库** - 所有 skills 存储在全局库中，可跨项目共享
+3. **Skill 分配** - 用户可将 skill 分配给特定项目的特定 Agent
+4. **Skill 调用** - Agent 在运行时可调用分配给它的 skills
+
+### 6.2 Skill 类型
+
+| 类型 | 描述 | 用途示例 |
+|------|------|----------|
+| `prompt` | 提示词模板 | 角色扮演、写作风格、对话模式 |
+| `function` | Python 函数 | 数据处理、格式转换、复杂计算 |
+| `workflow` | 多步骤工作流 | 内容生成流水线、审批流程 |
+| `knowledge` | 知识片段 | 世界设定、角色背景、剧情摘要 |
+
+### 6.3 数据模型
+
+**新文件**: `E:\_Workspace\Godview\app\models\skill.py`
+
+```python
+"""
+Agent Skill 数据模型
+"""
+from datetime import datetime
+from enum import Enum
+from typing import Any, Dict, List, Optional
+from pydantic import BaseModel, Field
+
+
+class SkillType(str, Enum):
+    """Skill 类型"""
+    PROMPT = "prompt"        # 提示词模板
+    FUNCTION = "function"    # Python 函数
+    WORKFLOW = "workflow"    # 多步骤工作流
+    KNOWLEDGE = "knowledge"  # 知识片段
+
+
+class SkillStatus(str, Enum):
+    """Skill 状态"""
+    DRAFT = "draft"          # 草稿
+    ACTIVE = "active"        # 激活
+    DEPRECATED = "deprecated" # 已废弃
+
+
+class SkillParameter(BaseModel):
+    """Skill 参数定义"""
+    name: str = Field(..., description="参数名")
+    type: str = Field(default="string", description="参数类型: string/number/boolean/array/object")
+    description: Optional[str] = Field(None, description="参数描述")
+    default: Optional[Any] = Field(None, description="默认值")
+    required: bool = Field(default=True, description="是否必填")
+    enum: Optional[List[str]] = Field(None, description="枚举值列表")
+
+
+class Skill(BaseModel):
+    """Skill 模型"""
+    
+    id: str = Field(..., description="Skill ID")
+    name: str = Field(..., description="Skill 名称")
+    description: str = Field(..., description="Skill 描述")
+    skill_type: SkillType = Field(..., description="Skill 类型")
+    
+    # 内容定义（根据类型使用不同字段）
+    prompt_template: Optional[str] = Field(None, description="Prompt 模板，支持 {{param}} 变量")
+    function_code: Optional[str] = Field(None, description="Python 函数代码")
+    workflow_steps: Optional[List[Dict[str, Any]]] = Field(None, description="工作流步骤")
+    knowledge_content: Optional[str] = Field(None, description="知识内容")
+    
+    # 参数定义
+    parameters: List[SkillParameter] = Field(default_factory=list, description="参数列表")
+    
+    # 元数据
+    tags: List[str] = Field(default_factory=list, description="标签")
+    version: str = Field(default="1.0.0", description="版本号")
+    status: SkillStatus = Field(default=SkillStatus.DRAFT, description="状态")
+    
+    # 创建来源
+    creator_project_id: Optional[str] = Field(None, description="创建项目 ID")
+    creator_agent_id: Optional[str] = Field(None, description="创建 Agent ID")
+    creator_user_id: Optional[str] = Field(None, description="创建用户 ID")
+    
+    # 使用统计
+    usage_count: int = Field(default=0, description="使用次数")
+    last_used_at: Optional[datetime] = Field(None, description="最后使用时间")
+    
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class SkillAssignment(BaseModel):
+    """Skill 分配模型"""
+    
+    id: str = Field(..., description="分配 ID")
+    skill_id: str = Field(..., description="Skill ID")
+    project_id: str = Field(..., description="项目 ID")
+    agent_id: str = Field(..., description="Agent ID (character_id)")
+    
+    # 分配配置
+    custom_parameters: Optional[Dict[str, Any]] = Field(None, description="覆盖默认参数")
+    priority: int = Field(default=0, description="执行优先级，数字越大越优先")
+    
+    assigned_by: str = Field(default="user", description="分配者")
+    assigned_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class SkillExecutionLog(BaseModel):
+    """Skill 执行日志"""
+    
+    id: str = Field(..., description="日志 ID")
+    skill_id: str = Field(..., description="Skill ID")
+    project_id: str = Field(..., description="项目 ID")
+    agent_id: str = Field(..., description="Agent ID")
+    
+    input_params: Dict[str, Any] = Field(default_factory=dict, description="输入参数")
+    output_result: Optional[str] = Field(None, description="输出结果")
+    success: bool = Field(default=True, description="是否成功")
+    error_message: Optional[str] = Field(None, description="错误信息")
+    execution_time_ms: Optional[int] = Field(None, description="执行耗时(ms)")
+    
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+```
+
+### 6.4 Skill 服务
+
+**新文件**: `E:\_Workspace\Godview\app\services\skill_service.py`
+
+```python
+"""
+Skill 管理服务
+"""
+import logging
+import uuid
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from app.models.skill import Skill, SkillAssignment, SkillType, SkillStatus
+from app.database.postgres import PostgresDB
+
+logger = logging.getLogger(__name__)
+
+
+class SkillService:
+    """Skill 管理服务"""
+    
+    def __init__(self, db: PostgresDB):
+        self.db = db
+    
+    async def generate_skill(
+        self,
+        name: str,
+        description: str,
+        skill_type: SkillType,
+        content: str,
+        parameters: Optional[List[Dict]] = None,
+        tags: Optional[List[str]] = None,
+        creator_project_id: Optional[str] = None,
+        creator_agent_id: Optional[str] = None,
+        creator_user_id: Optional[str] = None,
+    ) -> Skill:
+        """
+        生成新的 Skill
+        
+        Args:
+            name: Skill 名称
+            description: Skill 描述
+            skill_type: Skill 类型
+            content: 内容（根据类型含义不同）
+            parameters: 参数定义
+            tags: 标签
+            creator_project_id: 创建项目 ID
+            creator_agent_id: 创建 Agent ID
+            creator_user_id: 创建用户 ID
+        
+        Returns:
+            Skill: 创建的 Skill
+        """
+        skill_id = f"skill_{uuid.uuid4().hex[:12]}"
+        
+        skill_data = {
+            "id": skill_id,
+            "name": name,
+            "description": description,
+            "skill_type": skill_type.value,
+            "tags": tags or [],
+            "parameters": parameters or [],
+            "status": SkillStatus.DRAFT.value,
+            "creator_project_id": creator_project_id,
+            "creator_agent_id": creator_agent_id,
+            "creator_user_id": creator_user_id,
+        }
+        
+        # 根据类型设置内容
+        if skill_type == SkillType.PROMPT:
+            skill_data["prompt_template"] = content
+        elif skill_type == SkillType.FUNCTION:
+            skill_data["function_code"] = content
+        elif skill_type == SkillType.WORKFLOW:
+            skill_data["workflow_steps"] = content  # JSON string or list
+        elif skill_type == SkillType.KNOWLEDGE:
+            skill_data["knowledge_content"] = content
+        
+        await self.db.save_skill(skill_data)
+        
+        return Skill(**skill_data)
+    
+    async def assign_skill_to_agent(
+        self,
+        skill_id: str,
+        project_id: str,
+        agent_id: str,
+        custom_parameters: Optional[Dict] = None,
+        priority: int = 0,
+        assigned_by: str = "user",
+    ) -> SkillAssignment:
+        """
+        将 Skill 分配给 Agent
+        
+        Args:
+            skill_id: Skill ID
+            project_id: 项目 ID
+            agent_id: Agent ID
+            custom_parameters: 自定义参数
+            priority: 优先级
+            assigned_by: 分配者
+        
+        Returns:
+            SkillAssignment: 分配记录
+        """
+        # 检查 skill 是否存在
+        skill = await self.db.get_skill(skill_id)
+        if not skill:
+            raise ValueError(f"Skill {skill_id} 不存在")
+        
+        # 检查是否已分配
+        existing = await self.db.get_skill_assignment(skill_id, project_id, agent_id)
+        if existing:
+            raise ValueError(f"Skill {skill_id} 已分配给 Agent {agent_id}")
+        
+        assignment_id = f"assign_{uuid.uuid4().hex[:12]}"
+        
+        assignment_data = {
+            "id": assignment_id,
+            "skill_id": skill_id,
+            "project_id": project_id,
+            "agent_id": agent_id,
+            "custom_parameters": custom_parameters,
+            "priority": priority,
+            "assigned_by": assigned_by,
+        }
+        
+        await self.db.save_skill_assignment(assignment_data)
+        
+        return SkillAssignment(**assignment_data)
+    
+    async def get_agent_skills(self, project_id: str, agent_id: str) -> List[Dict[str, Any]]:
+        """
+        获取 Agent 已分配的 Skills
+        
+        Args:
+            project_id: 项目 ID
+            agent_id: Agent ID
+        
+        Returns:
+            List: Skill 列表（包含分配信息）
+        """
+        return await self.db.get_agent_skills(project_id, agent_id)
+    
+    async def list_skills(
+        self,
+        skill_type: Optional[SkillType] = None,
+        status: Optional[SkillStatus] = None,
+        tags: Optional[List[str]] = None,
+        search: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """
+        列出 Skills
+        
+        Args:
+            skill_type: 类型过滤
+            status: 状态过滤
+            tags: 标签过滤
+            search: 搜索关键词
+            limit: 数量限制
+            offset: 偏移量
+        
+        Returns:
+            List: Skill 列表
+        """
+        return await self.db.list_skills(
+            skill_type=skill_type.value if skill_type else None,
+            status=status.value if status else None,
+            tags=tags,
+            search=search,
+            limit=limit,
+            offset=offset,
+        )
+```
+
+### 6.5 Skill 执行器
+
+**新文件**: `E:\_Workspace\Godview\app\services\skill_executor.py`
+
+```python
+"""
+Skill 执行器
+"""
+import time
+import logging
+from typing import Any, Dict, Optional
+
+from app.models.skill import Skill, SkillType
+from app.services.model_router import create_llm
+
+logger = logging.getLogger(__name__)
+
+
+class SkillExecutor:
+    """Skill 执行器"""
+    
+    def __init__(self):
+        self.execution_logs = []
+    
+    async def execute_skill(
+        self,
+        skill: Skill,
+        params: Dict[str, Any],
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        执行 Skill
+        
+        Args:
+            skill: Skill 对象
+            params: 执行参数
+            context: 执行上下文（包含 agent、project 等信息）
+        
+        Returns:
+            Dict: 执行结果
+        """
+        start_time = time.time()
+        
+        try:
+            # 合并默认参数
+            merged_params = self._merge_parameters(skill, params)
+            
+            # 根据类型执行
+            if skill.skill_type == SkillType.PROMPT:
+                result = await self._execute_prompt_skill(skill, merged_params, context)
+            elif skill.skill_type == SkillType.FUNCTION:
+                result = await self._execute_function_skill(skill, merged_params, context)
+            elif skill.skill_type == SkillType.WORKFLOW:
+                result = await self._execute_workflow_skill(skill, merged_params, context)
+            elif skill.skill_type == SkillType.KNOWLEDGE:
+                result = await self._execute_knowledge_skill(skill, merged_params, context)
+            else:
+                raise ValueError(f"未知的 Skill 类型: {skill.skill_type}")
+            
+            execution_time = int((time.time() - start_time) * 1000)
+            
+            return {
+                "success": True,
+                "result": result,
+                "execution_time_ms": execution_time,
+            }
+        
+        except Exception as e:
+            execution_time = int((time.time() - start_time) * 1000)
+            logger.error(f"Skill 执行失败: {skill.id} - {e}")
+            
+            return {
+                "success": False,
+                "error": str(e),
+                "execution_time_ms": execution_time,
+            }
+    
+    def _merge_parameters(self, skill: Skill, params: Dict[str, Any]) -> Dict[str, Any]:
+        """合并默认参数和传入参数"""
+        merged = {}
+        
+        # 设置默认值
+        for param in skill.parameters:
+            if param.default is not None:
+                merged[param.name] = param.default
+        
+        # 覆盖传入参数
+        merged.update(params)
+        
+        # 检查必填参数
+        for param in skill.parameters:
+            if param.required and param.name not in merged:
+                raise ValueError(f"缺少必填参数: {param.name}")
+        
+        return merged
+    
+    async def _execute_prompt_skill(
+        self,
+        skill: Skill,
+        params: Dict[str, Any],
+        context: Optional[Dict[str, Any]],
+    ) -> str:
+        """执行 Prompt 类型 Skill"""
+        # 替换模板变量
+        prompt = skill.prompt_template
+        for key, value in params.items():
+            prompt = prompt.replace(f"{{{{{key}}}}}", str(value))
+        
+        # 添加上下文
+        if context:
+            agent_info = context.get("agent", {})
+            if agent_info:
+                prompt = f"[角色: {agent_info.get('name', '未知')}]\n\n{prompt}"
+        
+        # 调用 LLM
+        from app.config import settings
+        llm = create_llm(
+            provider=settings.llm_provider,
+            model=settings.llm_model,
+            api_key=settings.llm_api_key,
+            base_url=settings.llm_base_url,
+        )
+        
+        response = await llm.ainvoke([{"role": "user", "content": prompt}])
+        return response.content
+    
+    async def _execute_function_skill(
+        self,
+        skill: Skill,
+        params: Dict[str, Any],
+        context: Optional[Dict[str, Any]],
+    ) -> Any:
+        """执行 Function 类型 Skill"""
+        # 创建安全的执行环境
+        safe_globals = {
+            "__builtins__": {
+                "len": len,
+                "str": str,
+                "int": int,
+                "float": float,
+                "list": list,
+                "dict": dict,
+                "range": range,
+                "enumerate": enumerate,
+                "zip": zip,
+            }
+        }
+        
+        # 执行代码
+        local_vars = {"params": params, "context": context, "result": None}
+        exec(skill.function_code, safe_globals, local_vars)
+        
+        return local_vars.get("result")
+    
+    async def _execute_workflow_skill(
+        self,
+        skill: Skill,
+        params: Dict[str, Any],
+        context: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """执行 Workflow 类型 Skill"""
+        results = {}
+        
+        for step in skill.workflow_steps:
+            step_type = step.get("type")
+            step_params = {**params, **step.get("params", {})}
+            
+            if step_type == "prompt":
+                # 执行 prompt 步骤
+                prompt = step.get("template")
+                for key, value in {**step_params, **results}.items():
+                    prompt = prompt.replace(f"{{{{{key}}}}}", str(value))
+                
+                # 调用 LLM
+                from app.config import settings
+                llm = create_llm(
+                    provider=settings.llm_provider,
+                    model=settings.llm_model,
+                    api_key=settings.llm_api_key,
+                    base_url=settings.llm_base_url,
+                )
+                response = await llm.ainvoke([{"role": "user", "content": prompt}])
+                results[step.get("output_key", f"step_{len(results)}")] = response.content
+            
+            elif step_type == "transform":
+                # 执行数据转换
+                # TODO: 实现转换逻辑
+                pass
+        
+        return results
+    
+    async def _execute_knowledge_skill(
+        self,
+        skill: Skill,
+        params: Dict[str, Any],
+        context: Optional[Dict[str, Any]],
+    ) -> str:
+        """执行 Knowledge 类型 Skill"""
+        # 直接返回知识内容
+        return skill.knowledge_content
+```
+
+### 6.6 API 路由
+
+**新文件**: `E:\_Workspace\Godview\app\api\routes\skills.py`
+
+```python
+"""
+Skill 管理 API 路由
+"""
+import logging
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field
+
+from app.api.app import postgres_db
+from app.models.skill import SkillType, SkillStatus
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+
+class CreateSkillRequest(BaseModel):
+    """创建 Skill 请求"""
+    name: str
+    description: str
+    skill_type: str
+    content: str  # 根据 type 不同，含义不同
+    parameters: Optional[List[Dict]] = None
+    tags: Optional[List[str]] = None
+    creator_project_id: Optional[str] = None
+    creator_agent_id: Optional[str] = None
+
+
+class AssignSkillRequest(BaseModel):
+    """分配 Skill 请求"""
+    project_id: str
+    agent_id: str
+    custom_parameters: Optional[Dict[str, Any]] = None
+    priority: Optional[int] = 0
+
+
+@router.get("", response_model=List[Dict[str, Any]])
+async def list_skills(
+    skill_type: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    tags: Optional[str] = Query(None),  # 逗号分隔
+    search: Optional[str] = Query(None),
+    limit: int = Query(default=50, le=200),
+    offset: int = Query(default=0),
+):
+    """获取 Skill 列表"""
+    tag_list = tags.split(",") if tags else None
+    
+    skills = await postgres_db.list_skills(
+        skill_type=skill_type,
+        status=status,
+        tags=tag_list,
+        search=search,
+        limit=limit,
+        offset=offset,
+    )
+    return skills
+
+
+@router.post("", response_model=Dict[str, Any])
+async def create_skill(request: CreateSkillRequest):
+    """创建新 Skill"""
+    try:
+        skill_type = SkillType(request.skill_type)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"无效的 skill_type: {request.skill_type}")
+    
+    skill_data = {
+        "name": request.name,
+        "description": request.description,
+        "skill_type": skill_type.value,
+        "parameters": request.parameters or [],
+        "tags": request.tags or [],
+        "status": SkillStatus.DRAFT.value,
+        "creator_project_id": request.creator_project_id,
+        "creator_agent_id": request.creator_agent_id,
+    }
+    
+    # 根据类型设置内容
+    if skill_type == SkillType.PROMPT:
+        skill_data["prompt_template"] = request.content
+    elif skill_type == SkillType.FUNCTION:
+        skill_data["function_code"] = request.content
+    elif skill_type == SkillType.WORKFLOW:
+        skill_data["workflow_steps"] = request.content
+    elif skill_type == SkillType.KNOWLEDGE:
+        skill_data["knowledge_content"] = request.content
+    
+    skill_id = await postgres_db.save_skill(skill_data)
+    
+    return {
+        "success": True,
+        "id": skill_id,
+        "message": f"Skill '{request.name}' 创建成功",
+    }
+
+
+@router.get("/{skill_id}", response_model=Dict[str, Any])
+async def get_skill(skill_id: str):
+    """获取 Skill 详情"""
+    skill = await postgres_db.get_skill(skill_id)
+    if not skill:
+        raise HTTPException(status_code=404, detail="Skill 不存在")
+    return skill
+
+
+@router.put("/{skill_id}", response_model=Dict[str, Any])
+async def update_skill(skill_id: str, updates: Dict[str, Any]):
+    """更新 Skill"""
+    existing = await postgres_db.get_skill(skill_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Skill 不存在")
+    
+    await postgres_db.update_skill(skill_id, updates)
+    
+    return {
+        "success": True,
+        "id": skill_id,
+        "message": "Skill 更新成功",
+    }
+
+
+@router.delete("/{skill_id}", response_model=Dict[str, Any])
+async def delete_skill(skill_id: str):
+    """删除 Skill"""
+    await postgres_db.delete_skill(skill_id)
+    
+    return {
+        "success": True,
+        "message": f"Skill {skill_id} 已删除",
+    }
+
+
+@router.post("/{skill_id}/assign", response_model=Dict[str, Any])
+async def assign_skill(skill_id: str, request: AssignSkillRequest):
+    """将 Skill 分配给 Agent"""
+    # 检查 skill 是否存在
+    skill = await postgres_db.get_skill(skill_id)
+    if not skill:
+        raise HTTPException(status_code=404, detail="Skill 不存在")
+    
+    # 检查是否已分配
+    existing = await postgres_db.get_skill_assignment(
+        skill_id, request.project_id, request.agent_id
+    )
+    if existing:
+        raise HTTPException(status_code=400, detail="Skill 已分配给该 Agent")
+    
+    assignment_data = {
+        "skill_id": skill_id,
+        "project_id": request.project_id,
+        "agent_id": request.agent_id,
+        "custom_parameters": request.custom_parameters,
+        "priority": request.priority,
+    }
+    
+    await postgres_db.save_skill_assignment(assignment_data)
+    
+    return {
+        "success": True,
+        "message": f"Skill 已分配给 Agent",
+    }
+
+
+@router.delete("/{skill_id}/assign", response_model=Dict[str, Any])
+async def unassign_skill(skill_id: str, project_id: str, agent_id: str):
+    """取消 Skill 分配"""
+    await postgres_db.delete_skill_assignment(skill_id, project_id, agent_id)
+    
+    return {
+        "success": True,
+        "message": "Skill 分配已取消",
+    }
+
+
+@router.get("/agents/{project_id}/{agent_id}", response_model=List[Dict[str, Any]])
+async def get_agent_skills(project_id: str, agent_id: str):
+    """获取 Agent 已分配的 Skills"""
+    skills = await postgres_db.get_agent_skills(project_id, agent_id)
+    return skills
+
+
+@router.post("/{skill_id}/test", response_model=Dict[str, Any])
+async def test_skill(skill_id: str, params: Dict[str, Any]):
+    """测试 Skill"""
+    from app.services.skill_executor import SkillExecutor
+    from app.models.skill import Skill
+    
+    skill_data = await postgres_db.get_skill(skill_id)
+    if not skill_data:
+        raise HTTPException(status_code=404, detail="Skill 不存在")
+    
+    skill = Skill(**skill_data)
+    executor = SkillExecutor()
+    
+    result = await executor.execute_skill(skill, params)
+    
+    return result
+```
+
+### 6.7 前端组件
+
+**新文件**: `E:\_Workspace\Godview\frontend\src\pages\Skills.tsx`
+
+```tsx
+import { useState, useEffect } from 'react'
+import { Card, Button, Input } from '@/components/ui'
+import { getSkills, createSkill, deleteSkill } from '@/api/skills'
+import { Plus, Trash2, Play, Tag, Code, FileText, Workflow, BookOpen } from 'lucide-react'
+
+export default function Skills() {
+  const [skills, setSkills] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [filter, setFilter] = useState({
+    type: '',
+    search: '',
+  })
+  
+  const loadSkills = async () => {
+    setLoading(true)
+    try {
+      const data = await getSkills(filter)
+      setSkills(data)
+    } finally {
+      setLoading(false)
+    }
+  }
+  
+  useEffect(() => {
+    loadSkills()
+  }, [filter])
+  
+  const getTypeIcon = (type: string) => {
+    switch (type) {
+      case 'prompt': return <FileText size={18} />
+      case 'function': return <Code size={18} />
+      case 'workflow': return <Workflow size={18} />
+      case 'knowledge': return <BookOpen size={18} />
+      default: return <FileText size={18} />
+    }
+  }
+  
+  return (
+    <div>
+      <div className="flex justify-between items-center mb-6">
+        <h1 className="text-3xl font-bold text-gray-800">🛠️ Skill 库</h1>
+        <Button onClick={() => {/* 打开创建对话框 */}}>
+          <Plus size={18} className="mr-2" />
+          创建 Skill
+        </Button>
+      </div>
+      
+      {/* 过滤器 */}
+      <div className="flex gap-4 mb-6">
+        <Input
+          placeholder="搜索 Skill..."
+          value={filter.search}
+          onChange={(e) => setFilter({ ...filter, search: e.target.value })}
+          className="w-64"
+        />
+        <select
+          className="px-3 py-2 border rounded-lg"
+          value={filter.type}
+          onChange={(e) => setFilter({ ...filter, type: e.target.value })}
+        >
+          <option value="">所有类型</option>
+          <option value="prompt">Prompt</option>
+          <option value="function">Function</option>
+          <option value="workflow">Workflow</option>
+          <option value="knowledge">Knowledge</option>
+        </select>
+      </div>
+      
+      {/* Skill 列表 */}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        {skills.map(skill => (
+          <Card key={skill.id} className="p-4">
+            <div className="flex items-start justify-between mb-2">
+              <div className="flex items-center gap-2">
+                {getTypeIcon(skill.skill_type)}
+                <h3 className="font-semibold text-gray-800">{skill.name}</h3>
+              </div>
+              <span className={`text-xs px-2 py-1 rounded ${
+                skill.status === 'active' ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-600'
+              }`}>
+                {skill.status}
+              </span>
+            </div>
+            
+            <p className="text-sm text-gray-600 mb-3 line-clamp-2">{skill.description}</p>
+            
+            {/* 标签 */}
+            <div className="flex flex-wrap gap-1 mb-3">
+              {skill.tags?.map((tag: string, i: number) => (
+                <span key={i} className="text-xs px-2 py-0.5 bg-blue-50 text-blue-600 rounded">
+                  {tag}
+                </span>
+              ))}
+            </div>
+            
+            {/* 操作按钮 */}
+            <div className="flex gap-2 pt-2 border-t">
+              <Button size="sm" variant="outline">
+                <Play size={14} className="mr-1" />
+                测试
+              </Button>
+              <Button size="sm" variant="outline">
+                分配
+              </Button>
+              <Button size="sm" variant="outline" className="text-red-600">
+                <Trash2 size={14} />
+              </Button>
+            </div>
+          </Card>
+        ))}
+      </div>
+      
+      {skills.length === 0 && !loading && (
+        <div className="text-center py-12 text-gray-500">
+          <p>暂无 Skill，点击上方按钮创建</p>
+        </div>
+      )}
+    </div>
+  )
+}
+```
+
+### 6.8 数据库服务层扩展
+
+**文件**: `E:\_Workspace\Godview\app\database\postgres.py`
+
+添加以下方法：
+
+```python
+# ==================== Skill 相关操作 ====================
+
+async def save_skill(self, skill_data: Dict[str, Any]) -> str:
+    """保存 Skill"""
+    query = """
+    INSERT INTO skills (id, name, description, skill_type, prompt_template, function_code,
+                       workflow_steps, knowledge_content, parameters, tags, version, status,
+                       creator_project_id, creator_agent_id, creator_user_id, usage_count,
+                       last_used_at, created_at, updated_at)
+    VALUES (:id, :name, :description, :skill_type, :prompt_template, :function_code,
+            :workflow_steps, :knowledge_content, :parameters, :tags, :version, :status,
+            :creator_project_id, :creator_agent_id, :creator_user_id, :usage_count,
+            :last_used_at, :created_at, :updated_at)
+    ON CONFLICT (id) DO UPDATE SET
+        name = EXCLUDED.name,
+        description = EXCLUDED.description,
+        prompt_template = EXCLUDED.prompt_template,
+        function_code = EXCLUDED.function_code,
+        workflow_steps = EXCLUDED.workflow_steps,
+        knowledge_content = EXCLUDED.knowledge_content,
+        parameters = EXCLUDED.parameters,
+        tags = EXCLUDED.tags,
+        version = EXCLUDED.version,
+        status = EXCLUDED.status,
+        updated_at = EXCLUDED.updated_at
+    """
+    await self.execute_query(query, skill_data)
+    return skill_data.get("id", "")
+
+async def get_skill(self, skill_id: str) -> Optional[Dict[str, Any]]:
+    """获取 Skill"""
+    query = "SELECT * FROM skills WHERE id = :id"
+    results = await self.execute_query(query, {"id": skill_id})
+    return results[0] if results else None
+
+async def list_skills(self, skill_type=None, status=None, tags=None, search=None, limit=50, offset=0):
+    """列出 Skills"""
+    conditions = []
+    params = {"limit": limit, "offset": offset}
+    
+    if skill_type:
+        conditions.append("skill_type = :skill_type")
+        params["skill_type"] = skill_type
+    if status:
+        conditions.append("status = :status")
+        params["status"] = status
+    if search:
+        conditions.append("(name ILIKE :search OR description ILIKE :search)")
+        params["search"] = f"%{search}%"
+    
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    
+    query = f"""
+    SELECT * FROM skills {where_clause}
+    ORDER BY created_at DESC
+    LIMIT :limit OFFSET :offset
+    """
+    return await self.execute_query(query, params)
+
+async def save_skill_assignment(self, assignment_data: Dict[str, Any]) -> str:
+    """保存 Skill 分配"""
+    query = """
+    INSERT INTO skill_assignments (id, skill_id, project_id, agent_id, custom_parameters, priority, assigned_by, assigned_at)
+    VALUES (:id, :skill_id, :project_id, :agent_id, :custom_parameters, :priority, :assigned_by, :assigned_at)
+    ON CONFLICT (skill_id, project_id, agent_id) DO UPDATE SET
+        custom_parameters = EXCLUDED.custom_parameters,
+        priority = EXCLUDED.priority
+    """
+    await self.execute_query(query, assignment_data)
+    return assignment_data.get("id", "")
+
+async def get_agent_skills(self, project_id: str, agent_id: str) -> List[Dict[str, Any]]:
+    """获取 Agent 的 Skills"""
+    query = """
+    SELECT s.*, sa.custom_parameters, sa.priority, sa.assigned_at
+    FROM skills s
+    JOIN skill_assignments sa ON s.id = sa.skill_id
+    WHERE sa.project_id = :project_id AND sa.agent_id = :agent_id
+    ORDER BY sa.priority DESC, sa.assigned_at DESC
+    """
+    return await self.execute_query(query, {"project_id": project_id, "agent_id": agent_id})
+```
+
+---
+
+## Files to Modify (Part 6)
+
+| 文件 | 修改内容 |
+|------|----------|
+| `app/models/skill.py` | **新建** - Skill 数据模型 |
+| `app/services/skill_service.py` | **新建** - Skill 管理服务 |
+| `app/services/skill_executor.py` | **新建** - Skill 执行器 |
+| `app/api/routes/skills.py` | **新建** - Skill API 路由 |
+| `app/database/postgres.py` | 添加 Skill 相关数据库方法 |
+| `app/agents/character_agent.py` | 添加 Skill 调用能力 |
+| `frontend/src/pages/Skills.tsx` | **新建** - Skill 管理页面 |
+| `frontend/src/components/skills/SkillEditor.tsx` | **新建** - Skill 编辑器 |
+| `frontend/src/components/skills/SkillAssignDialog.tsx` | **新建** - 分配对话框 |
+| `frontend/src/api/skills.ts` | **新建** - Skill API |
+| `frontend/src/components/Layout.tsx` | 添加 Skills 菜单项 |
+
+---
+
+## Part 7: 双 RAG 架构设计（动态剧情 + 静态设定）
+
+### 7.1 架构概述
+
+现有的向量/图数据库记录的是世界的"现在进行时"（动态剧情），需要补充一个充当"世界宪法"和"风物志"的静态设定 RAG，记录世界的"底层运转逻辑"。
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        GodView 双 RAG 架构                       │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────┐    ┌─────────────────────────────┐ │
+│  │   静态设定 RAG (Lore)   │    │   动态剧情 RAG (Narrative)  │ │
+│  │   "世界宪法 + 风物志"    │    │      "现在进行时"           │ │
+│  ├─────────────────────────┤    ├─────────────────────────────┤ │
+│  │ • 世界观规则            │    │ • 当前事件                  │ │
+│  │ • 地理设定              │    │ • 角色状态变化              │ │
+│  │ • 历史背景              │    │ • 关系演变                  │ │
+│  │ • 势力体系              │    │ • 剧情进展                  │ │
+│  │ • 种族/职业设定         │    │ • 角色记忆                  │ │
+│  │ • 物品/装备设定         │    │ • 伏笔状态                  │ │
+│  │ • 文化习俗              │    │ • 时间线快照                │ │
+│  └─────────────────────────┘    └─────────────────────────────┘ │
+│           │                                │                    │
+│           ▼                                ▼                    │
+│  ┌─────────────────────────┐    ┌─────────────────────────────┐ │
+│  │  Qdrant: lore_records   │    │  Qdrant: narrative_records  │ │
+│  │  Nebula: lore_entities  │    │  Nebula: narrative_entities │ │
+│  └─────────────────────────┘    └─────────────────────────────┘ │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 7.2 数据模型
+
+**新文件**: `app/models/lore.py`
+
+```python
+"""
+静态设定数据模型（Lore）
+充当"世界宪法"和"风物志"，记录世界的"底层运转逻辑"
+"""
+
+from datetime import datetime
+from enum import Enum
+from typing import Any, Dict, List, Optional
+from pydantic import BaseModel, Field
+
+
+class LoreCategory(str, Enum):
+    """设定类别"""
+    
+    # 世界层面
+    WORLD_RULE = "world_rule"           # 世界规则（物理法则、魔法体系）
+    GEOGRAPHY = "geography"             # 地理设定（区域、地形、气候）
+    HISTORY = "history"                 # 历史背景（重大事件、时代划分）
+    
+    # 社会层面
+    FACTION = "faction"                 # 势力/组织
+    CULTURE = "culture"                 # 文化习俗
+    RELIGION = "religion"               # 宗教信仰
+    ECONOMY = "economy"                 # 经济体系
+    
+    # 生物层面
+    RACE = "race"                       # 种族设定
+    PROFESSION = "profession"           # 职业/阶层
+    CREATURE = "creature"               # 生物/怪物
+    
+    # 物品层面
+    ITEM = "item"                       # 物品/装备
+    MATERIAL = "material"               # 材料/资源
+    ARTIFACT = "artifact"               # 神器/宝物
+    
+    # 技能层面
+    SKILL = "skill"                     # 技能/能力
+    SPELL = "spell"                     # 法术/招式
+    TECHNIQUE = "technique"             # 功法/秘术
+
+
+class LorePriority(str, Enum):
+    """设定优先级（用于冲突解决）"""
+    CONSTITUTIONAL = "constitutional"   # 宪法级（不可违反）
+    CORE = "core"                       # 核心设定
+    STANDARD = "standard"               # 标准设定
+    FLEXIBLE = "flexible"               # 灵活设定
+
+
+class LoreEntry(BaseModel):
+    """设定条目"""
+    
+    id: str = Field(..., description="设定 ID")
+    project_id: str = Field(..., description="所属项目 ID")
+    
+    # 基本信息
+    name: str = Field(..., description="设定名称")
+    category: LoreCategory = Field(..., description="设定类别")
+    description: str = Field(..., description="设定描述")
+    
+    # 详细内容
+    content: str = Field(..., description="详细设定内容（Markdown）")
+    keywords: List[str] = Field(default_factory=list, description="关键词列表")
+    
+    # 优先级
+    priority: LorePriority = Field(default=LorePriority.STANDARD, description="优先级")
+    
+    # 关联
+    parent_id: Optional[str] = Field(None, description="父设定 ID（用于层级关系）")
+    related_entities: List[str] = Field(default_factory=list, description="关联实体 ID")
+    related_lore: List[str] = Field(default_factory=list, description="关联设定 ID")
+    
+    # 约束条件
+    constraints: List[str] = Field(default_factory=list, description="约束条件（该设定衍生的规则）")
+    forbidden_actions: List[str] = Field(default_factory=list, description="禁止的行为")
+    
+    # 来源
+    source: str = Field(default="user", description="来源：user/bootstrap/derived")
+    source_reference: Optional[str] = Field(None, description="来源引用")
+    
+    # 元数据
+    tags: List[str] = Field(default_factory=list, description="标签")
+    version: int = Field(default=1, description="版本号")
+    
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    
+    # 向量嵌入信息
+    embedding_hash: Optional[str] = Field(None, description="嵌入内容的哈希（用于检测变化）")
+
+
+class LoreReference(BaseModel):
+    """设定引用（用于追踪哪些内容引用了设定）"""
+    
+    id: str = Field(..., description="引用 ID")
+    lore_id: str = Field(..., description="设定 ID")
+    
+    # 引用来源
+    reference_type: str = Field(..., description="引用类型：chapter/event/dialogue/character")
+    reference_id: str = Field(..., description="引用来源 ID")
+    
+    # 引用上下文
+    context: Optional[str] = Field(None, description="引用上下文")
+    quoted_content: Optional[str] = Field(None, description="引用的具体内容")
+    
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class LoreConflict(BaseModel):
+    """设定冲突记录"""
+    
+    id: str = Field(..., description="冲突 ID")
+    project_id: str = Field(..., description="项目 ID")
+    
+    # 冲突信息
+    lore_id_1: str = Field(..., description="设定 1 ID")
+    lore_id_2: str = Field(..., description="设定 2 ID")
+    conflict_type: str = Field(..., description="冲突类型：contradiction/overlap/undefined")
+    description: str = Field(..., description="冲突描述")
+    
+    # 解决状态
+    status: str = Field(default="pending", description="状态：pending/resolved/ignored")
+    resolution: Optional[str] = Field(None, description="解决方案")
+    
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    resolved_at: Optional[datetime] = None
+```
+
+**新文件**: `app/models/narrative.py`
+
+```python
+"""
+动态剧情数据模型（Narrative）
+记录世界的"现在进行时"
+"""
+
+from datetime import datetime
+from enum import Enum
+from typing import Any, Dict, List, Optional
+from pydantic import BaseModel, Field
+
+
+class NarrativeEntryType(str, Enum):
+    """剧情条目类型"""
+    EVENT = "event"                     # 事件
+    STATE_CHANGE = "state_change"       # 状态变化
+    RELATIONSHIP_CHANGE = "relationship_change"  # 关系变化
+    LOCATION_CHANGE = "location_change" # 位置变化
+    DIALOGUE = "dialogue"               # 对话
+    ACTION = "action"                   # 行动
+    DISCOVERY = "discovery"             # 发现
+    CONFLICT = "conflict"               # 冲突
+    RESOLUTION = "resolution"           # 解决
+
+
+class TemporalScope(str, Enum):
+    """时间范围"""
+    INSTANT = "instant"                 # 瞬时（几秒）
+    SHORT = "short"                     # 短期（几分钟到几小时）
+    MEDIUM = "medium"                   # 中期（几天到几周）
+    LONG = "long"                       # 长期（几个月到几年）
+    PERMANENT = "permanent"             # 永久
+
+
+class NarrativeEntry(BaseModel):
+    """剧情条目"""
+    
+    id: str = Field(..., description="条目 ID")
+    project_id: str = Field(..., description="项目 ID")
+    world_id: str = Field(..., description="世界 ID")
+    
+    # 基本信息
+    entry_type: NarrativeEntryType = Field(..., description="条目类型")
+    title: str = Field(..., description="标题")
+    summary: str = Field(..., description="摘要")
+    content: str = Field(..., description="详细内容")
+    
+    # 时间信息
+    narrative_time: Optional[str] = Field(None, description="剧情内时间")
+    real_time: datetime = Field(default_factory=datetime.utcnow, description="现实时间")
+    temporal_scope: TemporalScope = Field(default=TemporalScope.SHORT, description="时间范围")
+    
+    # 参与者
+    participants: List[str] = Field(default_factory=list, description="参与角色 ID")
+    locations: List[str] = Field(default_factory=list, description="涉及地点 ID")
+    
+    # 因果关系
+    causes: List[str] = Field(default_factory=list, description="原因事件 ID")
+    effects: List[str] = Field(default_factory=list, description="结果事件 ID")
+    
+    # 状态变化
+    state_changes: Dict[str, Any] = Field(default_factory=dict, description="状态变化记录")
+    
+    # 关联设定
+    lore_references: List[str] = Field(default_factory=list, description="引用的设定 ID")
+    
+    # 元数据
+    importance: float = Field(default=0.5, ge=0, le=1, description="重要性")
+    chapter_id: Optional[str] = Field(None, description="所属章节 ID")
+    
+    # 向量嵌入
+    embedding_hash: Optional[str] = Field(None, description="嵌入哈希")
+
+
+class CharacterState(BaseModel):
+    """角色状态（当前进行时）"""
+    
+    id: str = Field(..., description="状态 ID")
+    character_id: str = Field(..., description="角色 ID")
+    project_id: str = Field(..., description="项目 ID")
+    
+    # 当前状态
+    current_location: Optional[str] = Field(None, description="当前位置")
+    current_status: str = Field(default="active", description="当前状态")
+    current_mood: Optional[str] = Field(None, description="当前情绪")
+    
+    # 属性状态
+    attributes: Dict[str, Any] = Field(default_factory=dict, description="当前属性")
+    inventory: List[str] = Field(default_factory=list, description="当前物品")
+    active_goals: List[str] = Field(default_factory=list, description="当前目标")
+    
+    # 关系状态
+    relationships: Dict[str, float] = Field(default_factory=dict, description="当前关系强度")
+    
+    # 最近事件
+    recent_events: List[str] = Field(default_factory=list, description="最近事件 ID")
+    
+    # 时间戳
+    snapshot_time: datetime = Field(default_factory=datetime.utcnow, description="快照时间")
+    version: int = Field(default=1, description="版本号")
+
+
+class WorldSnapshot(BaseModel):
+    """世界快照（记录某一时刻的世界状态）"""
+    
+    id: str = Field(..., description="快照 ID")
+    project_id: str = Field(..., description="项目 ID")
+    world_id: str = Field(..., description="世界 ID")
+    
+    # 快照信息
+    name: Optional[str] = Field(None, description="快照名称")
+    description: Optional[str] = Field(None, description="快照描述")
+    snapshot_type: str = Field(default="auto", description="类型：auto/manual/chapter_end")
+    
+    # 状态数据
+    character_states: Dict[str, Dict] = Field(default_factory=dict, description="角色状态")
+    relationship_states: Dict[str, Dict] = Field(default_factory=dict, description="关系状态")
+    location_states: Dict[str, Dict] = Field(default_factory=dict, description="地点状态")
+    hook_states: Dict[str, Dict] = Field(default_factory=dict, description="伏笔状态")
+    
+    # 索引信息
+    narrative_time: Optional[str] = Field(None, description="剧情时间")
+    chapter_id: Optional[str] = Field(None, description="章节 ID")
+    
+    # 时间戳
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+```
+
+### 7.3 Qdrant 集合重构
+
+**文件**: `app/database/qdrant.py`
+
+```python
+# 新增集合常量
+COLLECTION_LORE = "godview_lore"           # 静态设定 RAG
+COLLECTION_NARRATIVE = "godview_narrative" # 动态剧情 RAG
+COLLECTION_VOICE = "godview_voice"         # 角色声音样本
+
+async def init_collections(self):
+    """初始化所有集合"""
+    collections = [
+        # 静态设定集合
+        {
+            "name": COLLECTION_LORE,
+            "description": "静态设定 RAG - 世界宪法和风物志",
+        },
+        # 动态剧情集合
+        {
+            "name": COLLECTION_NARRATIVE,
+            "description": "动态剧情 RAG - 现在进行时",
+        },
+        # 角色声音集合
+        {
+            "name": COLLECTION_VOICE,
+            "description": "角色声音样本",
+        },
+    ]
+    
+    for col in collections:
+        await self._create_collection_if_not_exists(
+            collection_name=col["name"],
+            description=col["description"],
+        )
+
+# ==================== 静态设定 RAG 操作 ====================
+
+async def add_lore_entry(
+    self,
+    lore_id: str,
+    project_id: str,
+    category: str,
+    name: str,
+    content: str,
+    keywords: List[str],
+    priority: str,
+    embedding: Optional[List[float]] = None,
+) -> Optional[str]:
+    """
+    添加静态设定条目
+    
+    Args:
+        lore_id: 设定 ID
+        project_id: 项目 ID
+        category: 设定类别
+        name: 设定名称
+        content: 详细内容
+        keywords: 关键词
+        priority: 优先级
+        embedding: 向量嵌入
+    
+    Returns:
+        str: 条目 ID
+    """
+    payload = {
+        "type": "lore",
+        "project_id": project_id,
+        "category": category,
+        "name": name,
+        "keywords": keywords,
+        "priority": priority,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    
+    if embedding:
+        return await self.insert_vector(embedding, payload, lore_id)
+    else:
+        return await self.insert_text(content, payload, lore_id)
+
+async def search_lore(
+    self,
+    project_id: str,
+    query: str,
+    categories: Optional[List[str]] = None,
+    priority_min: Optional[str] = None,
+    limit: int = 10,
+) -> List[Dict[str, Any]]:
+    """
+    搜索静态设定
+    
+    Args:
+        project_id: 项目 ID
+        query: 查询文本
+        categories: 类别过滤
+        priority_min: 最低优先级
+        limit: 返回数量
+    
+    Returns:
+        List: 设定列表
+    """
+    filter_conditions = {
+        "type": "lore",
+        "project_id": project_id,
+    }
+    
+    # 类别过滤（Qdrant 不支持多值匹配，需要分开处理）
+    
+    return await self.search_by_text(
+        query_text=query,
+        limit=limit,
+        filter_conditions=filter_conditions,
+    )
+
+async def get_lore_by_keywords(
+    self,
+    project_id: str,
+    keywords: List[str],
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    """
+    通过关键词获取设定
+    
+    Args:
+        project_id: 项目 ID
+        keywords: 关键词列表
+        limit: 返回数量
+    
+    Returns:
+        List: 设定列表
+    """
+    # 使用布尔查询或关键词匹配
+    # 注意：Qdrant 的关键词搜索需要通过 payload 过滤
+    
+    results = []
+    for keyword in keywords[:5]:  # 限制关键词数量
+        query_result = await self.search_by_text(
+            query_text=keyword,
+            limit=limit // len(keywords) + 1,
+            filter_conditions={
+                "type": "lore",
+                "project_id": project_id,
+            },
+        )
+        results.extend(query_result)
+    
+    # 去重
+    seen = set()
+    unique_results = []
+    for r in results:
+        if r["id"] not in seen:
+            seen.add(r["id"])
+            unique_results.append(r)
+    
+    return unique_results[:limit]
+
+# ==================== 动态剧情 RAG 操作 ====================
+
+async def add_narrative_entry(
+    self,
+    entry_id: str,
+    project_id: str,
+    entry_type: str,
+    title: str,
+    content: str,
+    participants: List[str],
+    importance: float,
+    embedding: Optional[List[float]] = None,
+) -> Optional[str]:
+    """
+    添加动态剧情条目
+    
+    Args:
+        entry_id: 条目 ID
+        project_id: 项目 ID
+        entry_type: 条目类型
+        title: 标题
+        content: 内容
+        participants: 参与者
+        importance: 重要性
+        embedding: 向量嵌入
+    
+    Returns:
+        str: 条目 ID
+    """
+    payload = {
+        "type": "narrative",
+        "project_id": project_id,
+        "entry_type": entry_type,
+        "title": title,
+        "participants": participants,
+        "importance": importance,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    
+    if embedding:
+        return await self.insert_vector(embedding, payload, entry_id)
+    else:
+        return await self.insert_text(content, payload, entry_id)
+
+async def search_narrative(
+    self,
+    project_id: str,
+    query: str,
+    entry_types: Optional[List[str]] = None,
+    participants: Optional[List[str]] = None,
+    min_importance: float = 0.0,
+    limit: int = 10,
+) -> List[Dict[str, Any]]:
+    """
+    搜索动态剧情
+    
+    Args:
+        project_id: 项目 ID
+        query: 查询文本
+        entry_types: 条目类型过滤
+        participants: 参与者过滤
+        min_importance: 最小重要性
+        limit: 返回数量
+    
+    Returns:
+        List: 剧情列表
+    """
+    filter_conditions = {
+        "type": "narrative",
+        "project_id": project_id,
+    }
+    
+    results = await self.search_by_text(
+        query_text=query,
+        limit=limit * 2,  # 多取一些用于过滤
+        filter_conditions=filter_conditions,
+    )
+    
+    # 过滤重要性
+    results = [r for r in results if r.get("payload", {}).get("importance", 0) >= min_importance]
+    
+    return results[:limit]
+
+async def get_recent_narratives(
+    self,
+    project_id: str,
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    """
+    获取最近的剧情条目
+    
+    Args:
+        project_id: 项目 ID
+        limit: 返回数量
+    
+    Returns:
+        List: 剧情列表
+    """
+    # 按时间倒序获取
+    all_points, _ = self._client.scroll(
+        collection_name=COLLECTION_NARRATIVE,
+        scroll_filter=Filter(
+            must=[
+                FieldCondition(key="type", match=MatchValue(value="narrative")),
+                FieldCondition(key="project_id", match=MatchValue(value=project_id)),
+            ]
+        ),
+        limit=limit,
+        with_payload=True,
+        with_vectors=False,
+    )
+    
+    return [
+        {
+            "id": point.id,
+            "score": 1.0,
+            "payload": point.payload,
+        }
+        for point in all_points
+    ]
+```
+
+### 7.4 NebulaGraph Schema 扩展
+
+**文件**: `app/database/nebulagraph.py`
+
+```python
+async def init_lore_schema(self):
+    """初始化静态设定图 Schema"""
+    
+    # 设定实体 Tags
+    lore_tags = [
+        # 世界规则
+        """
+        CREATE TAG IF NOT EXISTS lore_world_rule (
+            name STRING,
+            description STRING,
+            priority STRING,
+            constraints STRING,
+            created_at TIMESTAMP
+        )
+        """,
+        # 地理设定
+        """
+        CREATE TAG IF NOT EXISTS lore_geography (
+            name STRING,
+            geography_type STRING,
+            description STRING,
+            climate STRING,
+            created_at TIMESTAMP
+        )
+        """,
+        # 势力
+        """
+        CREATE TAG IF NOT EXISTS lore_faction (
+            name STRING,
+            faction_type STRING,
+            description STRING,
+            power_level INT,
+            created_at TIMESTAMP
+        )
+        """,
+        # 种族
+        """
+        CREATE TAG IF NOT EXISTS lore_race (
+            name STRING,
+            description STRING,
+            traits STRING,
+            abilities STRING,
+            created_at TIMESTAMP
+        )
+        """,
+        # 物品
+        """
+        CREATE TAG IF NOT EXISTS lore_item (
+            name STRING,
+            item_type STRING,
+            rarity STRING,
+            description STRING,
+            created_at TIMESTAMP
+        )
+        """,
+    ]
+    
+    # 设定关系 Edges
+    lore_edges = [
+        # 设定层级关系
+        """
+        CREATE EDGE IF NOT EXISTS lore_parent_of ()
+        """,
+        # 设定关联
+        """
+        CREATE EDGE IF NOT EXISTS lore_related_to (
+            relation_type STRING
+        )
+        """,
+        # 设定约束
+        """
+        CREATE EDGE IF NOT EXISTS lore_constrains (
+            constraint_type STRING
+        )
+        """,
+    ]
+    
+    for tag_sql in lore_tags:
+        result = self._session_pool.execute(tag_sql)
+        if result.is_succeeded():
+            logger.info(f"Lore Tag 创建成功")
+    
+    for edge_sql in lore_edges:
+        result = self._session_pool.execute(edge_sql)
+        if result.is_succeeded():
+            logger.info(f"Lore Edge 创建成功")
+
+async def init_narrative_schema(self):
+    """初始化动态剧情图 Schema"""
+    
+    # 剧情实体 Tags
+    narrative_tags = [
+        # 事件
+        """
+        CREATE TAG IF NOT EXISTS narrative_event (
+            title STRING,
+            summary STRING,
+            event_type STRING,
+            importance FLOAT,
+            narrative_time STRING,
+            created_at TIMESTAMP
+        )
+        """,
+        # 状态变化
+        """
+        CREATE TAG IF NOT EXISTS narrative_state_change (
+            entity_type STRING,
+            entity_id STRING,
+            attribute STRING,
+            old_value STRING,
+            new_value STRING,
+            created_at TIMESTAMP
+        )
+        """,
+        # 关系变化
+        """
+        CREATE TAG IF NOT EXISTS narrative_relationship_change (
+            character_id_1 STRING,
+            character_id_2 STRING,
+            old_strength FLOAT,
+            new_strength FLOAT,
+            reason STRING,
+            created_at TIMESTAMP
+        )
+        """,
+    ]
+    
+    # 剧情关系 Edges
+    narrative_edges = [
+        # 事件因果
+        """
+        CREATE EDGE IF NOT EXISTS causes ()
+        """,
+        # 事件参与
+        """
+        CREATE EDGE IF NOT EXISTS participates_in (
+            role STRING
+        )
+        """,
+        # 事件发生地
+        """
+        CREATE EDGE IF NOT EXISTS occurs_at ()
+        """,
+        # 引用设定
+        """
+        CREATE EDGE IF NOT EXISTS references_lore ()
+        """,
+    ]
+    
+    for tag_sql in narrative_tags:
+        result = self._session_pool.execute(tag_sql)
+        if result.is_succeeded():
+            logger.info(f"Narrative Tag 创建成功")
+    
+    for edge_sql in narrative_edges:
+        result = self._session_pool.execute(edge_sql)
+        if result.is_succeeded():
+            logger.info(f"Narrative Edge 创建成功")
+```
+
+### 7.5 RAG 服务层
+
+**新文件**: `app/services/lore_rag.py`
+
+```python
+"""
+静态设定 RAG 服务
+充当"世界宪法"和"风物志"
+"""
+
+import logging
+from typing import Any, Dict, List, Optional
+
+from app.models.lore import LoreCategory, LoreEntry, LorePriority
+from app.database.qdrant import QdrantDatabase, COLLECTION_LORE
+from app.database.nebulagraph import NebulaGraphDatabase
+
+logger = logging.getLogger(__name__)
+
+
+class LoreRAGService:
+    """静态设定 RAG 服务"""
+    
+    def __init__(self, qdrant: QdrantDatabase, nebula: NebulaGraphDatabase):
+        self.qdrant = qdrant
+        self.nebula = nebula
+    
+    async def add_lore(
+        self,
+        project_id: str,
+        name: str,
+        category: LoreCategory,
+        content: str,
+        description: str = "",
+        keywords: List[str] = None,
+        priority: LorePriority = LorePriority.STANDARD,
+        constraints: List[str] = None,
+    ) -> LoreEntry:
+        """
+        添加静态设定
+        
+        Args:
+            project_id: 项目 ID
+            name: 设定名称
+            category: 设定类别
+            content: 详细内容
+            description: 简短描述
+            keywords: 关键词
+            priority: 优先级
+            constraints: 约束条件
+        
+        Returns:
+            LoreEntry: 创建的设定条目
+        """
+        import uuid
+        
+        lore_id = f"lore_{uuid.uuid4().hex[:12]}"
+        
+        # 创建模型
+        entry = LoreEntry(
+            id=lore_id,
+            project_id=project_id,
+            name=name,
+            category=category,
+            description=description or content[:200],
+            content=content,
+            keywords=keywords or [],
+            priority=priority,
+            constraints=constraints or [],
+        )
+        
+        # 添加到向量数据库
+        await self.qdrant.add_lore_entry(
+            lore_id=lore_id,
+            project_id=project_id,
+            category=category.value,
+            name=name,
+            content=content,
+            keywords=entry.keywords,
+            priority=priority.value,
+        )
+        
+        # 添加到图数据库（建立关联）
+        await self._add_lore_to_graph(entry)
+        
+        return entry
+    
+    async def search_lore(
+        self,
+        project_id: str,
+        query: str,
+        categories: Optional[List[LoreCategory]] = None,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """
+        搜索静态设定
+        
+        Args:
+            project_id: 项目 ID
+            query: 查询文本
+            categories: 类别过滤
+            limit: 返回数量
+        
+        Returns:
+            List: 设定列表
+        """
+        category_values = [c.value for c in categories] if categories else None
+        
+        return await self.qdrant.search_lore(
+            project_id=project_id,
+            query=query,
+            categories=category_values,
+            limit=limit,
+        )
+    
+    async def get_constitutional_rules(
+        self,
+        project_id: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        获取宪法级规则（不可违反的核心设定）
+        
+        Args:
+            project_id: 项目 ID
+        
+        Returns:
+            List: 宪法级规则列表
+        """
+        # 搜索宪法级设定
+        results = await self.qdrant.search_lore(
+            project_id=project_id,
+            query="world rule constitutional",
+            limit=50,
+        )
+        
+        # 过滤出宪法级
+        return [
+            r for r in results
+            if r.get("payload", {}).get("priority") == LorePriority.CONSTITUTIONAL.value
+        ]
+    
+    async def validate_against_lore(
+        self,
+        project_id: str,
+        content: str,
+    ) -> Dict[str, Any]:
+        """
+        验证内容是否符合静态设定
+        
+        Args:
+            project_id: 项目 ID
+            content: 待验证的内容
+        
+        Returns:
+            Dict: 验证结果
+        """
+        # 搜索相关设定
+        relevant_lore = await self.search_lore(
+            project_id=project_id,
+            query=content,
+            limit=10,
+        )
+        
+        # 获取宪法级规则
+        constitutional = await self.get_constitutional_rules(project_id)
+        
+        # 构建验证提示
+        validation_prompt = self._build_validation_prompt(
+            content=content,
+            relevant_lore=relevant_lore,
+            constitutional=constitutional,
+        )
+        
+        # TODO: 调用 LLM 进行验证
+        
+        return {
+            "valid": True,
+            "conflicts": [],
+            "warnings": [],
+            "relevant_lore": relevant_lore,
+        }
+    
+    async def get_lore_context_for_generation(
+        self,
+        project_id: str,
+        scene_description: str,
+        characters: List[str] = None,
+        location: str = None,
+    ) -> str:
+        """
+        获取生成内容所需的设定上下文
+        
+        Args:
+            project_id: 项目 ID
+            scene_description: 场景描述
+            characters: 涉及角色
+            location: 地点
+        
+        Returns:
+            str: 设定上下文
+        """
+        # 搜索场景相关设定
+        scene_lore = await self.search_lore(
+            project_id=project_id,
+            query=scene_description,
+            limit=5,
+        )
+        
+        # 获取地点设定
+        location_lore = []
+        if location:
+            location_lore = await self.search_lore(
+                project_id=project_id,
+                query=location,
+                categories=[LoreCategory.GEOGRAPHY],
+                limit=3,
+            )
+        
+        # 获取宪法级规则
+        constitutional = await self.get_constitutional_rules(project_id)
+        
+        # 组装上下文
+        context_parts = []
+        
+        if constitutional:
+            context_parts.append("【世界宪法 - 不可违反】")
+            for rule in constitutional[:3]:
+                payload = rule.get("payload", {})
+                context_parts.append(f"- {payload.get('name', '')}: {payload.get('description', '')}")
+        
+        if location_lore:
+            context_parts.append("\n【地点设定】")
+            for loc in location_lore:
+                payload = loc.get("payload", {})
+                context_parts.append(f"- {payload.get('name', '')}: {payload.get('description', '')}")
+        
+        if scene_lore:
+            context_parts.append("\n【相关设定】")
+            for lore in scene_lore[:5]:
+                payload = lore.get("payload", {})
+                context_parts.append(f"- {payload.get('name', '')}: {payload.get('description', '')}")
+        
+        return "\n".join(context_parts)
+    
+    async def _add_lore_to_graph(self, entry: LoreEntry):
+        """将设定添加到图数据库"""
+        # 根据类别选择 Tag
+        tag_map = {
+            LoreCategory.WORLD_RULE: "lore_world_rule",
+            LoreCategory.GEOGRAPHY: "lore_geography",
+            LoreCategory.FACTION: "lore_faction",
+            LoreCategory.RACE: "lore_race",
+            LoreCategory.ITEM: "lore_item",
+        }
+        
+        tag_name = tag_map.get(entry.category, "lore_world_rule")
+        
+        # 插入节点
+        query = f"""
+        INSERT VERTEX IF NOT EXISTS {tag_name} (
+            name, description, priority, constraints, created_at
+        )
+        VALUES "{entry.id}": (
+            "{entry.name}",
+            "{entry.description}",
+            "{entry.priority.value}",
+            "{entry.constraints}",
+            "{entry.created_at.isoformat()}"
+        )
+        """
+        
+        await self.nebula.query(query)
+```
+
+**新文件**: `app/services/narrative_rag.py`
+
+```python
+"""
+动态剧情 RAG 服务
+记录世界的"现在进行时"
+"""
+
+import logging
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from app.models.narrative import NarrativeEntry, NarrativeEntryType, CharacterState
+from app.database.qdrant import QdrantDatabase, COLLECTION_NARRATIVE
+from app.database.nebulagraph import NebulaGraphDatabase
+
+logger = logging.getLogger(__name__)
+
+
+class NarrativeRAGService:
+    """动态剧情 RAG 服务"""
+    
+    def __init__(self, qdrant: QdrantDatabase, nebula: NebulaGraphDatabase):
+        self.qdrant = qdrant
+        self.nebula = nebula
+    
+    async def record_event(
+        self,
+        project_id: str,
+        world_id: str,
+        title: str,
+        summary: str,
+        content: str,
+        participants: List[str],
+        event_type: NarrativeEntryType = NarrativeEntryType.EVENT,
+        importance: float = 0.5,
+        causes: List[str] = None,
+    ) -> NarrativeEntry:
+        """
+        记录剧情事件
+        
+        Args:
+            project_id: 项目 ID
+            world_id: 世界 ID
+            title: 事件标题
+            summary: 事件摘要
+            content: 详细内容
+            participants: 参与者
+            event_type: 事件类型
+            importance: 重要性
+            causes: 原因事件
+        
+        Returns:
+            NarrativeEntry: 创建的条目
+        """
+        import uuid
+        
+        entry_id = f"narr_{uuid.uuid4().hex[:12]}"
+        
+        entry = NarrativeEntry(
+            id=entry_id,
+            project_id=project_id,
+            world_id=world_id,
+            entry_type=event_type,
+            title=title,
+            summary=summary,
+            content=content,
+            participants=participants,
+            importance=importance,
+            causes=causes or [],
+        )
+        
+        # 添加到向量数据库
+        await self.qdrant.add_narrative_entry(
+            entry_id=entry_id,
+            project_id=project_id,
+            entry_type=event_type.value,
+            title=title,
+            content=content,
+            participants=participants,
+            importance=importance,
+        )
+        
+        # 添加到图数据库
+        await self._add_event_to_graph(entry)
+        
+        # 更新角色状态
+        for char_id in participants:
+            await self._update_character_state(project_id, char_id, entry)
+        
+        return entry
+    
+    async def search_narrative(
+        self,
+        project_id: str,
+        query: str,
+        participants: List[str] = None,
+        min_importance: float = 0.0,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """
+        搜索剧情
+        
+        Args:
+            project_id: 项目 ID
+            query: 查询文本
+            participants: 参与者过滤
+            min_importance: 最小重要性
+            limit: 返回数量
+        
+        Returns:
+            List: 剧情列表
+        """
+        return await self.qdrant.search_narrative(
+            project_id=project_id,
+            query=query,
+            participants=participants,
+            min_importance=min_importance,
+            limit=limit,
+        )
+    
+    async def get_character_state(
+        self,
+        project_id: str,
+        character_id: str,
+    ) -> Optional[CharacterState]:
+        """
+        获取角色当前状态
+        
+        Args:
+            project_id: 项目 ID
+            character_id: 角色 ID
+        
+        Returns:
+            CharacterState: 角色状态
+        """
+        # 从 PostgreSQL 获取最新状态
+        # 或从内存缓存获取
+        pass
+    
+    async def get_narrative_context(
+        self,
+        project_id: str,
+        character_id: str,
+        query: str,
+        limit: int = 5,
+    ) -> str:
+        """
+        获取角色的剧情上下文
+        
+        Args:
+            project_id: 项目 ID
+            character_id: 角色 ID
+            query: 查询
+            limit: 返回数量
+        
+        Returns:
+            str: 剧情上下文
+        """
+        # 搜索角色相关的剧情
+        results = await self.search_narrative(
+            project_id=project_id,
+            query=query,
+            participants=[character_id],
+            limit=limit,
+        )
+        
+        # 组装上下文
+        context_parts = ["【角色相关剧情】"]
+        for r in results:
+            payload = r.get("payload", {})
+            context_parts.append(f"- {payload.get('title', '')}: {payload.get('summary', '')}")
+        
+        return "\n".join(context_parts)
+    
+    async def get_recent_events(
+        self,
+        project_id: str,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """
+        获取最近的事件
+        
+        Args:
+            project_id: 项目 ID
+            limit: 返回数量
+        
+        Returns:
+            List: 事件列表
+        """
+        return await self.qdrant.get_recent_narratives(
+            project_id=project_id,
+            limit=limit,
+        )
+    
+    async def _add_event_to_graph(self, entry: NarrativeEntry):
+        """将事件添加到图数据库"""
+        # 插入事件节点
+        query = f"""
+        INSERT VERTEX IF NOT EXISTS narrative_event (
+            title, summary, event_type, importance, narrative_time, created_at
+        )
+        VALUES "{entry.id}": (
+            "{entry.title}",
+            "{entry.summary}",
+            "{entry.entry_type.value}",
+            {entry.importance},
+            "{entry.narrative_time or ''}",
+            "{entry.created_at.isoformat()}"
+        )
+        """
+        
+        await self.nebula.query(query)
+        
+        # 创建因果关系边
+        for cause_id in entry.causes:
+            await self.nebula.query(f"""
+            INSERT EDGE IF NOT EXISTS causes ()
+            VALUES "{cause_id}" -> "{entry.id}": ()
+            """)
+        
+        # 创建参与者边
+        for char_id in entry.participants:
+            await self.nebula.query(f"""
+            INSERT EDGE IF NOT EXISTS participates_in (role)
+            VALUES "{char_id}" -> "{entry.id}": ("participant")
+            """)
+    
+    async def _update_character_state(
+        self,
+        project_id: str,
+        character_id: str,
+        event: NarrativeEntry,
+    ):
+        """更新角色状态"""
+        # 记录状态变化
+        # 更新最近事件列表
+        pass
+```
+
+### 7.6 双 RAG 编排服务
+
+**新文件**: `app/services/rag_orchestrator.py`
+
+```python
+"""
+双 RAG 编排服务
+协调静态设定 RAG 和动态剧情 RAG
+"""
+
+import logging
+from typing import Any, Dict, List, Optional
+
+from app.services.lore_rag import LoreRAGService
+from app.services.narrative_rag import NarrativeRAGService
+
+logger = logging.getLogger(__name__)
+
+
+class RAGOrchestrator:
+    """双 RAG 编排器"""
+    
+    def __init__(
+        self,
+        lore_rag: LoreRAGService,
+        narrative_rag: NarrativeRAGService,
+    ):
+        self.lore_rag = lore_rag
+        self.narrative_rag = narrative_rag
+    
+    async def get_full_context(
+        self,
+        project_id: str,
+        query: str,
+        character_id: Optional[str] = None,
+        location: Optional[str] = None,
+        include_constitutional: bool = True,
+        lore_limit: int = 5,
+        narrative_limit: int = 5,
+    ) -> Dict[str, Any]:
+        """
+        获取完整的 RAG 上下文（静态 + 动态）
+        
+        Args:
+            project_id: 项目 ID
+            query: 查询
+            character_id: 角色 ID
+            location: 地点
+            include_constitutional: 是否包含宪法级规则
+            lore_limit: 设定数量限制
+            narrative_limit: 剧情数量限制
+        
+        Returns:
+            Dict: 完整上下文
+        """
+        # 并行获取静态设定和动态剧情
+        import asyncio
+        
+        lore_task = self.lore_rag.get_lore_context_for_generation(
+            project_id=project_id,
+            scene_description=query,
+            location=location,
+        )
+        
+        narrative_task = self.narrative_rag.get_recent_events(
+            project_id=project_id,
+            limit=narrative_limit,
+        )
+        
+        character_task = None
+        if character_id:
+            character_task = self.narrative_rag.get_narrative_context(
+                project_id=project_id,
+                character_id=character_id,
+                query=query,
+            )
+        
+        # 等待所有任务完成
+        results = await asyncio.gather(
+            lore_task,
+            narrative_task,
+            character_task or asyncio.sleep(0),
+        )
+        
+        lore_context = results[0]
+        recent_events = results[1]
+        character_context = results[2] if character_id else ""
+        
+        # 组装完整上下文
+        return {
+            "lore_context": lore_context,
+            "recent_events": recent_events,
+            "character_context": character_context,
+            "full_prompt": self._assemble_prompt(
+                lore_context=lore_context,
+                recent_events=recent_events,
+                character_context=character_context,
+            ),
+        }
+    
+    def _assemble_prompt(
+        self,
+        lore_context: str,
+        recent_events: List[Dict],
+        character_context: str,
+    ) -> str:
+        """组装完整的生成提示"""
+        parts = []
+        
+        if lore_context:
+            parts.append("【世界设定】\n" + lore_context)
+        
+        if recent_events:
+            parts.append("\n【最近发生的事件】")
+            for event in recent_events[:5]:
+                payload = event.get("payload", {})
+                parts.append(f"- {payload.get('title', '')}: {payload.get('summary', '')}")
+        
+        if character_context:
+            parts.append("\n" + character_context)
+        
+        return "\n".join(parts)
+    
+    async def validate_generation(
+        self,
+        project_id: str,
+        generated_content: str,
+    ) -> Dict[str, Any]:
+        """
+        验证生成内容是否符合设定
+        
+        Args:
+            project_id: 项目 ID
+            generated_content: 生成的内容
+        
+        Returns:
+            Dict: 验证结果
+        """
+        # 验证是否符合静态设定
+        lore_validation = await self.lore_rag.validate_against_lore(
+            project_id=project_id,
+            content=generated_content,
+        )
+        
+        # 检查剧情连贯性
+        # TODO: 实现剧情连贯性检查
+        
+        return {
+            "valid": lore_validation.get("valid", True),
+            "conflicts": lore_validation.get("conflicts", []),
+            "warnings": lore_validation.get("warnings", []),
+        }
+```
+
+---
+
+## Files to Modify (Part 7)
+
+| 文件 | 修改内容 |
+|------|----------|
+| `app/models/lore.py` | **新建** - 静态设定数据模型 |
+| `app/models/narrative.py` | **新建** - 动态剧情数据模型 |
+| `app/database/qdrant.py` | 重构为多集合架构，添加 Lore/Narrative 操作 |
+| `app/database/nebulagraph.py` | 添加 Lore/Narrative Schema |
+| `app/services/lore_rag.py` | **新建** - 静态设定 RAG 服务 |
+| `app/services/narrative_rag.py` | **新建** - 动态剧情 RAG 服务 |
+| `app/services/rag_orchestrator.py` | **新建** - 双 RAG 编排服务 |
+| `app/api/routes/lore.py` | **新建** - 设定管理 API |
+| `frontend/src/pages/Lore.tsx` | **新建** - 设定管理页面 |
+
+---
+
 ## Implementation Notes
 
 - **所有设计基于数据库持久化**
@@ -2439,3 +4813,1204 @@ async def init_tables():
 - Token 价格参考各模型官方定价，可能需要定期更新
 - 费用为估算值，实际费用以 API 提供商账单为准
 - LLM Provider 配置为运行时配置，不修改 .env 文件
+- **Skill 系统**：支持跨项目共享，安全执行，版本管理
+- **双 RAG 架构**：
+  - 静态设定 RAG (Lore) 充当"世界宪法"和"风物志"
+  - 动态剧情 RAG (Narrative) 记录"现在进行时"
+  - 宪法级设定不可违反，用于约束生成内容
+  - 设定有优先级，用于解决冲突
+
+---
+
+## Part 8: Setting Agent 持续设定管理
+
+### 8.1 概述
+
+Setting Agent 不是一次性的初始化工具，而是项目的**持续设定管理者**：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   Setting Agent 职责演进                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  【Bootstrap 阶段】          【运行时阶段】                       │
+│  ─────────────────          ─────────────────                    │
+│  • 收集初始设定              • 管理设定 RAG (Lore)               │
+│  • 提炼结构化 seed           • 处理设定修改请求                   │
+│  • 创建初始世界              • 检测设定冲突                       │
+│                              • 与用户协商解决冲突                 │
+│                              • 验证新内容是否符合宪法             │
+│                              • 维护设定一致性                     │
+│                                                                  │
+│                   ┌──────────────────────┐                       │
+│                   │   Setting Agent      │                       │
+│                   │   (常驻服务)          │                       │
+│                   │                      │                       │
+│                   │  ┌────────────────┐  │                       │
+│                   │  │  Lore RAG      │  │                       │
+│                   │  │  (静态设定库)   │  │                       │
+│                   │  └────────────────┘  │                       │
+│                   │                      │                       │
+│                   │  ┌────────────────┐  │                       │
+│                   │  │ 冲突检测引擎    │  │                       │
+│                   │  └────────────────┘  │                       │
+│                   │                      │                       │
+│                   │  ┌────────────────┐  │                       │
+│                   │  │ 协商对话系统    │  │                       │
+│                   │  └────────────────┘  │                       │
+│                   └──────────────────────┘                       │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 8.2 数据模型
+
+**扩展文件**: `app/models/setting_agent.py`
+
+```python
+"""
+Setting Agent 数据模型
+持续设定管理者的状态和会话管理
+"""
+
+from datetime import datetime
+from enum import Enum
+from typing import Any, Dict, List, Optional
+from pydantic import BaseModel, Field
+
+
+class SettingAgentMode(str, Enum):
+    """Setting Agent 运行模式"""
+    BOOTSTRAP = "bootstrap"         # 初始化模式（收集初始设定）
+    MANAGEMENT = "management"        # 管理模式（持续管理设定）
+    CONFLICT_RESOLUTION = "conflict_resolution"  # 冲突解决模式
+
+
+class SettingChangeType(str, Enum):
+    """设定变更类型"""
+    ADD = "add"                     # 新增设定
+    MODIFY = "modify"               # 修改设定
+    DELETE = "delete"               # 删除设定
+    MERGE = "merge"                 # 合并设定
+
+
+class SettingConflict(BaseModel):
+    """设定冲突"""
+    
+    id: str = Field(..., description="冲突 ID")
+    project_id: str = Field(..., description="项目 ID")
+    
+    # 冲突信息
+    conflict_type: str = Field(..., description="冲突类型")
+    description: str = Field(..., description="冲突描述")
+    
+    # 涉及的设定
+    existing_lore_id: str = Field(..., description="现有设定 ID")
+    existing_lore_name: str = Field(..., description="现有设定名称")
+    existing_lore_content: str = Field(..., description="现有设定内容")
+    
+    new_lore_content: str = Field(..., description="新设定内容")
+    
+    # 冲突级别
+    severity: str = Field(default="warning", description="严重程度：critical/warning/info")
+    
+    # 解决状态
+    status: str = Field(default="pending", description="状态：pending/resolved/ignored")
+    resolution: Optional[str] = Field(None, description="解决方案")
+    resolved_content: Optional[str] = Field(None, description="解决后的内容")
+    
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    resolved_at: Optional[datetime] = None
+
+
+class SettingChangeRequest(BaseModel):
+    """设定变更请求"""
+    
+    id: str = Field(..., description="请求 ID")
+    project_id: str = Field(..., description="项目 ID")
+    
+    # 变更信息
+    change_type: SettingChangeType = Field(..., description="变更类型")
+    category: str = Field(..., description="设定类别")
+    name: str = Field(..., description="设定名称")
+    description: str = Field(..., description="设定描述")
+    content: str = Field(..., description="详细内容")
+    
+    # 关联信息
+    target_lore_id: Optional[str] = Field(None, description="目标设定 ID（修改/删除时）")
+    parent_lore_id: Optional[str] = Field(None, description="父设定 ID")
+    
+    # 用户意图
+    user_reason: Optional[str] = Field(None, description="用户变更原因")
+    
+    # 冲突检测结果
+    detected_conflicts: List[SettingConflict] = Field(default_factory=list, description="检测到的冲突")
+    
+    # 状态
+    status: str = Field(default="pending", description="状态：pending/approved/rejected/negotiating")
+    
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class SettingAgentSession(BaseModel):
+    """Setting Agent 会话（持久化到项目）"""
+    
+    id: str = Field(..., description="会话 ID")
+    project_id: str = Field(..., description="项目 ID")
+    
+    # 会话模式
+    mode: SettingAgentMode = Field(default=SettingAgentMode.MANAGEMENT, description="运行模式")
+    
+    # 对话历史
+    messages: List[Dict[str, Any]] = Field(default_factory=list, description="对话历史")
+    
+    # 当前状态
+    current_request: Optional[SettingChangeRequest] = Field(None, description="当前处理的请求")
+    pending_conflicts: List[SettingConflict] = Field(default_factory=list, description="待解决的冲突")
+    
+    # 元数据
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class LoreKnowledgeIndex(BaseModel):
+    """设定知识索引（用于快速检索和冲突检测）"""
+    
+    project_id: str = Field(..., description="项目 ID")
+    
+    # 关键词索引
+    keyword_index: Dict[str, List[str]] = Field(default_factory=dict, description="关键词 -> 设定 ID 列表")
+    
+    # 实体索引
+    entity_index: Dict[str, List[str]] = Field(default_factory=dict, description="实体名 -> 设定 ID 列表")
+    
+    # 规则索引
+    rule_index: Dict[str, List[str]] = Field(default_factory=dict, description="规则类型 -> 设定 ID 列表")
+    
+    # 宪法级规则缓存
+    constitutional_rules: List[str] = Field(default_factory=list, description="宪法级设定 ID 列表")
+    
+    last_updated: datetime = Field(default_factory=datetime.utcnow)
+```
+
+### 8.3 Setting Agent 服务增强
+
+**扩展文件**: `app/services/setting_agent.py`
+
+```python
+"""
+Setting Agent 服务（增强版）
+持续设定管理者 - 负责项目的设定 RAG 管理和冲突解决
+"""
+
+import logging
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+from app.config import settings
+from app.models.setting_agent import (
+    SettingAgentMode,
+    SettingAgentSession,
+    SettingChangeRequest,
+    SettingChangeType,
+    SettingConflict,
+    LoreKnowledgeIndex,
+)
+from app.services.lore_rag import LoreRAGService
+from app.models.lore import LoreCategory, LorePriority
+
+logger = logging.getLogger(__name__)
+
+
+class SettingAgentService:
+    """
+    Setting Agent 服务
+    
+    职责：
+    1. Bootstrap 阶段：收集初始设定，创建世界
+    2. 运行时阶段：管理设定 RAG，处理修改请求，检测冲突
+    """
+    
+    def __init__(self, lore_rag: LoreRAGService):
+        self.lore_rag = lore_rag
+        self.llm_provider = settings.llm_provider
+        self.llm_api_key = settings.llm_api_key
+        self.llm_base_url = settings.llm_base_url
+        self.llm_model = settings.llm_model
+        
+        # 会话存储
+        self._sessions: Dict[str, SettingAgentSession] = {}
+        
+        # 知识索引缓存
+        self._knowledge_indexes: Dict[str, LoreKnowledgeIndex] = {}
+    
+    # ==================== 会话管理 ====================
+    
+    async def get_or_create_session(
+        self,
+        project_id: str,
+        mode: SettingAgentMode = SettingAgentMode.MANAGEMENT,
+    ) -> SettingAgentSession:
+        """
+        获取或创建项目的 Setting Agent 会话
+        
+        Args:
+            project_id: 项目 ID
+            mode: 运行模式
+        
+        Returns:
+            SettingAgentSession: 会话
+        """
+        # 查找现有会话
+        for session in self._sessions.values():
+            if session.project_id == project_id:
+                session.mode = mode
+                session.updated_at = datetime.utcnow()
+                return session
+        
+        # 创建新会话
+        import uuid
+        session_id = f"setting_agent_{uuid.uuid4().hex[:12]}"
+        
+        session = SettingAgentSession(
+            id=session_id,
+            project_id=project_id,
+            mode=mode,
+        )
+        
+        self._sessions[session_id] = session
+        
+        # 加载知识索引
+        await self._load_knowledge_index(project_id)
+        
+        return session
+    
+    async def _load_knowledge_index(self, project_id: str):
+        """加载项目的设定知识索引"""
+        # 获取所有设定
+        all_lore = await self.lore_rag.search_lore(
+            project_id=project_id,
+            query="",  # 空查询获取所有
+            limit=1000,
+        )
+        
+        # 构建索引
+        index = LoreKnowledgeIndex(project_id=project_id)
+        
+        for lore in all_lore:
+            payload = lore.get("payload", {})
+            lore_id = lore.get("id")
+            
+            # 关键词索引
+            for keyword in payload.get("keywords", []):
+                if keyword not in index.keyword_index:
+                    index.keyword_index[keyword] = []
+                index.keyword_index[keyword].append(lore_id)
+            
+            # 实体索引
+            name = payload.get("name", "")
+            if name:
+                if name not in index.entity_index:
+                    index.entity_index[name] = []
+                index.entity_index[name].append(lore_id)
+            
+            # 宪法级规则
+            if payload.get("priority") == LorePriority.CONSTITUTIONAL.value:
+                index.constitutional_rules.append(lore_id)
+        
+        self._knowledge_indexes[project_id] = index
+    
+    # ==================== 设定变更处理 ====================
+    
+    async def process_setting_change(
+        self,
+        project_id: str,
+        change_type: SettingChangeType,
+        category: str,
+        name: str,
+        description: str,
+        content: str,
+        target_lore_id: Optional[str] = None,
+        user_reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        处理设定变更请求
+        
+        Args:
+            project_id: 项目 ID
+            change_type: 变更类型
+            category: 设定类别
+            name: 设定名称
+            description: 描述
+            content: 详细内容
+            target_lore_id: 目标设定 ID
+            user_reason: 用户变更原因
+        
+        Returns:
+            Dict: 处理结果
+        """
+        # 获取会话
+        session = await self.get_or_create_session(project_id)
+        
+        # 创建变更请求
+        import uuid
+        request = SettingChangeRequest(
+            id=f"change_{uuid.uuid4().hex[:12]}",
+            project_id=project_id,
+            change_type=change_type,
+            category=category,
+            name=name,
+            description=description,
+            content=content,
+            target_lore_id=target_lore_id,
+            user_reason=user_reason,
+        )
+        
+        # 检测冲突
+        conflicts = await self._detect_conflicts(project_id, request)
+        request.detected_conflicts = conflicts
+        
+        # 根据冲突情况决定处理方式
+        if not conflicts:
+            # 无冲突，直接执行
+            result = await self._execute_change(request)
+            return {
+                "status": "approved",
+                "message": "设定变更已执行",
+                "result": result,
+            }
+        
+        # 有冲突，进入协商模式
+        session.mode = SettingAgentMode.CONFLICT_RESOLUTION
+        session.current_request = request
+        session.pending_conflicts = conflicts
+        
+        # 生成冲突说明
+        conflict_description = await self._generate_conflict_description(conflicts)
+        
+        return {
+            "status": "conflict_detected",
+            "message": "检测到设定冲突，需要协商解决",
+            "conflicts": [c.model_dump() for c in conflicts],
+            "conflict_description": conflict_description,
+            "suggestions": await self._generate_resolution_suggestions(conflicts, request),
+        }
+    
+    async def _detect_conflicts(
+        self,
+        project_id: str,
+        request: SettingChangeRequest,
+    ) -> List[SettingConflict]:
+        """
+        检测设定冲突
+        
+        Args:
+            project_id: 项目 ID
+            request: 变更请求
+        
+        Returns:
+            List: 冲突列表
+        """
+        conflicts = []
+        index = self._knowledge_indexes.get(project_id)
+        
+        if not index:
+            return conflicts
+        
+        # 1. 检查名称冲突
+        if request.name in index.entity_index:
+            for existing_id in index.entity_index[request.name]:
+                # 获取现有设定
+                existing = await self._get_lore_by_id(existing_id)
+                if existing and existing_id != request.target_lore_id:
+                    conflicts.append(SettingConflict(
+                        id=f"conflict_{request.id}_name",
+                        project_id=project_id,
+                        conflict_type="name_collision",
+                        description=f"已存在名为「{request.name}」的设定",
+                        existing_lore_id=existing_id,
+                        existing_lore_name=request.name,
+                        existing_lore_content=existing.get("description", ""),
+                        new_lore_content=request.content,
+                        severity="warning",
+                    ))
+        
+        # 2. 检查关键词冲突
+        for keyword in request.content.split()[:20]:  # 提取关键词
+            if keyword in index.keyword_index:
+                for existing_id in index.keyword_index[keyword]:
+                    existing = await self._get_lore_by_id(existing_id)
+                    if existing:
+                        # 使用 LLM 判断是否真的冲突
+                        is_conflict = await self._check_semantic_conflict(
+                            existing_content=existing.get("content", ""),
+                            new_content=request.content,
+                        )
+                        if is_conflict:
+                            conflicts.append(SettingConflict(
+                                id=f"conflict_{request.id}_{keyword}",
+                                project_id=project_id,
+                                conflict_type="semantic_conflict",
+                                description=f"新设定与现有设定「{existing.get('name')}」在语义上存在冲突",
+                                existing_lore_id=existing_id,
+                                existing_lore_name=existing.get("name", ""),
+                                existing_lore_content=existing.get("content", ""),
+                                new_lore_content=request.content,
+                                severity="warning",
+                            ))
+        
+        # 3. 检查宪法级规则冲突
+        for const_id in index.constitutional_rules:
+            const_lore = await self._get_lore_by_id(const_id)
+            if const_lore:
+                violation = await self._check_constitutional_violation(
+                    constitutional=const_lore,
+                    new_content=request.content,
+                )
+                if violation:
+                    conflicts.append(SettingConflict(
+                        id=f"conflict_{request.id}_constitutional",
+                        project_id=project_id,
+                        conflict_type="constitutional_violation",
+                        description=f"新设定违反宪法级规则「{const_lore.get('name')}」",
+                        existing_lore_id=const_id,
+                        existing_lore_name=const_lore.get("name", ""),
+                        existing_lore_content=const_lore.get("content", ""),
+                        new_lore_content=request.content,
+                        severity="critical",
+                    ))
+        
+        return conflicts
+    
+    async def _check_semantic_conflict(
+        self,
+        existing_content: str,
+        new_content: str,
+    ) -> bool:
+        """使用 LLM 检查语义冲突"""
+        prompt = f"""请判断以下两段设定是否存在冲突：
+
+【现有设定】
+{existing_content}
+
+【新设定】
+{new_content}
+
+请回答：是/否。如果存在矛盾、对立或不兼容的内容，请回答"是"；否则回答"否"。
+"""
+        
+        response = await self._call_llm_simple(prompt)
+        return "是" in response
+    
+    async def _check_constitutional_violation(
+        self,
+        constitutional: Dict[str, Any],
+        new_content: str,
+    ) -> bool:
+        """检查是否违反宪法级规则"""
+        const_content = constitutional.get("content", "")
+        const_constraints = constitutional.get("constraints", [])
+        
+        prompt = f"""请判断新设定是否违反以下宪法级规则：
+
+【宪法级规则】
+{const_content}
+
+【约束条件】
+{chr(10).join(const_constraints) if const_constraints else '无'}
+
+【新设定】
+{new_content}
+
+请回答：违反/不违反。如果新设定与宪法级规则存在矛盾或违反约束条件，请回答"违反"。
+"""
+        
+        response = await self._call_llm_simple(prompt)
+        return "违反" in response
+    
+    async def _generate_conflict_description(
+        self,
+        conflicts: List[SettingConflict],
+    ) -> str:
+        """生成冲突说明文本"""
+        descriptions = []
+        for c in conflicts:
+            severity_icon = "🚨" if c.severity == "critical" else "⚠️"
+            descriptions.append(
+                f"{severity_icon} **{c.conflict_type}**: {c.description}\n"
+                f"   - 现有设定: {c.existing_lore_name}\n"
+                f"   - 冲突级别: {c.severity}"
+            )
+        return "\n\n".join(descriptions)
+    
+    async def _generate_resolution_suggestions(
+        self,
+        conflicts: List[SettingConflict],
+        request: SettingChangeRequest,
+    ) -> List[Dict[str, Any]]:
+        """生成解决建议"""
+        suggestions = []
+        
+        for conflict in conflicts:
+            if conflict.severity == "critical":
+                # 宪法级冲突，建议修改新设定
+                suggestions.append({
+                    "type": "modify_new",
+                    "description": f"建议修改您的设定以符合「{conflict.existing_lore_name}」规则",
+                    "action": "edit",
+                })
+            else:
+                # 普通冲突，提供多个选项
+                suggestions.append({
+                    "type": "override",
+                    "description": f"覆盖现有设定「{conflict.existing_lore_name}」",
+                    "action": "override",
+                    "target_id": conflict.existing_lore_id,
+                })
+                suggestions.append({
+                    "type": "modify_new",
+                    "description": "修改您的新设定以避免冲突",
+                    "action": "edit",
+                })
+                suggestions.append({
+                    "type": "keep_both",
+                    "description": "保留两者（可能需要后续说明）",
+                    "action": "keep_both",
+                })
+        
+        return suggestions
+    
+    # ==================== 协商对话 ====================
+    
+    async def negotiate(
+        self,
+        project_id: str,
+        user_message: str,
+    ) -> Dict[str, Any]:
+        """
+        与用户协商解决冲突
+        
+        Args:
+            project_id: 项目 ID
+            user_message: 用户消息
+        
+        Returns:
+            Dict: 协商结果
+        """
+        session = await self.get_or_create_session(project_id)
+        
+        if not session.current_request:
+            return {
+                "status": "error",
+                "message": "没有待处理的变更请求",
+            }
+        
+        # 添加用户消息到历史
+        session.messages.append({
+            "role": "user",
+            "content": user_message,
+            "timestamp": datetime.utcnow().isoformat(),
+        })
+        
+        # 分析用户意图
+        intent = await self._analyze_user_intent(user_message)
+        
+        if intent == "cancel":
+            # 用户取消
+            session.current_request = None
+            session.pending_conflicts = []
+            session.mode = SettingAgentMode.MANAGEMENT
+            
+            return {
+                "status": "cancelled",
+                "message": "设定变更已取消",
+            }
+        
+        elif intent == "override":
+            # 用户选择覆盖
+            # 执行变更，标记被覆盖的设定
+            result = await self._execute_with_override(session)
+            
+            session.current_request = None
+            session.pending_conflicts = []
+            session.mode = SettingAgentMode.MANAGEMENT
+            
+            return {
+                "status": "resolved",
+                "message": "设定已更新（覆盖了冲突设定）",
+                "result": result,
+            }
+        
+        elif intent == "edit":
+            # 用户想要修改
+            return {
+                "status": "awaiting_edit",
+                "message": "请提供修改后的设定内容",
+            }
+        
+        else:
+            # 继续协商
+            response = await self._generate_negotiation_response(session, user_message)
+            
+            session.messages.append({
+                "role": "assistant",
+                "content": response,
+                "timestamp": datetime.utcnow().isoformat(),
+            })
+            
+            return {
+                "status": "negotiating",
+                "message": response,
+            }
+    
+    async def _analyze_user_intent(self, message: str) -> str:
+        """分析用户意图"""
+        message_lower = message.lower()
+        
+        if any(w in message_lower for w in ["取消", "不要", "算了", "cancel"]):
+            return "cancel"
+        elif any(w in message_lower for w in ["覆盖", "替换", "override"]):
+            return "override"
+        elif any(w in message_lower for w in ["修改", "改", "edit"]):
+            return "edit"
+        else:
+            return "continue"
+    
+    async def _generate_negotiation_response(
+        self,
+        session: SettingAgentSession,
+        user_message: str,
+    ) -> str:
+        """生成协商回复"""
+        context = f"""当前处理设定变更请求：
+- 类型: {session.current_request.change_type.value}
+- 名称: {session.current_request.name}
+- 内容: {session.current_request.content[:500]}
+
+检测到的冲突：
+{await self._generate_conflict_description(session.pending_conflicts)}
+
+用户消息: {user_message}
+
+请作为设定专家，帮助用户解决这些冲突。提供清晰的建议和选项。
+"""
+        
+        return await self._call_llm_simple(context)
+    
+    # ==================== 设定执行 ====================
+    
+    async def _execute_change(
+        self,
+        request: SettingChangeRequest,
+    ) -> Dict[str, Any]:
+        """执行设定变更"""
+        if request.change_type == SettingChangeType.ADD:
+            # 添加新设定
+            lore = await self.lore_rag.add_lore(
+                project_id=request.project_id,
+                name=request.name,
+                category=LoreCategory(request.category),
+                content=request.content,
+                description=request.description,
+            )
+            return {"action": "added", "lore_id": lore.id}
+        
+        elif request.change_type == SettingChangeType.MODIFY:
+            # 修改现有设定
+            # TODO: 实现修改逻辑
+            return {"action": "modified", "lore_id": request.target_lore_id}
+        
+        elif request.change_type == SettingChangeType.DELETE:
+            # 删除设定
+            # TODO: 实现删除逻辑
+            return {"action": "deleted", "lore_id": request.target_lore_id}
+        
+        return {"action": "unknown"}
+    
+    async def _execute_with_override(
+        self,
+        session: SettingAgentSession,
+    ) -> Dict[str, Any]:
+        """执行变更（覆盖冲突设定）"""
+        request = session.current_request
+        
+        # 标记被覆盖的设定
+        for conflict in session.pending_conflicts:
+            # 更新被覆盖设定的状态
+            # TODO: 实现
+            pass
+        
+        # 执行变更
+        return await self._execute_change(request)
+    
+    # ==================== 辅助方法 ====================
+    
+    async def _get_lore_by_id(self, lore_id: str) -> Optional[Dict[str, Any]]:
+        """获取设定详情"""
+        # 从 PostgreSQL 或缓存获取
+        # TODO: 实现
+        return None
+    
+    async def _call_llm_simple(self, prompt: str) -> str:
+        """简单 LLM 调用"""
+        # TODO: 实现
+        return ""
+    
+    # ==================== 查询接口 ====================
+    
+    async def get_project_lore_summary(
+        self,
+        project_id: str,
+    ) -> Dict[str, Any]:
+        """
+        获取项目设定摘要
+        
+        Args:
+            project_id: 项目 ID
+        
+        Returns:
+            Dict: 设定摘要
+        """
+        index = self._knowledge_indexes.get(project_id)
+        
+        if not index:
+            await self._load_knowledge_index(project_id)
+            index = self._knowledge_indexes.get(project_id)
+        
+        return {
+            "total_lore_count": sum(len(v) for v in index.entity_index.values()) if index else 0,
+            "keyword_count": len(index.keyword_index) if index else 0,
+            "constitutional_rules_count": len(index.constitutional_rules) if index else 0,
+            "categories": list(set(k for k in index.entity_index.keys())) if index else [],
+        }
+    
+    async def chat(
+        self,
+        project_id: str,
+        message: str,
+    ) -> Dict[str, Any]:
+        """
+        与 Setting Agent 聊天
+        
+        可以用于：
+        - 查询现有设定
+        - 讨论设定想法
+        - 发起变更请求
+        
+        Args:
+            project_id: 项目 ID
+            message: 用户消息
+        
+        Returns:
+            Dict: 响应
+        """
+        session = await self.get_or_create_session(project_id)
+        
+        # 添加用户消息
+        session.messages.append({
+            "role": "user",
+            "content": message,
+            "timestamp": datetime.utcnow().isoformat(),
+        })
+        
+        # 构建上下文
+        lore_context = await self.lore_rag.get_lore_context_for_generation(
+            project_id=project_id,
+            scene_description=message,
+        )
+        
+        # 生成响应
+        system_prompt = self._build_management_prompt()
+        response = await self._call_llm_with_context(
+            system_prompt=system_prompt,
+            user_message=message,
+            context=f"当前项目设定：\n{lore_context}",
+        )
+        
+        # 添加助手回复
+        session.messages.append({
+            "role": "assistant",
+            "content": response,
+            "timestamp": datetime.utcnow().isoformat(),
+        })
+        
+        return {
+            "status": "success",
+            "message": response,
+            "mode": session.mode.value,
+        }
+    
+    def _build_management_prompt(self) -> str:
+        """构建管理模式提示词"""
+        return """你是项目的设定管理者（Setting Agent）。你的职责是：
+
+1. 管理项目的静态设定 RAG（Lore）
+2. 帮助用户查询和理解现有设定
+3. 处理用户的设定修改请求
+4. 检测设定冲突并提醒用户
+5. 与用户协商解决冲突
+
+请遵循以下原则：
+- 深入了解项目的所有设定，特别是宪法级规则
+- 当用户想要修改设定时，检查是否与现有设定冲突
+- 如果检测到冲突，明确告知用户并提供解决方案
+- 宪法级规则不可违反，必须提醒用户
+- 保持专业、友好的态度
+
+你可以执行的操作：
+- 查询设定：搜索并展示相关设定
+- 新增设定：创建新的设定条目（需检查冲突）
+- 修改设定：更新现有设定（需确认影响）
+- 删除设定：移除不再需要的设定（需确认）
+"""
+```
+
+### 8.4 API 端点
+
+**新文件**: `app/api/routes/setting_agent.py`
+
+```python
+"""
+Setting Agent API 路由
+持续设定管理接口
+"""
+
+import logging
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+
+class ChatRequest(BaseModel):
+    """聊天请求"""
+    project_id: str
+    message: str
+
+
+class SettingChangeRequest(BaseModel):
+    """设定变更请求"""
+    project_id: str
+    change_type: str  # add/modify/delete
+    category: str
+    name: str
+    description: str = ""
+    content: str
+    target_lore_id: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class NegotiateRequest(BaseModel):
+    """协商请求"""
+    project_id: str
+    message: str
+
+
+@router.post("/chat", response_model=Dict[str, Any])
+async def chat_with_setting_agent(request: ChatRequest):
+    """
+    与 Setting Agent 聊天
+    
+    可以用于查询设定、讨论想法、发起变更等
+    """
+    from app.services.setting_agent import get_setting_agent_service
+    
+    agent = get_setting_agent_service()
+    
+    result = await agent.chat(
+        project_id=request.project_id,
+        message=request.message,
+    )
+    
+    return result
+
+
+@router.post("/change", response_model=Dict[str, Any])
+async def request_setting_change(request: SettingChangeRequest):
+    """
+    请求设定变更
+    
+    Setting Agent 会检测冲突并返回结果
+    """
+    from app.services.setting_agent import get_setting_agent_service
+    from app.models.setting_agent import SettingChangeType
+    
+    agent = get_setting_agent_service()
+    
+    result = await agent.process_setting_change(
+        project_id=request.project_id,
+        change_type=SettingChangeType(request.change_type),
+        category=request.category,
+        name=request.name,
+        description=request.description,
+        content=request.content,
+        target_lore_id=request.target_lore_id,
+        user_reason=request.reason,
+    )
+    
+    return result
+
+
+@router.post("/negotiate", response_model=Dict[str, Any])
+async def negotiate_conflict(request: NegotiateRequest):
+    """
+    协商解决设定冲突
+    
+    当检测到冲突时，通过此接口与 Agent 协商
+    """
+    from app.services.setting_agent import get_setting_agent_service
+    
+    agent = get_setting_agent_service()
+    
+    result = await agent.negotiate(
+        project_id=request.project_id,
+        user_message=request.message,
+    )
+    
+    return result
+
+
+@router.get("/{project_id}/summary", response_model=Dict[str, Any])
+async def get_lore_summary(project_id: str):
+    """
+    获取项目设定摘要
+    """
+    from app.services.setting_agent import get_setting_agent_service
+    
+    agent = get_setting_agent_service()
+    
+    result = await agent.get_project_lore_summary(project_id)
+    
+    return result
+
+
+@router.get("/{project_id}/history", response_model=List[Dict[str, Any]])
+async def get_chat_history(
+    project_id: str,
+    limit: int = Query(default=50, le=200),
+):
+    """
+    获取与 Setting Agent 的对话历史
+    """
+    from app.services.setting_agent import get_setting_agent_service
+    
+    agent = get_setting_agent_service()
+    session = await agent.get_or_create_session(project_id)
+    
+    return session.messages[-limit:]
+```
+
+### 8.5 前端集成
+
+**新组件**: `frontend/src/components/setting/SettingAgentChat.tsx`
+
+```tsx
+import { useState, useRef, useEffect } from 'react'
+import { Card, Button, Input } from '@/components/ui'
+import { chatWithSettingAgent, requestSettingChange } from '@/api/settingAgent'
+import { Send, Plus, AlertTriangle, CheckCircle } from 'lucide-react'
+
+export function SettingAgentChat({ projectId }: { projectId: string }) {
+  const [messages, setMessages] = useState<Array<{role: string; content: string}>>([])
+  const [input, setInput] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [pendingConflict, setPendingConflict] = useState<any>(null)
+  const messagesEndRef = useRef<HTMLDivElement>(null)
+  
+  const handleSend = async () => {
+    if (!input.trim() || loading) return
+    
+    const userMessage = input.trim()
+    setInput('')
+    setMessages(prev => [...prev, { role: 'user', content: userMessage }])
+    setLoading(true)
+    
+    try {
+      const result = await chatWithSettingAgent(projectId, userMessage)
+      
+      setMessages(prev => [...prev, { role: 'assistant', content: result.message }])
+      
+      if (result.status === 'conflict_detected') {
+        setPendingConflict(result)
+      }
+    } catch (error) {
+      setMessages(prev => [...prev, { 
+        role: 'assistant', 
+        content: '抱歉，处理您的请求时出现错误。' 
+      }])
+    } finally {
+      setLoading(false)
+    }
+  }
+  
+  const handleResolveConflict = async (action: 'override' | 'edit' | 'cancel') => {
+    if (!pendingConflict) return
+    
+    // 处理冲突解决
+    // ...
+  }
+  
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages])
+  
+  return (
+    <Card className="flex flex-col h-[600px]">
+      {/* 标题 */}
+      <div className="p-4 border-b">
+        <h3 className="font-semibold text-gray-800">🎭 设定管理者</h3>
+        <p className="text-xs text-gray-500">管理项目的世界设定，检测冲突</p>
+      </div>
+      
+      {/* 消息列表 */}
+      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        {messages.map((msg, i) => (
+          <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+            <div className={`max-w-[80%] p-3 rounded-lg ${
+              msg.role === 'user' 
+                ? 'bg-blue-500 text-white' 
+                : 'bg-gray-100 text-gray-800'
+            }`}>
+              {msg.content}
+            </div>
+          </div>
+        ))}
+        
+        {/* 冲突提示 */}
+        {pendingConflict && (
+          <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
+            <div className="flex items-center gap-2 text-yellow-700 font-medium mb-2">
+              <AlertTriangle size={18} />
+              检测到设定冲突
+            </div>
+            <p className="text-sm text-yellow-600 mb-3">
+              {pendingConflict.conflict_description}
+            </p>
+            <div className="flex gap-2">
+              <Button 
+                size="sm" 
+                variant="outline"
+                onClick={() => handleResolveConflict('override')}
+              >
+                覆盖现有设定
+              </Button>
+              <Button 
+                size="sm" 
+                variant="outline"
+                onClick={() => handleResolveConflict('edit')}
+              >
+                修改我的设定
+              </Button>
+              <Button 
+                size="sm" 
+                variant="outline"
+                onClick={() => handleResolveConflict('cancel')}
+              >
+                取消
+              </Button>
+            </div>
+          </div>
+        )}
+        
+        <div ref={messagesEndRef} />
+      </div>
+      
+      {/* 输入区 */}
+      <div className="p-4 border-t">
+        <div className="flex gap-2">
+          <Input
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            placeholder="询问设定、添加新设定、修改现有设定..."
+            onKeyPress={(e) => e.key === 'Enter' && handleSend()}
+            className="flex-1"
+          />
+          <Button onClick={handleSend} disabled={loading}>
+            <Send size={18} />
+          </Button>
+        </div>
+      </div>
+    </Card>
+  )
+}
+```
+
+---
+
+## Files to Modify (Part 8)
+
+| 文件 | 修改内容 |
+|------|----------|
+| `app/models/setting_agent.py` | **新建** - Setting Agent 数据模型 |
+| `app/services/setting_agent.py` | **重构** - 持续设定管理服务 |
+| `app/api/routes/setting_agent.py` | **新建** - Setting Agent API |
+| `frontend/src/components/setting/SettingAgentChat.tsx` | **新建** - 聊天组件 |
+| `frontend/src/api/settingAgent.ts` | **新建** - API 函数 |
+| `frontend/src/pages/Lore.tsx` | 集成 Setting Agent 聊天 |
+
+---
+
+## 架构对比：改进前 vs 改进后
+
+### 改进前
+
+```
+┌─────────────────────────────────┐
+│         单一 RAG 架构           │
+├─────────────────────────────────┤
+│                                 │
+│  Qdrant: godview_memory         │
+│  ├─ voice_sample (角色声音)     │
+│  ├─ memory (角色记忆)           │
+│  └─ (剧情事件混杂)              │
+│                                 │
+│  NebulaGraph: godview_space     │
+│  ├─ character, world, region    │
+│  ├─ hook, event, memory         │
+│  └─ (静态设定和动态剧情混杂)    │
+│                                 │
+│  问题：                         │
+│  ✗ 设定和剧情混在一起           │
+│  ✗ 无法区分优先级               │
+│  ✗ 难以约束生成内容             │
+│  ✗ 设定冲突无法检测             │
+│                                 │
+└─────────────────────────────────┘
+```
+
+### 改进后
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        双 RAG 架构                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────┐    ┌─────────────────────────────┐ │
+│  │   静态设定 RAG (Lore)   │    │   动态剧情 RAG (Narrative)  │ │
+│  │   "世界宪法 + 风物志"    │    │      "现在进行时"           │ │
+│  ├─────────────────────────┤    ├─────────────────────────────┤ │
+│  │ Qdrant: godview_lore    │    │ Qdrant: godview_narrative   │ │
+│  │ ├─ world_rule (宪法级)  │    │ ├─ event (事件)             │ │
+│  │ ├─ geography (地理)     │    │ ├─ state_change (状态变化)  │ │
+│  │ ├─ faction (势力)       │    │ ├─ dialogue (对话)          │ │
+│  │ ├─ race (种族)          │    │ └─ discovery (发现)         │ │
+│  │ └─ ...                  │    │                              │ │
+│  │                          │    │ NebulaGraph: narrative_*    │ │
+│  │ NebulaGraph: lore_*      │    │ ├─ causes (因果关系)        │ │
+│  │ ├─ parent_of (层级)      │    │ ├─ participates_in (参与)   │ │
+│  │ ├─ constrains (约束)     │    │ └─ references_lore (引用)   │ │
+│  └─────────────────────────┘    └─────────────────────────────┘ │
+│                                                                  │
+│  优势：                                                          │
+│  ✓ 静态设定和动态剧情分离                                        │
+│  ✓ 宪法级设定约束生成                                            │
+│  ✓ 优先级解决冲突                                                │
+│  ✓ 设定引用追踪                                                  │
+│  ✓ 剧情连贯性保障                                                │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```

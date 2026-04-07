@@ -36,6 +36,10 @@ class Project(BaseModel):
     # 关联实体
     world_id: Optional[str] = Field(None, description="关联的世界ID")
 
+    # Token 统计
+    total_tokens: int = Field(default=0, description="总Token消耗")
+    total_cost: float = Field(default=0.0, description="总费用(美元)")
+
     # 时间戳
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
