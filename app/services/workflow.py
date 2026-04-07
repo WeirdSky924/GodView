@@ -4,9 +4,10 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, Dict, List, Optional, TypedDict, TYPE_CHECKING
 
-from app.services.director import DirectorSystem
+if TYPE_CHECKING:
+    from app.services.director import DirectorSystem
 
 try:
     from langgraph.graph import END, StateGraph

@@ -36,6 +36,18 @@ class TerrainType(str, Enum):
     CUSTOM = "custom"  # 自定义
 
 
+class EncounterType(str, Enum):
+    """遭遇类型"""
+
+    MONSTER = "monster"  # 怪物
+    NPC = "npc"  # NPC
+    EVENT = "event"  # 事件
+    TREASURE = "treasure"  # 宝藏
+    TRAP = "trap"  # 陷阱
+    PUZZLE = "puzzle"  # 谜题
+    CUSTOM = "custom"  # 自定义
+
+
 class WorldRule(BaseModel):
     """世界规则模型"""
 

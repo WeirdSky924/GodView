@@ -3,7 +3,7 @@
  * GodView v5 世界模拟系统前端API
  */
 
-import api from './index'
+import { api } from './client'
 
 /**
  * 模拟状态枚举

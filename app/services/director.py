@@ -14,10 +14,12 @@ from app.agents.director.master_plotter import MasterPlotterAgent
 from app.agents.director.summarizer import SummarizerAgent
 from app.agents.director.writer import WriterAgent
 from app.agents.procgen import ProcGenAgent
-from app.api.app import qdrant_db
+# Removed circular import: qdrant_db will be imported lazily
+# from app.api.app import qdrant_db
 from app.models.character import Character
 from app.models.world import World
-from app.services.workflow import DirectorWorkflow
+# Removed to fix circular import: DirectorWorkflow will be imported lazily
+# from app.services.workflow import DirectorWorkflow
 
 logger = logging.getLogger(__name__)
 
@@ -341,6 +343,8 @@ class DirectorSystem:
         environment: str = "",
         character_moods: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
+        # Lazy import to avoid circular dependency
+        from app.services.workflow import DirectorWorkflow
         workflow = DirectorWorkflow(self)
         return await workflow.run_cycle(
             speaker_id=speaker_id,
@@ -534,6 +538,12 @@ class DirectorSystem:
         voice_samples = agent.character.voice_samples or []
         similar_samples: List[str] = []
         vector_hits: List[Dict[str, Any]] = []
+
+        # Lazy import to avoid circular dependency
+        try:
+            from app.api.app import qdrant_db
+        except ImportError:
+            qdrant_db = None
 
         if qdrant_db and (context or dialogue):
             query_text = f"{context}\n{dialogue}".strip()

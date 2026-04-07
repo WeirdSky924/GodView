@@ -6,6 +6,7 @@ v5.3 功能：提供预设的世界模板，加速项目初始化
 import logging
 import uuid
 from datetime import datetime
+from enum import Enum
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
@@ -677,8 +678,3 @@ def get_template_library() -> WorldTemplateLibrary:
     if _template_library is None:
         _template_library = WorldTemplateLibrary()
     return _template_library
-
-
-# 导入 Enum
-from enum import Enum
-import re

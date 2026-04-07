@@ -59,10 +59,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
 
     # PostgreSQL
     if settings.database_url:
-        postgres_db = PostgresDatabase(settings.database_url)
-        await postgres_db.connect()
-        await postgres_db.init_tables()
-        logger.info("PostgreSQL 初始化完成")
+        try:
+            postgres_db = PostgresDatabase(settings.database_url)
+            await postgres_db.connect()
+            await postgres_db.init_tables()
+            logger.info("PostgreSQL 初始化完成")
+        except Exception as e:
+            logger.warning(f"PostgreSQL 连接失败：{e}")
+            postgres_db = None
+    else:
+        logger.info("PostgreSQL 未配置，跳过初始化")
 
     # NebulaGraph
     if settings.nebula_host:
@@ -78,6 +84,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
             logger.info("NebulaGraph 初始化完成")
         except Exception as e:
             logger.warning(f"NebulaGraph 连接失败：{e}")
+            nebula_db = None
+    else:
+        logger.info("NebulaGraph 未配置，跳过初始化")
 
     # Embedding Service
     try:
@@ -105,6 +114,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
             logger.info("Qdrant 初始化完成")
         except Exception as e:
             logger.warning(f"Qdrant 连接失败：{e}")
+            qdrant_db = None
+    else:
+        logger.info("Qdrant 未配置，跳过初始化")
+
+    logger.info("应用初始化完成，开始服务...")
 
     yield
 

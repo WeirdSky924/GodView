@@ -3,7 +3,7 @@
  * GodView v5 时间流逝系统前端API
  */
 
-import api from './index'
+import { api } from './client'
 
 /**
  * 时间系统配置
