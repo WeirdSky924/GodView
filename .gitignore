@@ -1,46 +1,147 @@
-# 忽略配置文件（包含 API Key）
-config.yaml
+# ======================== 配置文件 ========================
+# 包含敏感信息的配置文件
 .env
+.env.local
+.env.*.local
+config.yaml
+config.local.yaml
 
-# 忽略系统或 IDE 缓存
+# ======================== IDE 和编辑器 ========================
 .DS_Store
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
 
-# Python 缓存
+# ======================== Python ========================
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
 # 虚拟环境
 venv/
 env/
+ENV/
+.venv/
+
+# ======================== Node.js / 前端 ========================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# 前端构建输出
+frontend/dist/
+frontend/build/
+
+# Vite 缓存
+frontend/.vite/
+
+# ======================== 数据库和数据 ========================
+# 本地数据目录（Docker 持久化）
+data/
+init/sql/
+
+# 备份目录
+backups/
 
 # 数据库文件
 *.db
 *.sqlite
-
-# 日志文件
-*.log
-logs/
-
-# 测试相关
-.pytest_cache/
-.coverage
-htmlcov/
+*.sqlite3
 
 # Qdrant 本地存储
 qdrant_storage/
 
+# ======================== 日志 ========================
+*.log
+logs/
+.nox/
+
+# ======================== 测试 ========================
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# ======================== 模型缓存 ========================
+# HuggingFace 模型缓存
+models/
+*.bin
+*.safetensors
+*.gguf
+
+# ======================== 设计文档 ========================
 # GodView 设计文档
 /godView.md
 /godView_v2.md
 /godView_v3.md
 /godView_v4.md
 /godView_v5.md
+/godView_v6.md
+/godView_v7.md
 
-# 实现状态追踪文档（本地使用，不提交）
+# 实现状态追踪文档
 /IMPLEMENTATION_STATUS.md
 /godView_v5_implementation_summary.md
+/godView_v6_implementation_summary.md
+/godView_v7_implementation_summary.md
 
-# 测试追踪文档（本地使用，不提交）
+# 测试追踪文档
 /TEST_REPORT.md
+
+# ======================== Docker ========================
+# Docker volumes (如果使用本地目录)
+.docker/
+
+# ======================== 临时文件 ========================
+*.tmp
+*.temp
+*.bak
+*.cache
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Linux
+*~
+
+# ======================== 其他 ========================
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/

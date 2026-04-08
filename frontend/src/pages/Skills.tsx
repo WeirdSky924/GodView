@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Card, Button, Input, TextArea, Modal } from '@/components/ui'
+import PageLayout from '@/components/PageLayout'
 import {
   getSkills,
   getSkill,
@@ -18,6 +19,7 @@ import {
   Plus, Edit, Trash2, Search, Play, Code, FileText, Workflow, BookOpen,
   Layers, ChevronDown, ChevronRight, Copy, CheckCircle, XCircle,
 } from 'lucide-react'
+import { useTheme } from '@/contexts/ThemeContext'
 
 const skillTypeIcons: Record<SkillType, React.ReactNode> = {
   prompt: <FileText size={18} />,
@@ -33,19 +35,10 @@ const skillTypeLabels: Record<SkillType, string> = {
   knowledge: '知识片段',
 }
 
-const statusColors: Record<SkillStatus, string> = {
-  draft: 'bg-gray-100 text-gray-700 border-gray-200',
-  active: 'bg-green-100 text-green-700 border-green-200',
-  deprecated: 'bg-red-100 text-red-700 border-red-200',
-}
-
-const statusLabels: Record<SkillStatus, string> = {
-  draft: '草稿',
-  active: '激活',
-  deprecated: '已废弃',
-}
-
 export default function Skills() {
+  const { theme } = useTheme()
+  const isDark = theme === 'dark'
+
   const [skills, setSkills] = useState<Skill[]>([])
   const [loading, setLoading] = useState(true)
   const [selectedSkill, setSelectedSkill] = useState<Skill | null>(null)
@@ -69,6 +62,29 @@ export default function Skills() {
     tags: [],
   })
   const [tagsInput, setTagsInput] = useState('')
+
+  const getStatusColors = (status: SkillStatus): string => {
+    if (isDark) {
+      switch (status) {
+        case 'draft': return 'bg-gray-800 text-gray-300 border-gray-600'
+        case 'active': return 'bg-green-900 text-green-300 border-green-700'
+        case 'deprecated': return 'bg-red-900 text-red-300 border-red-700'
+        default: return 'bg-gray-800 text-gray-300 border-gray-600'
+      }
+    }
+    switch (status) {
+      case 'draft': return 'bg-gray-100 text-gray-700 border-gray-200'
+      case 'active': return 'bg-green-100 text-green-700 border-green-200'
+      case 'deprecated': return 'bg-red-100 text-red-700 border-red-200'
+      default: return 'bg-gray-100 text-gray-700 border-gray-200'
+    }
+  }
+
+  const statusLabels: Record<SkillStatus, string> = {
+    draft: '草稿',
+    active: '激活',
+    deprecated: '已废弃',
+  }
 
   const loadSkills = useCallback(async () => {
     setLoading(true)
@@ -190,26 +206,20 @@ export default function Skills() {
   }
 
   return (
-    <div>
-      <div className="flex items-center justify-between mb-8">
-        <div>
-          <h1 className="text-3xl font-bold text-gray-800">🧩 Agent Skills</h1>
-          {stats && (
-            <p className="text-gray-500 mt-1">
-              共 {stats.total_skills} 个 Skill，累计使用 {stats.total_usage} 次
-            </p>
-          )}
-        </div>
+    <PageLayout
+      title="Agent Skills"
+      description={stats ? `共 ${stats.total_skills} 个 Skill，累计使用 ${stats.total_usage} 次` : undefined}
+      actions={
         <Button onClick={openCreateModal}>
           <Plus size={20} className="mr-2" />
           创建 Skill
         </Button>
-      </div>
-
+      }
+    >
       {loading ? (
         <div className="flex items-center justify-center py-20">
           <Layers size={24} className="animate-spin mr-3" />
-          <span className="text-gray-500">加载 Skills...</span>
+          <span className={isDark ? 'text-gray-400' : 'text-gray-500'}>加载 Skills...</span>
         </div>
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
@@ -218,25 +228,25 @@ export default function Skills() {
             {/* 搜索 */}
             <Card className="p-4">
               <div className="relative">
-                <Search size={18} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+                <Search size={18} className={`absolute left-3 top-1/2 -translate-y-1/2 ${isDark ? 'text-gray-500' : 'text-gray-400'}`} />
                 <input
                   type="text"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                   placeholder="搜索 Skill..."
-                  className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  className={`w-full pl-10 pr-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
                 />
               </div>
             </Card>
 
             {/* 类型筛选 */}
             <Card className="p-4">
-              <h3 className="font-medium text-gray-800 mb-3">类型</h3>
+              <h3 className={`font-medium mb-3 ${isDark ? 'text-white' : 'text-gray-800'}`}>类型</h3>
               <div className="space-y-2">
                 <button
                   onClick={() => setFilterType('')}
                   className={`w-full text-left px-3 py-2 rounded-lg text-sm ${
-                    filterType === '' ? 'bg-blue-50 text-blue-700' : 'hover:bg-gray-50'
+                    filterType === '' ? (isDark ? 'bg-blue-900 text-blue-300' : 'bg-blue-50 text-blue-700') : isDark ? 'hover:bg-gray-700 text-gray-300' : 'hover:bg-gray-50'
                   }`}
                 >
                   全部
@@ -246,7 +256,7 @@ export default function Skills() {
                     key={type}
                     onClick={() => setFilterType(type as SkillType)}
                     className={`w-full text-left px-3 py-2 rounded-lg text-sm flex items-center gap-2 ${
-                      filterType === type ? 'bg-blue-50 text-blue-700' : 'hover:bg-gray-50'
+                      filterType === type ? (isDark ? 'bg-blue-900 text-blue-300' : 'bg-blue-50 text-blue-700') : isDark ? 'hover:bg-gray-700 text-gray-300' : 'hover:bg-gray-50'
                     }`}
                   >
                     {skillTypeIcons[type as SkillType]}
@@ -258,12 +268,12 @@ export default function Skills() {
 
             {/* 状态筛选 */}
             <Card className="p-4">
-              <h3 className="font-medium text-gray-800 mb-3">状态</h3>
+              <h3 className={`font-medium mb-3 ${isDark ? 'text-white' : 'text-gray-800'}`}>状态</h3>
               <div className="space-y-2">
                 <button
                   onClick={() => setFilterStatus('')}
                   className={`w-full text-left px-3 py-2 rounded-lg text-sm ${
-                    filterStatus === '' ? 'bg-blue-50 text-blue-700' : 'hover:bg-gray-50'
+                    filterStatus === '' ? (isDark ? 'bg-blue-900 text-blue-300' : 'bg-blue-50 text-blue-700') : isDark ? 'hover:bg-gray-700 text-gray-300' : 'hover:bg-gray-50'
                   }`}
                 >
                   全部
@@ -273,7 +283,7 @@ export default function Skills() {
                     key={status}
                     onClick={() => setFilterStatus(status as SkillStatus)}
                     className={`w-full text-left px-3 py-2 rounded-lg text-sm ${
-                      filterStatus === status ? 'bg-blue-50 text-blue-700' : 'hover:bg-gray-50'
+                      filterStatus === status ? (isDark ? 'bg-blue-900 text-blue-300' : 'bg-blue-50 text-blue-700') : isDark ? 'hover:bg-gray-700 text-gray-300' : 'hover:bg-gray-50'
                     }`}
                   >
                     {label}
@@ -286,37 +296,37 @@ export default function Skills() {
           {/* 中间：Skill 列表 */}
           <div className="lg:col-span-1">
             <Card className="h-[calc(100vh-200px)] overflow-y-auto">
-              <div className="p-4 border-b sticky top-0 bg-white">
-                <h3 className="font-medium text-gray-800">
+              <div className={`p-4 border-b sticky top-0 ${isDark ? 'bg-gray-900 border-gray-700' : 'bg-white border-gray-200'}`}>
+                <h3 className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>
                   Skill 列表 ({skills.length})
                 </h3>
               </div>
               <div className="divide-y">
                 {skills.length === 0 ? (
-                  <div className="p-8 text-center text-gray-500">暂无 Skill</div>
+                  <div className={`p-8 text-center ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>暂无 Skill</div>
                 ) : (
                   skills.map(skill => (
                     <div
                       key={skill.id}
                       onClick={() => setSelectedSkill(skill)}
                       className={`p-4 cursor-pointer transition-colors ${
-                        selectedSkill?.id === skill.id ? 'bg-blue-50' : 'hover:bg-gray-50'
+                        selectedSkill?.id === skill.id ? (isDark ? 'bg-blue-900/30' : 'bg-blue-50') : isDark ? 'hover:bg-gray-800' : 'hover:bg-gray-50'
                       }`}
                     >
                       <div className="flex items-start gap-3">
-                        <div className="mt-1 text-gray-500">
+                        <div className={`mt-1 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
                           {skillTypeIcons[skill.skill_type]}
                         </div>
                         <div className="flex-1 min-w-0">
-                          <h4 className="font-medium text-gray-800 truncate">{skill.name}</h4>
-                          <p className="text-sm text-gray-500 mt-1 line-clamp-2">
+                          <h4 className={`font-medium truncate ${isDark ? 'text-white' : 'text-gray-800'}`}>{skill.name}</h4>
+                          <p className={`text-sm mt-1 line-clamp-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
                             {skill.description}
                           </p>
                           <div className="flex items-center gap-2 mt-2">
-                            <span className={`text-xs px-2 py-0.5 rounded border ${statusColors[skill.status]}`}>
+                            <span className={`text-xs px-2 py-0.5 rounded border ${getStatusColors(skill.status)}`}>
                               {statusLabels[skill.status]}
                             </span>
-                            <span className="text-xs text-gray-400">
+                            <span className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
                               使用 {skill.usage_count} 次
                             </span>
                           </div>
@@ -332,8 +342,8 @@ export default function Skills() {
           {/* 右侧：Skill 详情 */}
           <div className="lg:col-span-2">
             {!selectedSkill ? (
-              <Card className="h-[calc(100vh-200px)] flex items-center justify-center text-gray-500">
-                <div className="text-center">
+              <Card className="h-[calc(100vh-200px)] flex items-center justify-center">
+                <div className={`text-center ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
                   <Layers size={48} className="mx-auto mb-4 opacity-50" />
                   <p>选择一个 Skill 查看详情</p>
                 </div>
@@ -346,12 +356,12 @@ export default function Skills() {
                     <div>
                       <div className="flex items-center gap-3 mb-2">
                         {skillTypeIcons[selectedSkill.skill_type]}
-                        <span className={`text-xs px-2 py-0.5 rounded border ${statusColors[selectedSkill.status]}`}>
+                        <span className={`text-xs px-2 py-0.5 rounded border ${getStatusColors(selectedSkill.status)}`}>
                           {statusLabels[selectedSkill.status]}
                         </span>
                       </div>
-                      <h2 className="text-2xl font-bold text-gray-800">{selectedSkill.name}</h2>
-                      <p className="text-gray-600 mt-2">{selectedSkill.description}</p>
+                      <h2 className={`text-2xl font-bold ${isDark ? 'text-white' : 'text-gray-800'}`}>{selectedSkill.name}</h2>
+                      <p className={`mt-2 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>{selectedSkill.description}</p>
                     </div>
                     <div className="flex gap-2">
                       <Button variant="secondary" size="sm" onClick={() => setShowTestModal(true)}>
@@ -372,15 +382,15 @@ export default function Skills() {
                     {selectedSkill.prompt_template && (
                       <div>
                         <div className="flex items-center justify-between mb-2">
-                          <h3 className="font-medium text-gray-800">提示词模板</h3>
+                          <h3 className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>提示词模板</h3>
                           <button
                             onClick={() => copyToClipboard(selectedSkill.prompt_template!)}
-                            className="text-sm text-blue-600 hover:text-blue-700"
+                            className={`text-sm hover:underline ${isDark ? 'text-blue-400' : 'text-blue-600'}`}
                           >
                             <Copy size={14} className="inline mr-1" /> 复制
                           </button>
                         </div>
-                        <pre className="bg-gray-50 p-4 rounded-lg text-sm overflow-x-auto whitespace-pre-wrap">
+                        <pre className={`p-4 rounded-lg text-sm overflow-x-auto whitespace-pre-wrap ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
                           {selectedSkill.prompt_template}
                         </pre>
                       </div>
@@ -390,10 +400,10 @@ export default function Skills() {
                     {selectedSkill.function_code && (
                       <div>
                         <div className="flex items-center justify-between mb-2">
-                          <h3 className="font-medium text-gray-800">Python 代码</h3>
+                          <h3 className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>Python 代码</h3>
                           <button
                             onClick={() => copyToClipboard(selectedSkill.function_code!)}
-                            className="text-sm text-blue-600 hover:text-blue-700"
+                            className={`text-sm hover:underline ${isDark ? 'text-blue-400' : 'text-blue-600'}`}
                           >
                             <Copy size={14} className="inline mr-1" /> 复制
                           </button>
@@ -407,12 +417,12 @@ export default function Skills() {
                     {/* Workflow 步骤 */}
                     {selectedSkill.workflow_steps && selectedSkill.workflow_steps.length > 0 && (
                       <div>
-                        <h3 className="font-medium text-gray-800 mb-2">工作流步骤</h3>
+                        <h3 className={`font-medium mb-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>工作流步骤</h3>
                         <div className="space-y-2">
                           {selectedSkill.workflow_steps.map((step, idx) => (
-                            <div key={idx} className="bg-gray-50 p-3 rounded-lg">
-                              <span className="font-medium text-gray-700">{step.name || `步骤 ${idx + 1}`}</span>
-                              <p className="text-sm text-gray-600 mt-1">{step.action}</p>
+                            <div key={idx} className={`p-3 rounded-lg ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
+                              <span className={`font-medium ${isDark ? 'text-gray-200' : 'text-gray-700'}`}>{step.name || `步骤 ${idx + 1}`}</span>
+                              <p className={`text-sm mt-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>{step.action}</p>
                             </div>
                           ))}
                         </div>
@@ -422,8 +432,8 @@ export default function Skills() {
                     {/* Knowledge 内容 */}
                     {selectedSkill.knowledge_content && (
                       <div>
-                        <h3 className="font-medium text-gray-800 mb-2">知识内容</h3>
-                        <div className="bg-gray-50 p-4 rounded-lg text-sm whitespace-pre-wrap">
+                        <h3 className={`font-medium mb-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>知识内容</h3>
+                        <div className={`p-4 rounded-lg text-sm whitespace-pre-wrap ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
                           {selectedSkill.knowledge_content}
                         </div>
                       </div>
@@ -432,20 +442,20 @@ export default function Skills() {
                     {/* 参数 */}
                     {selectedSkill.parameters.length > 0 && (
                       <div>
-                        <h3 className="font-medium text-gray-800 mb-2">参数定义</h3>
+                        <h3 className={`font-medium mb-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>参数定义</h3>
                         <div className="space-y-2">
                           {selectedSkill.parameters.map((param, idx) => (
-                            <div key={idx} className="bg-gray-50 p-3 rounded-lg">
+                            <div key={idx} className={`p-3 rounded-lg ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
                               <div className="flex items-center gap-2">
-                                <span className="font-medium text-gray-700">{param.name}</span>
-                                <span className="text-xs text-gray-500">({param.type})</span>
+                                <span className={`font-medium ${isDark ? 'text-gray-200' : 'text-gray-700'}`}>{param.name}</span>
+                                <span className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-500'}`}>({param.type})</span>
                                 {param.required && (
                                   <span className="text-xs text-red-600">*必填</span>
                                 )}
                               </div>
-                              <p className="text-sm text-gray-600 mt-1">{param.description}</p>
+                              <p className={`text-sm mt-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>{param.description}</p>
                               {param.default !== undefined && (
-                                <p className="text-xs text-gray-500 mt-1">默认值: {JSON.stringify(param.default)}</p>
+                                <p className={`text-xs mt-1 ${isDark ? 'text-gray-500' : 'text-gray-500'}`}>默认值: {JSON.stringify(param.default)}</p>
                               )}
                             </div>
                           ))}
@@ -456,10 +466,10 @@ export default function Skills() {
                     {/* 标签 */}
                     {selectedSkill.tags.length > 0 && (
                       <div>
-                        <h3 className="font-medium text-gray-800 mb-2">标签</h3>
+                        <h3 className={`font-medium mb-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>标签</h3>
                         <div className="flex flex-wrap gap-2">
                           {selectedSkill.tags.map((tag, i) => (
-                            <span key={i} className="px-3 py-1 bg-gray-100 rounded-full text-sm text-gray-700">
+                            <span key={i} className={`px-3 py-1 rounded-full text-sm ${isDark ? 'bg-gray-800 text-gray-300' : 'bg-gray-100 text-gray-700'}`}>
                               {tag}
                             </span>
                           ))}
@@ -469,13 +479,13 @@ export default function Skills() {
 
                     {/* 元信息 */}
                     <div className="grid grid-cols-2 gap-4 text-sm">
-                      <div className="p-4 bg-gray-50 rounded-lg">
-                        <div className="text-gray-500 mb-1">版本</div>
-                        <div className="font-medium">{selectedSkill.version}</div>
+                      <div className={`p-4 rounded-lg ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
+                        <div className={`mb-1 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>版本</div>
+                        <div className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>{selectedSkill.version}</div>
                       </div>
-                      <div className="p-4 bg-gray-50 rounded-lg">
-                        <div className="text-gray-500 mb-1">使用次数</div>
-                        <div className="font-medium">{selectedSkill.usage_count}</div>
+                      <div className={`p-4 rounded-lg ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
+                        <div className={`mb-1 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>使用次数</div>
+                        <div className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>{selectedSkill.usage_count}</div>
                       </div>
                     </div>
                   </div>
@@ -503,9 +513,9 @@ export default function Skills() {
 
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">类型</label>
+              <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>类型</label>
               <select
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg"
+                className={`w-full px-3 py-2 border rounded-lg ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
                 value={formData.skill_type}
                 onChange={(e) => setFormData({ ...formData, skill_type: e.target.value as SkillType })}
               >
@@ -515,10 +525,10 @@ export default function Skills() {
               </select>
             </div>
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">版本</label>
+              <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>版本</label>
               <input
                 type="text"
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg"
+                className={`w-full px-3 py-2 border rounded-lg ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
                 value={editingSkill?.version || '1.0.0'}
                 disabled
               />
@@ -604,25 +614,25 @@ export default function Skills() {
           </Button>
 
           {testResult && (
-            <div className={`p-4 rounded-lg ${testResult.success ? 'bg-green-50' : 'bg-red-50'}`}>
+            <div className={`p-4 rounded-lg ${testResult.success ? (isDark ? 'bg-green-900/30' : 'bg-green-50') : (isDark ? 'bg-red-900/30' : 'bg-red-50')}`}>
               <div className="flex items-center gap-2 mb-2">
                 {testResult.success ? (
                   <CheckCircle size={18} className="text-green-600" />
                 ) : (
                   <XCircle size={18} className="text-red-600" />
                 )}
-                <span className={`font-medium ${testResult.success ? 'text-green-700' : 'text-red-700'}`}>
+                <span className={`font-medium ${testResult.success ? (isDark ? 'text-green-400' : 'text-green-700') : (isDark ? 'text-red-400' : 'text-red-700')}`}>
                   {testResult.success ? '执行成功' : '执行失败'}
                 </span>
                 {testResult.execution_time_ms && (
-                  <span className="text-xs text-gray-500">
+                  <span className={`text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
                     ({testResult.execution_time_ms}ms)
                   </span>
                 )}
               </div>
 
               {testResult.output && (
-                <pre className="bg-white p-3 rounded text-sm overflow-x-auto whitespace-pre-wrap">
+                <pre className={`p-3 rounded text-sm overflow-x-auto whitespace-pre-wrap ${isDark ? 'bg-gray-800' : 'bg-white'}`}>
                   {testResult.output}
                 </pre>
               )}
@@ -634,6 +644,6 @@ export default function Skills() {
           )}
         </div>
       </Modal>
-    </div>
+    </PageLayout>
   )
 }

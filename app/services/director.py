@@ -27,10 +27,11 @@ logger = logging.getLogger(__name__)
 class DirectorSystem:
     """导演系统 - orchestrates all agents for novel generation"""
 
-    def __init__(self, world_data: Dict[str, Any], config: Optional[Dict[str, Any]] = None):
+    def __init__(self, world_data: Dict[str, Any], config: Optional[Dict[str, Any]] = None, project_id: Optional[str] = None):
         self.world_id = world_data.get("id", str(uuid.uuid4()))
         self.world_data = world_data
         self.config = config or {}
+        self.project_id = project_id  # v7: 用于加载 prompt 模板
 
         self.current_chapter: Optional[Dict[str, Any]] = None
         self.chapter_events: List[Dict[str, Any]] = []
@@ -66,12 +67,13 @@ class DirectorSystem:
         self._model_factory = model_factory
         model = model_factory()
 
-        self.summarizer = SummarizerAgent(model=model)
-        self.master_plotter = MasterPlotterAgent(model=model)
-        self.hook_manager = HookManagerAgent(model=model)
-        self.writer = WriterAgent(model=model)
-        self.evaluator = EvaluatorAgent(model=model)
-        self.procgen = ProcGenAgent(world=World(**self._build_world_payload()), model=model)
+        # v7: 传入 project_id 以支持 prompt 模板系统
+        self.summarizer = SummarizerAgent(model=model, project_id=self.project_id)
+        self.master_plotter = MasterPlotterAgent(model=model, project_id=self.project_id)
+        self.hook_manager = HookManagerAgent(model=model, project_id=self.project_id)
+        self.writer = WriterAgent(model=model, project_id=self.project_id)
+        self.evaluator = EvaluatorAgent(model=model, project_id=self.project_id)
+        self.procgen = ProcGenAgent(world=World(**self._build_world_payload()), model=model, project_id=self.project_id)
 
         self.character_agents = {}
         for char_data in characters or []:
@@ -506,7 +508,7 @@ class DirectorSystem:
     def _create_character_agent(self, char_data: Dict[str, Any]) -> CharacterAgent:
         model = self._model_factory() if self._model_factory else None
         character = char_data if isinstance(char_data, Character) else Character(**char_data)
-        return CharacterAgent(character=character, model=model)
+        return CharacterAgent(character=character, model=model, project_id=self.project_id)
 
     def _build_fallback_character(self, speaker_id: str) -> Dict[str, Any]:
         return {

@@ -1,8 +1,10 @@
 import { useState, useEffect } from 'react'
 import { Card, Button } from '@/components/ui'
+import PageLayout from '@/components/PageLayout'
 import { getChapters, simulateReader } from '@/api/chapters'
 import { Eye, TrendingUp, AlertTriangle, Heart, Zap, Clock } from 'lucide-react'
 import type { Chapter, ReaderSimulationResult } from '@/api/chapters'
+import { useTheme } from '@/contexts/ThemeContext'
 
 interface ReaderMetrics {
   engagement_score: number
@@ -52,6 +54,9 @@ function mapReaderMetrics(chapter: Chapter | undefined, result: ReaderSimulation
 }
 
 export default function ReaderSimulator() {
+  const { theme } = useTheme()
+  const isDark = theme === 'dark'
+
   const [chapters, setChapters] = useState<Chapter[]>([])
   const [selectedChapter, setSelectedChapter] = useState<string>('')
   const [metrics, setMetrics] = useState<ReaderMetrics | null>(null)
@@ -97,20 +102,21 @@ export default function ReaderSimulator() {
   }
 
   return (
-    <div>
-      <div className="flex items-center justify-between mb-8">
-        <h1 className="text-3xl font-bold text-gray-800">👁️ 读者体验模拟器</h1>
+    <PageLayout
+      title="读者体验模拟器"
+      description="模拟读者阅读体验并分析章节表现"
+      actions={
         <Button onClick={simulateReading} disabled={!selectedChapter || loading}>
           <Eye size={18} className="mr-2" />
           {loading ? '模拟中...' : '开始阅读模拟'}
         </Button>
-      </div>
-
+      }
+    >
       <Card className="mb-6">
         <div className="flex items-center gap-4">
-          <label className="text-sm font-medium text-gray-700">选择章节：</label>
+          <label className={`text-sm font-medium ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>选择章节：</label>
           <select
-            className="px-3 py-2 border border-gray-300 rounded-lg flex-1 max-w-md"
+            className={`px-3 py-2 border rounded-lg flex-1 max-w-md ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
             value={selectedChapter}
             onChange={(e) => setSelectedChapter(e.target.value)}
           >
@@ -122,7 +128,7 @@ export default function ReaderSimulator() {
             ))}
           </select>
           {selectedChapterData && (
-            <span className="text-sm text-gray-500">
+            <span className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
               {selectedChapterData.content ? `${wordCount(selectedChapterData.content)} 字` : '无内容'}
             </span>
           )}
@@ -131,7 +137,7 @@ export default function ReaderSimulator() {
 
       {!metrics ? (
         <Card>
-          <div className="text-center py-12 text-gray-500">
+          <div className={`text-center py-12 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
             <Eye size={64} className="mx-auto mb-4 opacity-50" />
             <p className="text-lg">选择一个章节并点击"开始阅读模拟"</p>
             <p className="text-sm mt-2">系统会分析章节内容并预测读者反应</p>
@@ -143,37 +149,37 @@ export default function ReaderSimulator() {
             <Card className="p-6">
               <div className="flex items-center gap-3 mb-2">
                 <Heart size={24} className="text-pink-500" />
-                <span className="text-sm text-gray-500">沉浸度评分</span>
+                <span className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>沉浸度评分</span>
               </div>
               <div className={`text-3xl font-bold ${getScoreColor(metrics.engagement_score)}`}>
                 {metrics.engagement_score.toFixed(1)}
-                <span className="text-lg text-gray-400 ml-1">/5</span>
+                <span className={`text-lg ml-1 ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>/5</span>
               </div>
             </Card>
             <Card className="p-6">
               <div className="flex items-center gap-3 mb-2">
                 <Zap size={24} className="text-yellow-500" />
-                <span className="text-sm text-gray-500">悬念指数</span>
+                <span className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>悬念指数</span>
               </div>
               <div className="text-3xl font-bold text-purple-600">
                 {metrics.suspense_level.toFixed(0)}
-                <span className="text-lg text-gray-400 ml-1">%</span>
+                <span className={`text-lg ml-1 ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>%</span>
               </div>
             </Card>
             <Card className="p-6">
               <div className="flex items-center gap-3 mb-2">
                 <Clock size={24} className="text-blue-500" />
-                <span className="text-sm text-gray-500">预计留存率</span>
+                <span className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>预计留存率</span>
               </div>
               <div className="text-3xl font-bold text-green-600">
                 {metrics.predicted_retention.toFixed(0)}
-                <span className="text-lg text-gray-400 ml-1">%</span>
+                <span className={`text-lg ml-1 ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>%</span>
               </div>
             </Card>
           </div>
 
           <Card className="mb-6">
-            <h2 className="text-lg font-semibold text-gray-800 mb-4 flex items-center gap-2">
+            <h2 className={`text-lg font-semibold mb-4 flex items-center gap-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>
               <TrendingUp size={20} />
               情感弧线
             </h2>
@@ -181,9 +187,9 @@ export default function ReaderSimulator() {
               {metrics.emotional_arc.map((item, index) => (
                 <div key={index} className="flex flex-col items-center">
                   <div className="relative w-12 bg-gradient-to-t from-blue-500 to-purple-500 rounded-t" style={{ height: `${item.value}%` }}>
-                    <span className="absolute -top-6 left-1/2 transform -translate-x-1/2 text-xs text-gray-600">{item.value}</span>
+                    <span className={`absolute -top-6 left-1/2 transform -translate-x-1/2 text-xs ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>{item.value}</span>
                   </div>
-                  <span className="text-xs text-gray-500 mt-2 whitespace-nowrap">{item.chapter}</span>
+                  <span className={`text-xs mt-2 whitespace-nowrap ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>{item.chapter}</span>
                   <span className="text-xs text-purple-600 font-medium">{item.emotion}</span>
                 </div>
               ))}
@@ -192,32 +198,32 @@ export default function ReaderSimulator() {
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
             <Card>
-              <h2 className="text-lg font-semibold text-gray-800 mb-4">维度评分</h2>
+              <h2 className={`text-lg font-semibold mb-4 ${isDark ? 'text-white' : 'text-gray-800'}`}>维度评分</h2>
               <div className="space-y-4">
                 <div>
                   <div className="flex justify-between text-sm mb-1">
-                    <span className="text-gray-600">故事节奏</span>
+                    <span className={isDark ? 'text-gray-400' : 'text-gray-600'}>故事节奏</span>
                     <span className={getScoreColor(metrics.pacing_score)}>{metrics.pacing_score.toFixed(1)}/5</span>
                   </div>
-                  <div className="w-full bg-gray-200 rounded-full h-2">
+                  <div className={`w-full rounded-full h-2 ${isDark ? 'bg-gray-700' : 'bg-gray-200'}`}>
                     <div className="bg-blue-500 h-2 rounded-full" style={{ width: `${(metrics.pacing_score / 5) * 100}%` }}></div>
                   </div>
                 </div>
                 <div>
                   <div className="flex justify-between text-sm mb-1">
-                    <span className="text-gray-600">角色塑造</span>
+                    <span className={isDark ? 'text-gray-400' : 'text-gray-600'}>角色塑造</span>
                     <span className={getScoreColor(metrics.character_development)}>{metrics.character_development.toFixed(1)}/5</span>
                   </div>
-                  <div className="w-full bg-gray-200 rounded-full h-2">
+                  <div className={`w-full rounded-full h-2 ${isDark ? 'bg-gray-700' : 'bg-gray-200'}`}>
                     <div className="bg-green-500 h-2 rounded-full" style={{ width: `${(metrics.character_development / 5) * 100}%` }}></div>
                   </div>
                 </div>
                 <div>
                   <div className="flex justify-between text-sm mb-1">
-                    <span className="text-gray-600">剧情连贯性</span>
+                    <span className={isDark ? 'text-gray-400' : 'text-gray-600'}>剧情连贯性</span>
                     <span className={getScoreColor(metrics.plot_cohesion)}>{metrics.plot_cohesion.toFixed(1)}/5</span>
                   </div>
-                  <div className="w-full bg-gray-200 rounded-full h-2">
+                  <div className={`w-full rounded-full h-2 ${isDark ? 'bg-gray-700' : 'bg-gray-200'}`}>
                     <div className="bg-purple-500 h-2 rounded-full" style={{ width: `${(metrics.plot_cohesion / 5) * 100}%` }}></div>
                   </div>
                 </div>
@@ -225,14 +231,14 @@ export default function ReaderSimulator() {
             </Card>
 
             <Card>
-              <h2 className="text-lg font-semibold text-gray-800 mb-4">高亮时刻</h2>
+              <h2 className={`text-lg font-semibold mb-4 ${isDark ? 'text-white' : 'text-gray-800'}`}>高亮时刻</h2>
               <div className="space-y-3">
                 {metrics.highlighted_moments.map((moment, index) => (
-                  <div key={index} className="flex items-start gap-3 p-3 bg-yellow-50 rounded-lg">
-                    <AlertTriangle size={18} className="text-yellow-600 mt-0.5" />
+                  <div key={index} className={`flex items-start gap-3 p-3 rounded-lg ${isDark ? 'bg-yellow-900/30' : 'bg-yellow-50'}`}>
+                    <AlertTriangle size={18} className={`mt-0.5 ${isDark ? 'text-yellow-400' : 'text-yellow-600'}`} />
                     <div>
-                      <div className="text-sm font-medium text-gray-800">{moment.chapter} - {moment.timestamp}</div>
-                      <div className="text-sm text-gray-600">{moment.description}</div>
+                      <div className={`text-sm font-medium ${isDark ? 'text-gray-200' : 'text-gray-800'}`}>{moment.chapter} - {moment.timestamp}</div>
+                      <div className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>{moment.description}</div>
                     </div>
                   </div>
                 ))}
@@ -241,18 +247,18 @@ export default function ReaderSimulator() {
           </div>
 
           <Card>
-            <h2 className="text-lg font-semibold text-gray-800 mb-4">读者反馈预测</h2>
+            <h2 className={`text-lg font-semibold mb-4 ${isDark ? 'text-white' : 'text-gray-800'}`}>读者反馈预测</h2>
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               {metrics.reader_feedback.map((feedback, index) => (
-                <div key={index} className="p-4 border rounded-lg">
+                <div key={index} className={`p-4 border rounded-lg ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
                   <div className="flex items-center justify-between mb-2">
-                    <span className="font-medium text-gray-800">{feedback.aspect}</span>
+                    <span className={`font-medium ${isDark ? 'text-gray-200' : 'text-gray-800'}`}>{feedback.aspect}</span>
                     <div className="flex gap-0.5">
                       {[1, 2, 3, 4, 5].map((star) => (
                         <span
                           key={star}
                           className={`text-sm ${
-                            star <= Math.round(feedback.score) ? 'text-yellow-400' : 'text-gray-300'
+                            star <= Math.round(feedback.score) ? 'text-yellow-400' : isDark ? 'text-gray-600' : 'text-gray-300'
                           }`}
                         >
                           ★
@@ -260,14 +266,14 @@ export default function ReaderSimulator() {
                       ))}
                     </div>
                   </div>
-                  <p className="text-sm text-gray-600">{feedback.comments}</p>
+                  <p className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>{feedback.comments}</p>
                 </div>
               ))}
             </div>
           </Card>
         </>
       )}
-    </div>
+    </PageLayout>
   )
 }
 

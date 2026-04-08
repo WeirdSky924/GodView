@@ -6,8 +6,10 @@ import { useEffect, useState } from 'react'
 import {
   getProjectTokenStats,
   getProjectDailyStats,
+  getProjectTokenSummary,
   ProjectTokenStats,
   DailyTokenStats,
+  TokenUsageSummary,
 } from '@/api/tokenUsage'
 import { useProject } from '@/contexts/ProjectContext'
 import { Coins, TrendingUp, Calendar, BarChart3 } from 'lucide-react'
@@ -15,6 +17,7 @@ import { Coins, TrendingUp, Calendar, BarChart3 } from 'lucide-react'
 export default function TokenStats() {
   const { currentProject } = useProject()
   const [stats, setStats] = useState<ProjectTokenStats | null>(null)
+  const [summary, setSummary] = useState<TokenUsageSummary | null>(null)
   const [dailyStats, setDailyStats] = useState<DailyTokenStats[]>([])
   const [loading, setLoading] = useState(true)
 
@@ -29,11 +32,13 @@ export default function TokenStats() {
 
     setLoading(true)
     try {
-      const [statsData, dailyData] = await Promise.all([
+      const [statsData, summaryData, dailyData] = await Promise.all([
         getProjectTokenStats(currentProject.id),
+        getProjectTokenSummary(currentProject.id),
         getProjectDailyStats(currentProject.id, 7),
       ])
       setStats(statsData)
+      setSummary(summaryData)
       setDailyStats(dailyData)
     } catch (error) {
       console.error('Failed to load token stats:', error)
@@ -157,14 +162,15 @@ export default function TokenStats() {
       )}
 
       {/* 使用场景分布 */}
-      {stats.by_category && Object.keys(stats.by_category).length > 0 && (
+      {summary?.by_category && Object.keys(summary.by_category).length > 0 && (
         <div className="bg-white rounded-lg border p-4">
           <h4 className="text-sm font-medium text-gray-700 mb-4">使用场景分布</h4>
           <div className="space-y-2">
-            {Object.entries(stats.by_category)
-              .sort(([, a], [, b]) => b - a)
+            {Object.entries(summary.by_category)
+              .sort(([, a], [, b]) => (b as number) - (a as number))
               .map(([category, tokens]) => {
-                const percentage = (tokens / stats.total_tokens) * 100
+                const tokensNum = tokens as number
+                const percentage = (tokensNum / summary.total_tokens) * 100
                 const categoryLabels: Record<string, string> = {
                   bootstrap: '项目初始化',
                   character: '角色生成',
@@ -184,7 +190,7 @@ export default function TokenStats() {
                       <span className="text-gray-600">
                         {categoryLabels[category] || category}
                       </span>
-                      <span className="text-gray-400">{formatNumber(tokens)}</span>
+                      <span className="text-gray-400">{formatNumber(tokensNum)}</span>
                     </div>
                     <div className="h-2 bg-gray-100 rounded-full overflow-hidden">
                       <div

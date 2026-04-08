@@ -20,11 +20,13 @@ class SettingAgent:
 
     def __init__(self):
         self.llm_provider = settings.llm_provider
-        self.llm_api_key = settings.llm_api_key
-        self.llm_base_url = settings.llm_base_url
-        self.llm_model = settings.llm_model
-        self.llm_temperature = settings.llm_temperature
-        self.llm_max_tokens = settings.llm_max_tokens
+        # 获取当前 provider 的配置
+        llm_config = settings.get_llm_config(self.llm_provider)
+        self.llm_api_key = llm_config.get("api_key", "")
+        self.llm_base_url = llm_config.get("base_url", "")
+        self.llm_model = llm_config.get("model", "")
+        self.llm_temperature = llm_config.get("temperature", 0.7)
+        self.llm_max_tokens = llm_config.get("max_tokens", 4096)
         self._sessions: Dict[str, BootstrapSession] = {}
 
     async def process_message(self, session_id: str, message: str) -> Dict[str, Any]:

@@ -20,6 +20,11 @@ from app.models.skill import (
     ExecuteSkillDTO,
     SkillTestResult,
 )
+from app.models.prompt_template import (
+    PromptTemplate,
+    PromptTemplateCreate,
+    PromptCategory,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,11 +32,14 @@ logger = logging.getLogger(__name__)
 class SkillService:
     """Skill 服务"""
 
-    def __init__(self):
+    def __init__(self, prompt_template_service=None):
         # 内存存储（生产环境应使用数据库）
         self._skills: Dict[str, Skill] = {}
         self._assignments: Dict[str, SkillAssignment] = {}
         self._execution_logs: Dict[str, SkillExecutionLog] = {}
+
+        # 依赖服务
+        self.prompt_template_service = prompt_template_service
 
     # ==================== Skill CRUD ====================
 
@@ -39,12 +47,36 @@ class SkillService:
         """创建 Skill"""
         skill_id = f"skill_{uuid.uuid4().hex[:12]}"
 
+        # 处理 prompt 类型 Skill：创建关联的 PromptTemplate
+        prompt_template_id = dto.prompt_template_id
+
+        # 如果提供了 prompt 内容但没有关联的 PromptTemplate，则创建一个
+        if dto.skill_type == SkillType.PROMPT and not prompt_template_id:
+            if hasattr(dto, 'prompt_template') and dto.prompt_template:
+                # 创建一个新的 PromptTemplate
+                if self.prompt_template_service:
+                    prompt_create_dto = PromptTemplateCreate(
+                        name=f"{dto.name} (Skill)",
+                        description=f"由 Skill {skill_id} 创建的 PromptTemplate",
+                        category=PromptCategory.FUNCTION,  # 默认分类为 FUNCTION
+                        tags=dto.tags + ["skill-generated"],
+                        content=dto.prompt_template,
+                        variables=[],  # 可以从内容中提取，这里简化
+                        priority=50,
+                    )
+                    try:
+                        prompt_template = await self.prompt_template_service.create_template(prompt_create_dto)
+                        prompt_template_id = prompt_template.id
+                        logger.info(f"为 Skill {skill_id} 创建 PromptTemplate: {prompt_template_id}")
+                    except Exception as e:
+                        logger.error(f"创建 PromptTemplate 失败: {e}")
+
         skill = Skill(
             id=skill_id,
             name=dto.name,
             description=dto.description,
             skill_type=dto.skill_type,
-            prompt_template=dto.prompt_template,
+            prompt_template_id=prompt_template_id,  # 使用新的字段名
             function_code=dto.function_code,
             workflow_steps=dto.workflow_steps,
             knowledge_content=dto.knowledge_content,
@@ -324,20 +356,42 @@ class SkillService:
         parameters: Dict[str, Any],
     ) -> str:
         """执行 Prompt 类型 Skill"""
-        if not skill.prompt_template:
+        if not skill.prompt_template_id:
             return ""
 
-        # 替换模板中的参数
-        result = skill.prompt_template
-        for key, value in parameters.items():
-            result = result.replace(f"{{{key}}}", str(value))
+        # 如果有 prompt_template_service，使用它来渲染模板
+        if self.prompt_template_service:
+            try:
+                # 获取 PromptTemplate
+                prompt_template = await self.prompt_template_service.get_template(
+                    skill.prompt_template_id
+                )
+                if not prompt_template:
+                    logger.warning(f"PromptTemplate 不存在: {skill.prompt_template_id}")
+                    return ""
 
-        # 处理默认参数
-        for param in skill.parameters:
-            if param.name not in parameters and param.default is not None:
-                result = result.replace(f"{{{param.name}}}", str(param.default))
+                # 合并 Skill 参数和传入参数
+                merged_params = parameters.copy()
+                for param in skill.parameters:
+                    if param.name not in merged_params and param.default is not None:
+                        merged_params[param.name] = param.default
 
-        return result
+                # 渲染模板
+                from app.models.prompt_template import PromptRenderRequest
+                request = PromptRenderRequest(
+                    template_id=skill.prompt_template_id,
+                    variables=merged_params,
+                )
+                result = await self.prompt_template_service.render_template(request)
+                return result.rendered_content
+
+            except Exception as e:
+                logger.error(f"渲染 PromptTemplate 失败: {e}")
+                return f"[渲染失败: {str(e)}]"
+        else:
+            # 如果没有服务，返回占位符
+            logger.warning(f"PromptTemplateService 未注入，无法执行 prompt skill: {skill.id}")
+            return f"[需要 PromptTemplateService 来执行: {skill.prompt_template_id}]"
 
     async def _execute_function_skill(
         self,

@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Card, Button, Input, TextArea, Modal } from '@/components/ui'
+import PageLayout from '@/components/PageLayout'
 import {
   getCharacters,
   createCharacter,
@@ -18,6 +19,7 @@ import type {
 } from '@/api/characters'
 import { Plus, Edit, Trash2, User, Mic, Search, RefreshCw, FolderOpen } from 'lucide-react'
 import { useProject } from '@/contexts/ProjectContext'
+import { useTheme } from '@/contexts/ThemeContext'
 
 function splitCsvInput(value: string) {
   return value
@@ -28,6 +30,9 @@ function splitCsvInput(value: string) {
 
 export default function Characters() {
   const { currentProject } = useProject()
+  const { theme } = useTheme()
+  const isDark = theme === 'dark'
+
   const [characters, setCharacters] = useState<Character[]>([])
   const [showModal, setShowModal] = useState(false)
   const [editingChar, setEditingChar] = useState<Character | null>(null)
@@ -231,175 +236,174 @@ export default function Characters() {
   const selectedCharacter = characters.find((char) => char.id === selectedCharacterId)
 
   return (
-    <div className="space-y-8">
-      <div className="flex items-center justify-between">
-        <h1 className="text-3xl font-bold text-gray-800">角色管理</h1>
+    <PageLayout
+      title="角色管理"
+      description="管理小说中的角色信息和声音样本"
+      actions={
         <Button onClick={openCreateModal} disabled={!currentProject}>
-          <Plus size={20} className="mr-2" />
+          <Plus size={18} className="mr-2" />
           新增角色
         </Button>
-      </div>
-
+      }
+    >
       {!currentProject ? (
-        <div className="text-center py-20 text-gray-500">
+        <div className={`text-center py-20 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
           <FolderOpen size={48} className="mx-auto mb-4 opacity-50" />
           <p>请先在侧边栏选择一个项目</p>
         </div>
       ) : loading ? (
-        <p className="text-center text-gray-500 py-12">加载中...</p>
+        <p className={`text-center py-12 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>加载中...</p>
       ) : (
-        <>
-          <div className="grid grid-cols-1 xl:grid-cols-[2fr,1fr] gap-6">
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-              {characters.length === 0 ? (
-                <div className="col-span-full text-center text-gray-500 py-12">
-                  暂无角色，点击“新增角色”开始创建
-                </div>
-              ) : (
-                characters.map((char) => (
-                  <Card
-                    key={char.id}
-                    className={`hover:shadow-md transition-shadow ${selectedCharacterId === char.id ? 'ring-2 ring-blue-500' : ''}`}
-                  >
-                    <div className="flex items-start gap-4">
-                      <div className="w-16 h-16 bg-gradient-to-br from-blue-400 to-purple-500 rounded-lg flex items-center justify-center text-white text-2xl">
-                        <User size={24} />
-                      </div>
-                      <div className="flex-1 min-w-0 cursor-pointer" onClick={() => setSelectedCharacterId(char.id || '')}>
-                        <h3 className="font-semibold text-lg text-gray-800 truncate">{char.name}</h3>
-                        <p className="text-sm text-gray-500 mt-1">{char.role}</p>
-                        <p className="text-sm text-gray-600 mt-2 line-clamp-2">{char.description}</p>
-                        <div className="mt-3 flex flex-wrap gap-2">
-                          <span className={`inline-block px-2 py-1 text-xs rounded ${
-                            char.status === 'active' ? 'bg-green-100 text-green-700' :
-                            char.status === 'inactive' ? 'bg-gray-100 text-gray-700' :
-                            'bg-red-100 text-red-700'
-                          }`}>
-                            {char.status === 'active' ? '活跃' : char.status === 'inactive' ? '不活跃' : '已故'}
-                          </span>
-                          <span className="inline-block px-2 py-1 text-xs rounded bg-blue-50 text-blue-700">
-                            声音样本 {char.voice_samples?.length || 0}
-                          </span>
-                        </div>
+        <div className="grid grid-cols-1 xl:grid-cols-[2fr,1fr] gap-6">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            {characters.length === 0 ? (
+              <div className={`col-span-full text-center py-12 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+                暂无角色，点击"新增角色"开始创建
+              </div>
+            ) : (
+              characters.map((char) => (
+                <Card
+                  key={char.id}
+                  className={`transition-shadow ${selectedCharacterId === char.id ? 'ring-2 ring-blue-500' : ''}`}
+                >
+                  <div className="flex items-start gap-4">
+                    <div className="w-16 h-16 bg-gradient-to-br from-blue-400 to-purple-500 rounded-lg flex items-center justify-center text-white text-2xl">
+                      <User size={24} />
+                    </div>
+                    <div className="flex-1 min-w-0 cursor-pointer" onClick={() => setSelectedCharacterId(char.id || '')}>
+                      <h3 className={`font-semibold text-lg truncate ${isDark ? 'text-white' : 'text-gray-800'}`}>{char.name}</h3>
+                      <p className={`text-sm mt-1 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>{char.role}</p>
+                      <p className={`text-sm mt-2 line-clamp-2 ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>{char.description}</p>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <span className={`inline-block px-2 py-1 text-xs rounded ${
+                          char.status === 'active' ? 'bg-green-900 text-green-300' :
+                          char.status === 'inactive' ? (isDark ? 'bg-gray-700 text-gray-300' : 'bg-gray-200 text-gray-700') :
+                          'bg-red-900 text-red-300'
+                        }`}>
+                          {char.status === 'active' ? '活跃' : char.status === 'inactive' ? '不活跃' : '已故'}
+                        </span>
+                        <span className={`inline-block px-2 py-1 text-xs rounded ${isDark ? 'bg-blue-900 text-blue-300' : 'bg-blue-100 text-blue-700'}`}>
+                          声音样本 {char.voice_samples?.length || 0}
+                        </span>
                       </div>
                     </div>
-                    <div className="flex gap-2 mt-4 pt-4 border-t">
-                      <Button variant="secondary" size="sm" onClick={() => openEditModal(char)}>
-                        <Edit size={16} className="mr-1" /> 编辑
-                      </Button>
-                      <Button variant="danger" size="sm" onClick={() => handleDelete(char.id)}>
-                        <Trash2 size={16} className="mr-1" /> 删除
-                      </Button>
-                    </div>
-                  </Card>
-                ))
-              )}
+                  </div>
+                  <div className={`flex gap-2 mt-4 pt-4 ${isDark ? 'border-gray-700' : 'border-gray-200'} border-t`}>
+                    <Button variant="secondary" size="sm" onClick={() => openEditModal(char)}>
+                      <Edit size={14} className="mr-1" /> 编辑
+                    </Button>
+                    <Button variant="danger" size="sm" onClick={() => handleDelete(char.id)}>
+                      <Trash2 size={14} className="mr-1" /> 删除
+                    </Button>
+                  </div>
+                </Card>
+              ))
+            )}
+          </div>
+
+          <Card>
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-2">
+                <Mic size={18} className={isDark ? 'text-gray-400' : 'text-gray-500'} />
+                <h2 className={`text-lg font-semibold ${isDark ? 'text-white' : 'text-gray-800'}`}>声音样本</h2>
+              </div>
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={handleSyncVoiceSamples}
+                disabled={!selectedCharacterId || syncingVoice}
+              >
+                <RefreshCw size={14} className="mr-1" />
+                {syncingVoice ? '同步中' : '同步向量'}
+              </Button>
             </div>
 
-            <Card>
-              <div className="flex items-center justify-between mb-4">
-                <div className="flex items-center gap-2">
-                  <Mic size={18} />
-                  <h2 className="text-lg font-semibold text-gray-800">声音样本</h2>
+            {!selectedCharacter ? (
+              <p className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>请选择左侧角色后查看和管理声音样本。</p>
+            ) : (
+              <div className="space-y-4">
+                <div className={`rounded-lg p-3 text-sm ${isDark ? 'bg-gray-800 text-gray-300' : 'bg-gray-50 text-gray-700'}`}>
+                  <div><span className="font-medium">当前角色：</span>{selectedCharacter.name}</div>
+                  <div className="mt-1"><span className="font-medium">说话风格：</span>{selectedCharacter.speech_pattern || '未设置'}</div>
                 </div>
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  onClick={handleSyncVoiceSamples}
-                  disabled={!selectedCharacterId || syncingVoice}
-                >
-                  <RefreshCw size={14} className="mr-1" />
-                  {syncingVoice ? '同步中' : '同步向量'}
+
+                <TextArea
+                  label="新增台词样本"
+                  value={voiceForm.text}
+                  onChange={(e) => setVoiceForm((prev) => ({ ...prev, text: e.target.value }))}
+                  placeholder="输入能代表该角色语言风格的典型台词"
+                />
+                <Input
+                  label="样本上下文"
+                  value={voiceForm.context}
+                  onChange={(e) => setVoiceForm((prev) => ({ ...prev, context: e.target.value }))}
+                  placeholder="如：争吵场景、初次见面、自言自语"
+                />
+                <Button onClick={handleAddVoiceSample} disabled={!voiceForm.text.trim()}>
+                  添加声音样本
                 </Button>
-              </div>
 
-              {!selectedCharacter ? (
-                <p className="text-sm text-gray-500">请选择左侧角色后查看和管理声音样本。</p>
-              ) : (
-                <div className="space-y-4">
-                  <div className="rounded-lg bg-gray-50 p-3 text-sm text-gray-700">
-                    <div><span className="font-medium">当前角色：</span>{selectedCharacter.name}</div>
-                    <div className="mt-1"><span className="font-medium">说话风格：</span>{selectedCharacter.speech_pattern || '未设置'}</div>
-                  </div>
-
-                  <TextArea
-                    label="新增台词样本"
-                    value={voiceForm.text}
-                    onChange={(e) => setVoiceForm((prev) => ({ ...prev, text: e.target.value }))}
-                    placeholder="输入能代表该角色语言风格的典型台词"
-                  />
-                  <Input
-                    label="样本上下文"
-                    value={voiceForm.context}
-                    onChange={(e) => setVoiceForm((prev) => ({ ...prev, context: e.target.value }))}
-                    placeholder="如：争吵场景、初次见面、自言自语"
-                  />
-                  <Button onClick={handleAddVoiceSample} disabled={!voiceForm.text.trim()}>
-                    添加声音样本
-                  </Button>
-
-                  <div className="border-t pt-4">
-                    <div className="flex gap-2">
-                      <Input
-                        label="语义检索"
-                        value={voiceForm.query}
-                        onChange={(e) => setVoiceForm((prev) => ({ ...prev, query: e.target.value }))}
-                        placeholder="输入一句待对比台词"
-                      />
-                      <div className="flex items-end">
-                        <Button onClick={handleSearchVoiceSamples} disabled={!voiceForm.query.trim() || voiceSearchLoading}>
-                          <Search size={16} className="mr-1" />
-                          {voiceSearchLoading ? '检索中' : '检索'}
-                        </Button>
-                      </div>
+                <div className={`pt-4 ${isDark ? 'border-gray-700' : 'border-gray-200'} border-t`}>
+                  <div className="flex gap-2">
+                    <Input
+                      label="语义检索"
+                      value={voiceForm.query}
+                      onChange={(e) => setVoiceForm((prev) => ({ ...prev, query: e.target.value }))}
+                      placeholder="输入一句待对比台词"
+                    />
+                    <div className="flex items-end">
+                      <Button onClick={handleSearchVoiceSamples} disabled={!voiceForm.query.trim() || voiceSearchLoading}>
+                        <Search size={14} className="mr-1" />
+                        {voiceSearchLoading ? '检索中' : '检索'}
+                      </Button>
                     </div>
                   </div>
-
-                  <div>
-                    <h3 className="text-sm font-medium text-gray-700 mb-2">已存样本</h3>
-                    {voiceLoading ? (
-                      <p className="text-sm text-gray-500">加载中...</p>
-                    ) : voiceSamples.length === 0 ? (
-                      <p className="text-sm text-gray-500">暂无声音样本</p>
-                    ) : (
-                      <div className="space-y-2 max-h-64 overflow-auto">
-                        {voiceSamples.map((sample) => (
-                          <div key={sample.id} className="rounded border p-3 text-sm">
-                            <div className="text-gray-800">{sample.payload.text}</div>
-                            {sample.payload.context ? (
-                              <div className="mt-1 text-xs text-gray-500">上下文：{sample.payload.context}</div>
-                            ) : null}
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-
-                  <div>
-                    <h3 className="text-sm font-medium text-gray-700 mb-2">检索结果</h3>
-                    {voiceSearchResults.length === 0 ? (
-                      <p className="text-sm text-gray-500">暂无检索结果</p>
-                    ) : (
-                      <div className="space-y-2 max-h-56 overflow-auto">
-                        {voiceSearchResults.map((sample) => (
-                          <div key={sample.id} className="rounded border border-blue-100 bg-blue-50 p-3 text-sm">
-                            <div className="flex items-center justify-between gap-3">
-                              <span className="text-gray-800">{sample.payload.text}</span>
-                              <span className="text-xs text-blue-700">相似度 {sample.score.toFixed(3)}</span>
-                            </div>
-                            {sample.payload.context ? (
-                              <div className="mt-1 text-xs text-gray-500">上下文：{sample.payload.context}</div>
-                            ) : null}
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
                 </div>
-              )}
-            </Card>
-          </div>
-        </>
+
+                <div>
+                  <h3 className={`text-sm font-medium mb-2 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>已存样本</h3>
+                  {voiceLoading ? (
+                    <p className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>加载中...</p>
+                  ) : voiceSamples.length === 0 ? (
+                    <p className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>暂无声音样本</p>
+                  ) : (
+                    <div className="space-y-2 max-h-64 overflow-auto">
+                      {voiceSamples.map((sample) => (
+                        <div key={sample.id} className={`rounded border p-3 text-sm ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+                          <div className={isDark ? 'text-gray-200' : 'text-gray-800'}>{sample.payload.text}</div>
+                          {sample.payload.context ? (
+                            <div className={`mt-1 text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>上下文：{sample.payload.context}</div>
+                          ) : null}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div>
+                  <h3 className={`text-sm font-medium mb-2 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>检索结果</h3>
+                  {voiceSearchResults.length === 0 ? (
+                    <p className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>暂无检索结果</p>
+                  ) : (
+                    <div className="space-y-2 max-h-56 overflow-auto">
+                      {voiceSearchResults.map((sample) => (
+                        <div key={sample.id} className="rounded border border-blue-500/30 bg-blue-900/20 p-3 text-sm">
+                          <div className="flex items-center justify-between gap-3">
+                            <span className={isDark ? 'text-gray-200' : 'text-gray-800'}>{sample.payload.text}</span>
+                            <span className="text-xs text-blue-400">相似度 {sample.score.toFixed(3)}</span>
+                          </div>
+                          {sample.payload.context ? (
+                            <div className={`mt-1 text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>上下文：{sample.payload.context}</div>
+                          ) : null}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </Card>
+        </div>
       )}
 
       <Modal
@@ -423,9 +427,9 @@ export default function Characters() {
               placeholder="如：主角 / 反派 / 配角"
             />
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">状态</label>
+              <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>状态</label>
               <select
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'bg-white border-gray-300 text-gray-800'}`}
                 value={formData.status}
                 onChange={(e) => setFormData({ ...formData, status: e.target.value as Character['status'] })}
               >
@@ -477,6 +481,6 @@ export default function Characters() {
           </div>
         </div>
       </Modal>
-    </div>
+    </PageLayout>
   )
 }

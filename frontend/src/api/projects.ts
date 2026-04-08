@@ -7,6 +7,8 @@ export interface Project {
   user_id?: string
   status: string
   world_id?: string
+  world_type?: string
+  tone?: string
   created_at: string
   updated_at: string
   metadata: Record<string, any>
@@ -16,6 +18,8 @@ export interface CreateProjectRequest {
   name: string
   description?: string
   user_id?: string
+  world_type?: string
+  tone?: string
   metadata?: Record<string, any>
 }
 
@@ -23,6 +27,8 @@ export interface UpdateProjectRequest {
   name?: string
   description?: string
   status?: string
+  world_type?: string
+  tone?: string
   metadata?: Record<string, any>
 }
 

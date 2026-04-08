@@ -9,6 +9,7 @@ from langchain_core.language_models import BaseLanguageModel
 from langchain_core.messages import HumanMessage
 
 from app.agents.base import BaseAgent, AgentResponse
+from app.models.agent_template import AgentType
 
 logger = logging.getLogger(__name__)
 
@@ -16,17 +17,29 @@ logger = logging.getLogger(__name__)
 class EvaluatorAgent(BaseAgent):
     """评估 Agent"""
 
+    AGENT_TYPE = AgentType.EVALUATOR
+
     def __init__(
         self,
         model: Optional[BaseLanguageModel] = None,
         config: Optional[Dict[str, Any]] = None,
+        project_id: Optional[str] = None,
+        system_prompt: Optional[str] = None,
     ):
         super().__init__(
             name="EvaluatorAgent",
             model=model,
-            system_prompt="",
+            system_prompt=system_prompt or "",
             config=config,
+            project_id=project_id,
         )
+
+    def _get_default_variables(self) -> Dict[str, Any]:
+        """获取默认变量（Evaluator 特定）"""
+        return {
+            "agent_role": "评估员",
+            "task_description": "章节判定与读者模拟",
+        }
 
     async def execute(self, input_data: Dict[str, Any]) -> AgentResponse:
         """

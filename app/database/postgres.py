@@ -701,198 +701,146 @@ class PostgresDatabase:
 
     async def init_tables(self):
         """初始化数据库表结构"""
-        create_tables_sql = """
-        -- 角色表
-        CREATE TABLE IF NOT EXISTS characters (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            project_id TEXT REFERENCES projects(id),
-            world_id TEXT,
-            description TEXT,
-            role TEXT DEFAULT 'supporting',
-            status TEXT DEFAULT 'active',
-            appearance TEXT,
-            age INTEGER,
-            gender TEXT,
-            personality_traits JSONB DEFAULT '[]',
-            background_story TEXT,
-            speech_pattern TEXT,
-            lexicon JSONB DEFAULT '[]',
-            forbidden_words JSONB DEFAULT '[]',
-            voice_samples JSONB DEFAULT '[]',
-            attributes JSONB DEFAULT '{}',
-            goals JSONB DEFAULT '[]',
-            inventory JSONB DEFAULT '[]',
-            current_location TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
+        # 先检查已存在的表
+        existing_tables = []
+        try:
+            check_sql = """
+            SELECT table_name FROM information_schema.tables
+            WHERE table_schema = 'public'
+            """
+            result = await self.execute_query(check_sql)
+            existing_tables = [row['table_name'] for row in result]
+        except Exception:
+            pass
 
-        CREATE INDEX IF NOT EXISTS idx_characters_project_id ON characters(project_id);
+        # 定义需要创建的表（仅包含新表，不包含已存在的表）
+        tables_to_create = []
 
-        -- 项目表 (v4 新增)
-        CREATE TABLE IF NOT EXISTS projects (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            description TEXT,
-            user_id TEXT,
-            status TEXT DEFAULT 'draft',
-            world_id TEXT,
-            total_tokens BIGINT DEFAULT 0,
-            total_cost DECIMAL(10, 6) DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            metadata JSONB DEFAULT '{}'
-        );
+        # 世界表 - 使用 UUID 类型匹配现有 schema
+        if 'worlds' not in existing_tables:
+            tables_to_create.append("""
+            CREATE TABLE worlds (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                name TEXT NOT NULL,
+                project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+                description TEXT,
+                world_type TEXT DEFAULT 'fantasy',
+                tone TEXT DEFAULT 'serious',
+                rules JSONB DEFAULT '[]',
+                power_system TEXT,
+                technology_level TEXT,
+                history TEXT,
+                geography TEXT,
+                factions JSONB DEFAULT '[]',
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_worlds_project_id ON worlds(project_id);
+            """)
 
-        -- 世界表
-        CREATE TABLE IF NOT EXISTS worlds (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            project_id TEXT REFERENCES projects(id),
-            description TEXT,
-            world_type TEXT DEFAULT 'fantasy',
-            tone TEXT DEFAULT 'serious',
-            rules JSONB DEFAULT '[]',
-            power_system TEXT,
-            technology_level TEXT,
-            history TEXT,
-            geography TEXT,
-            factions JSONB DEFAULT '[]',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
+        # 区域表
+        if 'regions' not in existing_tables:
+            tables_to_create.append("""
+            CREATE TABLE regions (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                name TEXT NOT NULL,
+                world_id UUID REFERENCES worlds(id) ON DELETE CASCADE,
+                region_type TEXT DEFAULT 'custom',
+                terrain_type TEXT DEFAULT 'custom',
+                description TEXT,
+                atmosphere TEXT,
+                coordinates JSONB,
+                area_size FLOAT,
+                terrain_features JSONB DEFAULT '[]',
+                landmarks JSONB DEFAULT '[]',
+                encounters JSONB DEFAULT '[]',
+                connections JSONB DEFAULT '[]',
+                local_rules JSONB DEFAULT '[]',
+                is_generated BOOLEAN DEFAULT FALSE,
+                visit_count INTEGER DEFAULT 0,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_regions_world_id ON regions(world_id);
+            """)
 
-        CREATE INDEX IF NOT EXISTS idx_worlds_project_id ON worlds(project_id);
+        # 世界快照表
+        if 'world_snapshots' not in existing_tables:
+            tables_to_create.append("""
+            CREATE TABLE world_snapshots (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                world_id UUID REFERENCES worlds(id) ON DELETE CASCADE,
+                chapter_id UUID REFERENCES chapters(id) ON DELETE SET NULL,
+                snapshot_type TEXT DEFAULT 'auto',
+                name TEXT,
+                description TEXT,
+                characters JSONB DEFAULT '{}',
+                relationships JSONB DEFAULT '{}',
+                regions JSONB DEFAULT '{}',
+                hooks JSONB DEFAULT '{}',
+                main_plot_progress FLOAT DEFAULT 0,
+                completed_events JSONB DEFAULT '[]',
+                character_locations JSONB DEFAULT '{}',
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                created_by TEXT DEFAULT 'system',
+                parent_snapshot_id UUID REFERENCES world_snapshots(id),
+                is_branch BOOLEAN DEFAULT FALSE,
+                branch_reason TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_world_snapshots_world_id ON world_snapshots(world_id);
+            CREATE INDEX IF NOT EXISTS idx_world_snapshots_chapter_id ON world_snapshots(chapter_id);
+            """)
 
-        -- 区域表
-        CREATE TABLE IF NOT EXISTS regions (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            world_id TEXT REFERENCES worlds(id),
-            region_type TEXT DEFAULT 'custom',
-            terrain_type TEXT DEFAULT 'custom',
-            description TEXT,
-            atmosphere TEXT,
-            coordinates JSONB,
-            area_size FLOAT,
-            terrain_features JSONB DEFAULT '[]',
-            landmarks JSONB DEFAULT '[]',
-            encounters JSONB DEFAULT '[]',
-            connections JSONB DEFAULT '[]',
-            local_rules JSONB DEFAULT '[]',
-            is_generated BOOLEAN DEFAULT FALSE,
-            visit_count INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
+        # 干预日志表
+        if 'intervention_logs' not in existing_tables:
+            tables_to_create.append("""
+            CREATE TABLE intervention_logs (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                snapshot_id UUID REFERENCES world_snapshots(id) ON DELETE SET NULL,
+                intervention_type TEXT NOT NULL,
+                description TEXT,
+                details JSONB DEFAULT '{}',
+                affected_hooks JSONB DEFAULT '[]',
+                affected_relationships JSONB DEFAULT '[]',
+                affected_characters JSONB DEFAULT '[]',
+                outcome_rating FLOAT,
+                outcome_notes TEXT,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_intervention_logs_snapshot_id ON intervention_logs(snapshot_id);
+            """)
 
-        -- 伏笔表
-        CREATE TABLE IF NOT EXISTS hooks (
-            id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            project_id TEXT REFERENCES projects(id),
-            world_id TEXT,
-            description TEXT,
-            hook_type TEXT DEFAULT 'custom',
-            status TEXT DEFAULT 'planted',
-            related_characters JSONB DEFAULT '[]',
-            related_locations JSONB DEFAULT '[]',
-            related_objects JSONB DEFAULT '[]',
-            plant_context TEXT,
-            plant_chapter TEXT,
-            resolution_hint TEXT,
-            resolution_context TEXT,
-            resolution_chapter TEXT,
-            priority INTEGER DEFAULT 1,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            resolved_at TIMESTAMP
-        );
+        # 事件摘要表
+        if 'event_summaries' not in existing_tables:
+            tables_to_create.append("""
+            CREATE TABLE event_summaries (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                chapter_id UUID REFERENCES chapters(id) ON DELETE CASCADE,
+                summary TEXT,
+                event_type TEXT DEFAULT 'custom',
+                participants JSONB DEFAULT '[]',
+                subtext_markers JSONB DEFAULT '[]',
+                hook_triggers JSONB DEFAULT '[]',
+                info_gain_score FLOAT DEFAULT 0,
+                raw_dialogue_refs JSONB DEFAULT '[]',
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                "order" INTEGER DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_event_summaries_chapter_id ON event_summaries(chapter_id);
+            """)
 
-        CREATE INDEX IF NOT EXISTS idx_hooks_project_id ON hooks(project_id);
-        CREATE INDEX IF NOT EXISTS idx_hooks_status ON hooks(status);
-
-        -- 章节表
-        CREATE TABLE IF NOT EXISTS chapters (
-            id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            project_id TEXT REFERENCES projects(id),
-            world_id TEXT REFERENCES worlds(id),
-            content TEXT,
-            word_count INTEGER DEFAULT 0,
-            status TEXT DEFAULT 'draft',
-            events JSONB DEFAULT '[]',
-            hooks_planted JSONB DEFAULT '[]',
-            hooks_resolved JSONB DEFAULT '[]',
-            main_plot_progress FLOAT DEFAULT 0,
-            reader_scores JSONB,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            completed_at TIMESTAMP
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_chapters_project_id ON chapters(project_id);
-
-        -- 世界快照表
-        CREATE TABLE IF NOT EXISTS world_snapshots (
-            id TEXT PRIMARY KEY,
-            world_id TEXT REFERENCES worlds(id),
-            chapter_id TEXT REFERENCES chapters(id),
-            snapshot_type TEXT DEFAULT 'auto',
-            name TEXT,
-            description TEXT,
-            characters JSONB DEFAULT '{}',
-            relationships JSONB DEFAULT '{}',
-            regions JSONB DEFAULT '{}',
-            hooks JSONB DEFAULT '{}',
-            main_plot_progress FLOAT DEFAULT 0,
-            completed_events JSONB DEFAULT '[]',
-            character_locations JSONB DEFAULT '{}',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            created_by TEXT DEFAULT 'system',
-            parent_snapshot_id TEXT REFERENCES world_snapshots(id),
-            is_branch BOOLEAN DEFAULT FALSE,
-            branch_reason TEXT
-        );
-
-        -- 干预日志表
-        CREATE TABLE IF NOT EXISTS intervention_logs (
-            id TEXT PRIMARY KEY,
-            snapshot_id TEXT REFERENCES world_snapshots(id),
-            intervention_type TEXT NOT NULL,
-            description TEXT,
-            details JSONB DEFAULT '{}',
-            affected_hooks JSONB DEFAULT '[]',
-            affected_relationships JSONB DEFAULT '[]',
-            affected_characters JSONB DEFAULT '[]',
-            outcome_rating FLOAT,
-            outcome_notes TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        -- 事件摘要表
-        CREATE TABLE IF NOT EXISTS event_summaries (
-            id TEXT PRIMARY KEY,
-            chapter_id TEXT REFERENCES chapters(id),
-            summary TEXT,
-            event_type TEXT DEFAULT 'custom',
-            participants JSONB DEFAULT '[]',
-            subtext_markers JSONB DEFAULT '[]',
-            hook_triggers JSONB DEFAULT '[]',
-            info_gain_score FLOAT DEFAULT 0,
-            raw_dialogue_refs JSONB DEFAULT '[]',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            "order" INTEGER DEFAULT 0
-        );
-        """
-
+        # 执行创建表
         async with self.get_session() as session:
-            for statement in create_tables_sql.split(';'):
-                if statement.strip():
-                    await session.execute(text(statement))
+            for table_sql in tables_to_create:
+                for statement in table_sql.split(';'):
+                    if statement.strip():
+                        try:
+                            await session.execute(text(statement))
+                        except Exception as e:
+                            logger.warning(f"创建表时出错（可能已存在）: {str(e)[:100]}")
             await session.commit()
 
-        logger.info("数据库表结构初始化完成")
+        logger.info(f"数据库表结构初始化完成，已存在表: {existing_tables}, 新创建表: {len(tables_to_create)}")
 
     # ==================== Token 使用统计操作 ====================
 

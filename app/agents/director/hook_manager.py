@@ -9,6 +9,7 @@ from langchain_core.language_models import BaseLanguageModel
 from langchain_core.messages import HumanMessage
 
 from app.agents.base import BaseAgent, AgentResponse
+from app.models.agent_template import AgentType
 
 logger = logging.getLogger(__name__)
 
@@ -16,12 +17,37 @@ logger = logging.getLogger(__name__)
 class HookManagerAgent(BaseAgent):
     """伏笔管理员 Agent"""
 
+    AGENT_TYPE = AgentType.HOOK_MANAGER
+
     def __init__(
         self,
         model: Optional[BaseLanguageModel] = None,
         config: Optional[Dict[str, Any]] = None,
+        project_id: Optional[str] = None,
+        system_prompt: Optional[str] = None,
     ):
-        system_prompt = """你是伏笔管理员，负责在日常互动中埋设和回收伏笔。
+        # 如果没有提供 system_prompt 且没有 project_id，使用默认的硬编码 prompt（向后兼容）
+        if not system_prompt and not project_id:
+            system_prompt = self._build_default_system_prompt()
+
+        super().__init__(
+            name="HookManagerAgent",
+            model=model,
+            system_prompt=system_prompt,
+            config=config,
+            project_id=project_id,
+        )
+
+    def _get_default_variables(self) -> Dict[str, Any]:
+        """获取默认变量（HookManager 特定）"""
+        return {
+            "agent_role": "伏笔管理员",
+            "task_description": "负责在日常互动中埋设和回收伏笔",
+        }
+
+    def _build_default_system_prompt(self) -> str:
+        """构建默认系统提示（向后兼容）"""
+        return """你是伏笔管理员，负责在日常互动中埋设和回收伏笔。
 
 你的职责：
 1. 根据当前场景选择合适的伏笔进行埋设
@@ -35,13 +61,6 @@ class HookManagerAgent(BaseAgent):
     "hooks_to_resolve": [{"hook_id": "ID", "resolution": "回收方式"}],
     "hooks_status_updates": [{"hook_id": "ID", "new_status": "triggered/resolved"}]
 }"""
-
-        super().__init__(
-            name="HookManagerAgent",
-            model=model,
-            system_prompt=system_prompt,
-            config=config,
-        )
 
     async def execute(self, input_data: Dict[str, Any]) -> AgentResponse:
         """

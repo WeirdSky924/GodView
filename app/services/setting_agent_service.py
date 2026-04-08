@@ -34,11 +34,13 @@ class SettingAgentService:
 
     def __init__(self):
         self.llm_provider = settings.llm_provider
-        self.llm_api_key = settings.llm_api_key
-        self.llm_base_url = settings.llm_base_url
-        self.llm_model = settings.llm_model
-        self.llm_temperature = settings.llm_temperature
-        self.llm_max_tokens = settings.llm_max_tokens
+        # 获取当前 provider 的配置
+        llm_config = settings.get_llm_config(self.llm_provider)
+        self.llm_api_key = llm_config.get("api_key", "")
+        self.llm_base_url = llm_config.get("base_url", "")
+        self.llm_model = llm_config.get("model", "")
+        self.llm_temperature = llm_config.get("temperature", 0.7)
+        self.llm_max_tokens = llm_config.get("max_tokens", 4096)
 
         # 会话存储
         self._sessions: Dict[str, BootstrapSession] = {}
@@ -447,11 +449,224 @@ class SettingAgentService:
 
         session.last_activity_at = datetime.now()
 
+        # 自动分析并更新项目元数据（每5次对话触发一次）
+        if len(session.conversation_history) % 10 == 0:  # 每5次用户消息
+            metadata_results = await self.analyze_and_update_project_metadata(
+                project_id,
+                session.conversation_history,
+            )
+            if metadata_results.get("updated"):
+                logger.info(f"自动更新项目 {project_id} 元数据: {metadata_results}")
+
         return {
             "response": response,
             "session_id": session.id,
             "mode": session.mode.value,
         }
+
+    # ==================== 智能推断方法 ====================
+
+    async def infer_world_type(self, conversation_history: List[Dict[str, Any]]) -> Optional[str]:
+        """
+        从对话历史中推断世界类型
+
+        Args:
+            conversation_history: 对话历史
+
+        Returns:
+            Optional[str]: 推断的世界类型 (fantasy/scifi/modern/historical/wuxia)
+        """
+        if not conversation_history:
+            return None
+
+        # 构建分析提示
+        recent_messages = conversation_history[-5:]  # 最近5条消息
+        history_text = "\n".join([
+            f"{msg.get('role', 'user')}: {msg.get('content', '')}"
+            for msg in recent_messages
+        ])
+
+        prompt = f"""请从以下对话中推断故事的世界类型。
+
+可能的类型：
+- fantasy (奇幻): 魔法、精灵、怪物、异世界
+- scifi (科幻): 太空、未来科技、外星人、赛博朋克
+- modern (现代): 当代社会、都市、现实题材
+- historical (历史): 古代/近代历史背景
+- wuxia (武侠): 江湖、武功、门派、恩怨
+
+对话内容：
+{history_text}
+
+请直接返回世界类型名称（如 fantasy），如果没有足够信息推断则返回 "unknown"。
+"""
+
+        try:
+            result = await self._call_llm_simple(prompt)
+            result = result.strip().lower()
+
+            valid_types = ["fantasy", "scifi", "modern", "historical", "wuxia"]
+            if result in valid_types:
+                logger.info(f"推断世界类型: {result}")
+                return result
+            return None
+        except Exception as e:
+            logger.error(f"推断世界类型失败: {e}")
+            return None
+
+    async def infer_tone(self, conversation_history: List[Dict[str, Any]]) -> Optional[str]:
+        """
+        从对话历史中推断叙事基调
+
+        Args:
+            conversation_history: 对话历史
+
+        Returns:
+            Optional[str]: 推断的叙事基调 (serious/lighthearted/dark/comedic/adventurous)
+        """
+        if not conversation_history:
+            return None
+
+        # 构建分析提示
+        recent_messages = conversation_history[-5:]
+        history_text = "\n".join([
+            f"{msg.get('role', 'user')}: {msg.get('content', '')}"
+            for msg in recent_messages
+        ])
+
+        prompt = f"""请从以下对话中推断故事的叙事基调。
+
+可能的基调：
+- serious (严肃): 正剧、深刻主题、命运沉重
+- lighthearted (轻松): 轻松幽默、日常甜蜜
+- dark (暗黑): 悲剧、虐心、压抑
+- comedic (喜剧): 搞笑、荒诞、无厘头
+- adventurous (冒险): 热血、成长、挑战
+
+对话内容：
+{history_text}
+
+请直接返回基调名称（如 serious），如果没有足够信息推断则返回 "unknown"。
+"""
+
+        try:
+            result = await self._call_llm_simple(prompt)
+            result = result.strip().lower()
+
+            valid_tones = ["serious", "lighthearted", "dark", "comedic", "adventurous"]
+            if result in valid_tones:
+                logger.info(f"推断叙事基调: {result}")
+                return result
+            return None
+        except Exception as e:
+            logger.error(f"推断叙事基调失败: {e}")
+            return None
+
+    async def update_project_metadata(
+        self,
+        project_id: str,
+        world_type: Optional[str] = None,
+        tone: Optional[str] = None,
+        additional_metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """
+        更新项目元数据
+
+        Args:
+            project_id: 项目 ID
+            world_type: 世界类型
+            tone: 叙事基调
+            additional_metadata: 其他元数据
+
+        Returns:
+            bool: 是否更新成功
+        """
+        try:
+            from app.api.app import postgres_db
+
+            if not postgres_db:
+                logger.warning("数据库未连接，无法更新项目元数据")
+                return False
+
+            # 构建更新数据
+            update_data = {}
+            if world_type:
+                update_data["world_type"] = world_type
+            if tone:
+                update_data["tone"] = tone
+            if additional_metadata:
+                update_data["metadata"] = additional_metadata
+
+            if not update_data:
+                return True
+
+            # 从项目元数据中获取现有值
+            project = await postgres_db.get_project(project_id)
+            if not project:
+                logger.warning(f"项目不存在: {project_id}")
+                return False
+
+            # 更新元数据
+            metadata = project.get("metadata", {})
+            if "metadata" not in update_data:
+                update_data["metadata"] = metadata
+
+            # 合并世界类型和基调到元数据
+            if world_type:
+                update_data["world_type"] = world_type
+            if tone:
+                update_data["tone"] = tone
+
+            await postgres_db.update_project(project_id, update_data)
+
+            logger.info(f"更新项目 {project_id} 元数据: {update_data}")
+            return True
+
+        except Exception as e:
+            logger.error(f"更新项目元数据失败: {e}")
+            return False
+
+    async def analyze_and_update_project_metadata(
+        self,
+        project_id: str,
+        conversation_history: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        分析对话并自动更新项目元数据
+
+        Args:
+            project_id: 项目 ID
+            conversation_history: 对话历史
+
+        Returns:
+            Dict: 分析和更新结果
+        """
+        results = {
+            "world_type": None,
+            "tone": None,
+            "updated": False,
+        }
+
+        # 推断世界类型
+        world_type = await self.infer_world_type(conversation_history)
+        if world_type:
+            results["world_type"] = world_type
+
+        # 推断叙事基调
+        tone = await self.infer_tone(conversation_history)
+        if tone:
+            results["tone"] = tone
+
+        # 如果有推断结果，更新项目元数据
+        if world_type or tone:
+            success = await self.update_project_metadata(
+                project_id,
+                world_type=world_type,
+                tone=tone,
+            )
+            results["updated"] = success
+
+        return results
 
     def _build_management_system_prompt(self, session: SettingAgentSession) -> str:
         """构建管理模式系统提示"""

@@ -9,6 +9,7 @@ from langchain_core.language_models import BaseLanguageModel
 
 from app.agents.base import BaseAgent, AgentResponse
 from app.models.character import Character
+from app.models.agent_template import AgentType
 
 logger = logging.getLogger(__name__)
 
@@ -16,21 +17,51 @@ logger = logging.getLogger(__name__)
 class CharacterAgent(BaseAgent):
     """角色 Agent"""
 
+    AGENT_TYPE = AgentType.CHARACTER
+
     def __init__(
         self,
         character: Character,
         model: Optional[BaseLanguageModel] = None,
         prompt_template: Optional[str] = None,
         config: Optional[Dict[str, Any]] = None,
+        project_id: Optional[str] = None,
     ):
         self.character = character
-        system_prompt = self._build_system_prompt()
+
+        # 如果没有提供 prompt_template，使用旧的构建方式（向后兼容）
+        if not prompt_template and not project_id:
+            system_prompt = self._build_system_prompt()
+        else:
+            system_prompt = prompt_template
+
         super().__init__(
             name=f"CharacterAgent-{character.name}",
             model=model,
             system_prompt=system_prompt,
             config=config,
+            project_id=project_id,
         )
+
+    def _get_default_variables(self) -> Dict[str, Any]:
+        """获取默认变量（Character 特定）"""
+        char = self.character
+        traits_desc = ", ".join(
+            [f"{t.name}({t.value})" for t in char.personality_traits]
+        )
+
+        return {
+            "character_name": char.name,
+            "character_description": char.description or "无",
+            "personality_traits": traits_desc,
+            "background_story": char.background_story or "无",
+            "speech_pattern": char.speech_pattern or "无特殊限制",
+            "lexicon": ", ".join(char.lexicon) if char.lexicon else "无限制",
+            "forbidden_words": ", ".join(char.forbidden_words) if char.forbidden_words else "无禁止",
+            "current_location": char.current_location or "未知",
+            "goals": ", ".join(char.goals) if char.goals else "无特定目标",
+            "inventory": ", ".join(char.inventory) if char.inventory else "无",
+        }
 
     def _build_system_prompt(self) -> str:
         """构建角色系统提示"""

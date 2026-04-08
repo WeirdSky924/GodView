@@ -20,6 +20,9 @@ import Bootstrap from './pages/Bootstrap'
 import ProjectSetup from './pages/ProjectSetup'
 import ObservationMode from './pages/ObservationMode'
 import Skills from './pages/Skills'
+import Prompts from './pages/Prompts'
+import AgentTemplates from './pages/AgentTemplates'
+import WritingRules from './pages/WritingRules'
 
 function App() {
   return (
@@ -46,6 +49,9 @@ function App() {
         <Route path="/project-setup" element={<ProjectSetup />} />
         <Route path="/observation" element={<ObservationMode />} />
         <Route path="/skills" element={<Skills />} />
+        <Route path="/prompts" element={<Prompts />} />
+        <Route path="/agent-templates" element={<AgentTemplates />} />
+        <Route path="/writing-rules" element={<WritingRules />} />
       </Routes>
     </Layout>
   )

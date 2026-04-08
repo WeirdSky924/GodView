@@ -198,25 +198,25 @@ export default function LoreTree({
   const treeData = useMemo(() => {
     // 如果有关系数据，构建层级树
     if (relationships.length > 0) {
-      const nodeMap = new Map<string, TreeNode>()
-      const childIds = new Set<string>()
+      const nodeMap: Record<string, TreeNode> = {}
+      const childIds: Set<string> = new Set()
 
       // 初始化所有节点
       loreList.forEach((lore) => {
-        nodeMap.set(lore.id, {
+        nodeMap[lore.id] = {
           id: lore.id,
           name: lore.title,
           category: lore.category,
           priority: lore.priority,
           children: [],
           lore,
-        })
+        }
       })
 
       // 根据关系构建树
       relationships.forEach((rel) => {
-        const parent = nodeMap.get(rel.parent_id)
-        const child = nodeMap.get(rel.child_id)
+        const parent = nodeMap[rel.parent_id]
+        const child = nodeMap[rel.child_id]
         if (parent && child) {
           parent.children.push(child)
           childIds.add(rel.child_id)
@@ -225,7 +225,7 @@ export default function LoreTree({
 
       // 找出根节点（没有父节点的）
       const roots: TreeNode[] = []
-      nodeMap.forEach((node, id) => {
+      Object.entries(nodeMap).forEach(([id, node]) => {
         if (!childIds.has(id)) {
           roots.push(node)
         }

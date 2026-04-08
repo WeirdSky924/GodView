@@ -9,6 +9,7 @@ from langchain_core.language_models import BaseLanguageModel
 from langchain_core.messages import HumanMessage
 
 from app.agents.base import BaseAgent, AgentResponse
+from app.models.agent_template import AgentType
 
 logger = logging.getLogger(__name__)
 
@@ -16,12 +17,37 @@ logger = logging.getLogger(__name__)
 class WriterAgent(BaseAgent):
     """内容执行官 Agent"""
 
+    AGENT_TYPE = AgentType.WRITER
+
     def __init__(
         self,
         model: Optional[BaseLanguageModel] = None,
         config: Optional[Dict[str, Any]] = None,
+        project_id: Optional[str] = None,
+        system_prompt: Optional[str] = None,
     ):
-        system_prompt = """你是内容执行官，负责将干巴巴的剧情意图润色成有小说质感的连贯文本。
+        # 如果没有提供 system_prompt 且没有 project_id，使用默认的硬编码 prompt（向后兼容）
+        if not system_prompt and not project_id:
+            system_prompt = self._build_default_system_prompt()
+
+        super().__init__(
+            name="WriterAgent",
+            model=model,
+            system_prompt=system_prompt,
+            config=config,
+            project_id=project_id,
+        )
+
+    def _get_default_variables(self) -> Dict[str, Any]:
+        """获取默认变量（Writer 特定）"""
+        return {
+            "agent_role": "内容执行官",
+            "task_description": "将剧情意图润色成小说文本",
+        }
+
+    def _build_default_system_prompt(self) -> str:
+        """构建默认系统提示（向后兼容）"""
+        return """你是内容执行官，负责将干巴巴的剧情意图润色成有小说质感的连贯文本。
 
 写作要求：
 1. 展示，而不是告知 (Show, Don't Tell)
@@ -41,13 +67,6 @@ class WriterAgent(BaseAgent):
     },
     "hooks_embedded": ["嵌入的伏笔 ID 列表"]
 }"""
-
-        super().__init__(
-            name="WriterAgent",
-            model=model,
-            system_prompt=system_prompt,
-            config=config,
-        )
 
     async def execute(self, input_data: Dict[str, Any]) -> AgentResponse:
         """

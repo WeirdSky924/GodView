@@ -38,7 +38,7 @@ export default function WorldView() {
     try {
       const result = await getWorlds()
       setWorlds(result)
-      if (result.length > 0 && !selectedWorldId) {
+      if (result.length > 0 && !selectedWorldId && result[0]?.id) {
         setSelectedWorldId(result[0].id)
       }
     } catch (error) {

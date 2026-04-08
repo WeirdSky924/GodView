@@ -5,6 +5,7 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { api } from '@/api/client'
+import { getWsBaseUrl } from '@/api/systemConfig'
 import { TimeUpdateResult, TimeUpdateHandler, TimeConnectionHandler, ErrorHandler, TimeHistoryResponse } from '@/api/time'
 
 interface UseTimeWebSocketOptions {
@@ -25,9 +26,9 @@ interface UseTimeWebSocketResult {
   timeScale: number | null
   tickCount: number | null
   isFrozen: boolean | null
+  getFriendlyTimeDisplay: () => string
+  copyTimeToClipboard: () => Promise<boolean>
 }
-
-const TIME_WS_URL = 'ws://localhost:8000'
 
 export function useTimeWebSocket({
   worldId,
@@ -45,13 +46,15 @@ export function useTimeWebSocket({
   const [isFrozen, setIsFrozen] = useState<boolean | null>(null)
 
   // 连接WebSocket
-  const connect = useCallback(() => {
+  const connect = useCallback(async () => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       return // 已经连接
     }
 
     try {
-      const wsUrl = `${TIME_WS_URL}/ws/time/${worldId}`
+      // 从配置获取 WebSocket 基础 URL
+      const wsBaseUrl = await getWsBaseUrl()
+      const wsUrl = `${wsBaseUrl}/ws/time/${worldId}`
       wsRef.current = new WebSocket(wsUrl)
 
       wsRef.current.onopen = () => {
@@ -169,10 +172,16 @@ export function useTimeWebSocket({
   }, [autoConnect, connect, disconnect])
 
   // 复制到剪贴板
-  const copyTimeToClipboard = useCallback(() => {
+  const copyTimeToClipboard = useCallback(async (): Promise<boolean> => {
     if (currentTime) {
-      navigator.clipboard.writeText(currentTime)
+      try {
+        await navigator.clipboard.writeText(currentTime)
+        return true
+      } catch {
+        return false
+      }
     }
+    return false
   }, [currentTime])
 
   // 获取时间格式的友好显示

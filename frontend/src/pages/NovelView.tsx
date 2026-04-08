@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Card, Button, Input, Modal } from '@/components/ui'
+import PageLayout from '@/components/PageLayout'
 import {
   FileText, Download, ChevronLeft, ChevronRight, Save, Plus,
   Edit3, Eye, Trash2, RefreshCw, FileDown, FolderOpen
@@ -7,10 +8,14 @@ import {
 import { getChapters, createChapter, updateChapter, deleteChapter } from '@/api/chapters'
 import type { Chapter } from '@/api/chapters'
 import { useProject } from '@/contexts/ProjectContext'
+import { useTheme } from '@/contexts/ThemeContext'
 
 
 export default function NovelView() {
   const { currentProject } = useProject()
+  const { theme } = useTheme()
+  const isDark = theme === 'dark'
+
   const [chapters, setChapters] = useState<Chapter[]>([])
   const [currentChapterIndex, setCurrentChapterIndex] = useState(-1)
   const [loading, setLoading] = useState(true)
@@ -178,10 +183,10 @@ export default function NovelView() {
 
   const getStatusClass = (status: string) => {
     switch (status) {
-      case 'draft': return 'bg-yellow-100 text-yellow-700'
-      case 'published': return 'bg-green-100 text-green-700'
-      case 'archived': return 'bg-gray-100 text-gray-700'
-      default: return 'bg-gray-100'
+      case 'draft': return isDark ? 'bg-yellow-900/50 text-yellow-400' : 'bg-yellow-100 text-yellow-700'
+      case 'published': return isDark ? 'bg-green-900/50 text-green-400' : 'bg-green-100 text-green-700'
+      case 'archived': return isDark ? 'bg-gray-700 text-gray-300' : 'bg-gray-100 text-gray-700'
+      default: return isDark ? 'bg-gray-700 text-gray-300' : 'bg-gray-100'
     }
   }
 
@@ -191,65 +196,77 @@ export default function NovelView() {
     return chinese + words
   }
 
-  return (
-    <div>
-      <div className="flex items-center justify-between mb-8">
-        <h1 className="text-3xl font-bold text-gray-800">📚 小说编辑器</h1>
-        <div className="flex items-center gap-3">
-          {saveStatus === 'saved' && (
-            <span className="text-sm text-green-600 flex items-center gap-1">
-              ✓ 已保存
-            </span>
-          )}
-          <div className="relative group">
-            <Button variant="secondary" disabled={!currentProject}>
-              <Download size={18} className="mr-2" />
-              导出
-            </Button>
-            <div className="absolute right-0 top-full mt-1 bg-white rounded-lg shadow-lg border border-gray-200 py-1 hidden group-hover:block z-10 min-w-[160px]">
-              <button
-                onClick={exportToTxt}
-                className="w-full text-left px-4 py-2 text-sm hover:bg-gray-50 flex items-center gap-2"
-              >
-                <FileText size={16} /> 导出全文 TXT
-              </button>
-              <button
-                onClick={exportCurrentChapter}
-                className="w-full text-left px-4 py-2 text-sm hover:bg-gray-50 flex items-center gap-2"
-              >
-                <FileText size={16} /> 导出当前章节
-              </button>
-              <button
-                onClick={exportToMarkdown}
-                className="w-full text-left px-4 py-2 text-sm hover:bg-gray-50 flex items-center gap-2"
-              >
-                <FileDown size={16} /> 导出 Markdown
-              </button>
-            </div>
-          </div>
-          <Button onClick={() => setShowCreateModal(true)} disabled={!currentProject}>
-            <Plus size={18} className="mr-2" />
-            新建章节
-          </Button>
+  // Action buttons for PageLayout header
+  const headerActions = (
+    <div className="flex items-center gap-3">
+      {saveStatus === 'saved' && (
+        <span className="text-sm text-green-600 flex items-center gap-1">
+          已保存
+        </span>
+      )}
+      <div className="relative group">
+        <Button variant="secondary" disabled={!currentProject}>
+          <Download size={18} className="mr-2" />
+          导出
+        </Button>
+        <div className={`absolute right-0 top-full mt-1 rounded-lg shadow-lg border py-1 hidden group-hover:block z-10 min-w-[160px] ${
+          isDark ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'
+        }`}>
+          <button
+            onClick={exportToTxt}
+            className={`w-full text-left px-4 py-2 text-sm flex items-center gap-2 ${
+              isDark ? 'hover:bg-gray-700 text-gray-200' : 'hover:bg-gray-50 text-gray-700'
+            }`}
+          >
+            <FileText size={16} /> 导出全文 TXT
+          </button>
+          <button
+            onClick={exportCurrentChapter}
+            className={`w-full text-left px-4 py-2 text-sm flex items-center gap-2 ${
+              isDark ? 'hover:bg-gray-700 text-gray-200' : 'hover:bg-gray-50 text-gray-700'
+            }`}
+          >
+            <FileText size={16} /> 导出当前章节
+          </button>
+          <button
+            onClick={exportToMarkdown}
+            className={`w-full text-left px-4 py-2 text-sm flex items-center gap-2 ${
+              isDark ? 'hover:bg-gray-700 text-gray-200' : 'hover:bg-gray-50 text-gray-700'
+            }`}
+          >
+            <FileDown size={16} /> 导出 Markdown
+          </button>
         </div>
       </div>
+      <Button onClick={() => setShowCreateModal(true)} disabled={!currentProject}>
+        <Plus size={18} className="mr-2" />
+        新建章节
+      </Button>
+    </div>
+  )
 
+  return (
+    <PageLayout
+      title="小说编辑器"
+      description="编辑和管理小说章节"
+      actions={headerActions}
+    >
       {!currentProject ? (
-        <div className="text-center py-20 text-gray-500">
+        <div className={`text-center py-20 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
           <FolderOpen size={48} className="mx-auto mb-4 opacity-50" />
           <p>请先在侧边栏选择一个项目</p>
         </div>
       ) : loading ? (
         <div className="flex items-center justify-center py-20">
           <RefreshCw size={24} className="animate-spin mr-3" />
-          <span className="text-gray-500">加载章节...</span>
+          <span className={isDark ? 'text-gray-400' : 'text-gray-500'}>加载章节...</span>
         </div>
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
           {/* 目录 */}
           <Card className="lg:col-span-1 h-[calc(100vh-200px)] flex flex-col">
-            <div className="px-6 py-4 border-b flex items-center justify-between">
-              <h2 className="font-semibold text-gray-800 flex items-center gap-2">
+            <div className={`px-6 py-4 border-b flex items-center justify-between ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+              <h2 className={`font-semibold flex items-center gap-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>
                 <FileText size={20} />
                 目录 ({chapters.length})
               </h2>
@@ -257,7 +274,7 @@ export default function NovelView() {
             <div className="flex-1 overflow-y-auto p-4 space-y-2">
               {chapters.length === 0 ? (
                 <div className="text-center py-8">
-                  <p className="text-sm text-gray-500 mb-3">暂无章节</p>
+                  <p className={`text-sm mb-3 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>暂无章节</p>
                   <Button size="sm" onClick={() => setShowCreateModal(true)}>
                     <Plus size={16} className="mr-1" /> 创建第一章
                   </Button>
@@ -269,18 +286,20 @@ export default function NovelView() {
                     onClick={() => setCurrentChapterIndex(index)}
                     className={`p-3 rounded-lg cursor-pointer transition-colors group ${
                       index === currentChapterIndex
-                        ? 'bg-blue-50 border-l-4 border-blue-500'
-                        : 'hover:bg-gray-50 border-l-4 border-transparent'
+                        ? isDark ? 'bg-blue-900/30 border-l-4 border-blue-500' : 'bg-blue-50 border-l-4 border-blue-500'
+                        : isDark ? 'hover:bg-gray-700 border-l-4 border-transparent' : 'hover:bg-gray-50 border-l-4 border-transparent'
                     }`}
                   >
                     <div className="flex items-start justify-between">
-                      <p className="font-medium text-sm truncate">{chapter.title}</p>
+                      <p className={`font-medium text-sm truncate ${isDark ? 'text-gray-200' : 'text-gray-700'}`}>{chapter.title}</p>
                       <button
                         onClick={(e) => {
                           e.stopPropagation()
                           handleDeleteChapter(chapter.id)
                         }}
-                        className="opacity-0 group-hover:opacity-100 text-red-400 hover:text-red-600 transition-opacity p-1"
+                        className={`opacity-0 group-hover:opacity-100 transition-opacity p-1 ${
+                          isDark ? 'text-red-400 hover:text-red-300' : 'text-red-400 hover:text-red-600'
+                        }`}
                       >
                         <Trash2 size={14} />
                       </button>
@@ -289,7 +308,7 @@ export default function NovelView() {
                       <span className={`text-xs px-1.5 py-0.5 rounded ${getStatusClass(chapter.status || 'draft')}`}>
                         {getStatusLabel(chapter.status || 'draft')}
                       </span>
-                      <span className="text-xs text-gray-400">
+                      <span className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
                         {wordCount(chapter.content || '')} 字
                       </span>
                     </div>
@@ -302,35 +321,37 @@ export default function NovelView() {
           {/* 编辑/预览区 */}
           <Card className="lg:col-span-3 h-[calc(100vh-200px)] flex flex-col">
             {!currentChapter ? (
-              <div className="flex-1 flex flex-col items-center justify-center text-gray-400">
+              <div className={`flex-1 flex flex-col items-center justify-center ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
                 <FileText size={48} className="mb-4" />
                 <p className="text-lg">选择或创建一个章节开始编辑</p>
               </div>
             ) : (
               <>
                 {/* 章节头部 */}
-                <div className="px-6 py-4 border-b flex items-center justify-between">
+                <div className={`px-6 py-4 border-b flex items-center justify-between ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
                   <div className="flex-1">
                     {editMode ? (
                       <input
                         type="text"
                         value={currentChapter.title}
                         onChange={(e) => updateCurrentChapter({ title: e.target.value })}
-                        className="text-xl font-semibold text-gray-800 bg-transparent border-none focus:outline-none w-full"
+                        className={`text-xl font-semibold bg-transparent border-none focus:outline-none w-full ${
+                          isDark ? 'text-white' : 'text-gray-800'
+                        }`}
                         placeholder="章节标题"
                       />
                     ) : (
-                      <h2 className="text-xl font-semibold text-gray-800">{currentChapter.title}</h2>
+                      <h2 className={`text-xl font-semibold ${isDark ? 'text-white' : 'text-gray-800'}`}>{currentChapter.title}</h2>
                     )}
                     <div className="flex items-center gap-3 mt-1">
                       <span className={`text-xs px-2 py-0.5 rounded ${getStatusClass(currentChapter.status || 'draft')}`}>
                         {getStatusLabel(currentChapter.status || 'draft')}
                       </span>
-                      <span className="text-xs text-gray-400">
+                      <span className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
                         {wordCount(currentChapter.content || '')} 字
                       </span>
                       {currentChapter.updated_at && (
-                        <span className="text-xs text-gray-400">
+                        <span className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
                           最后修改: {new Date(currentChapter.updated_at).toLocaleString('zh-CN')}
                         </span>
                       )}
@@ -364,13 +385,17 @@ export default function NovelView() {
                     <textarea
                       value={currentChapter.content || ''}
                       onChange={(e) => updateCurrentChapter({ content: e.target.value })}
-                      className="w-full h-full p-6 resize-none border-none focus:outline-none text-gray-700 leading-relaxed font-mono text-sm"
+                      className={`w-full h-full p-6 resize-none border-none focus:outline-none leading-relaxed font-mono text-sm ${
+                        isDark ? 'bg-gray-800 text-gray-200' : 'text-gray-700'
+                      }`}
                       placeholder="开始写作..."
                       style={{ minHeight: '400px' }}
                     />
                   ) : (
                     <div className="p-6 prose max-w-none">
-                      <pre className="whitespace-pre-wrap text-gray-700 leading-relaxed font-sans text-base">
+                      <pre className={`whitespace-pre-wrap leading-relaxed font-sans text-base ${
+                        isDark ? 'text-gray-200' : 'text-gray-700'
+                      }`}>
                         {currentChapter.content || '暂无内容，点击"编辑"开始创作'}
                       </pre>
                     </div>
@@ -378,7 +403,7 @@ export default function NovelView() {
                 </div>
 
                 {/* 底部导航 */}
-                <div className="px-6 py-3 border-t flex items-center justify-between bg-gray-50">
+                <div className={`px-6 py-3 border-t flex items-center justify-between ${isDark ? 'bg-gray-800 border-gray-700' : 'bg-gray-50 border-gray-200'}`}>
                   <Button
                     variant="secondary"
                     size="sm"
@@ -388,7 +413,7 @@ export default function NovelView() {
                     <ChevronLeft size={18} className="mr-1" />
                     上一章
                   </Button>
-                  <span className="text-sm text-gray-500">
+                  <span className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
                     {currentChapterIndex + 1} / {chapters.length}
                   </span>
                   <Button
@@ -440,6 +465,6 @@ export default function NovelView() {
           </div>
         </div>
       </Modal>
-    </div>
+    </PageLayout>
   )
 }

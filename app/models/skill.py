@@ -43,7 +43,7 @@ class Skill(BaseModel):
     skill_type: SkillType = Field(..., description="Skill 类型")
 
     # 内容定义
-    prompt_template: Optional[str] = Field(default=None, description="Prompt 类型：提示词模板")
+    prompt_template_id: Optional[str] = Field(default=None, description="关联的 PromptTemplate ID")
     function_code: Optional[str] = Field(default=None, description="Function 类型：Python 代码")
     workflow_steps: Optional[List[Dict[str, Any]]] = Field(default=None, description="Workflow 类型：工作流步骤")
     knowledge_content: Optional[str] = Field(default=None, description="Knowledge 类型：知识内容")
@@ -109,7 +109,7 @@ class CreateSkillDTO(BaseModel):
     name: str
     description: str = ""
     skill_type: SkillType
-    prompt_template: Optional[str] = None
+    prompt_template_id: Optional[str] = None
     function_code: Optional[str] = None
     workflow_steps: Optional[List[Dict[str, Any]]] = None
     knowledge_content: Optional[str] = None
@@ -124,7 +124,7 @@ class UpdateSkillDTO(BaseModel):
     """更新 Skill DTO"""
     name: Optional[str] = None
     description: Optional[str] = None
-    prompt_template: Optional[str] = None
+    prompt_template_id: Optional[str] = None
     function_code: Optional[str] = None
     workflow_steps: Optional[List[Dict[str, Any]]] = None
     knowledge_content: Optional[str] = None

@@ -2,11 +2,12 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ==================== 明亮主题（默认） ==================== */
 :root {
-  --background: 0 0% 100%;
-  --foreground: 222.2 84% 4.9%;
+  --background: 0 0% 98%;
+  --foreground: 222.2 47.4% 11.2%;
   --card: 0 0% 100%;
-  --card-foreground: 222.2 84% 4.9%;
+  --card-foreground: 222.2 47.4% 11.2%;
   --primary: 221.2 83.2% 53.3%;
   --primary-foreground: 210 40% 98%;
   --secondary: 210 40% 96.1%;
@@ -20,8 +21,49 @@
   --border: 214.3 31.8% 91.4%;
   --input: 214.3 31.8% 91.4%;
   --ring: 221.2 83.2% 53.3%;
+
+  /* 明亮主题背景 */
+  --bg-primary: #f8fafc;
+  --bg-secondary: #ffffff;
+  --bg-tertiary: #f1f5f9;
+  --bg-sidebar: rgba(255, 255, 255, 0.95);
+  --bg-card: #ffffff;
+
+  /* 明亮主题文字 */
+  --text-primary: #1e293b;
+  --text-secondary: #475569;
+  --text-muted: #94a3b8;
+
+  /* 明亮主题边框 */
+  --border-color: #e2e8f0;
+  --border-hover: #cbd5e1;
+
+  /* v7: 渐变变量 */
+  --gradient-primary: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%);
+  --gradient-secondary: linear-gradient(135deg, #06b6d4 0%, #3b82f6 100%);
+  --gradient-accent: linear-gradient(135deg, #f59e0b 0%, #ef4444 100%);
+  --gradient-bg: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%);
+
+  /* 发光颜色 */
+  --glow-primary: 0 4px 20px rgba(59, 130, 246, 0.15);
+  --glow-secondary: 0 4px 20px rgba(139, 92, 246, 0.15);
+  --glow-success: 0 4px 20px rgba(16, 185, 129, 0.15);
+  --glow-warning: 0 4px 20px rgba(245, 158, 11, 0.15);
+  --glow-danger: 0 4px 20px rgba(239, 68, 68, 0.15);
+
+  /* 玻璃态 - 明亮主题 */
+  --glass-bg: rgba(255, 255, 255, 0.8);
+  --glass-border: rgba(226, 232, 240, 0.8);
+  --glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.08);
+
+  /* 侧边栏 */
+  --sidebar-bg: rgba(255, 255, 255, 0.95);
+  --sidebar-border: #e2e8f0;
+  --sidebar-hover: #f1f5f9;
+  --sidebar-active: linear-gradient(135deg, rgba(59, 130, 246, 0.1) 0%, rgba(139, 92, 246, 0.1) 100%);
 }
 
+/* ==================== 黑暗主题 ==================== */
 .dark {
   --background: 222.2 84% 4.9%;
   --foreground: 210 40% 98%;
@@ -40,10 +82,51 @@
   --border: 217.2 32.6% 17.5%;
   --input: 217.2 32.6% 17.5%;
   --ring: 224.3 76.3% 48%;
+
+  /* 黑暗主题背景 */
+  --bg-primary: #0f172a;
+  --bg-secondary: #1e293b;
+  --bg-tertiary: #334155;
+  --bg-sidebar: rgba(15, 23, 42, 0.95);
+  --bg-card: #1e293b;
+
+  /* 黑暗主题文字 */
+  --text-primary: #f1f5f9;
+  --text-secondary: #cbd5e1;
+  --text-muted: #64748b;
+
+  /* 黑暗主题边框 */
+  --border-color: #334155;
+  --border-hover: #475569;
+
+  /* 黑暗主题渐变 */
+  --gradient-bg: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+
+  /* 发光颜色 - 黑暗主题更强 */
+  --glow-primary: 0 0 20px rgba(59, 130, 246, 0.4);
+  --glow-secondary: 0 0 20px rgba(139, 92, 246, 0.4);
+  --glow-success: 0 0 20px rgba(16, 185, 129, 0.4);
+  --glow-warning: 0 0 20px rgba(245, 158, 11, 0.4);
+  --glow-danger: 0 0 20px rgba(239, 68, 68, 0.4);
+
+  /* 黑暗玻璃态 */
+  --glass-bg: rgba(15, 23, 42, 0.8);
+  --glass-border: rgba(255, 255, 255, 0.1);
+  --glass-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+
+  /* 侧边栏 */
+  --sidebar-bg: rgba(15, 23, 42, 0.95);
+  --sidebar-border: #334155;
+  --sidebar-hover: #1e293b;
+  --sidebar-active: linear-gradient(135deg, rgba(59, 130, 246, 0.2) 0%, rgba(139, 92, 246, 0.2) 100%);
 }
 
+/* ==================== 基础样式 ==================== */
 body {
   @apply bg-background text-foreground font-sans;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  transition: background-color 0.3s ease, color 0.3s ease;
 }
 
 * {
@@ -56,4 +139,243 @@ button {
 
 input, textarea, select {
   @apply focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary;
+  transition: all 0.2s ease;
+  background: var(--bg-secondary);
+  border-color: var(--border-color);
+  color: var(--text-primary);
+}
+
+input:focus, textarea:focus, select:focus {
+  transform: translateY(-1px);
+  box-shadow: var(--glow-primary);
+}
+
+/* ==================== 发光阴影样式 ==================== */
+
+.glow-primary {
+  box-shadow: var(--glow-primary);
+}
+
+.glow-secondary {
+  box-shadow: var(--glow-secondary);
+}
+
+.glow-success {
+  box-shadow: var(--glow-success);
+}
+
+.glow-warning {
+  box-shadow: var(--glow-warning);
+}
+
+.glow-danger {
+  box-shadow: var(--glow-danger);
+}
+
+/* ==================== 玻璃态背景样式 ==================== */
+
+.glass {
+  background: var(--glass-bg);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow);
+}
+
+.glass-card {
+  background: var(--glass-bg);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--glass-border);
+  border-radius: 16px;
+  box-shadow: var(--glass-shadow);
+}
+
+.glass-sidebar {
+  background: var(--sidebar-bg);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-right: 1px solid var(--sidebar-border);
+}
+
+/* ==================== 渐变背景样式 ==================== */
+
+.gradient-primary {
+  background: var(--gradient-primary);
+}
+
+.gradient-secondary {
+  background: var(--gradient-secondary);
+}
+
+.gradient-accent {
+  background: var(--gradient-accent);
+}
+
+.gradient-text {
+  background: var(--gradient-primary);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* ==================== 动画工具类 ==================== */
+
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-10px); }
+}
+
+@keyframes pulse-glow {
+  0%, 100% { box-shadow: var(--glow-primary); }
+  50% { box-shadow: 0 0 40px rgba(59, 130, 246, 0.6); }
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.animate-float {
+  animation: float 3s ease-in-out infinite;
+}
+
+.animate-pulse-glow {
+  animation: pulse-glow 2s ease-in-out infinite;
+}
+
+.shimmer-bg {
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.1), transparent);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+}
+
+/* ==================== 滚动条美化 ==================== */
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(156, 163, 175, 0.3);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(156, 163, 175, 0.5);
+}
+
+.dark ::-webkit-scrollbar-thumb {
+  background: rgba(71, 85, 105, 0.5);
+}
+
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: rgba(71, 85, 105, 0.7);
+}
+
+/* ==================== 主题切换过渡 ==================== */
+html {
+  transition: background-color 0.3s ease;
+}
+
+/* ==================== 明亮主题特定样式 ==================== */
+.nav-link-light {
+  @apply text-gray-600 hover:text-gray-900 hover:bg-gray-100;
+}
+
+.card-light {
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  box-shadow: var(--glow-primary);
+}
+
+/* ==================== 黑暗主题特定样式 ==================== */
+.dark .nav-link-dark {
+  @apply text-gray-400 hover:text-white hover:bg-gray-800/50;
+}
+
+/* ==================== 主题感知文字颜色类 ==================== */
+
+/* 主要文字颜色 */
+.text-theme-primary {
+  color: var(--text-primary);
+}
+
+/* 次要文字颜色 */
+.text-theme-secondary {
+  color: var(--text-secondary);
+}
+
+/* 淡化文字颜色 */
+.text-theme-muted {
+  color: var(--text-muted);
+}
+
+/* 主题感知背景类 */
+.bg-theme-primary {
+  background-color: var(--bg-primary);
+}
+
+.bg-theme-secondary {
+  background-color: var(--bg-secondary);
+}
+
+.bg-theme-tertiary {
+  background-color: var(--bg-tertiary);
+}
+
+.bg-theme-card {
+  background-color: var(--bg-card);
+}
+
+/* 主题感知边框类 */
+.border-theme {
+  border-color: var(--border-color);
+}
+
+.border-theme-hover:hover {
+  border-color: var(--border-hover);
+}
+
+/* 组合类 - 卡片样式 */
+.theme-card {
+  background-color: var(--bg-card);
+  border: 1px solid var(--border-color);
+  box-shadow: var(--glass-shadow);
+}
+
+.dark .theme-card {
+  background-color: var(--bg-secondary);
+}
+
+/* 组合类 - 输入框背景 */
+.theme-input-bg {
+  background-color: var(--bg-secondary);
+}
+
+.dark .theme-input-bg {
+  background-color: rgba(30, 41, 59, 0.5);
+}
+
+/* 下拉菜单/选择框背景 */
+.theme-select-bg {
+  background-color: var(--bg-secondary);
+}
+
+.dark .theme-select-bg {
+  background-color: #1e293b;
+}
+
+/* 悬停背景 */
+.theme-hover:hover {
+  background-color: var(--bg-tertiary);
+}
+
+.dark .theme-hover:hover {
+  background-color: rgba(30, 41, 59, 0.5);
 }

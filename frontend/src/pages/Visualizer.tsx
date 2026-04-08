@@ -1,14 +1,19 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Card } from '@/components/ui'
+import PageLayout from '@/components/PageLayout'
 import ReactFlow, { Background, Controls, MiniMap } from 'reactflow'
 import 'reactflow/dist/style.css'
 import { getVisualizationData } from '@/api/visualization'
 import { getWorlds, type World } from '@/api/worlds'
 import { Network, Users, GitBranch } from 'lucide-react'
+import { useTheme } from '@/contexts/ThemeContext'
 
 type TabType = 'workflow' | 'plots' | 'snapshots'
 
 export default function Visualizer() {
+  const { theme } = useTheme()
+  const isDark = theme === 'dark'
+
   const [activeTab, setActiveTab] = useState<TabType>('workflow')
   const [data, setData] = useState<any>(null)
   const [worlds, setWorlds] = useState<World[]>([])
@@ -99,13 +104,14 @@ export default function Visualizer() {
   const currentEdges = activeTab === 'workflow' ? workflowEdges : activeTab === 'plots' ? plotEdges : snapshotEdges
 
   return (
-    <div>
-      <div className="flex items-center justify-between mb-8">
-        <h1 className="text-3xl font-bold text-gray-800">🔗 可视化工作台</h1>
+    <PageLayout
+      title="可视化工作台"
+      description="可视化展示工作流、剧情树和版本树"
+      actions={
         <div className="w-72">
-          <label className="block text-sm font-medium text-gray-700 mb-1">世界</label>
+          <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>世界</label>
           <select
-            className="w-full px-3 py-2 border border-gray-300 rounded-lg bg-white"
+            className={`w-full px-3 py-2 border rounded-lg ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'bg-white border-gray-300'}`}
             value={selectedWorldId}
             onChange={(e) => setSelectedWorldId(e.target.value)}
           >
@@ -115,10 +121,10 @@ export default function Visualizer() {
             ))}
           </select>
         </div>
-      </div>
-
+      }
+    >
       {currentWorld && (
-        <div className="mb-4 text-sm text-gray-500">
+        <div className={`mb-4 text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
           当前世界：{currentWorld.name || currentWorld.id}
         </div>
       )}
@@ -129,7 +135,11 @@ export default function Visualizer() {
             key={tab.key}
             onClick={() => setActiveTab(tab.key as TabType)}
             className={`px-4 py-2 rounded-lg font-medium transition-colors ${
-              activeTab === tab.key ? 'bg-blue-500 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+              activeTab === tab.key
+                ? 'bg-blue-500 text-white'
+                : isDark
+                  ? 'bg-gray-800 text-gray-300 hover:bg-gray-700'
+                  : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
             }`}
           >
             <span className="inline mr-2">{tab.icon}</span>
@@ -146,11 +156,11 @@ export default function Visualizer() {
             <Background />
           </ReactFlow>
         ) : (
-          <div className="h-[600px] flex items-center justify-center text-gray-500">
+          <div className={`h-[600px] flex items-center justify-center ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
             暂无世界数据，请先创建世界
           </div>
         )}
       </Card>
-    </div>
+    </PageLayout>
   )
 }

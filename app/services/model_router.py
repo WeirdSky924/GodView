@@ -1,5 +1,6 @@
 """
 模型路由服务 - 根据配置创建 LLM 实例
+简化版：只区分 OpenAI 兼容 API 和 Anthropic API
 """
 
 import logging
@@ -26,16 +27,6 @@ class MissingAPIKeyModel:
         )
 
 
-_SUPPORTED_PROVIDERS = {"openai", "anthropic"}
-
-
-def _normalize_base_url(base_url: Optional[str]) -> Optional[str]:
-    if not base_url:
-        return None
-    value = base_url.strip()
-    return value or None
-
-
 def create_llm(
     provider: Optional[str] = None,
     model: Optional[str] = None,
@@ -44,37 +35,33 @@ def create_llm(
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
 ) -> BaseLanguageModel:
-    """根据配置创建 LangChain 语言模型实例。"""
-    provider = (provider or settings.llm_provider or "openai").strip().lower()
-    model_name = model or settings.llm_model
-    api_key = api_key if api_key is not None else settings.llm_api_key
-    base_url = _normalize_base_url(base_url if base_url is not None else settings.llm_base_url)
-    temperature = settings.llm_temperature if temperature is None else temperature
-    max_tokens = settings.llm_max_tokens if max_tokens is None else max_tokens
+    """
+    根据配置创建 LangChain 语言模型实例。
 
-    if provider not in _SUPPORTED_PROVIDERS:
-        raise ValueError(f"不支持的 LLM provider: {provider}")
+    简化逻辑：
+    - provider == "anthropic" → 使用 ChatAnthropic
+    - 其他所有情况 → 使用 ChatOpenAI（OpenAI 兼容 API）
+
+    前端的 provider 选择只是预填配置，不影响后端调用方式。
+    """
+    provider = (provider or settings.llm_provider or "openai").strip().lower()
+
+    # 获取当前 provider 的配置
+    llm_config = settings.get_llm_config(provider)
+
+    model_name = model or llm_config.get("model", "")
+    api_key = api_key if api_key is not None else llm_config.get("api_key", "")
+    base_url = _normalize_base_url(base_url if base_url is not None else llm_config.get("base_url", ""))
+    temperature = llm_config.get("temperature", 0.7) if temperature is None else temperature
+    max_tokens = llm_config.get("max_tokens", 4096) if max_tokens is None else max_tokens
+
+    logger.info(f"create_llm: provider={provider}, model={model_name}, base_url={base_url}")
 
     if not api_key:
         logger.warning("未配置 LLM_API_KEY，返回占位模型")
         return MissingAPIKeyModel(provider=provider, model_name=model_name)
 
-    if provider == "openai":
-        try:
-            from langchain_openai import ChatOpenAI
-        except ImportError as exc:
-            raise RuntimeError("缺少依赖 langchain-openai，请先安装") from exc
-
-        kwargs = {
-            "model": model_name,
-            "api_key": api_key,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-        if base_url:
-            kwargs["base_url"] = base_url
-        return ChatOpenAI(**kwargs)
-
+    # Anthropic 使用专用 SDK
     if provider == "anthropic":
         try:
             from langchain_anthropic import ChatAnthropic
@@ -91,7 +78,40 @@ def create_llm(
             kwargs["base_url"] = base_url
         return ChatAnthropic(**kwargs)
 
-    raise ValueError(f"未知的 LLM provider: {provider}")
+    # 其他所有 provider 都使用 OpenAI 兼容 API
+    # 包括：openai, zhipu, qwen, deepseek, moonshot, baichuan, wenxin, yi, minimax, openrouter, custom 等
+    try:
+        from langchain_openai import ChatOpenAI
+    except ImportError as exc:
+        raise RuntimeError("缺少依赖 langchain-openai，请先安装") from exc
+
+    kwargs = {
+        "model": model_name,
+        "api_key": api_key,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+
+    # base_url 必须由用户在配置界面填写（前端选择 provider 时会预填）
+    if base_url:
+        kwargs["base_url"] = base_url
+
+    # OpenRouter 需要额外的 headers
+    if provider == "openrouter":
+        kwargs["default_headers"] = {
+            "HTTP-Referer": "https://godview.app",
+            "X-Title": "GodView",
+        }
+
+    return ChatOpenAI(**kwargs)
+
+
+def _normalize_base_url(base_url: Optional[str]) -> Optional[str]:
+    """规范化 base_url"""
+    if not base_url:
+        return None
+    value = base_url.strip()
+    return value or None
 
 
 def create_model_factory(

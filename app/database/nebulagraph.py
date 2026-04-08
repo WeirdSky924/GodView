@@ -23,7 +23,7 @@ class NebulaGraphDatabase:
         port: int = 9669,
         user: str = "root",
         password: str = "nebula",
-        space_name: str = "godview_space",
+        space_name: str = "godview",
         timeout_ms: int = 10000,
     ):
         """
@@ -84,12 +84,24 @@ class NebulaGraphDatabase:
 
     async def _ensure_space(self):
         """确保图空间存在"""
+        import asyncio
+
+        # 先添加存储主机（NebulaGraph v3 必需）
+        add_hosts_result = self._session_pool.execute('ADD HOSTS IF NOT EXISTS "nebula-storaged":9779;')
+        if add_hosts_result.is_succeeded():
+            logger.info("存储主机已添加: nebula-storaged:9779")
+
         # 检查空间是否存在
         result = self._session_pool.execute(
             f"SHOW SPACES LIKE '{self.space_name}'"
         )
 
-        if result.is_succeeded() and len(result.data.rows()) == 0:
+        space_exists = False
+        if result.is_succeeded():
+            rows = result.data.rows()
+            space_exists = len(rows) > 0
+
+        if not space_exists:
             # 创建空间
             create_space = f"""
             CREATE SPACE IF NOT EXISTS {self.space_name} (
@@ -101,17 +113,28 @@ class NebulaGraphDatabase:
             result = self._session_pool.execute(create_space)
             if result.is_succeeded():
                 logger.info(f"图空间 '{self.space_name}' 创建成功")
+                # 等待空间创建完成
+                await asyncio.sleep(5)
             else:
                 logger.error(f"图空间创建失败：{result.error_msg()}")
+                return
 
         # 使用空间
         result = self._session_pool.execute(f"USE {self.space_name}")
         if not result.is_succeeded():
             logger.error(f"使用图空间失败：{result.error_msg()}")
+        else:
+            logger.info(f"已切换到图空间: {self.space_name}")
 
     async def init_schema(self):
         """初始化图 schema（Tag 和 Edge）"""
         await self.connect()
+
+        # 确保使用了正确的空间
+        result = self._session_pool.execute(f"USE {self.space_name}")
+        if not result.is_succeeded():
+            logger.error(f"切换图空间失败：{result.error_msg()}")
+            return
 
         # 创建 Tag
         tags = [

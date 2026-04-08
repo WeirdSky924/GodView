@@ -1,5 +1,7 @@
 import { ReactNode } from 'react'
 import { X } from 'lucide-react'
+import { motion, AnimatePresence } from 'framer-motion'
+import { useTheme } from '@/contexts/ThemeContext'
 
 interface ModalProps {
   isOpen: boolean
@@ -7,10 +9,12 @@ interface ModalProps {
   title: string
   children: ReactNode
   size?: 'sm' | 'md' | 'lg' | 'xl'
+  className?: string
 }
 
-export function Modal({ isOpen, onClose, title, children, size = 'md' }: ModalProps) {
-  if (!isOpen) return null
+export function Modal({ isOpen, onClose, title, children, size = 'md', className = '' }: ModalProps) {
+  const { theme } = useTheme()
+  const isDark = theme === 'dark'
 
   const sizes = {
     sm: 'max-w-sm',
@@ -20,31 +24,50 @@ export function Modal({ isOpen, onClose, title, children, size = 'md' }: ModalPr
   }
 
   return (
-    <div className="fixed inset-0 z-50 overflow-y-auto">
-      <div className="flex min-h-screen items-center justify-center p-4">
-        {/* 背景遮罩 */}
-        <div
-          className="fixed inset-0 bg-black/50 transition-opacity"
-          onClick={onClose}
-        />
-
-        {/* 模态框 */}
-        <div className={`relative bg-white rounded-xl shadow-xl w-full ${sizes[size]} transform transition-all`}>
-          {/* 头部 */}
-          <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200">
-            <h3 className="text-lg font-semibold text-gray-800">{title}</h3>
-            <button
+    <AnimatePresence>
+      {isOpen && (
+        <div className="fixed inset-0 z-50 overflow-y-auto">
+          <div className="flex min-h-screen items-center justify-center p-4">
+            {/* 背景遮罩 */}
+            <motion.div
+              className={`fixed inset-0 backdrop-blur-sm ${isDark ? 'bg-black/70' : 'bg-black/50'}`}
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
               onClick={onClose}
-              className="p-1 rounded hover:bg-gray-100 transition-colors"
-            >
-              <X size={20} />
-            </button>
-          </div>
+            />
 
-          {/* 内容 */}
-          <div className="p-6">{children}</div>
+            {/* 模态框 */}
+            <motion.div
+              className={`relative rounded-xl shadow-2xl border w-full ${sizes[size]} ${className} ${
+                isDark ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'
+              }`}
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              transition={{ type: 'spring', stiffness: 300, damping: 25 }}
+            >
+              {/* 头部 */}
+              <div className={`flex items-center justify-between px-6 py-4 border-b ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+                <h3 className={`text-lg font-semibold ${isDark ? 'text-white' : 'text-gray-800'}`}>{title}</h3>
+                <motion.button
+                  onClick={onClose}
+                  className={`p-1.5 rounded-lg transition-colors ${
+                    isDark ? 'text-gray-400 hover:text-white hover:bg-gray-700' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-100'
+                  }`}
+                  whileHover={{ scale: 1.1 }}
+                  whileTap={{ scale: 0.9 }}
+                >
+                  <X size={20} />
+                </motion.button>
+              </div>
+
+              {/* 内容 */}
+              <div className="p-6 max-h-[80vh] overflow-y-auto">{children}</div>
+            </motion.div>
+          </div>
         </div>
-      </div>
-    </div>
+      )}
+    </AnimatePresence>
   )
 }

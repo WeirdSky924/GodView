@@ -10,6 +10,7 @@ from langchain_core.messages import HumanMessage
 
 from app.agents.base import BaseAgent, AgentResponse
 from app.models.world import World, Region, RegionType, TerrainType
+from app.models.agent_template import AgentType
 
 logger = logging.getLogger(__name__)
 
@@ -17,20 +18,38 @@ logger = logging.getLogger(__name__)
 class ProcGenAgent(BaseAgent):
     """世界生成 Agent"""
 
+    AGENT_TYPE = AgentType.PROC_GEN
+
     def __init__(
         self,
         world: World,
         model: Optional[BaseLanguageModel] = None,
         config: Optional[Dict[str, Any]] = None,
+        project_id: Optional[str] = None,
+        system_prompt: Optional[str] = None,
     ):
         self.world = world
-        system_prompt = self._build_system_prompt()
+
+        # 如果没有提供 system_prompt 且没有 project_id，使用默认的构建方式（向后兼容）
+        if not system_prompt and not project_id:
+            system_prompt = self._build_system_prompt()
+
         super().__init__(
             name="ProcGenAgent",
             model=model,
             system_prompt=system_prompt,
             config=config,
+            project_id=project_id,
         )
+
+    def _get_default_variables(self) -> Dict[str, Any]:
+        """获取默认变量（ProcGen 特定）"""
+        return {
+            "agent_role": "造物主助理",
+            "task_description": "根据世界观规则程序化生成新的区域和内容",
+            "world_name": self.world.name,
+            "world_type": self.world.world_type,
+        }
 
     def _build_system_prompt(self) -> str:
         """构建系统提示"""

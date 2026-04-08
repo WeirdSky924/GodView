@@ -1,10 +1,15 @@
 import { useEffect, useState } from 'react'
 import { Card, Button } from '@/components/ui'
+import PageLayout from '@/components/PageLayout'
 import { evaluateChapter, getChapters } from '@/api/chapters'
 import type { Chapter, ChapterEvaluationResult } from '@/api/chapters'
 import { CheckCircle2, Gauge, Sparkles, BookOpen, AlertCircle } from 'lucide-react'
+import { useTheme } from '@/contexts/ThemeContext'
 
 export default function ChapterEvaluator() {
+  const { theme } = useTheme()
+  const isDark = theme === 'dark'
+
   const [chapters, setChapters] = useState<Chapter[]>([])
   const [selectedChapterId, setSelectedChapterId] = useState('')
   const [loading, setLoading] = useState(false)
@@ -55,19 +60,20 @@ export default function ChapterEvaluator() {
   }
 
   return (
-    <div>
-      <div className="flex items-center justify-between mb-8">
-        <h1 className="text-3xl font-bold text-gray-800">✅ 章节结束判定器</h1>
+    <PageLayout
+      title="章节结束判定器"
+      description="评估章节是否适合收尾"
+      actions={
         <Button onClick={runEvaluation} loading={loading} disabled={!selectedChapterId}>
           <CheckCircle2 size={18} className="mr-2" />开始评估
         </Button>
-      </div>
-
+      }
+    >
       <Card className="mb-6">
         <div className="flex items-center gap-4">
-          <label className="text-sm font-medium text-gray-700">选择章节：</label>
+          <label className={`text-sm font-medium ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>选择章节：</label>
           <select
-            className="px-3 py-2 border border-gray-300 rounded-lg flex-1 max-w-md"
+            className={`px-3 py-2 border rounded-lg flex-1 max-w-md ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
             value={selectedChapterId}
             onChange={(e) => setSelectedChapterId(e.target.value)}
           >
@@ -79,16 +85,16 @@ export default function ChapterEvaluator() {
             ))}
           </select>
           {selectedChapter && (
-            <span className="text-sm text-gray-500">{(selectedChapter.content || '').length} 字符</span>
+            <span className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>{(selectedChapter.content || '').length} 字符</span>
           )}
         </div>
       </Card>
 
       {!result ? (
         <Card>
-          <div className="text-center py-12 text-gray-500">
+          <div className={`text-center py-12 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
             <CheckCircle2 size={64} className="mx-auto mb-4 opacity-50" />
-            <p className="text-lg">选择一个章节并点击“开始评估”</p>
+            <p className="text-lg">选择一个章节并点击"开始评估"</p>
             <p className="text-sm mt-2">系统会从信息增量、悬念、节奏与完整度四个维度给出建议</p>
           </div>
         </Card>
@@ -98,7 +104,7 @@ export default function ChapterEvaluator() {
             <Card className="p-5">
               <div className="flex items-center gap-3 mb-2">
                 <Sparkles size={22} className="text-blue-500" />
-                <span className="text-sm text-gray-500">信息增量</span>
+                <span className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>信息增量</span>
               </div>
               <div className={`text-2xl font-bold ${scoreText(result.scores.info_gain)}`}>
                 {(result.scores.info_gain * 100).toFixed(0)}%
@@ -107,7 +113,7 @@ export default function ChapterEvaluator() {
             <Card className="p-5">
               <div className="flex items-center gap-3 mb-2">
                 <AlertCircle size={22} className="text-purple-500" />
-                <span className="text-sm text-gray-500">悬念埋设</span>
+                <span className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>悬念埋设</span>
               </div>
               <div className={`text-2xl font-bold ${scoreText(result.scores.suspense)}`}>
                 {(result.scores.suspense * 100).toFixed(0)}%
@@ -116,7 +122,7 @@ export default function ChapterEvaluator() {
             <Card className="p-5">
               <div className="flex items-center gap-3 mb-2">
                 <Gauge size={22} className="text-yellow-500" />
-                <span className="text-sm text-gray-500">节奏控制</span>
+                <span className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>节奏控制</span>
               </div>
               <div className={`text-2xl font-bold ${scoreText(result.scores.pacing)}`}>
                 {(result.scores.pacing * 100).toFixed(0)}%
@@ -125,7 +131,7 @@ export default function ChapterEvaluator() {
             <Card className="p-5">
               <div className="flex items-center gap-3 mb-2">
                 <BookOpen size={22} className="text-green-500" />
-                <span className="text-sm text-gray-500">完整度</span>
+                <span className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>完整度</span>
               </div>
               <div className={`text-2xl font-bold ${scoreText(result.scores.completeness)}`}>
                 {(result.scores.completeness * 100).toFixed(0)}%
@@ -134,7 +140,7 @@ export default function ChapterEvaluator() {
           </div>
 
           <Card className="mb-6">
-            <h2 className="text-lg font-semibold text-gray-800 mb-4">维度详情</h2>
+            <h2 className={`text-lg font-semibold mb-4 ${isDark ? 'text-white' : 'text-gray-800'}`}>维度详情</h2>
             <div className="space-y-4">
               {[
                 { key: 'info_gain', label: '信息增量', value: result.scores.info_gain },
@@ -144,10 +150,10 @@ export default function ChapterEvaluator() {
               ].map((item) => (
                 <div key={item.key}>
                   <div className="flex justify-between text-sm mb-1">
-                    <span className="text-gray-600">{item.label}</span>
+                    <span className={isDark ? 'text-gray-400' : 'text-gray-600'}>{item.label}</span>
                     <span className={scoreText(item.value)}>{(item.value * 100).toFixed(0)}%</span>
                   </div>
-                  <div className="w-full bg-gray-200 rounded-full h-3 overflow-hidden">
+                  <div className={`w-full rounded-full h-3 overflow-hidden ${isDark ? 'bg-gray-700' : 'bg-gray-200'}`}>
                     <div className={`h-full ${scoreColor(item.value)}`} style={{ width: `${item.value * 100}%` }} />
                   </div>
                 </div>
@@ -156,22 +162,22 @@ export default function ChapterEvaluator() {
           </Card>
 
           <Card>
-            <h2 className="text-lg font-semibold text-gray-800 mb-4">判定结果</h2>
-            <div className={`p-4 rounded-lg ${result.should_end ? 'bg-green-50 border border-green-200' : 'bg-yellow-50 border border-yellow-200'}`}>
+            <h2 className={`text-lg font-semibold mb-4 ${isDark ? 'text-white' : 'text-gray-800'}`}>判定结果</h2>
+            <div className={`p-4 rounded-lg ${result.should_end ? (isDark ? 'bg-green-900/30 border border-green-700' : 'bg-green-50 border border-green-200') : (isDark ? 'bg-yellow-900/30 border border-yellow-700' : 'bg-yellow-50 border border-yellow-200')}`}>
               <div className="flex items-center gap-2 mb-2">
                 <CheckCircle2 className={result.should_end ? 'text-green-600' : 'text-yellow-600'} size={20} />
-                <span className={`font-semibold ${result.should_end ? 'text-green-700' : 'text-yellow-700'}`}>
+                <span className={`font-semibold ${result.should_end ? (isDark ? 'text-green-400' : 'text-green-700') : (isDark ? 'text-yellow-400' : 'text-yellow-700')}`}>
                   {result.should_end ? '建议可以收尾' : '建议暂不收尾'}
                 </span>
               </div>
-              <p className="text-sm text-gray-700 leading-relaxed">{result.reason}</p>
+              <p className={`text-sm leading-relaxed ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>{result.reason}</p>
               {result.suggested_continuation && (
-                <p className="text-sm text-gray-600 mt-3">后续建议：{result.suggested_continuation}</p>
+                <p className={`text-sm mt-3 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>后续建议：{result.suggested_continuation}</p>
               )}
             </div>
           </Card>
         </>
       )}
-    </div>
+    </PageLayout>
   )
 }

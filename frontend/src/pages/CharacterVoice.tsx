@@ -1,10 +1,15 @@
 import { useEffect, useState } from 'react'
 import { Card, Button, Input, TextArea } from '@/components/ui'
+import PageLayout from '@/components/PageLayout'
 import { getCharacters, getCharacter, updateCharacter } from '@/api/characters'
 import type { Character, UpdateCharacterDTO } from '@/api/characters'
 import { Mic2, Plus, X, Volume2, Ban } from 'lucide-react'
+import { useTheme } from '@/contexts/ThemeContext'
 
 export default function CharacterVoice() {
+  const { theme } = useTheme()
+  const isDark = theme === 'dark'
+
   const [characters, setCharacters] = useState<Character[]>([])
   const [selectedId, setSelectedId] = useState<string>('')
   const [loading, setLoading] = useState(true)
@@ -92,31 +97,36 @@ export default function CharacterVoice() {
   }
 
   return (
-    <div>
-      <div className="flex items-center justify-between mb-8">
-        <h1 className="text-3xl font-bold text-gray-800">🗣️ 角色声音管理</h1>
+    <PageLayout
+      title="角色声音管理"
+      description="管理角色说话风格、常用词汇和禁用词"
+      actions={
         <Button onClick={saveVoiceConfig} loading={saving} disabled={!form}>
           <Mic2 size={18} className="mr-2" />保存声音配置
         </Button>
-      </div>
-
+      }
+    >
       {loading ? (
-        <div className="text-center py-12 text-gray-500">加载角色中...</div>
+        <div className={`text-center py-12 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>加载角色中...</div>
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
           <Card className="lg:col-span-1">
-            <h2 className="font-semibold text-gray-800 mb-4">角色列表</h2>
+            <h2 className={`font-semibold mb-4 ${isDark ? 'text-white' : 'text-gray-800'}`}>角色列表</h2>
             <div className="space-y-2">
               {characters.map((character) => (
                 <button
                   key={character.id}
                   onClick={() => selectCharacter(character.id || '')}
                   className={`w-full text-left p-3 rounded-lg transition-colors ${
-                    selectedId === character.id ? 'bg-blue-50 text-blue-700' : 'hover:bg-gray-50'
+                    selectedId === character.id
+                      ? 'bg-blue-900/30 text-blue-300'
+                      : isDark
+                        ? 'hover:bg-gray-800 text-gray-300'
+                        : 'hover:bg-gray-50 text-gray-800'
                   }`}
                 >
                   <p className="font-medium">{character.name}</p>
-                  <p className="text-xs text-gray-500 mt-1">{character.role}</p>
+                  <p className={`text-xs mt-1 ${isDark ? 'text-gray-500' : 'text-gray-500'}`}>{character.role}</p>
                 </button>
               ))}
             </div>
@@ -125,14 +135,14 @@ export default function CharacterVoice() {
           <div className="lg:col-span-3 space-y-6">
             {!form ? (
               <Card>
-                <div className="text-center py-12 text-gray-500">请选择一个角色开始配置</div>
+                <div className={`text-center py-12 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>请选择一个角色开始配置</div>
               </Card>
             ) : (
               <>
                 <Card>
                   <div className="flex items-center gap-3 mb-4">
                     <Volume2 size={20} className="text-blue-600" />
-                    <h2 className="font-semibold text-gray-800">说话风格</h2>
+                    <h2 className={`font-semibold ${isDark ? 'text-white' : 'text-gray-800'}`}>说话风格</h2>
                   </div>
                   <TextArea
                     label="Speech Pattern"
@@ -145,14 +155,14 @@ export default function CharacterVoice() {
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                   <Card>
-                    <h2 className="font-semibold text-gray-800 mb-4">常用词汇表</h2>
+                    <h2 className={`font-semibold mb-4 ${isDark ? 'text-white' : 'text-gray-800'}`}>常用词汇表</h2>
                     <div className="flex gap-2 mb-4">
                       <Input value={newLexicon} onChange={(e) => setNewLexicon(e.target.value)} placeholder="新增常用词" />
                       <Button onClick={() => addListItem('lexicon', newLexicon, () => setNewLexicon(''))}><Plus size={16} /></Button>
                     </div>
                     <div className="flex flex-wrap gap-2">
                       {(form.lexicon || []).map((item, index) => (
-                        <span key={`${item}-${index}`} className="inline-flex items-center gap-1 px-3 py-1 bg-blue-100 text-blue-700 rounded-full text-sm">
+                        <span key={`${item}-${index}`} className={`inline-flex items-center gap-1 px-3 py-1 rounded-full text-sm ${isDark ? 'bg-blue-900 text-blue-300' : 'bg-blue-100 text-blue-700'}`}>
                           {item}
                           <button onClick={() => removeListItem('lexicon', index)}><X size={14} /></button>
                         </span>
@@ -163,7 +173,7 @@ export default function CharacterVoice() {
                   <Card>
                     <div className="flex items-center gap-2 mb-4">
                       <Ban size={18} className="text-red-600" />
-                      <h2 className="font-semibold text-gray-800">禁用词</h2>
+                      <h2 className={`font-semibold ${isDark ? 'text-white' : 'text-gray-800'}`}>禁用词</h2>
                     </div>
                     <div className="flex gap-2 mb-4">
                       <Input value={newForbidden} onChange={(e) => setNewForbidden(e.target.value)} placeholder="新增禁用词" />
@@ -171,7 +181,7 @@ export default function CharacterVoice() {
                     </div>
                     <div className="flex flex-wrap gap-2">
                       {(form.forbidden_words || []).map((item, index) => (
-                        <span key={`${item}-${index}`} className="inline-flex items-center gap-1 px-3 py-1 bg-red-100 text-red-700 rounded-full text-sm">
+                        <span key={`${item}-${index}`} className={`inline-flex items-center gap-1 px-3 py-1 rounded-full text-sm ${isDark ? 'bg-red-900 text-red-300' : 'bg-red-100 text-red-700'}`}>
                           {item}
                           <button onClick={() => removeListItem('forbidden_words', index)}><X size={14} /></button>
                         </span>
@@ -181,16 +191,16 @@ export default function CharacterVoice() {
                 </div>
 
                 <Card>
-                  <h2 className="font-semibold text-gray-800 mb-4">典型台词样本</h2>
+                  <h2 className={`font-semibold mb-4 ${isDark ? 'text-white' : 'text-gray-800'}`}>典型台词样本</h2>
                   <div className="flex gap-2 mb-4">
                     <Input value={newSample} onChange={(e) => setNewSample(e.target.value)} placeholder="新增典型台词" />
                     <Button onClick={() => addListItem('voice_samples', newSample, () => setNewSample(''))}><Plus size={16} /></Button>
                   </div>
                   <div className="space-y-3">
                     {(form.voice_samples || []).map((item, index) => (
-                      <div key={`${item}-${index}`} className="flex items-start justify-between gap-3 p-3 bg-gray-50 rounded-lg">
-                        <p className="text-sm text-gray-700">{item}</p>
-                        <button className="text-gray-400 hover:text-red-500" onClick={() => removeListItem('voice_samples', index)}>
+                      <div key={`${item}-${index}`} className={`flex items-start justify-between gap-3 p-3 rounded-lg ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
+                        <p className={`text-sm ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>{item}</p>
+                        <button className={`hover:text-red-500 ${isDark ? 'text-gray-500' : 'text-gray-400'}`} onClick={() => removeListItem('voice_samples', index)}>
                           <X size={16} />
                         </button>
                       </div>
@@ -202,6 +212,6 @@ export default function CharacterVoice() {
           </div>
         </div>
       )}
-    </div>
+    </PageLayout>
   )
 }

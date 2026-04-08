@@ -9,6 +9,7 @@ from langchain_core.language_models import BaseLanguageModel
 from langchain_core.messages import HumanMessage
 
 from app.agents.base import BaseAgent, AgentResponse
+from app.models.agent_template import AgentType
 
 logger = logging.getLogger(__name__)
 
@@ -16,12 +17,37 @@ logger = logging.getLogger(__name__)
 class MasterPlotterAgent(BaseAgent):
     """总编剧 Agent"""
 
+    AGENT_TYPE = AgentType.MASTER_PLOTTER
+
     def __init__(
         self,
         model: Optional[BaseLanguageModel] = None,
         config: Optional[Dict[str, Any]] = None,
+        project_id: Optional[str] = None,
+        system_prompt: Optional[str] = None,
     ):
-        system_prompt = """你是总编剧，负责把控主线进度和剧情走向。
+        # 如果没有提供 system_prompt 且没有 project_id，使用默认的硬编码 prompt（向后兼容）
+        if not system_prompt and not project_id:
+            system_prompt = self._build_default_system_prompt()
+
+        super().__init__(
+            name="MasterPlotterAgent",
+            model=model,
+            system_prompt=system_prompt,
+            config=config,
+            project_id=project_id,
+        )
+
+    def _get_default_variables(self) -> Dict[str, Any]:
+        """获取默认变量（MasterPlotter 特定）"""
+        return {
+            "agent_role": "总编剧",
+            "task_description": "把控主线进度和剧情走向",
+        }
+
+    def _build_default_system_prompt(self) -> str:
+        """构建默认系统提示（向后兼容）"""
+        return """你是总编剧，负责把控主线进度和剧情走向。
 
 你的职责：
 1. 评估当前剧情是否应该推进到下一阶段
@@ -38,13 +64,6 @@ class MasterPlotterAgent(BaseAgent):
     "forced_event": "强制推进事件（如触发阈值）",
     "next_milestone": "下一个剧情里程碑"
 }"""
-
-        super().__init__(
-            name="MasterPlotterAgent",
-            model=model,
-            system_prompt=system_prompt,
-            config=config,
-        )
 
     async def execute(self, input_data: Dict[str, Any]) -> AgentResponse:
         """

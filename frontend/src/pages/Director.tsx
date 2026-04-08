@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Card, Button, Input, TextArea, Modal } from '@/components/ui'
-import { useWebSocket } from '@/hooks/useWebSocket'
+import PageLayout from '@/components/PageLayout'
+import { useDynamicWebSocket } from '@/hooks/useWebSocket'
 import { getDirectorState, getSnapshotTree, getWorkflowGraph } from '@/api/director'
 import { getCharacters } from '@/api/characters'
 import { Play, Pause, RotateCcw, Zap, Target, BookOpen, MessageSquare, Map, GitBranch, RefreshCcw, Workflow, Mic, PenLine, FolderOpen, UserPlus, UserMinus, Users } from 'lucide-react'
 import { useProject } from '@/contexts/ProjectContext'
+import { useTheme } from '@/contexts/ThemeContext'
 
 interface AgentStatus {
   name: string
@@ -113,6 +115,9 @@ function parseCharacterMoods(value: string) {
 
 export default function Director() {
   const { currentProject } = useProject()
+  const { theme } = useTheme()
+  const isDark = theme === 'dark'
+
   const [sessionId, setSessionId] = useState<string>('')
   const [isGenerating, setIsGenerating] = useState(false)
   const [selectedAgent, setSelectedAgent] = useState<string>('')
@@ -150,8 +155,9 @@ export default function Director() {
     setLogs((prev) => [`[${timestamp}] ${message}`, ...prev.slice(0, 199)])
   }
 
-  const wsUrl = useMemo(
-    () => (sessionId.trim() ? `ws://localhost:8000/api/ws/connect/${sessionId.trim()}` : ''),
+  // 使用相对路径，WebSocket 基础 URL 从配置获取
+  const wsPath = useMemo(
+    () => (sessionId.trim() ? `/api/ws/connect/${sessionId.trim()}` : ''),
     [sessionId]
   )
 
@@ -203,7 +209,7 @@ export default function Director() {
     loadCharacters()
   }, [currentProject])
 
-  const { status: wsStatus, send } = useWebSocket(wsUrl, {
+  const { status: wsStatus, send } = useDynamicWebSocket(wsPath, {
     onOpen: () => addLog('WebSocket 已连接'),
     onClose: () => addLog('WebSocket 已关闭'),
     onError: () => addLog('WebSocket 连接异常'),
@@ -448,11 +454,11 @@ export default function Director() {
   const renderSnapshotTree = (nodes: SnapshotNode[], depth = 0): React.ReactNode => {
     return nodes.map((node) => (
       <div key={node.id} className="space-y-2">
-        <div className="rounded-lg border border-gray-200 p-3" style={{ marginLeft: `${depth * 16}px` }}>
+        <div className={`rounded-lg border p-3 ${isDark ? 'border-gray-700' : 'border-gray-200'}`} style={{ marginLeft: `${depth * 16}px` }}>
           <div className="flex items-center justify-between gap-3">
             <div>
-              <p className="text-sm font-medium text-gray-800">{node.name || node.id}</p>
-              <p className="text-xs text-gray-500">{node.snapshot_type} {node.is_branch ? '· 分支' : ''}</p>
+              <p className={`text-sm font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>{node.name || node.id}</p>
+              <p className={`text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>{node.snapshot_type} {node.is_branch ? '· 分支' : ''}</p>
               {node.branch_reason && <p className="text-xs text-purple-600 mt-1">{node.branch_reason}</p>}
             </div>
             <Button
@@ -469,32 +475,30 @@ export default function Director() {
     ))
   }
 
-  return (
-    <div>
-      <div className="flex items-center justify-between mb-8">
-        <h1 className="text-3xl font-bold text-gray-800">导演模式</h1>
-        <div className="flex items-center gap-4">
-          {currentProject && (
-            <span className="px-3 py-1 rounded-full text-sm bg-blue-100 text-blue-700">
-              📁 {currentProject.name}
-            </span>
-          )}
-          <span
-            className={`px-3 py-1 rounded-full text-sm ${
-              wsStatus === 'connected'
-                ? 'bg-green-100 text-green-700'
-                : wsStatus === 'connecting'
-                  ? 'bg-yellow-100 text-yellow-700'
-                  : 'bg-gray-100 text-gray-600'
-            }`}
-          >
-            {wsStatus === 'connected' ? '● 已连接' : wsStatus === 'connecting' ? '◐ 连接中' : '○ 未连接'}
-          </span>
-        </div>
-      </div>
+  const headerActions = (
+    <div className="flex items-center gap-4">
+      <span
+        className={`px-3 py-1 rounded-full text-sm ${
+          wsStatus === 'connected'
+            ? isDark ? 'bg-green-900 text-green-300' : 'bg-green-100 text-green-700'
+            : wsStatus === 'connecting'
+              ? isDark ? 'bg-yellow-900 text-yellow-300' : 'bg-yellow-100 text-yellow-700'
+              : isDark ? 'bg-gray-700 text-gray-300' : 'bg-gray-100 text-gray-600'
+        }`}
+      >
+        {wsStatus === 'connected' ? '● 已连接' : wsStatus === 'connecting' ? '◐ 连接中' : '○ 未连接'}
+      </span>
+    </div>
+  )
 
+  return (
+    <PageLayout
+      title="导演模式"
+      description={currentProject ? `项目: ${currentProject.name}` : undefined}
+      actions={headerActions}
+    >
       {!currentProject ? (
-        <div className="text-center py-20 text-gray-500">
+        <div className={`text-center py-20 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
           <FolderOpen size={48} className="mx-auto mb-4 opacity-50" />
           <p>请先在侧边栏选择一个项目</p>
         </div>
@@ -527,15 +531,15 @@ export default function Director() {
           <Card title="Agent 状态" className="mb-6">
             <div className="space-y-3">
               {agents.map((agent) => (
-                <div key={agent.name} className="flex items-center gap-3 p-3 bg-gray-50 rounded-lg">
+                <div key={agent.name} className={`flex items-center gap-3 p-3 rounded-lg ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
                   <div className={`w-3 h-3 rounded-full ${getAgentColor(agent.status)}`} />
                   <div className="flex-1">
-                    <p className="font-medium text-gray-800">{agent.name}</p>
-                    <p className="text-sm text-gray-500">{agent.message}</p>
+                    <p className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>{agent.name}</p>
+                    <p className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>{agent.message}</p>
                   </div>
                   {agent.progress !== undefined && (
                     <div className="w-32">
-                      <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
+                      <div className={`h-2 rounded-full overflow-hidden ${isDark ? 'bg-gray-700' : 'bg-gray-200'}`}>
                         <div className="h-full bg-blue-500 transition-all" style={{ width: `${agent.progress}%` }} />
                       </div>
                     </div>
@@ -619,7 +623,7 @@ export default function Director() {
           <Card title="角色管理" className="mb-6">
             <div className="space-y-4">
               <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2 text-gray-600">
+                <div className={`flex items-center gap-2 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>
                   <Users size={18} />
                   <span>当前角色 ({availableCharacters.length})</span>
                 </div>
@@ -633,17 +637,17 @@ export default function Director() {
               </div>
 
               {availableCharacters.length === 0 ? (
-                <p className="text-sm text-gray-500 text-center py-4">暂无角色，请先在项目中创建角色</p>
+                <p className={`text-sm text-center py-4 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>暂无角色，请先在项目中创建角色</p>
               ) : (
                 <div className="space-y-2 max-h-48 overflow-y-auto">
                   {availableCharacters.map((char) => (
                     <div
                       key={char.id}
-                      className="flex items-center justify-between p-3 bg-gray-50 rounded-lg"
+                      className={`flex items-center justify-between p-3 rounded-lg ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}
                     >
                       <div>
-                        <span className="font-medium text-gray-800">{char.name}</span>
-                        <span className="text-xs text-gray-500 ml-2">{char.id}</span>
+                        <span className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>{char.name}</span>
+                        <span className={`text-xs ml-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>{char.id}</span>
                       </div>
                       <Button
                         variant="secondary"
@@ -662,30 +666,30 @@ export default function Director() {
 
           <Card title="声音审查面板" className="mb-6">
             {!dialoguePanel ? (
-              <p className="text-sm text-gray-500">暂无对话结果。执行“生成对话”或工作流后会显示声音审查数据。</p>
+              <p className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>暂无对话结果。执行"生成对话"或工作流后会显示声音审查数据。</p>
             ) : (
               <div className="space-y-4 text-sm">
-                <div className="rounded-lg bg-gray-50 p-4">
-                  <div className="flex items-center gap-2 mb-2 text-gray-800 font-medium">
+                <div className={`rounded-lg p-4 ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
+                  <div className={`flex items-center gap-2 mb-2 font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>
                     <Mic size={16} /> 最新对话
                   </div>
                   <p><span className="font-medium">角色：</span>{dialoguePanel.speaker_id || '-'}</p>
-                  <p className="mt-2 whitespace-pre-wrap text-gray-700">{dialoguePanel.dialogue || '-'}</p>
-                  {dialoguePanel.action ? <p className="mt-2 text-gray-500">动作：{dialoguePanel.action}</p> : null}
-                  {dialoguePanel.emotion ? <p className="text-gray-500">情绪：{dialoguePanel.emotion}</p> : null}
+                  <p className={`mt-2 whitespace-pre-wrap ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>{dialoguePanel.dialogue || '-'}</p>
+                  {dialoguePanel.action ? <p className={`mt-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>动作：{dialoguePanel.action}</p> : null}
+                  {dialoguePanel.emotion ? <p className={isDark ? 'text-gray-400' : 'text-gray-500'}>情绪：{dialoguePanel.emotion}</p> : null}
                 </div>
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div className="rounded-lg border p-4">
-                    <h3 className="font-medium text-gray-800 mb-2">声音上下文</h3>
-                    <p>向量检索：{dialoguePanel.voice_context?.used_qdrant ? '已启用' : '未启用'}</p>
-                    <p>命中样本数：{dialoguePanel.voice_context?.retrieved_count || 0}</p>
+                  <div className={`rounded-lg border p-4 ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+                    <h3 className={`font-medium mb-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>声音上下文</h3>
+                    <p className={isDark ? 'text-gray-300' : 'text-gray-700'}>向量检索：{dialoguePanel.voice_context?.used_qdrant ? '已启用' : '未启用'}</p>
+                    <p className={isDark ? 'text-gray-300' : 'text-gray-700'}>命中样本数：{dialoguePanel.voice_context?.retrieved_count || 0}</p>
                     <div className="mt-2 space-y-2">
                       {(dialoguePanel.voice_context?.retrieved_samples || []).length === 0 ? (
-                        <p className="text-gray-500">暂无参考样本</p>
+                        <p className={isDark ? 'text-gray-400' : 'text-gray-500'}>暂无参考样本</p>
                       ) : (
                         dialoguePanel.voice_context?.retrieved_samples?.map((sample, index) => (
-                          <div key={`${sample}-${index}`} className="rounded bg-gray-50 p-2 text-gray-700">
+                          <div key={`${sample}-${index}`} className={`rounded p-2 ${isDark ? 'bg-gray-700 text-gray-300' : 'bg-gray-50 text-gray-700'}`}>
                             {sample}
                           </div>
                         ))
@@ -693,20 +697,20 @@ export default function Director() {
                     </div>
                   </div>
 
-                  <div className="rounded-lg border p-4">
-                    <h3 className="font-medium text-gray-800 mb-2">OOC 审查</h3>
-                    <p>已审查：{dialoguePanel.voice_review?.checked ? '是' : '否'}</p>
-                    <p>结果：{dialoguePanel.voice_review?.is_ooc ? '检测到 OOC' : '通过'}</p>
-                    <p>置信度：{typeof dialoguePanel.voice_review?.confidence === 'number' ? dialoguePanel.voice_review.confidence.toFixed(3) : '-'}</p>
+                  <div className={`rounded-lg border p-4 ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+                    <h3 className={`font-medium mb-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>OOC 审查</h3>
+                    <p className={isDark ? 'text-gray-300' : 'text-gray-700'}>已审查：{dialoguePanel.voice_review?.checked ? '是' : '否'}</p>
+                    <p className={isDark ? 'text-gray-300' : 'text-gray-700'}>结果：{dialoguePanel.voice_review?.is_ooc ? '检测到 OOC' : '通过'}</p>
+                    <p className={isDark ? 'text-gray-300' : 'text-gray-700'}>置信度：{typeof dialoguePanel.voice_review?.confidence === 'number' ? dialoguePanel.voice_review.confidence.toFixed(3) : '-'}</p>
                     {dialoguePanel.voice_review?.suggestion ? (
                       <p className="mt-2 text-amber-700">建议：{dialoguePanel.voice_review.suggestion}</p>
                     ) : null}
                     <div className="mt-2 space-y-2">
                       {(dialoguePanel.voice_review?.issues || []).length === 0 ? (
-                        <p className="text-gray-500">无明显问题</p>
+                        <p className={isDark ? 'text-gray-400' : 'text-gray-500'}>无明显问题</p>
                       ) : (
                         dialoguePanel.voice_review?.issues?.map((issue, index) => (
-                          <div key={`${issue}-${index}`} className="rounded bg-red-50 p-2 text-red-700">
+                          <div key={`${issue}-${index}`} className={`rounded p-2 ${isDark ? 'bg-red-900 text-red-300' : 'bg-red-50 text-red-700'}`}>
                             {issue}
                           </div>
                         ))
@@ -715,9 +719,9 @@ export default function Director() {
                   </div>
                 </div>
 
-                <div className="rounded-lg border p-4">
-                  <h3 className="font-medium text-gray-800 mb-2">自动重写结果</h3>
-                  <p>是否重写：{dialoguePanel.rewrite_result?.applied ? '已重写' : '未触发'}</p>
+                <div className={`rounded-lg border p-4 ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+                  <h3 className={`font-medium mb-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>自动重写结果</h3>
+                  <p className={isDark ? 'text-gray-300' : 'text-gray-700'}>是否重写：{dialoguePanel.rewrite_result?.applied ? '已重写' : '未触发'}</p>
                   {dialoguePanel.rewrite_result?.original_dialogue ? (
                     <div className="mt-3 rounded bg-amber-50 p-3">
                       <p className="text-xs font-medium text-amber-800 mb-1">重写前</p>
@@ -727,7 +731,7 @@ export default function Director() {
                   {(dialoguePanel.rewrite_result?.changes_made || []).length > 0 ? (
                     <div className="mt-3 space-y-2">
                       {dialoguePanel.rewrite_result?.changes_made?.map((change, index) => (
-                        <div key={`${change}-${index}`} className="rounded bg-green-50 p-2 text-green-700">
+                        <div key={`${change}-${index}`} className={`rounded p-2 ${isDark ? 'bg-green-900 text-green-300' : 'bg-green-50 text-green-700'}`}>
                           {change}
                         </div>
                       ))}
@@ -740,38 +744,38 @@ export default function Director() {
 
           <Card title="叙事闭环面板" className="mb-6">
             {!narrativePanel ? (
-              <p className="text-sm text-gray-500">暂无叙事结果。执行“生成叙事”或工作流后会显示叙事闭环数据。</p>
+              <p className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>暂无叙事结果。执行"生成叙事"或工作流后会显示叙事闭环数据。</p>
             ) : (
               <div className="space-y-4 text-sm">
-                <div className="rounded-lg bg-gray-50 p-4">
-                  <div className="flex items-center gap-2 mb-2 text-gray-800 font-medium">
+                <div className={`rounded-lg p-4 ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
+                  <div className={`flex items-center gap-2 mb-2 font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>
                     <PenLine size={16} /> 最新叙事
                   </div>
-                  <p className="text-xs text-gray-500">字数：{narrativePanel.word_count || 0}</p>
-                  <p className="mt-2 whitespace-pre-wrap text-gray-700">{narrativePanel.content || '-'}</p>
+                  <p className={`text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>字数：{narrativePanel.word_count || 0}</p>
+                  <p className={`mt-2 whitespace-pre-wrap ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>{narrativePanel.content || '-'}</p>
                 </div>
 
-                <div className="rounded-lg border p-4">
-                  <h3 className="font-medium text-gray-800 mb-2">叙事声音审查</h3>
-                  <p>已审查：{narrativePanel.voice_review?.checked ? '是' : '否'}</p>
-                  <p>是否存在 OOC：{narrativePanel.voice_review?.has_ooc ? '是' : '否'}</p>
+                <div className={`rounded-lg border p-4 ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+                  <h3 className={`font-medium mb-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>叙事声音审查</h3>
+                  <p className={isDark ? 'text-gray-300' : 'text-gray-700'}>已审查：{narrativePanel.voice_review?.checked ? '是' : '否'}</p>
+                  <p className={isDark ? 'text-gray-300' : 'text-gray-700'}>是否存在 OOC：{narrativePanel.voice_review?.has_ooc ? '是' : '否'}</p>
                   {narrativePanel.voice_review?.reason ? (
-                    <p className="text-gray-500 mt-1">原因：{narrativePanel.voice_review.reason}</p>
+                    <p className={`mt-1 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>原因：{narrativePanel.voice_review.reason}</p>
                   ) : null}
                   <div className="mt-3 space-y-3">
                     {(narrativePanel.voice_review?.results || []).length === 0 ? (
-                      <p className="text-gray-500">暂无角色级审查结果</p>
+                      <p className={isDark ? 'text-gray-400' : 'text-gray-500'}>暂无角色级审查结果</p>
                     ) : (
                       narrativePanel.voice_review?.results?.map((entry, index) => (
-                        <div key={`${entry.character_id || 'entry'}-${index}`} className="rounded border bg-gray-50 p-3">
-                          <p className="font-medium text-gray-800">{entry.character_name || entry.character_id || '未知角色'}</p>
-                          <p className="text-xs text-gray-500 mt-1">Qdrant：{entry.voice_context?.used_qdrant ? '已启用' : '未启用'} / 命中样本：{entry.voice_context?.retrieved_count || 0}</p>
-                          <p className="mt-2">结果：{entry.voice_review?.is_ooc ? '检测到 OOC' : '通过'}</p>
+                        <div key={`${entry.character_id || 'entry'}-${index}`} className={`rounded border p-3 ${isDark ? 'bg-gray-800 border-gray-700' : 'bg-gray-50 border-gray-200'}`}>
+                          <p className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>{entry.character_name || entry.character_id || '未知角色'}</p>
+                          <p className={`text-xs mt-1 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>Qdrant：{entry.voice_context?.used_qdrant ? '已启用' : '未启用'} / 命中样本：{entry.voice_context?.retrieved_count || 0}</p>
+                          <p className={`mt-2 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>结果：{entry.voice_review?.is_ooc ? '检测到 OOC' : '通过'}</p>
                           {entry.voice_review?.suggestion ? <p className="text-amber-700 mt-1">建议：{entry.voice_review.suggestion}</p> : null}
                           {(entry.voice_review?.issues || []).length > 0 ? (
                             <div className="mt-2 space-y-1">
                               {entry.voice_review?.issues?.map((issue, issueIndex) => (
-                                <div key={`${issue}-${issueIndex}`} className="rounded bg-red-50 p-2 text-red-700">
+                                <div key={`${issue}-${issueIndex}`} className={`rounded p-2 ${isDark ? 'bg-red-900 text-red-300' : 'bg-red-50 text-red-700'}`}>
                                   {issue}
                                 </div>
                               ))}
@@ -783,11 +787,11 @@ export default function Director() {
                   </div>
                 </div>
 
-                <div className="rounded-lg border p-4">
-                  <h3 className="font-medium text-gray-800 mb-2">叙事自动重写</h3>
-                  <p>是否重写：{narrativePanel.rewrite_result?.applied ? '已重写' : '未触发'}</p>
+                <div className={`rounded-lg border p-4 ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+                  <h3 className={`font-medium mb-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>叙事自动重写</h3>
+                  <p className={isDark ? 'text-gray-300' : 'text-gray-700'}>是否重写：{narrativePanel.rewrite_result?.applied ? '已重写' : '未触发'}</p>
                   {narrativePanel.rewrite_result?.target_character_name ? (
-                    <p className="mt-1 text-gray-600">目标角色：{narrativePanel.rewrite_result.target_character_name}</p>
+                    <p className={`mt-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>目标角色：{narrativePanel.rewrite_result.target_character_name}</p>
                   ) : null}
                   {narrativePanel.rewrite_result?.original_content ? (
                     <div className="mt-3 rounded bg-amber-50 p-3">
@@ -798,7 +802,7 @@ export default function Director() {
                   {(narrativePanel.rewrite_result?.changes_made || []).length > 0 ? (
                     <div className="mt-3 space-y-2">
                       {narrativePanel.rewrite_result?.changes_made?.map((change, index) => (
-                        <div key={`${change}-${index}`} className="rounded bg-green-50 p-2 text-green-700">
+                        <div key={`${change}-${index}`} className={`rounded p-2 ${isDark ? 'bg-green-900 text-green-300' : 'bg-green-50 text-green-700'}`}>
                           {change}
                         </div>
                       ))}
@@ -812,7 +816,7 @@ export default function Director() {
           <Card title="第三阶段控制台">
             <div className="space-y-4">
               <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">区域生成提示</label>
+                <label className={`block text-sm font-medium mb-2 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>区域生成提示</label>
                 <TextArea value={regionPrompt} onChange={(e) => setRegionPrompt(e.target.value)} />
               </div>
               <div className="flex gap-3 flex-wrap">
@@ -853,7 +857,7 @@ export default function Director() {
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <Card title="运行时状态">
-          <div className="space-y-2 text-sm text-gray-700">
+          <div className={`space-y-2 text-sm ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
             <p>阶段：{runtimeState?.state_machine?.phase || '-'}</p>
             <p>当前快照：{runtimeState?.current_snapshot_id || '-'}</p>
             <p>主线进度：{typeof runtimeState?.main_plot_progress === 'number' ? `${Math.round(runtimeState.main_plot_progress * 100)}%` : '-'}</p>
@@ -864,23 +868,23 @@ export default function Director() {
         </Card>
 
         <Card title="工作流图">
-          <div className="space-y-2 text-sm text-gray-700">
-            <div className="flex items-center gap-2 mb-2 text-gray-800 font-medium">
+          <div className={`space-y-2 text-sm ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+            <div className={`flex items-center gap-2 mb-2 font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>
               <Workflow size={16} />工作流节点
             </div>
             {workflowGraph?.nodes?.map((node) => (
-              <div key={node.id} className="rounded bg-gray-50 px-3 py-2 border border-gray-200">
+              <div key={node.id} className={`rounded px-3 py-2 border ${isDark ? 'bg-gray-800 border-gray-700' : 'bg-gray-50 border-gray-200'}`}>
                 {node.label}
               </div>
-            )) || <p className="text-gray-500">暂无工作流数据</p>}
+            )) || <p className={isDark ? 'text-gray-400' : 'text-gray-500'}>暂无工作流数据</p>}
           </div>
         </Card>
 
         <Card title="版本树 / 快照树">
           <div className="space-y-3 max-h-[360px] overflow-y-auto">
-            {snapshotTree.length > 0 ? renderSnapshotTree(snapshotTree) : <p className="text-sm text-gray-500">暂无快照树数据</p>}
-            <div className="pt-2 border-t border-gray-100">
-              <p className="text-xs text-gray-500 mb-2">当前选择回档快照</p>
+            {snapshotTree.length > 0 ? renderSnapshotTree(snapshotTree) : <p className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>暂无快照树数据</p>}
+            <div className={`pt-2 border-t ${isDark ? 'border-gray-700' : 'border-gray-100'}`}>
+              <p className={`text-xs mb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>当前选择回档快照</p>
               <Input value={rollbackSnapshotId} onChange={(e) => setRollbackSnapshotId(e.target.value)} placeholder="snapshot_id" />
             </div>
           </div>
@@ -890,9 +894,9 @@ export default function Director() {
       <Modal isOpen={showCommandModal} onClose={() => setShowCommandModal(false)} title="手动 Agent 指令">
         <div className="space-y-4">
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-2">选择 Agent</label>
+            <label className={`block text-sm font-medium mb-2 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>选择 Agent</label>
             <select
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
               value={selectedAgent}
               onChange={(e) => setSelectedAgent(e.target.value)}
             >
@@ -924,9 +928,9 @@ export default function Director() {
             placeholder="输入角色名称"
           />
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">角色类型</label>
+            <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>角色类型</label>
             <select
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
               value={newCharacterForm.role}
               onChange={(e) => setNewCharacterForm({ ...newCharacterForm, role: e.target.value })}
             >
@@ -965,6 +969,6 @@ export default function Director() {
       </Modal>
         </>
       )}
-    </div>
+    </PageLayout>
   )
 }

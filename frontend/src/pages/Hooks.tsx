@@ -1,8 +1,10 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Card, Button, Input, TextArea, Modal } from '@/components/ui'
+import PageLayout from '@/components/PageLayout'
 import { getHooks, createHook, updateHookStatus } from '@/api/chapters'
 import { Plus, Flag, CheckCircle, Clock, XCircle, Trash2, Edit, FolderOpen } from 'lucide-react'
 import { useProject } from '@/contexts/ProjectContext'
+import { useTheme } from '@/contexts/ThemeContext'
 
 interface Hook {
   id?: string
@@ -32,6 +34,9 @@ interface CreateHookDTO {
 
 export default function Hooks() {
   const { currentProject } = useProject()
+  const { theme } = useTheme()
+  const isDark = theme === 'dark'
+
   const [hooks, setHooks] = useState<Hook[]>([])
   const [showModal, setShowModal] = useState(false)
   const [editingHook, setEditingHook] = useState<Hook | null>(null)
@@ -134,6 +139,15 @@ export default function Hooks() {
   }
 
   const getStatusClass = (status: string) => {
+    if (isDark) {
+      switch (status) {
+        case 'planted': return 'bg-blue-900 text-blue-300'
+        case 'triggered': return 'bg-yellow-900 text-yellow-300'
+        case 'resolved': return 'bg-green-900 text-green-300'
+        case 'dropped': return 'bg-gray-700 text-gray-400'
+        default: return 'bg-gray-700'
+      }
+    }
     switch (status) {
       case 'planted': return 'bg-blue-100 text-blue-700'
       case 'triggered': return 'bg-yellow-100 text-yellow-700'
@@ -167,17 +181,18 @@ export default function Hooks() {
   }
 
   return (
-    <div>
-      <div className="flex items-center justify-between mb-8">
-        <h1 className="text-3xl font-bold text-gray-800">🎯 伏笔管理</h1>
+    <PageLayout
+      title="伏笔管理"
+      description="管理小说中的伏笔埋设与回收"
+      actions={
         <Button onClick={openCreateModal} disabled={!currentProject}>
           <Plus size={20} className="mr-2" />
           新建伏笔
         </Button>
-      </div>
-
+      }
+    >
       {!currentProject ? (
-        <div className="text-center py-20 text-gray-500">
+        <div className={`text-center py-20 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
           <FolderOpen size={48} className="mx-auto mb-4 opacity-50" />
           <p>请先在侧边栏选择一个项目</p>
         </div>
@@ -198,7 +213,9 @@ export default function Hooks() {
                 className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
                   filterStatus === s.key
                     ? 'bg-blue-500 text-white'
-                    : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                    : isDark
+                      ? 'bg-gray-800 text-gray-300 hover:bg-gray-700'
+                      : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
                 }`}
               >
                 {s.label} ({statusCounts[s.key as keyof typeof statusCounts]})
@@ -207,159 +224,159 @@ export default function Hooks() {
           </div>
 
           {loading ? (
-        <div className="flex items-center justify-center py-20">
-          <Flag size={24} className="animate-spin mr-3" />
-          <span className="text-gray-500">加载伏笔...</span>
-        </div>
-      ) : (
-        <div className="grid grid-cols-1 gap-4">
-          {filteredHooks.length === 0 ? (
-            <Card>
-              <div className="text-center py-12 text-gray-500">
-                <Flag size={48} className="mx-auto mb-4 opacity-50" />
-                <p>暂无伏笔记录</p>
-                <p className="text-sm mt-2">点击"新建伏笔"开始创建</p>
-              </div>
-            </Card>
+            <div className="flex items-center justify-center py-20">
+              <Flag size={24} className="animate-spin mr-3" />
+              <span className={isDark ? 'text-gray-400' : 'text-gray-500'}>加载伏笔...</span>
+            </div>
           ) : (
-            filteredHooks.map((hook) => (
-              <Card key={hook.id} className="hover:shadow-md transition-shadow">
-                <div className="flex items-start justify-between">
-                  <div className="flex items-start gap-4 flex-1">
-                    <div className="mt-1">{getStatusIcon(hook.status)}</div>
-                    <div className="flex-1">
-                      <div className="flex items-center gap-3">
-                        <h3 className="font-semibold text-lg text-gray-800">{hook.title}</h3>
-                        <span className={`text-xs px-2 py-0.5 rounded ${getStatusClass(hook.status)}`}>
-                          {getStatusLabel(hook.status)}
-                        </span>
-                        <span className="text-xs px-2 py-0.5 rounded bg-purple-100 text-purple-700">
-                          {getTypeLabel(hook.hook_type)}
-                        </span>
-                        {hook.priority && hook.priority >= 3 && (
-                          <span className="text-xs px-2 py-0.5 rounded bg-red-100 text-red-700">
-                            高优先级
-                          </span>
-                        )}
+            <div className="grid grid-cols-1 gap-4">
+              {filteredHooks.length === 0 ? (
+                <Card>
+                  <div className={`text-center py-12 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+                    <Flag size={48} className="mx-auto mb-4 opacity-50" />
+                    <p>暂无伏笔记录</p>
+                    <p className="text-sm mt-2">点击"新建伏笔"开始创建</p>
+                  </div>
+                </Card>
+              ) : (
+                filteredHooks.map((hook) => (
+                  <Card key={hook.id} className="hover:shadow-md transition-shadow">
+                    <div className="flex items-start justify-between">
+                      <div className="flex items-start gap-4 flex-1">
+                        <div className="mt-1">{getStatusIcon(hook.status)}</div>
+                        <div className="flex-1">
+                          <div className="flex items-center gap-3 flex-wrap">
+                            <h3 className={`font-semibold text-lg ${isDark ? 'text-white' : 'text-gray-800'}`}>{hook.title}</h3>
+                            <span className={`text-xs px-2 py-0.5 rounded ${getStatusClass(hook.status)}`}>
+                              {getStatusLabel(hook.status)}
+                            </span>
+                            <span className={`text-xs px-2 py-0.5 rounded ${isDark ? 'bg-purple-900 text-purple-300' : 'bg-purple-100 text-purple-700'}`}>
+                              {getTypeLabel(hook.hook_type)}
+                            </span>
+                            {hook.priority && hook.priority >= 3 && (
+                              <span className={`text-xs px-2 py-0.5 rounded ${isDark ? 'bg-red-900 text-red-300' : 'bg-red-100 text-red-700'}`}>
+                                高优先级
+                              </span>
+                            )}
+                          </div>
+                          <p className={`text-sm mt-2 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>{hook.description}</p>
+                          <div className={`flex items-center gap-4 mt-3 text-xs ${isDark ? 'text-gray-500' : 'text-gray-500'}`}>
+                            {hook.plant_chapter && (
+                              <span>埋设章节：{hook.plant_chapter}</span>
+                            )}
+                            {hook.resolution_chapter && (
+                              <span>回收章节：{hook.resolution_chapter}</span>
+                            )}
+                            {hook.created_at && (
+                              <span>创建时间：{new Date(hook.created_at).toLocaleDateString('zh-CN')}</span>
+                            )}
+                          </div>
+                        </div>
                       </div>
-                      <p className="text-sm text-gray-600 mt-2">{hook.description}</p>
-                      <div className="flex items-center gap-4 mt-3 text-xs text-gray-500">
-                        {hook.plant_chapter && (
-                          <span>埋设章节：{hook.plant_chapter}</span>
-                        )}
-                        {hook.resolution_chapter && (
-                          <span>回收章节：{hook.resolution_chapter}</span>
-                        )}
-                        {hook.created_at && (
-                          <span>创建时间：{new Date(hook.created_at).toLocaleDateString('zh-CN')}</span>
-                        )}
+                      <div className="flex items-center gap-2">
+                        <div className="relative group">
+                          <Button variant="secondary" size="sm">
+                            变更状态
+                          </Button>
+                          <div className={`absolute right-0 top-full mt-1 rounded-lg shadow-lg border py-1 hidden group-hover:block z-10 min-w-[120px] ${isDark ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'}`}>
+                            <button
+                              onClick={() => updateStatus(hook.id, 'planted')}
+                              className={`w-full text-left px-4 py-2 text-sm hover:bg-gray-50 flex items-center gap-2 ${isDark ? 'hover:bg-gray-700 text-gray-300' : ''}`}
+                            >
+                              <Clock size={14} /> 已埋设
+                            </button>
+                            <button
+                              onClick={() => updateStatus(hook.id, 'triggered')}
+                              className={`w-full text-left px-4 py-2 text-sm hover:bg-gray-50 flex items-center gap-2 ${isDark ? 'hover:bg-gray-700 text-gray-300' : ''}`}
+                            >
+                              <Flag size={14} /> 已触发
+                            </button>
+                            <button
+                              onClick={() => updateStatus(hook.id, 'resolved')}
+                              className={`w-full text-left px-4 py-2 text-sm hover:bg-gray-50 flex items-center gap-2 ${isDark ? 'hover:bg-gray-700 text-gray-300' : ''}`}
+                            >
+                              <CheckCircle size={14} /> 已回收
+                            </button>
+                            <button
+                              onClick={() => updateStatus(hook.id, 'dropped')}
+                              className={`w-full text-left px-4 py-2 text-sm hover:bg-gray-50 flex items-center gap-2 ${isDark ? 'hover:bg-gray-700 text-gray-300' : ''}`}
+                            >
+                              <XCircle size={14} /> 已废弃
+                            </button>
+                          </div>
+                        </div>
+                        <Button variant="secondary" size="sm" onClick={() => openEditModal(hook)}>
+                          <Edit size={16} />
+                        </Button>
+                        <Button variant="danger" size="sm" onClick={() => deleteHook(hook.id)}>
+                          <Trash2 size={16} />
+                        </Button>
                       </div>
                     </div>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <div className="relative group">
-                      <Button variant="secondary" size="sm">
-                        变更状态
-                      </Button>
-                      <div className="absolute right-0 top-full mt-1 bg-white rounded-lg shadow-lg border border-gray-200 py-1 hidden group-hover:block z-10 min-w-[120px]">
-                        <button
-                          onClick={() => updateStatus(hook.id, 'planted')}
-                          className="w-full text-left px-4 py-2 text-sm hover:bg-gray-50 flex items-center gap-2"
-                        >
-                          <Clock size={14} /> 已埋设
-                        </button>
-                        <button
-                          onClick={() => updateStatus(hook.id, 'triggered')}
-                          className="w-full text-left px-4 py-2 text-sm hover:bg-gray-50 flex items-center gap-2"
-                        >
-                          <Flag size={14} /> 已触发
-                        </button>
-                        <button
-                          onClick={() => updateStatus(hook.id, 'resolved')}
-                          className="w-full text-left px-4 py-2 text-sm hover:bg-gray-50 flex items-center gap-2"
-                        >
-                          <CheckCircle size={14} /> 已回收
-                        </button>
-                        <button
-                          onClick={() => updateStatus(hook.id, 'dropped')}
-                          className="w-full text-left px-4 py-2 text-sm hover:bg-gray-50 flex items-center gap-2"
-                        >
-                          <XCircle size={14} /> 已废弃
-                        </button>
-                      </div>
-                    </div>
-                    <Button variant="secondary" size="sm" onClick={() => openEditModal(hook)}>
-                      <Edit size={16} />
-                    </Button>
-                    <Button variant="danger" size="sm" onClick={() => deleteHook(hook.id)}>
-                      <Trash2 size={16} />
-                    </Button>
-                  </div>
-                </div>
-              </Card>
-            ))
+                  </Card>
+                ))
+              )}
+            </div>
           )}
-        </div>
-      )}
 
-      {/* 创建/编辑模态框 */}
-      <Modal
-        isOpen={showModal}
-        onClose={() => setShowModal(false)}
-        title={editingHook ? '编辑伏笔' : '新建伏笔'}
-        size="lg"
-      >
-        <div className="space-y-4">
-          <Input
-            label="伏笔标题 *"
-            value={formData.title}
-            onChange={(e) => setFormData({ ...formData, title: e.target.value })}
-            placeholder="如：神秘的黑衣人身份"
-            autoFocus
-          />
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">伏笔类型</label>
-              <select
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg"
-                value={formData.hook_type}
-                onChange={(e) => setFormData({ ...formData, hook_type: e.target.value })}
-              >
-                <option value="foreshadowing">伏笔</option>
-                <option value="character">角色线索</option>
-                <option value="plot">剧情线索</option>
-                <option value="object">物品线索</option>
-                <option value="location">地点线索</option>
-              </select>
+          {/* 创建/编辑模态框 */}
+          <Modal
+            isOpen={showModal}
+            onClose={() => setShowModal(false)}
+            title={editingHook ? '编辑伏笔' : '新建伏笔'}
+            size="lg"
+          >
+            <div className="space-y-4">
+              <Input
+                label="伏笔标题 *"
+                value={formData.title}
+                onChange={(e) => setFormData({ ...formData, title: e.target.value })}
+                placeholder="如：神秘的黑衣人身份"
+                autoFocus
+              />
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>伏笔类型</label>
+                  <select
+                    className={`w-full px-3 py-2 border rounded-lg ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
+                    value={formData.hook_type}
+                    onChange={(e) => setFormData({ ...formData, hook_type: e.target.value })}
+                  >
+                    <option value="foreshadowing">伏笔</option>
+                    <option value="character">角色线索</option>
+                    <option value="plot">剧情线索</option>
+                    <option value="object">物品线索</option>
+                    <option value="location">地点线索</option>
+                  </select>
+                </div>
+                <div>
+                  <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>优先级</label>
+                  <select
+                    className={`w-full px-3 py-2 border rounded-lg ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
+                    value={formData.priority}
+                    onChange={(e) => setFormData({ ...formData, priority: parseInt(e.target.value) })}
+                  >
+                    <option value={1}>普通</option>
+                    <option value={2}>重要</option>
+                    <option value={3}>高优先级</option>
+                  </select>
+                </div>
+              </div>
+              <TextArea
+                label="伏笔描述"
+                value={formData.description}
+                onChange={(e) => setFormData({ ...formData, description: e.target.value })}
+                placeholder="描述这个伏笔的内容、作用..."
+                rows={4}
+              />
+              <div className="flex justify-end gap-3 pt-4">
+                <Button variant="secondary" onClick={() => setShowModal(false)}>取消</Button>
+                <Button onClick={saveHook}>{editingHook ? '保存修改' : '创建'}</Button>
+              </div>
             </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">优先级</label>
-              <select
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg"
-                value={formData.priority}
-                onChange={(e) => setFormData({ ...formData, priority: parseInt(e.target.value) })}
-              >
-                <option value={1}>普通</option>
-                <option value={2}>重要</option>
-                <option value={3}>高优先级</option>
-              </select>
-            </div>
-          </div>
-          <TextArea
-            label="伏笔描述"
-            value={formData.description}
-            onChange={(e) => setFormData({ ...formData, description: e.target.value })}
-            placeholder="描述这个伏笔的内容、作用..."
-            rows={4}
-          />
-          <div className="flex justify-end gap-3 pt-4">
-            <Button variant="secondary" onClick={() => setShowModal(false)}>取消</Button>
-            <Button onClick={saveHook}>{editingHook ? '保存修改' : '创建'}</Button>
-          </div>
-        </div>
-      </Modal>
+          </Modal>
         </>
       )}
-    </div>
+    </PageLayout>
   )
 }

@@ -1,12 +1,17 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Card, Button, Input, TextArea, Modal } from '@/components/ui'
+import PageLayout from '@/components/PageLayout'
 import { getWorlds, createWorld, updateWorld, deleteWorld } from '@/api/worlds'
 import type { World, CreateWorldDTO, UpdateWorldDTO } from '@/api/worlds'
 import { Plus, Edit, Trash2, Globe, FolderOpen } from 'lucide-react'
 import { useProject } from '@/contexts/ProjectContext'
+import { useTheme } from '@/contexts/ThemeContext'
 
 export default function Worlds() {
   const { currentProject } = useProject()
+  const { theme } = useTheme()
+  const isDark = theme === 'dark'
+
   const [worlds, setWorlds] = useState<World[]>([])
   const [showModal, setShowModal] = useState(false)
   const [editingWorld, setEditingWorld] = useState<World | null>(null)
@@ -98,29 +103,30 @@ export default function Worlds() {
   ]
 
   return (
-    <div>
-      <div className="flex items-center justify-between mb-8">
-        <h1 className="text-3xl font-bold text-gray-800">🌍 世界管理</h1>
+    <PageLayout
+      title="世界管理"
+      description="管理小说的世界观设定"
+      actions={
         <Button onClick={openCreateModal} disabled={!currentProject}>
           <Plus size={20} className="mr-2" />
           新建世界
         </Button>
-      </div>
-
+      }
+    >
       {!currentProject ? (
-        <div className="text-center py-20 text-gray-500">
+        <div className={`text-center py-20 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
           <FolderOpen size={48} className="mx-auto mb-4 opacity-50" />
           <p>请先在侧边栏选择一个项目</p>
         </div>
       ) : loading ? (
         <div className="flex items-center justify-center py-20">
           <Globe size={24} className="animate-spin mr-3" />
-          <span className="text-gray-500">加载世界...</span>
+          <span className={isDark ? 'text-gray-400' : 'text-gray-500'}>加载世界...</span>
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
           {worlds.length === 0 ? (
-            <div className="col-span-full text-center text-gray-500 py-12">
+            <div className={`col-span-full text-center py-12 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
               暂无世界设定，点击"新建世界"开始创建
             </div>
           ) : (
@@ -131,19 +137,19 @@ export default function Worlds() {
                     <Globe size={24} />
                   </div>
                   <div className="flex-1 min-w-0">
-                    <h3 className="font-semibold text-lg text-gray-800">{world.name}</h3>
+                    <h3 className={`font-semibold text-lg ${isDark ? 'text-white' : 'text-gray-800'}`}>{world.name}</h3>
                     <div className="flex items-center gap-2 mt-1">
-                      <span className="text-xs px-2 py-0.5 rounded bg-blue-100 text-blue-700">
+                      <span className={`text-xs px-2 py-0.5 rounded ${isDark ? 'bg-blue-900 text-blue-300' : 'bg-blue-100 text-blue-700'}`}>
                         {worldTypes.find((t) => t.value === world.world_type)?.label || '自定义'}
                       </span>
-                      <span className="text-xs px-2 py-0.5 rounded bg-purple-100 text-purple-700">
+                      <span className={`text-xs px-2 py-0.5 rounded ${isDark ? 'bg-purple-900 text-purple-300' : 'bg-purple-100 text-purple-700'}`}>
                         {toneOptions.find((t) => t.value === world.tone)?.label || '自定义'}
                       </span>
                     </div>
-                    <p className="text-sm text-gray-600 mt-2 line-clamp-3">{world.description}</p>
+                    <p className={`text-sm mt-2 line-clamp-3 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>{world.description}</p>
                   </div>
                 </div>
-                <div className="flex gap-2 mt-4 pt-4 border-t">
+                <div className={`flex gap-2 mt-4 pt-4 ${isDark ? 'border-gray-700' : 'border-gray-200'} border-t`}>
                   <Button variant="secondary" size="sm" onClick={() => openEditModal(world)}>
                     <Edit size={16} className="mr-1" /> 编辑
                   </Button>
@@ -167,9 +173,9 @@ export default function Worlds() {
           />
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">世界类型</label>
+              <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>世界类型</label>
               <select
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg"
+                className={`w-full px-3 py-2 border rounded-lg ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
                 value={formData.world_type}
                 onChange={(e) => setFormData({ ...formData, world_type: e.target.value })}
               >
@@ -179,9 +185,9 @@ export default function Worlds() {
               </select>
             </div>
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">故事基调</label>
+              <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>故事基调</label>
               <select
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg"
+                className={`w-full px-3 py-2 border rounded-lg ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
                 value={formData.tone}
                 onChange={(e) => setFormData({ ...formData, tone: e.target.value })}
               >
@@ -204,6 +210,6 @@ export default function Worlds() {
           </div>
         </div>
       </Modal>
-    </div>
+    </PageLayout>
   )
 }

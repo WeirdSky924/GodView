@@ -2,6 +2,6 @@
 API 路由包
 """
 
-from app.api.routes import characters, worlds, plots, websocket, config
+from app.api.routes import characters, worlds, plots, websocket, config, writing_rules, prompts, agent_templates, agent_configs
 
-__all__ = ["characters", "worlds", "plots", "websocket", "config"]
+__all__ = ["characters", "worlds", "plots", "websocket", "config", "writing_rules", "prompts", "agent_templates", "agent_configs"]

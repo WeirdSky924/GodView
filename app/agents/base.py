@@ -30,23 +30,58 @@ class AgentResponse(BaseModel):
 class BaseAgent(ABC):
     """Agent 基类"""
 
+    # 类属性，子类必须覆盖
+    AGENT_TYPE: Optional[str] = None
+
     def __init__(
         self,
         name: str,
         model: Optional[BaseLanguageModel] = None,
         system_prompt: Optional[str] = None,
         config: Optional[Dict[str, Any]] = None,
+        project_id: Optional[str] = None,
     ):
         self.name = name
         self.model = model
-        self.system_prompt = system_prompt or ""
         self.config = config or {}
+        self.project_id = project_id
         self.message_history: List = []
         self._lock = asyncio.Lock()
+
+        # 如果有 project_id 且没有手动指定 system_prompt，尝试从模板加载
+        if project_id and not system_prompt and self.AGENT_TYPE:
+            self.system_prompt = self._load_system_prompt()
+        else:
+            self.system_prompt = system_prompt or ""
 
     @abstractmethod
     async def execute(self, input_data: Dict[str, Any]) -> AgentResponse:
         pass
+
+    @abstractmethod
+    def _get_default_variables(self) -> Dict[str, Any]:
+        """
+        获取默认变量（子类实现）
+
+        Returns:
+            Dict: 默认变量字典，用于 Prompt 模板渲染
+        """
+        pass
+
+    def _load_system_prompt(self) -> str:
+        """
+        从模板系统加载 system prompt
+
+        Returns:
+            str: 加载的 system prompt，如果无法加载则返回空字符串
+        """
+        if not self.project_id or not self.AGENT_TYPE:
+            return ""
+
+        # TODO: 调用 AgentConfigService 获取最终 prompt
+        # 目前返回空字符串，等待服务注入
+        logger.debug(f"Agent {self.name} 尝试从模板加载 prompt (project={self.project_id}, type={self.AGENT_TYPE})")
+        return ""
 
     async def _call_llm(
         self,

@@ -6,10 +6,17 @@ export interface EmbeddingProviderInfo {
   description: string
   default_model: string
   default_url: string
-  default_dimension: number
   requires_api_key: boolean
   requires_local_install: boolean
   install_command?: string
+  models?: EmbeddingModelInfo[]
+}
+
+export interface EmbeddingModelInfo {
+  id: string
+  name: string
+  dimension: number
+  description: string
 }
 
 export interface LLMProviderInfo {
@@ -42,7 +49,6 @@ export interface EmbeddingConfig {
   model: string
   api_key: string
   base_url: string
-  dimension: number
 }
 
 export interface LLMConfig {
@@ -57,6 +63,14 @@ export interface LLMConfig {
 export interface ConfigResult {
   success: boolean
   message: string
+  dimension?: number
+}
+
+export interface DownloadProgress {
+  status: 'idle' | 'downloading' | 'completed' | 'error'
+  progress: number
+  message: string
+  model: string
 }
 
 export async function getEmbeddingProviders(): Promise<EmbeddingProviderInfo[]> {
@@ -64,8 +78,13 @@ export async function getEmbeddingProviders(): Promise<EmbeddingProviderInfo[]> 
   return response.data
 }
 
-export async function getEmbeddingConfig(): Promise<EmbeddingConfig> {
-  const response = await api.get<EmbeddingConfig>('/config/embedding')
+export async function getEmbeddingConfig(): Promise<EmbeddingConfig & { dimension: number }> {
+  const response = await api.get<EmbeddingConfig & { dimension: number }>('/config/embedding')
+  return response.data
+}
+
+export async function getEmbeddingProviderConfig(provider: string): Promise<EmbeddingConfig & { dimension?: number }> {
+  const response = await api.get<EmbeddingConfig & { dimension?: number }>(`/config/embedding/${provider}`)
   return response.data
 }
 
@@ -79,6 +98,11 @@ export async function testEmbeddingConfig(config?: Partial<EmbeddingConfig>): Pr
   return response.data
 }
 
+export async function getEmbeddingDownloadProgress(): Promise<DownloadProgress> {
+  const response = await api.get<DownloadProgress>('/config/embedding/download-progress')
+  return response.data
+}
+
 export async function getLLMProviders(): Promise<LLMProviderInfo[]> {
   const response = await api.get<LLMProviderInfo[]>('/config/llm/providers')
   return response.data
@@ -86,6 +110,11 @@ export async function getLLMProviders(): Promise<LLMProviderInfo[]> {
 
 export async function getLLMConfig(): Promise<LLMConfig> {
   const response = await api.get<LLMConfig>('/config/llm')
+  return response.data
+}
+
+export async function getLLMProviderConfig(provider: string): Promise<LLMConfig> {
+  const response = await api.get<LLMConfig>(`/config/llm/${provider}`)
   return response.data
 }
 
@@ -101,5 +130,27 @@ export async function testLLMConfig(config?: Partial<LLMConfig>): Promise<Config
 
 export async function getProviderModels(providerId: string): Promise<ProviderModelsResponse> {
   const response = await api.get<ProviderModelsResponse>(`/config/llm/providers/${providerId}/models`)
+  return response.data
+}
+
+export interface DatabaseStatus {
+  name: string
+  type: string
+  status: 'connected' | 'disconnected' | 'reachable' | 'error'
+  message: string
+  host: string
+}
+
+export interface DatabaseStatusResponse {
+  databases: DatabaseStatus[]
+  summary: {
+    connected: number
+    total: number
+    status: 'healthy' | 'degraded' | 'error'
+  }
+}
+
+export async function getDatabaseStatus(): Promise<DatabaseStatusResponse> {
+  const response = await api.get<DatabaseStatusResponse>('/config/database/status')
   return response.data
 }

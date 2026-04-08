@@ -1,82 +1,139 @@
-"""
-Docker Compose 配置
-用于快速启动开发环境（PostgreSQL + NebulaGraph + Qdrant）
-"""
-
-version: '3.8'
-
 services:
-  # PostgreSQL
+  # PostgreSQL 数据库
   postgres:
-    image: postgres:15-alpine
+    image: postgres:16-alpine
     container_name: godview-postgres
+    restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: password
       POSTGRES_DB: godview
+      # 性能优化
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.UTF-8"
     ports:
       - "5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - ./data/postgres:/var/lib/postgresql/data
+      - ./init/sql:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 5s
+      interval: 10s
       timeout: 5s
       retries: 5
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=256MB"
+      - "-c"
+      - "work_mem=64MB"
+      - "-c"
+      - "maintenance_work_mem=128MB"
+      - "-c"
+      - "effective_cache_size=512MB"
 
-  # NebulaGraph Graphd
-  graphd:
-    image: vesoft/graphd-nebula-v3.6.0
-    container_name: godview-graphd
-    depends_on:
-      - metastore
-      - storaged
-    environment:
-      - META_SERVER_ADDRESSES=metad0:9559
-      - LOGTOSTDERR=true
-    ports:
-      - "9669:9669"
-      - "19669:19669"
-    command: --minloglevel=2
-
-  # NebulaGraph Metastore
-  metastore:
-    image: vesoft/metad-nebula-v3.6.0
-    container_name: godview-metad
-    depends_on:
-      - storaged
-    environment:
-      - SERVERS_ONLINE=false
-      - LOGTOSTDERR=true
-    ports:
-      - "9559:9559"
-      - "19559:19559"
-    command: --minloglevel=2
-
-  # NebulaGraph Storage
-  storaged:
-    image: vesoft/storaged-nebula-v3.6.0
-    container_name: godview-storaged
-    environment:
-      - LOGTOSTDERR=true
-    ports:
-      - "9779:9779"
-      - "19779:19779"
-    command: --minloglevel=2
-
-  # Qdrant
+  # Qdrant 向量数据库
   qdrant:
     image: qdrant/qdrant:latest
     container_name: godview-qdrant
+    restart: unless-stopped
     ports:
       - "6333:6333"
       - "6334:6334"
     volumes:
-      - qdrant_storage:/qdrant/storage
+      - ./data/qdrant:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 5 sh -c 'curl -f http://localhost:6333/ || exit 1' || exit 0"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
     environment:
-      - QDRANT__SERVICE__HTTP_PORT=6333
-      - QDRANT__SERVICE__GRPC_PORT=6334
+      QDRANT__LOG_LEVEL: INFO
 
-volumes:
-  postgres_data:
-  qdrant_storage:
+  # NebulaGraph 图数据库
+  nebula:
+    image: vesoft/nebula-graphd:v3
+    container_name: godview-nebula-graphd
+    restart: unless-stopped
+    environment:
+      USER: root
+    ports:
+      - "9669:9669"
+      - "19669:19669"
+    depends_on:
+      - nebula-metad
+      - nebula-storaged
+    networks:
+      godview-network:
+        aliases:
+          - nebula-graphd
+    entrypoint: ["/usr/local/nebula/bin/nebula-graphd"]
+    command:
+      - "--flagfile=/usr/local/nebula/etc/nebula-graphd.conf"
+      - "--daemonize=false"
+      - "--containerized=true"
+      - "--meta_server_addrs=nebula-metad:9559"
+      - "--local_ip=nebula"
+      - "--port=9669"
+      - "--ws_ip=0.0.0.0"
+      - "--ws_http_port=19669"
+      - "--enable_ssl=false"
+
+  nebula-metad:
+    image: vesoft/nebula-metad:v3
+    container_name: godview-nebula-metad
+    restart: unless-stopped
+    environment:
+      USER: root
+    ports:
+      - "9559:9559"
+      - "19559:19559"
+    volumes:
+      - ./data/nebula/meta:/data/meta
+    networks:
+      godview-network:
+        aliases:
+          - nebula-metad
+    entrypoint: ["/usr/local/nebula/bin/nebula-metad"]
+    command:
+      - "--flagfile=/usr/local/nebula/etc/nebula-metad.conf"
+      - "--daemonize=false"
+      - "--containerized=true"
+      - "--meta_server_addrs=nebula-metad:9559"
+      - "--local_ip=nebula-metad"
+      - "--port=9559"
+      - "--data_path=/data/meta"
+      - "--ws_ip=0.0.0.0"
+      - "--ws_http_port=19559"
+      - "--enable_ssl=false"
+
+  nebula-storaged:
+    image: vesoft/nebula-storaged:v3
+    container_name: godview-nebula-storaged
+    restart: unless-stopped
+    environment:
+      USER: root
+    ports:
+      - "9779:9779"
+      - "19779:19779"
+    volumes:
+      - ./data/nebula/storage:/data/storage
+    networks:
+      godview-network:
+        aliases:
+          - nebula-storaged
+    entrypoint: ["/usr/local/nebula/bin/nebula-storaged"]
+    command:
+      - "--flagfile=/usr/local/nebula/etc/nebula-storaged.conf"
+      - "--daemonize=false"
+      - "--containerized=true"
+      - "--meta_server_addrs=nebula-metad:9559"
+      - "--local_ip=nebula-storaged"
+      - "--port=9779"
+      - "--data_path=/data/storage"
+      - "--ws_ip=0.0.0.0"
+      - "--ws_http_port=19779"
+      - "--enable_ssl=false"
+
+networks:
+  godview-network:
+    name: godview-network

@@ -88,24 +88,24 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     else:
         logger.info("NebulaGraph 未配置，跳过初始化")
 
-    # Embedding Service
+    # Embedding Service - 使用分 provider 配置
+    embedding_config = settings.get_embedding_config(settings.embedding_provider)
     try:
         _embedding_service = create_embedding_service(
             provider=settings.embedding_provider,
-            model=settings.embedding_model,
-            api_key=settings.embedding_api_key,
-            base_url=settings.embedding_base_url,
-            dimension=settings.embedding_dimension,
+            model=embedding_config.get("model", ""),
+            api_key=embedding_config.get("api_key", ""),
+            base_url=embedding_config.get("base_url", ""),
         )
-        logger.info(f"Embedding 服务初始化：{settings.embedding_provider} ({settings.embedding_model})")
+        logger.info(f"Embedding 服务初始化：{settings.embedding_provider} ({embedding_config.get('model')})")
     except Exception as e:
         logger.warning(f"Embedding 服务初始化失败：{e}")
 
-    # Qdrant
+    # Qdrant - 使用默认维度 384，实际维度由 embedding service 决定
     if settings.qdrant_url:
         qdrant_db = QdrantDatabase(
             url=settings.qdrant_url,
-            vector_size=settings.embedding_dimension,
+            vector_size=384,  # 默认维度，实际由 embedding service 决定
             embedding_service=_embedding_service,
         )
         try:
@@ -159,7 +159,7 @@ def create_app() -> FastAPI:
     )
 
     # 注册路由
-    from app.api.routes import characters, worlds, plots, websocket, config, time, simulation, projects, bootstrap, lore, setting_agent, skills
+    from app.api.routes import characters, worlds, plots, websocket, config, time, simulation, projects, bootstrap, lore, setting_agent, skills, token_usage, writing_rules, prompts, agent_templates, agent_configs
 
     app.include_router(characters.router, prefix="/api/characters", tags=["角色管理"])
     app.include_router(worlds.router, prefix="/api/worlds", tags=["世界管理"])
@@ -173,6 +173,11 @@ def create_app() -> FastAPI:
     app.include_router(bootstrap.router, prefix="/api/bootstrap", tags=["Bootstrap 流程"])
     app.include_router(setting_agent.router, prefix="/api/setting-agent", tags=["设定 Agent"])
     app.include_router(skills.router, prefix="/api/skills", tags=["Agent Skills"])
+    app.include_router(token_usage.router, prefix="/api/token-usage", tags=["Token 统计"])
+    app.include_router(writing_rules.router, prefix="/api", tags=["写作规则"])
+    app.include_router(prompts.router, prefix="/api", tags=["Prompt 管理"])
+    app.include_router(agent_templates.router, prefix="/api", tags=["Agent 模板管理"])
+    app.include_router(agent_configs.router, prefix="/api", tags=["Agent 配置管理"])
 
     # 健康检查
     @app.get("/health")
@@ -194,3 +199,7 @@ def create_app() -> FastAPI:
     logger.info("FastAPI 应用创建完成")
 
     return app
+
+
+# 创建应用实例
+app = create_app()

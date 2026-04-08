@@ -7,6 +7,7 @@ Token 追踪服务
 import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
+import uuid
 
 from app.models.token_usage import (
     TokenUsageRecord,
@@ -16,13 +17,27 @@ from app.models.token_usage import (
     UsageCategory,
     calculate_cost,
 )
-from app.database.postgres import get_connection
 
 logger = logging.getLogger(__name__)
 
 
 class TokenTracker:
     """Token 追踪服务"""
+
+    def __init__(self):
+        self._db = None
+
+    def set_db(self, db):
+        """设置数据库实例"""
+        self._db = db
+
+    @property
+    def db(self):
+        """获取数据库实例"""
+        if self._db is None:
+            from app.api.app import postgres_db
+            self._db = postgres_db
+        return self._db
 
     async def record_usage(
         self,
@@ -61,6 +76,7 @@ class TokenTracker:
         estimated_cost = calculate_cost(model, input_tokens, output_tokens)
 
         record = TokenUsageRecord(
+            id=str(uuid.uuid4()),
             project_id=project_id,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
@@ -77,68 +93,39 @@ class TokenTracker:
         )
 
         # 保存到数据库
-        await self._save_record(record)
+        if self.db:
+            try:
+                await self.db.save_token_usage({
+                    "id": record.id,
+                    "project_id": record.project_id,
+                    "input_tokens": record.input_tokens,
+                    "output_tokens": record.output_tokens,
+                    "total_tokens": record.total_tokens,
+                    "provider": record.provider,
+                    "model": record.model,
+                    "category": record.category,
+                    "agent_name": record.agent_name,
+                    "session_id": record.session_id,
+                    "chapter_id": record.chapter_id,
+                    "character_id": record.character_id,
+                    "estimated_cost": record.estimated_cost,
+                    "metadata": record.metadata,
+                    "created_at": record.created_at,
+                })
 
-        # 更新项目统计
-        await self._update_project_stats(project_id, total_tokens, estimated_cost)
+                # 更新项目统计
+                await self.db._update_project_token_stats(project_id, total_tokens, estimated_cost)
 
-        logger.info(
-            f"Token usage recorded: project={project_id}, "
-            f"tokens={total_tokens}, cost=${estimated_cost:.6f}"
-        )
+                logger.info(
+                    f"Token usage recorded: project={project_id}, "
+                    f"tokens={total_tokens}, cost=${estimated_cost:.6f}"
+                )
+            except Exception as e:
+                logger.error(f"Failed to save token usage: {e}")
+        else:
+            logger.warning("Database not available, token usage not saved")
 
         return record
-
-    async def _save_record(self, record: TokenUsageRecord) -> str:
-        """保存记录到数据库"""
-        async with get_connection() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO token_usage (
-                    project_id, input_tokens, output_tokens, total_tokens,
-                    provider, model, category, agent_name, session_id,
-                    chapter_id, character_id, estimated_cost, metadata, created_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-                RETURNING id
-                """,
-                record.project_id,
-                record.input_tokens,
-                record.output_tokens,
-                record.total_tokens,
-                record.provider,
-                record.model,
-                record.category,
-                record.agent_name,
-                record.session_id,
-                record.chapter_id,
-                record.character_id,
-                record.estimated_cost,
-                record.metadata,
-                record.created_at,
-            )
-            record.id = str(row["id"])
-            return record.id
-
-    async def _update_project_stats(
-        self,
-        project_id: str,
-        tokens: int,
-        cost: float
-    ) -> None:
-        """更新项目统计"""
-        async with get_connection() as conn:
-            await conn.execute(
-                """
-                UPDATE projects
-                SET total_tokens = COALESCE(total_tokens, 0) + $1,
-                    total_cost = COALESCE(total_cost, 0) + $2,
-                    updated_at = NOW()
-                WHERE id = $3
-                """,
-                tokens,
-                cost,
-                project_id,
-            )
 
     async def get_project_summary(
         self,
@@ -157,69 +144,31 @@ class TokenTracker:
         Returns:
             Token 使用摘要
         """
-        async with get_connection() as conn:
-            conditions = ["project_id = $1"]
-            params = [project_id]
-            param_idx = 2
+        if not self.db:
+            return TokenUsageSummary()
 
-            if start_date:
-                conditions.append(f"created_at >= ${param_idx}")
-                params.append(start_date)
-                param_idx += 1
+        try:
+            stats = await self.db.get_token_stats_by_project(project_id)
 
-            if end_date:
-                conditions.append(f"created_at <= ${param_idx}")
-                params.append(end_date)
-                param_idx += 1
+            # 获取按场景和模型分组
+            by_category_list = await self.db.get_token_stats_by_category(project_id)
+            by_model_list = await self.db.get_token_stats_by_model(project_id)
 
-            where_clause = " AND ".join(conditions)
-
-            # 总计
-            total_row = await conn.fetchrow(
-                f"""
-                SELECT
-                    COALESCE(SUM(total_tokens), 0) as total_tokens,
-                    COALESCE(SUM(input_tokens), 0) as input_tokens,
-                    COALESCE(SUM(output_tokens), 0) as output_tokens,
-                    COALESCE(SUM(estimated_cost), 0) as total_cost,
-                    COUNT(*) as record_count
-                FROM token_usage
-                WHERE {where_clause}
-                """,
-                *params,
-            )
-
-            # 按场景分组
-            category_rows = await conn.fetch(
-                f"""
-                SELECT category, SUM(total_tokens) as tokens
-                FROM token_usage
-                WHERE {where_clause}
-                GROUP BY category
-                """,
-                *params,
-            )
-
-            # 按模型分组
-            model_rows = await conn.fetch(
-                f"""
-                SELECT model, SUM(total_tokens) as tokens
-                FROM token_usage
-                WHERE {where_clause}
-                GROUP BY model
-                """,
-                *params,
-            )
+            by_category = {item["category"]: item["tokens"] for item in by_category_list}
+            by_model = {item["model"]: item["tokens"] for item in by_model_list}
 
             return TokenUsageSummary(
-                total_tokens=total_row["total_tokens"] or 0,
-                total_input_tokens=total_row["input_tokens"] or 0,
-                total_output_tokens=total_row["output_tokens"] or 0,
-                total_cost=float(total_row["total_cost"] or 0),
-                record_count=total_row["record_count"] or 0,
-                by_category={row["category"]: row["tokens"] for row in category_rows},
-                by_model={row["model"]: row["tokens"] for row in model_rows},
+                total_tokens=stats.get("total_tokens", 0) or 0,
+                total_input_tokens=stats.get("input_tokens", 0) or 0,
+                total_output_tokens=stats.get("output_tokens", 0) or 0,
+                total_cost=float(stats.get("total_cost", 0) or 0),
+                record_count=stats.get("record_count", 0) or 0,
+                by_category=by_category,
+                by_model=by_model,
             )
+        except Exception as e:
+            logger.error(f"Failed to get token summary: {e}")
+            return TokenUsageSummary()
 
     async def get_project_stats(self, project_id: str) -> ProjectTokenStats:
         """
@@ -227,90 +176,87 @@ class TokenTracker:
 
         包括今日、本周、本月统计
         """
+        if not self.db:
+            raise ValueError("Database not available")
+
         now = datetime.now()
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         week_start = today_start - timedelta(days=now.weekday())
         month_start = today_start.replace(day=1)
 
-        async with get_connection() as conn:
+        try:
             # 获取项目信息
-            project_row = await conn.fetchrow(
-                "SELECT name, total_tokens, total_cost FROM projects WHERE id = $1",
-                project_id,
-            )
-
-            if not project_row:
+            project = await self.db.get_project(project_id)
+            if not project:
                 raise ValueError(f"Project not found: {project_id}")
 
-            # 今日统计
-            today_row = await conn.fetchrow(
-                """
-                SELECT
-                    COALESCE(SUM(total_tokens), 0) as tokens,
-                    COALESCE(SUM(estimated_cost), 0) as cost
-                FROM token_usage
-                WHERE project_id = $1 AND created_at >= $2
-                """,
-                project_id,
-                today_start,
-            )
+            # 获取每日统计用于计算今日、本周、本月
+            daily_stats = await self.db.get_daily_token_stats(project_id, 31)
 
-            # 本周统计
-            week_row = await conn.fetchrow(
-                """
-                SELECT
-                    COALESCE(SUM(total_tokens), 0) as tokens,
-                    COALESCE(SUM(estimated_cost), 0) as cost
-                FROM token_usage
-                WHERE project_id = $1 AND created_at >= $2
-                """,
-                project_id,
-                week_start,
-            )
+            today_tokens = 0
+            today_cost = 0.0
+            week_tokens = 0
+            week_cost = 0.0
+            month_tokens = 0
+            month_cost = 0.0
 
-            # 本月统计
-            month_row = await conn.fetchrow(
-                """
-                SELECT
-                    COALESCE(SUM(total_tokens), 0) as tokens,
-                    COALESCE(SUM(estimated_cost), 0) as cost
-                FROM token_usage
-                WHERE project_id = $1 AND created_at >= $2
-                """,
-                project_id,
-                month_start,
-            )
+            today_str = today_start.strftime("%Y-%m-%d")
+            week_str = week_start.strftime("%Y-%m-%d")
+            month_str = month_start.strftime("%Y-%m-%d")
+
+            for stat in daily_stats:
+                date_str = stat.get("date", "")
+                if hasattr(date_str, 'strftime'):
+                    date_str = date_str.strftime("%Y-%m-%d")
+
+                tokens = stat.get("total_tokens", 0) or 0
+                cost = float(stat.get("cost", 0) or 0)
+
+                if date_str == today_str:
+                    today_tokens = tokens
+                    today_cost = cost
+
+                if date_str >= week_str:
+                    week_tokens += tokens
+                    week_cost += cost
+
+                if date_str >= month_str:
+                    month_tokens += tokens
+                    month_cost += cost
 
             return ProjectTokenStats(
                 project_id=project_id,
-                project_name=project_row["name"],
-                total_tokens=project_row["total_tokens"] or 0,
-                total_cost=float(project_row["total_cost"] or 0),
-                today_tokens=today_row["tokens"] or 0,
-                today_cost=float(today_row["cost"] or 0),
-                week_tokens=week_row["tokens"] or 0,
-                week_cost=float(week_row["cost"] or 0),
-                month_tokens=month_row["tokens"] or 0,
-                month_cost=float(month_row["cost"] or 0),
+                project_name=project.get("name", ""),
+                total_tokens=project.get("total_tokens", 0) or 0,
+                total_cost=float(project.get("total_cost", 0) or 0),
+                today_tokens=today_tokens,
+                today_cost=today_cost,
+                week_tokens=week_tokens,
+                week_cost=week_cost,
+                month_tokens=month_tokens,
+                month_cost=month_cost,
             )
+        except Exception as e:
+            logger.error(f"Failed to get project stats: {e}")
+            raise
 
     async def get_all_project_stats(self) -> List[ProjectTokenStats]:
         """获取所有项目的 Token 统计"""
-        async with get_connection() as conn:
-            projects = await conn.fetch(
-                """
-                SELECT id, name, total_tokens, total_cost
-                FROM projects
-                ORDER BY total_tokens DESC NULLS LAST
-                """
-            )
+        if not self.db:
+            return []
 
+        try:
+            projects = await self.db.get_all_project_token_stats()
             stats_list = []
+
             for project in projects:
-                stats = await self.get_project_stats(str(project["id"]))
+                stats = await self.get_project_stats(project["project_id"])
                 stats_list.append(stats)
 
             return stats_list
+        except Exception as e:
+            logger.error(f"Failed to get all project stats: {e}")
+            return []
 
     async def get_daily_stats(
         self,
@@ -327,38 +273,26 @@ class TokenTracker:
         Returns:
             每日统计列表
         """
-        start_date = datetime.now() - timedelta(days=days)
+        if not self.db:
+            return []
 
-        async with get_connection() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT
-                    DATE(created_at) as date,
-                    COALESCE(SUM(total_tokens), 0) as total_tokens,
-                    COALESCE(SUM(input_tokens), 0) as input_tokens,
-                    COALESCE(SUM(output_tokens), 0) as output_tokens,
-                    COALESCE(SUM(estimated_cost), 0) as cost,
-                    COUNT(*) as record_count
-                FROM token_usage
-                WHERE project_id = $1 AND created_at >= $2
-                GROUP BY DATE(created_at)
-                ORDER BY date DESC
-                """,
-                project_id,
-                start_date,
-            )
+        try:
+            rows = await self.db.get_daily_token_stats(project_id, days)
 
             return [
                 DailyTokenStats(
-                    date=str(row["date"]),
-                    total_tokens=row["total_tokens"] or 0,
-                    input_tokens=row["input_tokens"] or 0,
-                    output_tokens=row["output_tokens"] or 0,
-                    cost=float(row["cost"] or 0),
-                    record_count=row["record_count"] or 0,
+                    date=str(row.get("date", "")),
+                    total_tokens=row.get("total_tokens", 0) or 0,
+                    input_tokens=row.get("input_tokens", 0) or 0,
+                    output_tokens=row.get("output_tokens", 0) or 0,
+                    cost=float(row.get("cost", 0) or 0),
+                    record_count=row.get("record_count", 0) or 0,
                 )
                 for row in rows
             ]
+        except Exception as e:
+            logger.error(f"Failed to get daily stats: {e}")
+            return []
 
 
 # 全局实例
