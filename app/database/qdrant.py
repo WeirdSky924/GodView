@@ -301,9 +301,9 @@ class QdrantDatabase:
                 query_filter = Filter(must=must_conditions)
 
         # 搜索
-        results = self._client.search(
+        results = self._client.query_points(
             collection_name=self.collection_name,
-            query_vector=query_vector,
+            query=query_vector,
             query_filter=query_filter,
             limit=limit,
             score_threshold=score_threshold,
@@ -315,7 +315,7 @@ class QdrantDatabase:
 
         # 格式化结果
         formatted_results = []
-        for result in results:
+        for result in results.points:
             formatted_results.append({
                 "id": result.id,
                 "score": result.score,
@@ -363,6 +363,7 @@ class QdrantDatabase:
         text: str,
         embedding: Optional[List[float]] = None,
         context: Optional[str] = None,
+        project_id: Optional[str] = None,
     ) -> Optional[str]:
         """
         添加角色台词样本
@@ -373,6 +374,7 @@ class QdrantDatabase:
             text: 台词文本
             embedding: 向量嵌入（如不提供则自动通过 EmbeddingService 生成）
             context: 上下文
+            project_id: 项目 ID（用于按项目过滤）
 
         Returns:
             str: 样本 ID
@@ -383,6 +385,8 @@ class QdrantDatabase:
             "text": text,
             "context": context or "",
         }
+        if project_id:
+            payload["project_id"] = project_id
 
         if embedding:
             return await self.insert_vector(embedding, payload, sample_id)
@@ -393,6 +397,7 @@ class QdrantDatabase:
         self,
         query_embedding: List[float],
         character_id: Optional[str] = None,
+        project_id: Optional[str] = None,
         limit: int = 5,
     ) -> List[Dict[str, Any]]:
         """
@@ -401,6 +406,7 @@ class QdrantDatabase:
         Args:
             query_embedding: 查询向量
             character_id: 角色 ID 过滤
+            project_id: 项目 ID 过滤
             limit: 返回数量
 
         Returns:
@@ -409,6 +415,8 @@ class QdrantDatabase:
         filter_conditions = {}
         if character_id:
             filter_conditions["character_id"] = character_id
+        if project_id:
+            filter_conditions["project_id"] = project_id
         filter_conditions["type"] = "voice_sample"
 
         return await self.search_similar(
@@ -421,6 +429,7 @@ class QdrantDatabase:
         self,
         query_text: str,
         character_id: Optional[str] = None,
+        project_id: Optional[str] = None,
         limit: int = 5,
     ) -> List[Dict[str, Any]]:
         """
@@ -429,6 +438,7 @@ class QdrantDatabase:
         Args:
             query_text: 查询文本
             character_id: 角色 ID 过滤
+            project_id: 项目 ID 过滤
             limit: 返回数量
 
         Returns:
@@ -437,6 +447,8 @@ class QdrantDatabase:
         filter_conditions = {}
         if character_id:
             filter_conditions["character_id"] = character_id
+        if project_id:
+            filter_conditions["project_id"] = project_id
         filter_conditions["type"] = "voice_sample"
 
         return await self.search_by_text(
@@ -449,6 +461,7 @@ class QdrantDatabase:
         self,
         character_id: str,
         limit: int = 10,
+        project_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         获取角色的所有台词样本
@@ -456,18 +469,21 @@ class QdrantDatabase:
         Args:
             character_id: 角色 ID
             limit: 返回数量
+            project_id: 项目 ID 过滤
 
         Returns:
             List: 台词样本列表
         """
+        must_conditions = [
+            FieldCondition(key="character_id", match=MatchValue(value=character_id)),
+            FieldCondition(key="type", match=MatchValue(value="voice_sample")),
+        ]
+        if project_id:
+            must_conditions.append(FieldCondition(key="project_id", match=MatchValue(value=project_id)))
+
         all_points, _ = self._client.scroll(
             collection_name=self.collection_name,
-            scroll_filter=Filter(
-                must=[
-                    FieldCondition(key="character_id", match=MatchValue(value=character_id)),
-                    FieldCondition(key="type", match=MatchValue(value="voice_sample")),
-                ]
-            ),
+            scroll_filter=Filter(must=must_conditions),
             limit=limit,
             with_payload=True,
             with_vectors=False,

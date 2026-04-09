@@ -88,6 +88,11 @@ export default function SettingAgentChat({
       }
 
       setMessages((prev) => [...prev, assistantMessage])
+
+      // 如果保存了新设定，刷新设定列表
+      if (response.lore_saved) {
+        onLoreChange?.()
+      }
     } catch (error) {
       console.error('Chat error:', error)
       setMessages((prev) => [
@@ -198,15 +203,9 @@ export default function SettingAgentChat({
   }
 
   return (
-    <Card className="flex flex-col h-full">
-      {/* 头部 */}
-      <div className="flex items-center gap-2 p-4 border-b">
-        <MessageCircle size={20} className="text-blue-600" />
-        <h3 className="font-medium text-gray-800">设定管理者</h3>
-      </div>
-
-      {/* 消息列表 */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+    <div className="flex flex-col h-full">
+      {/* 消息列表 - 可滚动区域 */}
+      <div className="flex-1 overflow-y-auto p-4 space-y-4 min-h-0">
         {messages.map((msg) => (
           <div
             key={msg.id}
@@ -302,7 +301,7 @@ export default function SettingAgentChat({
       </div>
 
       {/* 输入框 */}
-      <div className="p-4 border-t">
+      <div className="p-4 border-t flex-shrink-0">
         <div className="flex gap-2">
           <input
             type="text"
@@ -318,6 +317,6 @@ export default function SettingAgentChat({
           </Button>
         </div>
       </div>
-    </Card>
+    </div>
   )
 }

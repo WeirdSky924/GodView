@@ -10,14 +10,18 @@ import {
   addCharacterVoiceSample,
   syncCharacterVoiceSamples,
   searchCharacterVoiceSamples,
+  getCharacterAgentPrompt,
+  batchEnableCharacterAgents,
+  generateCharacterPersonality,
 } from '@/api/characters'
 import type {
   Character,
   CreateCharacterDTO,
   UpdateCharacterDTO,
   CharacterVoiceSampleSearchResult,
+  CharacterAgentPrompt,
 } from '@/api/characters'
-import { Plus, Edit, Trash2, User, Mic, Search, RefreshCw, FolderOpen } from 'lucide-react'
+import { Plus, Edit, Trash2, User, Mic, Search, RefreshCw, FolderOpen, Bot, Target, Brain, Eye, Sparkles } from 'lucide-react'
 import { useProject } from '@/contexts/ProjectContext'
 import { useTheme } from '@/contexts/ThemeContext'
 
@@ -44,6 +48,11 @@ export default function Characters() {
   const [voiceSearchLoading, setVoiceSearchLoading] = useState(false)
   const [syncingVoice, setSyncingVoice] = useState(false)
   const [voiceForm, setVoiceForm] = useState({ text: '', context: '', query: '' })
+  const [showAgentPromptModal, setShowAgentPromptModal] = useState(false)
+  const [agentPromptData, setAgentPromptData] = useState<CharacterAgentPrompt | null>(null)
+  const [agentPromptLoading, setAgentPromptLoading] = useState(false)
+  const [batchEnabling, setBatchEnabling] = useState(false)
+  const [generatingPersonality, setGeneratingPersonality] = useState(false)
 
   const [formData, setFormData] = useState<CreateCharacterDTO>({
     name: '',
@@ -54,10 +63,16 @@ export default function Characters() {
     lexicon: [],
     forbidden_words: [],
     voice_samples: [],
+    has_agent: false,
+    agent_enabled: true,
+    agent_goals: [],
+    agent_memory: [],
   })
   const [lexiconInput, setLexiconInput] = useState('')
   const [forbiddenWordsInput, setForbiddenWordsInput] = useState('')
   const [voiceSamplesInput, setVoiceSamplesInput] = useState('')
+  const [agentGoalsInput, setAgentGoalsInput] = useState('')
+  const [agentMemoryInput, setAgentMemoryInput] = useState('')
 
   const loadCharacters = useCallback(async () => {
     setLoading(true)
@@ -80,7 +95,7 @@ export default function Characters() {
 
     setVoiceLoading(true)
     try {
-      const data = await getCharacterVoiceSamples(characterId)
+      const data = await getCharacterVoiceSamples(characterId, 10, currentProject?.id)
       setVoiceSamples(data)
     } catch (error) {
       console.error('Failed to load voice samples:', error)
@@ -88,7 +103,7 @@ export default function Characters() {
     } finally {
       setVoiceLoading(false)
     }
-  }, [])
+  }, [currentProject?.id])
 
   useEffect(() => {
     loadCharacters()
@@ -115,10 +130,16 @@ export default function Characters() {
       lexicon: [],
       forbidden_words: [],
       voice_samples: [],
+      has_agent: false,
+      agent_enabled: true,
+      agent_goals: [],
+      agent_memory: [],
     })
     setLexiconInput('')
     setForbiddenWordsInput('')
     setVoiceSamplesInput('')
+    setAgentGoalsInput('')
+    setAgentMemoryInput('')
     setShowModal(true)
   }
 
@@ -136,10 +157,16 @@ export default function Characters() {
       lexicon: character.lexicon || [],
       forbidden_words: character.forbidden_words || [],
       voice_samples: character.voice_samples || [],
+      has_agent: character.has_agent || false,
+      agent_enabled: character.agent_enabled ?? true,
+      agent_goals: character.agent_goals || [],
+      agent_memory: character.agent_memory || [],
     })
     setLexiconInput((character.lexicon || []).join('，'))
     setForbiddenWordsInput((character.forbidden_words || []).join('，'))
     setVoiceSamplesInput((character.voice_samples || []).join('\n'))
+    setAgentGoalsInput((character.agent_goals || []).join('\n'))
+    setAgentMemoryInput((character.agent_memory || []).join('\n'))
     setShowModal(true)
   }
 
@@ -150,16 +177,22 @@ export default function Characters() {
         lexicon: splitCsvInput(lexiconInput),
         forbidden_words: splitCsvInput(forbiddenWordsInput),
         voice_samples: splitCsvInput(voiceSamplesInput),
+        agent_goals: splitCsvInput(agentGoalsInput),
+        agent_memory: splitCsvInput(agentMemoryInput),
       }
 
       if (editingChar?.id) {
         const updateData: UpdateCharacterDTO = {
           id: editingChar.id,
           ...normalizedData,
+          project_id: editingChar.project_id || currentProject?.id,
         }
         await updateCharacter(editingChar.id, updateData)
       } else {
-        await createCharacter(normalizedData)
+        await createCharacter({
+          ...normalizedData,
+          project_id: currentProject?.id,
+        })
       }
       await loadCharacters()
       setShowModal(false)
@@ -189,7 +222,7 @@ export default function Characters() {
 
     try {
       await addCharacterVoiceSample(selectedCharacterId, {
-        id: `${selectedCharacterId}_${Date.now()}`,
+        id: crypto.randomUUID(),
         character_id: selectedCharacterId,
         text: voiceForm.text.trim(),
         context: voiceForm.context.trim(),
@@ -223,13 +256,72 @@ export default function Characters() {
 
     setVoiceSearchLoading(true)
     try {
-      const results = await searchCharacterVoiceSamples(selectedCharacterId, voiceForm.query.trim())
+      const results = await searchCharacterVoiceSamples(
+        selectedCharacterId,
+        voiceForm.query.trim(),
+        5,
+        currentProject?.id
+      )
       setVoiceSearchResults(results)
     } catch (error) {
       console.error('Failed to search voice samples:', error)
       alert('声音样本检索失败')
     } finally {
       setVoiceSearchLoading(false)
+    }
+  }
+
+  const handlePreviewAgentPrompt = async () => {
+    if (!selectedCharacterId) return
+
+    setAgentPromptLoading(true)
+    setShowAgentPromptModal(true)
+    try {
+      const data = await getCharacterAgentPrompt(selectedCharacterId)
+      setAgentPromptData(data)
+    } catch (error) {
+      console.error('Failed to get agent prompt:', error)
+      setAgentPromptData({ has_agent: false, message: '获取 Agent Prompt 失败' })
+    } finally {
+      setAgentPromptLoading(false)
+    }
+  }
+
+  const handleBatchEnableAgents = async () => {
+    if (!currentProject?.id) return
+    if (!confirm('确定要为项目中所有主要角色启用 Agent 吗？\n这将自动配置角色的目标和记忆。')) return
+
+    setBatchEnabling(true)
+    try {
+      const result = await batchEnableCharacterAgents(currentProject.id)
+      alert(`批量启用完成！\n更新: ${result.updated_count} 个角色\n跳过: ${result.skipped_count} 个角色\n错误: ${result.error_count} 个`)
+      await loadCharacters()
+    } catch (error) {
+      console.error('Failed to batch enable agents:', error)
+      alert('批量启用失败')
+    } finally {
+      setBatchEnabling(false)
+    }
+  }
+
+  const handleGeneratePersonality = async () => {
+    if (!selectedCharacterId) return
+    if (!confirm('确定要调用 Setting Agent 为该角色生成性格设定吗？')) return
+
+    setGeneratingPersonality(true)
+    try {
+      const result = await generateCharacterPersonality(selectedCharacterId)
+      if (result.success) {
+        alert(`性格生成成功！\n\n性格：${result.personality}\n说话风格：${result.speech_pattern}`)
+        await loadCharacters()
+      } else {
+        alert('生成失败：' + (result.message || '未知错误'))
+      }
+    } catch (error) {
+      console.error('Failed to generate personality:', error)
+      alert('生成性格失败')
+    } finally {
+      setGeneratingPersonality(false)
     }
   }
 
@@ -240,10 +332,16 @@ export default function Characters() {
       title="角色管理"
       description="管理小说中的角色信息和声音样本"
       actions={
-        <Button onClick={openCreateModal} disabled={!currentProject}>
-          <Plus size={18} className="mr-2" />
-          新增角色
-        </Button>
+        <div className="flex gap-2">
+          <Button variant="secondary" onClick={handleBatchEnableAgents} disabled={!currentProject || batchEnabling}>
+            <Bot size={18} className="mr-2" />
+            {batchEnabling ? '启用中...' : '批量启用 Agent'}
+          </Button>
+          <Button onClick={openCreateModal} disabled={!currentProject}>
+            <Plus size={18} className="mr-2" />
+            新增角色
+          </Button>
+        </div>
       }
     >
       {!currentProject ? (
@@ -276,12 +374,18 @@ export default function Characters() {
                       <p className={`text-sm mt-2 line-clamp-2 ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>{char.description}</p>
                       <div className="mt-3 flex flex-wrap gap-2">
                         <span className={`inline-block px-2 py-1 text-xs rounded ${
-                          char.status === 'active' ? 'bg-green-900 text-green-300' :
+                          char.status === 'active' ? (isDark ? 'bg-green-900 text-green-300' : 'bg-green-100 text-green-700') :
                           char.status === 'inactive' ? (isDark ? 'bg-gray-700 text-gray-300' : 'bg-gray-200 text-gray-700') :
-                          'bg-red-900 text-red-300'
+                          char.status === 'dead' ? (isDark ? 'bg-red-900 text-red-300' : 'bg-red-100 text-red-700') :
+                          (isDark ? 'bg-yellow-900 text-yellow-300' : 'bg-yellow-100 text-yellow-700')
                         }`}>
-                          {char.status === 'active' ? '活跃' : char.status === 'inactive' ? '不活跃' : '已故'}
+                          {char.status === 'active' ? '活跃' : char.status === 'inactive' ? '不活跃' : char.status === 'dead' ? '已故' : '暂停'}
                         </span>
+                        {char.has_agent && (
+                          <span className={`inline-flex items-center px-2 py-1 text-xs rounded ${isDark ? 'bg-purple-900 text-purple-300' : 'bg-purple-100 text-purple-700'}`}>
+                            <Bot size={12} className="mr-1" />Agent
+                          </span>
+                        )}
                         <span className={`inline-block px-2 py-1 text-xs rounded ${isDark ? 'bg-blue-900 text-blue-300' : 'bg-blue-100 text-blue-700'}`}>
                           声音样本 {char.voice_samples?.length || 0}
                         </span>
@@ -325,7 +429,65 @@ export default function Characters() {
                 <div className={`rounded-lg p-3 text-sm ${isDark ? 'bg-gray-800 text-gray-300' : 'bg-gray-50 text-gray-700'}`}>
                   <div><span className="font-medium">当前角色：</span>{selectedCharacter.name}</div>
                   <div className="mt-1"><span className="font-medium">说话风格：</span>{selectedCharacter.speech_pattern || '未设置'}</div>
+                  <div className="mt-1"><span className="font-medium">性格：</span>{selectedCharacter.personality || '未设置'}</div>
+                  {selectedCharacter.has_agent && (
+                    <div className="mt-2 flex items-center gap-2">
+                      <span className={`inline-flex items-center px-2 py-0.5 text-xs rounded ${isDark ? 'bg-purple-900 text-purple-300' : 'bg-purple-100 text-purple-700'}`}>
+                        <Bot size={12} className="mr-1" />Agent {(selectedCharacter.agent_enabled ?? true) ? '已激活' : '未激活'}
+                      </span>
+                    </div>
+                  )}
+                  {/* 生成性格按钮 */}
+                  <div className="mt-3 flex gap-2">
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      onClick={handleGeneratePersonality}
+                      disabled={generatingPersonality}
+                    >
+                      <Sparkles size={14} className="mr-1" />
+                      {generatingPersonality ? '生成中...' : 'AI 生成性格'}
+                    </Button>
+                  </div>
                 </div>
+
+                {/* Agent 信息面板 */}
+                {selectedCharacter.has_agent && (
+                  <div className={`rounded-lg p-3 text-sm ${isDark ? 'bg-purple-900/20 border border-purple-700/30' : 'bg-purple-50 border border-purple-200'}`}>
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="flex items-center gap-2">
+                        <Bot size={16} className={isDark ? 'text-purple-400' : 'text-purple-600'} />
+                        <span className={`font-medium ${isDark ? 'text-purple-300' : 'text-purple-700'}`}>Agent 配置</span>
+                      </div>
+                      <Button size="sm" variant="secondary" onClick={handlePreviewAgentPrompt}>
+                        <Eye size={14} className="mr-1" /> 预览 Prompt
+                      </Button>
+                    </div>
+                    {selectedCharacter.agent_goals && selectedCharacter.agent_goals.length > 0 && (
+                      <div className="mb-2">
+                        <span className={`text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>目标：</span>
+                        <ul className={`text-xs mt-1 ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
+                          {selectedCharacter.agent_goals.map((goal, i) => (
+                            <li key={i}>• {goal}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    {selectedCharacter.agent_memory && selectedCharacter.agent_memory.length > 0 && (
+                      <div>
+                        <span className={`text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>记忆：</span>
+                        <ul className={`text-xs mt-1 ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
+                          {selectedCharacter.agent_memory.slice(0, 3).map((mem, i) => (
+                            <li key={i}>• {mem}</li>
+                          ))}
+                          {selectedCharacter.agent_memory.length > 3 && (
+                            <li className={isDark ? 'text-gray-500' : 'text-gray-400'}>... 共 {selectedCharacter.agent_memory.length} 条</li>
+                          )}
+                        </ul>
+                      </div>
+                    )}
+                  </div>
+                )}
 
                 <TextArea
                   label="新增台词样本"
@@ -435,7 +597,8 @@ export default function Characters() {
               >
                 <option value="active">活跃</option>
                 <option value="inactive">不活跃</option>
-                <option value="deceased">已故</option>
+                <option value="dead">已故</option>
+                <option value="paused">暂停</option>
               </select>
             </div>
           </div>
@@ -475,11 +638,121 @@ export default function Characters() {
             onChange={(e) => setVoiceSamplesInput(e.target.value)}
             placeholder="每行一条典型台词"
           />
+
+          {/* Agent 配置区域 */}
+          <div className={`pt-4 mt-4 border-t ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+            <div className="flex items-center gap-2 mb-3">
+              <Bot size={18} className={isDark ? 'text-purple-400' : 'text-purple-600'} />
+              <h3 className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>角色 Agent 配置</h3>
+            </div>
+            <p className={`text-sm mb-3 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+              启用后，该角色将拥有独立的 Agent，可参与故事发展和对话
+            </p>
+
+            <label className={`flex items-center gap-2 mb-4 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+              <input
+                type="checkbox"
+                checked={formData.has_agent || false}
+                onChange={(e) => setFormData({ ...formData, has_agent: e.target.checked })}
+                className="w-4 h-4 rounded"
+              />
+              <span>启用角色 Agent</span>
+            </label>
+
+            {formData.has_agent && (
+              <div className="space-y-4 pl-6 border-l-2 border-purple-500/30">
+                <label className={`flex items-center gap-2 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+                  <input
+                    type="checkbox"
+                    checked={formData.agent_enabled ?? true}
+                    onChange={(e) => setFormData({ ...formData, agent_enabled: e.target.checked })}
+                    className="w-4 h-4 rounded"
+                  />
+                  <span>Agent 激活状态</span>
+                </label>
+
+                <div>
+                  <label className={`block text-sm mb-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>
+                    <Target size={14} className="inline mr-1" /> Agent 目标
+                  </label>
+                  <TextArea
+                    value={agentGoalsInput}
+                    onChange={(e) => setAgentGoalsInput(e.target.value)}
+                    placeholder="每行一个目标，如：&#10;保护主角安全&#10;寻找失散的家人&#10;提升自身实力"
+                    rows={3}
+                  />
+                </div>
+
+                <div>
+                  <label className={`block text-sm mb-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>
+                    <Brain size={14} className="inline mr-1" /> Agent 记忆要点
+                  </label>
+                  <TextArea
+                    value={agentMemoryInput}
+                    onChange={(e) => setAgentMemoryInput(e.target.value)}
+                    placeholder="每行一个记忆要点，如：&#10;曾受过主角救命之恩&#10;知道一个重要秘密&#10;与反派有深仇大恨"
+                    rows={3}
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+
           <div className="flex justify-end gap-3 pt-4">
             <Button variant="secondary" onClick={() => setShowModal(false)}>取消</Button>
             <Button onClick={saveCharacter}>{editingChar ? '保存修改' : '创建角色'}</Button>
           </div>
         </div>
+      </Modal>
+
+      {/* Agent Prompt 预览 Modal */}
+      <Modal
+        isOpen={showAgentPromptModal}
+        onClose={() => setShowAgentPromptModal(false)}
+        title="Agent Prompt 预览"
+        size="xl"
+      >
+        {agentPromptLoading ? (
+          <div className={`text-center py-8 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>加载中...</div>
+        ) : agentPromptData?.has_agent ? (
+          <div className="space-y-4">
+            <div className={`p-3 rounded-lg ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
+              <div className="flex items-center gap-2 mb-2">
+                <span className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>
+                  {agentPromptData.character_name}
+                </span>
+                <span className={`px-2 py-0.5 text-xs rounded ${agentPromptData.agent_enabled ? 'bg-green-100 text-green-700' : 'bg-gray-200 text-gray-500'}`}>
+                  {agentPromptData.agent_enabled ? '已激活' : '未激活'}
+                </span>
+              </div>
+              <div className={`text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+                Prompt 长度: {agentPromptData.prompt_length} 字符
+              </div>
+            </div>
+
+            {agentPromptData.variables && (
+              <div>
+                <h4 className={`text-sm font-medium mb-2 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>变量</h4>
+                <div className={`p-3 rounded text-xs font-mono ${isDark ? 'bg-gray-800' : 'bg-gray-100'}`}>
+                  <div><span className="text-blue-400">character_background:</span> {agentPromptData.variables.character_background?.substring(0, 100)}...</div>
+                  <div><span className="text-blue-400">character_personality:</span> {agentPromptData.variables.character_personality?.substring(0, 100)}...</div>
+                  <div><span className="text-blue-400">character_goals:</span> {agentPromptData.variables.character_goals?.split('\n')[0]}...</div>
+                </div>
+              </div>
+            )}
+
+            <div>
+              <h4 className={`text-sm font-medium mb-2 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>完整 Prompt</h4>
+              <pre className={`p-4 rounded text-xs overflow-auto max-h-[400px] whitespace-pre-wrap ${isDark ? 'bg-gray-900 text-gray-300' : 'bg-gray-100 text-gray-700'}`}>
+                {agentPromptData.prompt}
+              </pre>
+            </div>
+          </div>
+        ) : (
+          <div className={`text-center py-8 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+            {agentPromptData?.message || '该角色未启用 Agent'}
+          </div>
+        )}
       </Modal>
     </PageLayout>
   )

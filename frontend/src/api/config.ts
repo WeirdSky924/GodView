@@ -162,3 +162,17 @@ export interface DatabaseStatusResponse {
 export async function getDatabaseStatus(): Promise<DatabaseStatusResponse> {
   return await api.get<DatabaseStatusResponse>('/config/database/status')
 }
+
+export interface GlobalStats {
+  project_count: number
+  character_count: number
+  world_count: number
+  chapter_count: number
+  total_tokens: number
+  total_cost: number
+}
+
+export async function getGlobalStats(projectId?: string): Promise<GlobalStats> {
+  const params = projectId ? { project_id: projectId } : {}
+  return await api.get<GlobalStats>('/config/stats', { params })
+}

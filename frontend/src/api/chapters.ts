@@ -4,6 +4,7 @@ export interface Chapter {
   id?: string
   title: string
   world_id?: string
+  summary?: string
   content?: string
   word_count?: number
   status: 'draft' | 'published' | 'archived' | 'in_progress' | 'completed'
@@ -19,13 +20,16 @@ export interface Chapter {
 
 export interface CreateChapterDTO {
   title: string
+  project_id?: string
   world_id?: string
+  summary?: string
   content?: string
   status?: string
 }
 
 export interface UpdateChapterDTO {
-  title: string
+  title?: string
+  summary?: string
   content?: string
   status?: string
   world_id?: string
@@ -102,6 +106,7 @@ export async function createHook(data: {
   hook_type?: string
   related_characters?: string[]
   priority?: number
+  project_id?: string
 }) {
   return await api.post<any>('/plots/hooks', data)
 }
@@ -110,4 +115,20 @@ export async function updateHookStatus(hookId: string, status: string) {
   return await api.put<any>(`/plots/hooks/${hookId}/status`, null, {
     params: { status },
   })
+}
+
+export async function updateHook(hookId: string, data: {
+  title: string
+  description?: string
+  hook_type?: string
+  related_characters?: string[]
+  priority?: number
+  project_id?: string
+  status?: string
+}) {
+  return await api.put<any>(`/plots/hooks/${hookId}`, data)
+}
+
+export async function deleteHook(hookId: string) {
+  return await api.delete<any>(`/plots/hooks/${hookId}`)
 }

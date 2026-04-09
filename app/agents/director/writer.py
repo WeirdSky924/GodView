@@ -88,6 +88,8 @@ class WriterAgent(BaseAgent):
                 - hooks: 需要埋设/回收的伏笔
                 - previous_style: 前文风格样本
                 - word_count: 目标字数
+                - auto_write_mode: 自动写作模式（使用完整提示）
+                - writing_prompt: 自动写作的完整提示
 
         Returns:
             AgentResponse: 生成的小说文本
@@ -99,24 +101,39 @@ class WriterAgent(BaseAgent):
             hooks = input_data.get("hooks", [])
             previous_style = input_data.get("previous_style", "")
             word_count = input_data.get("word_count", 500)
+            auto_write_mode = input_data.get("auto_write_mode", False)
+            writing_prompt = input_data.get("writing_prompt", "")
 
             # 构建用户消息
-            user_message = self._build_user_message(
-                intents=intents,
-                environment=environment,
-                character_moods=character_moods,
-                hooks=hooks,
-                previous_style=previous_style,
-                word_count=word_count,
-            )
+            if auto_write_mode and writing_prompt:
+                # 自动写作模式：使用完整提示
+                user_message = writing_prompt
+            else:
+                # 普通模式：构建用户消息
+                user_message = self._build_user_message(
+                    intents=intents,
+                    environment=environment,
+                    character_moods=character_moods,
+                    hooks=hooks,
+                    previous_style=previous_style,
+                    word_count=word_count,
+                )
 
-            # 调用 LLM
+            # 调用 LLM（自动写作模式使用更高的 temperature 增加创造性）
+            temperature = 0.8 if auto_write_mode else 0.7
             response_text = await self._call_llm(
-                messages=[HumanMessage(content=user_message)], temperature=0.7
+                messages=[HumanMessage(content=user_message)], temperature=temperature
             )
 
             # 解析响应
             result = self._parse_json_response(response_text)
+
+            # 如果解析失败，尝试直接返回文本
+            if not result or not result.get("content"):
+                result = {
+                    "content": response_text,
+                    "word_count": len(response_text),
+                }
 
             # 验证风格一致性（如果有前文样本）
             if previous_style and self.config.get("style_check_enabled", True):
@@ -132,6 +149,7 @@ class WriterAgent(BaseAgent):
                 metadata={
                     "target_word_count": word_count,
                     "actual_word_count": result.get("word_count", 0),
+                    "auto_write_mode": auto_write_mode,
                 },
             )
 

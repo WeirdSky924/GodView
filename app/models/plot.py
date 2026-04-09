@@ -35,7 +35,7 @@ class Hook(BaseModel):
 
     id: Optional[str] = Field(None, description="伏笔唯一 ID（创建时自动生成）")
     title: str = Field(..., description="伏笔标题")
-    description: str = Field(..., description="伏笔描述")
+    description: Optional[str] = Field(default="", description="伏笔描述")
 
     # 项目归属
     project_id: Optional[str] = Field(None, description="所属项目ID")
@@ -163,6 +163,7 @@ class Chapter(BaseModel):
     world_id: Optional[str] = Field(None, description="所属世界 ID")
 
     # 内容
+    summary: Optional[str] = Field(None, description="章节摘要/期望内容")
     content: Optional[str] = Field(None, description="章节正文")
     word_count: int = Field(default=0, description="字数")
 
@@ -205,7 +206,9 @@ class CreateChapterDTO(BaseModel):
     """创建章节请求模型"""
 
     title: str = Field(..., description="章节标题")
-    world_id: str = Field(default="default_world", description="所属世界 ID")
+    project_id: Optional[str] = Field(None, description="所属项目 ID")
+    world_id: Optional[str] = Field(None, description="所属世界 ID")
+    summary: Optional[str] = Field(None, description="章节摘要/期望内容")
     content: Optional[str] = Field(default="", description="章节正文")
     status: ChapterStatus = Field(default=ChapterStatus.DRAFT, description="章节状态")
 
@@ -215,6 +218,7 @@ class UpdateChapterDTO(BaseModel):
 
     title: Optional[str] = Field(default=None, description="章节标题")
     world_id: Optional[str] = Field(default=None, description="所属世界 ID")
+    summary: Optional[str] = Field(default=None, description="章节摘要/期望内容")
     content: Optional[str] = Field(default=None, description="章节正文")
     status: Optional[ChapterStatus] = Field(default=None, description="章节状态")
 

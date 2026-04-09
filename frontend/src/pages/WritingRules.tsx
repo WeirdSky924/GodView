@@ -11,7 +11,10 @@ import {
   updateWritingRule,
   deleteWritingRule,
   getWritingRuleSets,
+  getWritingRuleSet,
   createWritingRuleSet,
+  updateWritingRuleSet,
+  deleteWritingRuleSet,
   getProjectWritingConfig,
   updateProjectWritingConfig,
   previewWritingPrompt,
@@ -32,12 +35,18 @@ const CATEGORY_LABELS: Record<WritingRuleCategory, string> = {
   structure: '结构类',
   style: '风格类',
   pacing: '节奏类',
+  character: '角色塑造类',
+  plot: '剧情类',
+  format: '格式类',
+  grammar: '语法类',
 }
 
 const SEVERITY_LABELS: Record<RuleSeverity, { label: string; color: string }> = {
   required: { label: '必须', color: 'bg-red-900 text-red-300' },
+  strong: { label: '强烈', color: 'bg-orange-900 text-orange-300' },
   recommended: { label: '推荐', color: 'bg-yellow-900 text-yellow-300' },
   optional: { label: '可选', color: 'bg-gray-700 text-gray-300' },
+  info: { label: '信息', color: 'bg-blue-900 text-blue-300' },
 }
 
 type TabType = 'rules' | 'sets' | 'config'
@@ -83,6 +92,8 @@ export default function WritingRules() {
 
   // 规则集表单
   const [showRuleSetModal, setShowRuleSetModal] = useState(false)
+  const [editingRuleSet, setEditingRuleSet] = useState<WritingRuleSet | null>(null)
+  const [viewingRuleSet, setViewingRuleSet] = useState<WritingRuleSet | null>(null)
   const [ruleSetForm, setRuleSetForm] = useState({
     name: '',
     description: '',
@@ -95,6 +106,27 @@ export default function WritingRules() {
     loadData()
   }, [activeTab, currentProject])
 
+  // 筛选状态变化时重新加载规则列表
+  useEffect(() => {
+    if (activeTab === 'rules') {
+      const loadFilteredRules = async () => {
+        setLoading(true)
+        try {
+          const data = await getWritingRules(
+            selectedCategory || undefined,
+            selectedSeverity || undefined
+          )
+          setRules(data)
+        } catch (error) {
+          console.error('Failed to load filtered rules:', error)
+        } finally {
+          setLoading(false)
+        }
+      }
+      loadFilteredRules()
+    }
+  }, [selectedCategory, selectedSeverity, activeTab])
+
   const loadData = async () => {
     setLoading(true)
     try {
@@ -102,8 +134,13 @@ export default function WritingRules() {
         const data = await getWritingRules(selectedCategory || undefined, selectedSeverity || undefined)
         setRules(data)
       } else if (activeTab === 'sets') {
-        const data = await getWritingRuleSets()
-        setRuleSets(data)
+        // 同时加载规则集和规则列表（用于显示规则名称）
+        const [setsData, rulesData] = await Promise.all([
+          getWritingRuleSets(),
+          getWritingRules()
+        ])
+        setRuleSets(setsData)
+        setRules(rulesData)
       } else if (activeTab === 'config' && currentProject) {
         const config = await getProjectWritingConfig(currentProject.id)
         setProjectConfig(config)
@@ -214,6 +251,60 @@ export default function WritingRules() {
     }
   }
 
+  // 规则集操作
+  const handleViewRuleSet = (ruleSet: WritingRuleSet) => {
+    setViewingRuleSet(ruleSet)
+  }
+
+  const handleEditRuleSet = (ruleSet: WritingRuleSet) => {
+    setEditingRuleSet(ruleSet)
+    setRuleSetForm({
+      name: ruleSet.name,
+      description: ruleSet.description,
+      rule_ids: ruleSet.rule_ids,
+      target_genre: ruleSet.target_genre || '',
+      tags: ruleSet.tags,
+    })
+    setShowRuleSetModal(true)
+  }
+
+  const handleCreateRuleSet = () => {
+    setEditingRuleSet(null)
+    setRuleSetForm({
+      name: '',
+      description: '',
+      rule_ids: [],
+      target_genre: '',
+      tags: [],
+    })
+    setShowRuleSetModal(true)
+  }
+
+  const handleSaveRuleSet = async () => {
+    try {
+      if (editingRuleSet) {
+        // 更新规则集
+        await updateWritingRuleSet(editingRuleSet.id, ruleSetForm)
+      } else {
+        // 创建规则集
+        await createWritingRuleSet(ruleSetForm)
+      }
+      setShowRuleSetModal(false)
+      loadData()
+    } catch (error) {
+      console.error('Failed to save rule set:', error)
+    }
+  }
+
+  const handleToggleRuleInSet = (ruleId: string) => {
+    const currentIds = ruleSetForm.rule_ids
+    if (currentIds.includes(ruleId)) {
+      setRuleSetForm({ ...ruleSetForm, rule_ids: currentIds.filter(id => id !== ruleId) })
+    } else {
+      setRuleSetForm({ ...ruleSetForm, rule_ids: [...currentIds, ruleId] })
+    }
+  }
+
   const addExample = () => {
     if (exampleInput.trim()) {
       const currentExamples = formData.examples || []
@@ -246,10 +337,31 @@ export default function WritingRules() {
       )
     : (rules || [])
 
+  // 计算启用的规则集中包含的所有规则ID（去重）
+  const getRuleIdsFromEnabledSets = () => {
+    const ruleIds = new Set<string>()
+    if (projectConfig) {
+      for (const setId of projectConfig.enabled_rule_set_ids) {
+        const ruleSet = ruleSets.find(s => s.id === setId)
+        if (ruleSet) {
+          for (const ruleId of ruleSet.rule_ids) {
+            ruleIds.add(ruleId)
+          }
+        }
+      }
+    }
+    return ruleIds
+  }
+
+  // 判断规则是否被规则集包含
+  const isRuleFromEnabledSet = (ruleId: string) => {
+    return getRuleIdsFromEnabledSets().has(ruleId)
+  }
+
   return (
-    <div className="h-full flex flex-col">
-      {/* 头部 */}
-      <div className={`p-4 border-b ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+    <div className="h-[calc(100vh-4rem)] flex flex-col">
+      {/* 头部 - 固定在顶部 */}
+      <div className={`sticky top-0 z-10 p-4 border-b ${isDark ? 'bg-gray-900 border-gray-700' : 'bg-white border-gray-200'}`}>
         <div className="flex items-center justify-between mb-4">
           <h1 className={`text-2xl font-bold ${isDark ? 'text-white' : 'text-gray-800'}`}>写作规则</h1>
           {activeTab === 'rules' && (
@@ -259,7 +371,7 @@ export default function WritingRules() {
             </Button>
           )}
           {activeTab === 'sets' && (
-            <Button onClick={() => setShowRuleSetModal(true)}>
+            <Button onClick={handleCreateRuleSet}>
               <Plus className="w-4 h-4 mr-2" />
               新建规则集
             </Button>
@@ -381,14 +493,39 @@ export default function WritingRules() {
             {ruleSets.map((set) => (
               <Card key={set.id} className="p-4">
                 <div className="flex items-start justify-between">
-                  <div>
-                    <h3 className={`font-semibold text-lg ${isDark ? 'text-white' : 'text-gray-800'}`}>{set.name}</h3>
+                  <div className="flex-1">
+                    <div className="flex items-center gap-2">
+                      <h3 className={`font-semibold text-lg ${isDark ? 'text-white' : 'text-gray-800'}`}>{set.name}</h3>
+                      {set.is_system && (
+                        <span className="px-2 py-1 text-xs bg-blue-900 text-blue-300 rounded">系统</span>
+                      )}
+                    </div>
                     <p className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>{set.description}</p>
                     <p className={`text-xs mt-1 ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>包含 {set.rule_ids.length} 条规则</p>
                   </div>
-                  {set.is_system && (
-                    <span className="px-2 py-1 text-xs bg-blue-900 text-blue-300 rounded">系统</span>
-                  )}
+                  <div className="flex gap-2">
+                    <Button size="sm" variant="secondary" onClick={() => handleViewRuleSet(set)}>
+                      <Eye className="w-4 h-4 mr-1" />
+                      查看
+                    </Button>
+                    <Button size="sm" variant="secondary" onClick={() => handleEditRuleSet(set)}>
+                      <Edit2 className="w-4 h-4 mr-1" />
+                      编辑
+                    </Button>
+                    {!set.is_system && (
+                      <Button size="sm" variant="danger" onClick={async () => {
+                        if (!confirm('确定要删除此规则集吗？')) return
+                        try {
+                          await deleteWritingRuleSet(set.id)
+                          loadData()
+                        } catch (error) {
+                          console.error('Failed to delete rule set:', error)
+                        }
+                      }}>
+                        <Trash2 className="w-4 h-4" />
+                      </Button>
+                    )}
+                  </div>
                 </div>
               </Card>
             ))}
@@ -433,31 +570,49 @@ export default function WritingRules() {
 
               {/* 单独规则选择 */}
               <Card className="p-4">
-                <h3 className={`font-semibold mb-3 ${isDark ? 'text-white' : 'text-gray-800'}`}>单独启用规则</h3>
+                <div className="flex items-center justify-between mb-3">
+                  <h3 className={`font-semibold ${isDark ? 'text-white' : 'text-gray-800'}`}>单独启用规则</h3>
+                  <p className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+                    蓝色边框 = 已被规则集包含
+                  </p>
+                </div>
                 <div className="grid gap-2 md:grid-cols-2 lg:grid-cols-3">
-                  {rules.map((rule) => (
-                    <label
-                      key={rule.id}
-                      className={`flex items-center gap-2 p-2 rounded cursor-pointer transition-colors ${
-                        projectConfig.enabled_rule_ids.includes(rule.id)
-                          ? 'bg-green-900/30 border border-green-500'
-                          : isDark
-                            ? 'bg-gray-800 hover:bg-gray-700'
-                            : 'bg-gray-100 hover:bg-gray-200'
-                      }`}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={projectConfig.enabled_rule_ids.includes(rule.id)}
-                        onChange={() => handleToggleRule(rule.id)}
-                        className="w-4 h-4"
-                      />
-                      <div className="flex-1 min-w-0">
-                        <div className={`text-sm font-medium truncate ${isDark ? 'text-white' : 'text-gray-800'}`}>{rule.name}</div>
-                        <div className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>{CATEGORY_LABELS[rule.category]}</div>
-                      </div>
-                    </label>
-                  ))}
+                  {rules.map((rule) => {
+                    const isEnabled = projectConfig.enabled_rule_ids.includes(rule.id)
+                    const isFromSet = isRuleFromEnabledSet(rule.id)
+                    const isChecked = isEnabled || isFromSet
+
+                    return (
+                      <label
+                        key={rule.id}
+                        className={`flex items-center gap-2 p-2 rounded cursor-pointer transition-colors ${
+                          isFromSet
+                            ? 'bg-blue-900/20 border border-blue-500'
+                            : isEnabled
+                              ? 'bg-green-900/30 border border-green-500'
+                              : isDark
+                                ? 'bg-gray-800 hover:bg-gray-700'
+                                : 'bg-gray-100 hover:bg-gray-200'
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={isChecked}
+                          onChange={() => handleToggleRule(rule.id)}
+                          className="w-4 h-4"
+                        />
+                        <div className="flex-1 min-w-0">
+                          <div className={`text-sm font-medium truncate ${isDark ? 'text-white' : 'text-gray-800'}`}>
+                            {rule.name}
+                            {isFromSet && (
+                              <span className="ml-1 text-xs text-blue-400">(规则集)</span>
+                            )}
+                          </div>
+                          <div className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>{CATEGORY_LABELS[rule.category]}</div>
+                        </div>
+                      </label>
+                    )
+                  })}
                 </div>
               </Card>
             </div>
@@ -466,7 +621,7 @@ export default function WritingRules() {
       </div>
 
       {/* 编辑规则 Modal */}
-      <Modal isOpen={showEditModal} onClose={() => setShowEditModal(false)} title={editingRule ? '编辑规则' : '新建规则'} className="max-w-3xl">
+      <Modal isOpen={showEditModal} onClose={() => setShowEditModal(false)} title={editingRule ? '编辑规则' : '新建规则'} size="xl">
         <div className="space-y-4">
           <div className="grid grid-cols-2 gap-4">
             <div>
@@ -532,8 +687,9 @@ export default function WritingRules() {
                 value={exampleInput}
                 onChange={(e) => setExampleInput(e.target.value)}
                 placeholder="添加示例"
+                className="flex-1"
               />
-              <Button variant="secondary" onClick={addExample}>添加</Button>
+              <Button variant="secondary" onClick={addExample} className="whitespace-nowrap">添加</Button>
             </div>
             {(formData.examples?.length ?? 0) > 0 && (
               <ul className={`text-sm space-y-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
@@ -555,8 +711,9 @@ export default function WritingRules() {
                 value={antiPatternInput}
                 onChange={(e) => setAntiPatternInput(e.target.value)}
                 placeholder="添加反例"
+                className="flex-1"
               />
-              <Button variant="secondary" onClick={addAntiPattern}>添加</Button>
+              <Button variant="secondary" onClick={addAntiPattern} className="whitespace-nowrap">添加</Button>
             </div>
             {(formData.anti_patterns?.length ?? 0) > 0 && (
               <ul className={`text-sm space-y-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
@@ -578,8 +735,9 @@ export default function WritingRules() {
                 value={tagInput}
                 onChange={(e) => setTagInput(e.target.value)}
                 placeholder="添加标签"
+                className="flex-1"
               />
-              <Button variant="secondary" onClick={addTag}>添加</Button>
+              <Button variant="secondary" onClick={addTag} className="whitespace-nowrap">添加</Button>
             </div>
             <div className="flex gap-1 flex-wrap">
               {(formData.tags || []).map((tag) => (
@@ -589,17 +747,164 @@ export default function WritingRules() {
           </div>
 
           <div className="flex justify-end gap-2 pt-4">
-            <Button variant="secondary" onClick={() => setShowEditModal(false)}>取消</Button>
-            <Button onClick={handleSaveRule}>{editingRule ? '保存' : '创建'}</Button>
+            <Button variant="secondary" onClick={() => setShowEditModal(false)} className="whitespace-nowrap">取消</Button>
+            <Button onClick={handleSaveRule} className="whitespace-nowrap">{editingRule ? '保存' : '创建'}</Button>
           </div>
         </div>
       </Modal>
 
       {/* 预览 Modal */}
-      <Modal isOpen={showPreviewModal} onClose={() => setShowPreviewModal(false)} title="写作规则 Prompt 预览" className="max-w-4xl">
+      <Modal isOpen={showPreviewModal} onClose={() => setShowPreviewModal(false)} title="写作规则 Prompt 预览" size="xl">
         <pre className={`p-4 rounded text-sm overflow-auto max-h-[500px] whitespace-pre-wrap ${isDark ? 'bg-gray-900' : 'bg-gray-100'}`}>
           {previewContent || '加载中...'}
         </pre>
+      </Modal>
+
+      {/* 规则集详情 Modal */}
+      <Modal isOpen={!!viewingRuleSet} onClose={() => setViewingRuleSet(null)} title={viewingRuleSet?.name || '规则集详情'} size="xl">
+        {viewingRuleSet && (
+          <div className="space-y-4">
+            <div>
+              <h4 className={`font-medium mb-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>描述</h4>
+              <p className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>{viewingRuleSet.description}</p>
+            </div>
+
+            {viewingRuleSet.target_genre && (
+              <div>
+                <h4 className={`font-medium mb-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>目标体裁</h4>
+                <p className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>{viewingRuleSet.target_genre}</p>
+              </div>
+            )}
+
+            <div>
+              <h4 className={`font-medium mb-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>
+                包含规则 ({viewingRuleSet.rule_ids.length} 条)
+              </h4>
+              <div className="space-y-2 max-h-[300px] overflow-auto">
+                {viewingRuleSet.rule_ids.map((ruleId) => {
+                  const rule = rules.find(r => r.id === ruleId)
+                  return rule ? (
+                    <div key={ruleId} className={`p-2 rounded ${isDark ? 'bg-gray-800' : 'bg-gray-100'}`}>
+                      <div className="flex items-center gap-2">
+                        <span className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>{rule.name}</span>
+                        <span className={`px-2 py-0.5 text-xs rounded ${SEVERITY_LABELS[rule.severity].color}`}>
+                          {SEVERITY_LABELS[rule.severity].label}
+                        </span>
+                        <span className={`px-2 py-0.5 text-xs rounded ${isDark ? 'bg-gray-700' : 'bg-gray-200'}`}>
+                          {CATEGORY_LABELS[rule.category]}
+                        </span>
+                      </div>
+                      <p className={`text-xs mt-1 ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+                        {rule.description}
+                      </p>
+                    </div>
+                  ) : (
+                    <div key={ruleId} className={`p-2 rounded ${isDark ? 'bg-gray-800 text-gray-500' : 'bg-gray-100 text-gray-400'}`}>
+                      {ruleId} (未找到)
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+
+            {viewingRuleSet.tags && viewingRuleSet.tags.length > 0 && (
+              <div>
+                <h4 className={`font-medium mb-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>标签</h4>
+                <div className="flex gap-1 flex-wrap">
+                  {viewingRuleSet.tags.map((tag) => (
+                    <span key={tag} className={`px-2 py-1 rounded text-sm ${isDark ? 'bg-gray-700 text-gray-300' : 'bg-gray-200 text-gray-700'}`}>
+                      {tag}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div className="flex justify-end gap-2 pt-4">
+              <Button variant="secondary" onClick={() => setViewingRuleSet(null)}>关闭</Button>
+              <Button onClick={() => {
+                setViewingRuleSet(null)
+                handleEditRuleSet(viewingRuleSet)
+              }}>编辑</Button>
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      {/* 规则集编辑 Modal */}
+      <Modal isOpen={showRuleSetModal} onClose={() => setShowRuleSetModal(false)} title={editingRuleSet ? '编辑规则集' : '新建规则集'} size="xl">
+        <div className="space-y-4">
+          <div>
+            <label className={`block text-sm mb-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>名称</label>
+            <Input
+              value={ruleSetForm.name}
+              onChange={(e) => setRuleSetForm({ ...ruleSetForm, name: e.target.value })}
+              placeholder="规则集名称"
+            />
+          </div>
+
+          <div>
+            <label className={`block text-sm mb-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>描述</label>
+            <Input
+              value={ruleSetForm.description}
+              onChange={(e) => setRuleSetForm({ ...ruleSetForm, description: e.target.value })}
+              placeholder="规则集描述"
+            />
+          </div>
+
+          <div>
+            <label className={`block text-sm mb-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>目标体裁</label>
+            <Input
+              value={ruleSetForm.target_genre}
+              onChange={(e) => setRuleSetForm({ ...ruleSetForm, target_genre: e.target.value })}
+              placeholder="如：玄幻、都市、仙侠等"
+            />
+          </div>
+
+          <div>
+            <label className={`block text-sm mb-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>
+              选择规则 ({ruleSetForm.rule_ids.length} 条已选)
+            </label>
+            <div className={`border rounded p-2 max-h-[300px] overflow-auto ${isDark ? 'border-gray-600' : 'border-gray-300'}`}>
+              {rules.length === 0 ? (
+                <p className={`text-center py-4 ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>加载规则中...</p>
+              ) : (
+                <div className="space-y-1">
+                  {rules.map((rule) => (
+                    <label
+                      key={rule.id}
+                      className={`flex items-center gap-2 p-2 rounded cursor-pointer transition-colors ${
+                        ruleSetForm.rule_ids.includes(rule.id)
+                          ? 'bg-blue-900/30'
+                          : isDark
+                            ? 'hover:bg-gray-700'
+                            : 'hover:bg-gray-100'
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={ruleSetForm.rule_ids.includes(rule.id)}
+                        onChange={() => handleToggleRuleInSet(rule.id)}
+                        className="w-4 h-4"
+                      />
+                      <div className="flex-1">
+                        <span className={`${isDark ? 'text-white' : 'text-gray-800'}`}>{rule.name}</span>
+                        <span className={`ml-2 text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+                          {CATEGORY_LABELS[rule.category]}
+                        </span>
+                      </div>
+                    </label>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="flex justify-end gap-2 pt-4">
+            <Button variant="secondary" onClick={() => setShowRuleSetModal(false)} className="whitespace-nowrap">取消</Button>
+            <Button onClick={handleSaveRuleSet} className="whitespace-nowrap">{editingRuleSet ? '保存' : '创建'}</Button>
+          </div>
+        </div>
       </Modal>
     </div>
   )

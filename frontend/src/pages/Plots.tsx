@@ -19,6 +19,7 @@ export default function Plots() {
 
   const [formData, setFormData] = useState<CreateChapterDTO>({
     title: '',
+    summary: '',
     content: '',
     status: 'draft',
   })
@@ -42,7 +43,7 @@ export default function Plots() {
 
   const openCreateModal = () => {
     setEditingChapter(null)
-    setFormData({ title: '', content: '', status: 'draft' })
+    setFormData({ title: '', summary: '', content: '', status: 'draft' })
     setShowModal(true)
   }
 
@@ -50,6 +51,7 @@ export default function Plots() {
     setEditingChapter(chapter)
     setFormData({
       title: chapter.title,
+      summary: chapter.summary || '',
       content: chapter.content || '',
       status: chapter.status || 'draft',
     })
@@ -63,7 +65,10 @@ export default function Plots() {
       if (editingChapter?.id) {
         await updateChapter(editingChapter.id, formData)
       } else {
-        await createChapter(formData)
+        await createChapter({
+          ...formData,
+          project_id: currentProject?.id,
+        })
       }
       await loadChapters()
       setShowModal(false)
@@ -199,6 +204,13 @@ export default function Plots() {
             onChange={(e) => setFormData({ ...formData, title: e.target.value })}
             placeholder="如：第一章 相遇"
             autoFocus
+          />
+          <TextArea
+            label="章节摘要"
+            value={formData.summary || ''}
+            onChange={(e) => setFormData({ ...formData, summary: e.target.value })}
+            placeholder="输入该章节的期望内容或大纲摘要..."
+            rows={3}
           />
           <div>
             <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>状态</label>

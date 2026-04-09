@@ -1,32 +1,43 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef } from 'react'
 import { Card, Button, Input, TextArea } from '@/components/ui'
 import PageLayout from '@/components/PageLayout'
 import { getCharacters, getCharacter, updateCharacter } from '@/api/characters'
 import type { Character, UpdateCharacterDTO } from '@/api/characters'
-import { Mic2, Plus, X, Volume2, Ban } from 'lucide-react'
+import { Mic2, Plus, X, Volume2, Ban, FolderOpen, Check } from 'lucide-react'
 import { useTheme } from '@/contexts/ThemeContext'
+import { useProject } from '@/contexts/ProjectContext'
 
 export default function CharacterVoice() {
   const { theme } = useTheme()
   const isDark = theme === 'dark'
+  const { currentProject } = useProject()
 
   const [characters, setCharacters] = useState<Character[]>([])
   const [selectedId, setSelectedId] = useState<string>('')
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
+  const [saved, setSaved] = useState(false)
   const [form, setForm] = useState<Character | null>(null)
   const [newLexicon, setNewLexicon] = useState('')
   const [newForbidden, setNewForbidden] = useState('')
   const [newSample, setNewSample] = useState('')
 
+  const debounceRef = useRef<NodeJS.Timeout | null>(null)
+
   useEffect(() => {
     loadCharacters()
-  }, [])
+  }, [currentProject?.id])
 
   const loadCharacters = async () => {
+    setLoading(true)
     try {
-      const data = await getCharacters()
+      const data = await getCharacters(currentProject?.id)
       setCharacters(data)
+      // 如果当前选中的角色不在新列表中，清空选择
+      if (selectedId && !data.find(c => c.id === selectedId)) {
+        setSelectedId('')
+        setForm(null)
+      }
       if (data.length > 0 && !selectedId) {
         await selectCharacter(data[0].id || '')
       }
@@ -53,47 +64,78 @@ export default function CharacterVoice() {
     }
   }
 
-  const saveVoiceConfig = async () => {
-    if (!form?.id) return
+  // 自动保存函数
+  const autoSave = async (data: Character) => {
+    if (!data?.id) return
     setSaving(true)
     try {
       const payload: UpdateCharacterDTO = {
-        id: form.id,
-        name: form.name,
-        role: form.role,
-        status: form.status,
-        description: form.description,
-        personality: form.personality,
-        appearance: form.appearance,
-        background: form.background,
-        speech_pattern: form.speech_pattern,
-        lexicon: form.lexicon || [],
-        forbidden_words: form.forbidden_words || [],
-        voice_samples: form.voice_samples || [],
+        id: data.id,
+        name: data.name,
+        role: data.role,
+        status: data.status,
+        description: data.description,
+        project_id: data.project_id,
+        personality: data.personality,
+        appearance: data.appearance,
+        background: data.background,
+        speech_pattern: data.speech_pattern,
+        lexicon: data.lexicon || [],
+        forbidden_words: data.forbidden_words || [],
+        voice_samples: data.voice_samples || [],
       }
-      await updateCharacter(form.id, payload)
-      await selectCharacter(form.id)
-      alert('角色声音配置已保存')
+      await updateCharacter(data.id, payload)
+      setCharacters(prev => prev.map(c => c.id === data.id ? { ...c, ...payload } : c))
+      setSaved(true)
+      setTimeout(() => setSaved(false), 2000)
     } catch (error) {
-      console.error('Failed to save voice config:', error)
-      alert('保存失败，请重试')
+      console.error('Failed to auto-save:', error)
     } finally {
       setSaving(false)
     }
   }
 
-  const addListItem = (field: 'lexicon' | 'forbidden_words' | 'voice_samples', value: string, clear: () => void) => {
-    if (!form || !value.trim()) return
-    const next = [...(form[field] || []), value.trim()]
-    setForm({ ...form, [field]: next })
-    clear()
+  // 说话风格变更处理（带 debounce）
+  const handleSpeechPatternChange = (value: string) => {
+    if (!form) return
+    const updatedForm = { ...form, speech_pattern: value }
+    setForm(updatedForm)
+
+    // 清除之前的定时器
+    if (debounceRef.current) {
+      clearTimeout(debounceRef.current)
+    }
+    // 设置新的 debounce 定时器（800ms）
+    debounceRef.current = setTimeout(() => {
+      autoSave(updatedForm)
+    }, 800)
   }
 
-  const removeListItem = (field: 'lexicon' | 'forbidden_words' | 'voice_samples', index: number) => {
+  // 组件卸载时清理定时器
+  useEffect(() => {
+    return () => {
+      if (debounceRef.current) {
+        clearTimeout(debounceRef.current)
+      }
+    }
+  }, [])
+
+  const addListItem = async (field: 'lexicon' | 'forbidden_words' | 'voice_samples', value: string, clear: () => void) => {
+    if (!form || !value.trim()) return
+    const next = [...(form[field] || []), value.trim()]
+    const updatedForm = { ...form, [field]: next }
+    setForm(updatedForm)
+    clear()
+    await autoSave(updatedForm)
+  }
+
+  const removeListItem = async (field: 'lexicon' | 'forbidden_words' | 'voice_samples', index: number) => {
     if (!form) return
     const next = [...(form[field] || [])]
     next.splice(index, 1)
-    setForm({ ...form, [field]: next })
+    const updatedForm = { ...form, [field]: next }
+    setForm(updatedForm)
+    await autoSave(updatedForm)
   }
 
   return (
@@ -101,17 +143,37 @@ export default function CharacterVoice() {
       title="角色声音管理"
       description="管理角色说话风格、常用词汇和禁用词"
       actions={
-        <Button onClick={saveVoiceConfig} loading={saving} disabled={!form}>
-          <Mic2 size={18} className="mr-2" />保存声音配置
-        </Button>
+        saving ? (
+          <span className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>保存中...</span>
+        ) : saved ? (
+          <span className="flex items-center gap-1 text-sm text-green-500">
+            <Check size={14} /> 已保存
+          </span>
+        ) : null
       }
     >
-      {loading ? (
+      {!currentProject ? (
+        <Card>
+          <div className="text-center py-16">
+            <FolderOpen size={48} className={`mx-auto mb-4 ${isDark ? 'text-gray-600' : 'text-gray-300'}`} />
+            <p className={`text-lg ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>请先选择一个项目</p>
+            <p className={`mt-2 text-sm ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>在左侧项目列表中选择项目后，即可管理该项目的角色声音</p>
+          </div>
+        </Card>
+      ) : loading ? (
         <div className={`text-center py-12 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>加载角色中...</div>
+      ) : characters.length === 0 ? (
+        <Card>
+          <div className="text-center py-16">
+            <Mic2 size={48} className={`mx-auto mb-4 ${isDark ? 'text-gray-600' : 'text-gray-300'}`} />
+            <p className={`text-lg ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>当前项目暂无角色</p>
+            <p className={`mt-2 text-sm ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>请先在角色管理页面创建角色</p>
+          </div>
+        </Card>
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
           <Card className="lg:col-span-1">
-            <h2 className={`font-semibold mb-4 ${isDark ? 'text-white' : 'text-gray-800'}`}>角色列表</h2>
+            <h2 className={`font-semibold mb-4 ${isDark ? 'text-white' : 'text-gray-800'}`}>角色列表 ({characters.length})</h2>
             <div className="space-y-2">
               {characters.map((character) => (
                 <button
@@ -147,7 +209,7 @@ export default function CharacterVoice() {
                   <TextArea
                     label="Speech Pattern"
                     value={form.speech_pattern || ''}
-                    onChange={(e) => setForm({ ...form, speech_pattern: e.target.value })}
+                    onChange={(e) => handleSpeechPatternChange(e.target.value)}
                     placeholder="例如：说话直接、带江湖气、不喜欢绕弯子..."
                     rows={4}
                   />

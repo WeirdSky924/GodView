@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { Card, Button, Input, Modal } from '@/components/ui'
+import { Card, Button, Input, Modal, TextArea } from '@/components/ui'
 import PageLayout from '@/components/PageLayout'
 import {
   FileText, Download, ChevronLeft, ChevronRight, Save, Plus,
@@ -23,7 +23,9 @@ export default function NovelView() {
   const [editMode, setEditMode] = useState(false)
   const [showCreateModal, setShowCreateModal] = useState(false)
   const [newChapterTitle, setNewChapterTitle] = useState('')
+  const [newChapterSummary, setNewChapterSummary] = useState('')
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saved' | 'saving'>('idle')
+  const [showSummary, setShowSummary] = useState(true)
 
   const currentChapter = currentChapterIndex >= 0 ? chapters[currentChapterIndex] : null
 
@@ -58,14 +60,17 @@ export default function NovelView() {
     try {
       const result = await createChapter({
         title: newChapterTitle,
+        summary: newChapterSummary,
         content: '',
         status: 'draft',
+        project_id: currentProject?.id,
       })
       await loadChapters()
       const newIndex = chapters.findIndex((c) => c.id === result.id)
       if (newIndex >= 0) setCurrentChapterIndex(newIndex)
       setShowCreateModal(false)
       setNewChapterTitle('')
+      setNewChapterSummary('')
       setEditMode(true)
     } catch (error) {
       console.error('Failed to create chapter:', error)
@@ -93,6 +98,7 @@ export default function NovelView() {
     try {
       await updateChapter(currentChapter.id, {
         title: currentChapter.title,
+        summary: currentChapter.summary,
         content: currentChapter.content,
         status: currentChapter.status,
       })
@@ -264,14 +270,14 @@ export default function NovelView() {
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
           {/* 目录 */}
-          <Card className="lg:col-span-1 h-[calc(100vh-200px)] flex flex-col">
-            <div className={`px-6 py-4 border-b flex items-center justify-between ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+          <Card className="lg:col-span-1 h-[calc(100vh-200px)] flex flex-col overflow-hidden" noPadding>
+            <div className={`px-6 py-4 border-b flex items-center justify-between flex-shrink-0 ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
               <h2 className={`font-semibold flex items-center gap-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>
                 <FileText size={20} />
                 目录 ({chapters.length})
               </h2>
             </div>
-            <div className="flex-1 overflow-y-auto p-4 space-y-2">
+            <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-2">
               {chapters.length === 0 ? (
                 <div className="text-center py-8">
                   <p className={`text-sm mb-3 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>暂无章节</p>
@@ -319,7 +325,7 @@ export default function NovelView() {
           </Card>
 
           {/* 编辑/预览区 */}
-          <Card className="lg:col-span-3 h-[calc(100vh-200px)] flex flex-col">
+          <Card className="lg:col-span-3 h-[calc(100vh-200px)] flex flex-col overflow-hidden" noPadding>
             {!currentChapter ? (
               <div className={`flex-1 flex flex-col items-center justify-center ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
                 <FileText size={48} className="mb-4" />
@@ -328,7 +334,7 @@ export default function NovelView() {
             ) : (
               <>
                 {/* 章节头部 */}
-                <div className={`px-6 py-4 border-b flex items-center justify-between ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+                <div className={`px-6 py-4 border-b flex items-center justify-between flex-shrink-0 ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
                   <div className="flex-1">
                     {editMode ? (
                       <input
@@ -379,8 +385,40 @@ export default function NovelView() {
                   </div>
                 </div>
 
+                {/* 摘要区域 */}
+                {(currentChapter.summary || editMode) && (
+                  <div className={`px-6 py-3 border-b flex-shrink-0 ${isDark ? 'border-gray-700 bg-gray-800/50' : 'border-gray-200 bg-gray-50'}`}>
+                    <div className="flex items-center justify-between mb-2">
+                      <span className={`text-sm font-medium ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>章节摘要</span>
+                      <button
+                        onClick={() => setShowSummary(!showSummary)}
+                        className={`text-xs ${isDark ? 'text-gray-400 hover:text-gray-300' : 'text-gray-500 hover:text-gray-600'}`}
+                      >
+                        {showSummary ? '收起' : '展开'}
+                      </button>
+                    </div>
+                    {showSummary && (
+                      editMode ? (
+                        <textarea
+                          value={currentChapter.summary || ''}
+                          onChange={(e) => updateCurrentChapter({ summary: e.target.value })}
+                          className={`w-full px-3 py-2 text-sm rounded-lg border resize-none focus:outline-none focus:ring-2 focus:ring-blue-500 ${
+                            isDark ? 'bg-gray-700 border-gray-600 text-gray-200' : 'bg-white border-gray-300 text-gray-700'
+                          }`}
+                          rows={3}
+                          placeholder="输入该章节的期望内容或大纲摘要..."
+                        />
+                      ) : (
+                        <p className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>
+                          {currentChapter.summary || '暂无摘要'}
+                        </p>
+                      )
+                    )}
+                  </div>
+                )}
+
                 {/* 内容区 */}
-                <div className="flex-1 overflow-y-auto">
+                <div className="flex-1 min-h-0 overflow-y-auto">
                   {editMode ? (
                     <textarea
                       value={currentChapter.content || ''}
@@ -389,7 +427,6 @@ export default function NovelView() {
                         isDark ? 'bg-gray-800 text-gray-200' : 'text-gray-700'
                       }`}
                       placeholder="开始写作..."
-                      style={{ minHeight: '400px' }}
                     />
                   ) : (
                     <div className="p-6 prose max-w-none">
@@ -403,7 +440,7 @@ export default function NovelView() {
                 </div>
 
                 {/* 底部导航 */}
-                <div className={`px-6 py-3 border-t flex items-center justify-between ${isDark ? 'bg-gray-800 border-gray-700' : 'bg-gray-50 border-gray-200'}`}>
+                <div className={`px-6 py-3 border-t flex items-center justify-between flex-shrink-0 ${isDark ? 'bg-gray-800 border-gray-700' : 'bg-gray-50 border-gray-200'}`}>
                   <Button
                     variant="secondary"
                     size="sm"
@@ -438,6 +475,7 @@ export default function NovelView() {
         onClose={() => {
           setShowCreateModal(false)
           setNewChapterTitle('')
+          setNewChapterSummary('')
         }}
         title="新建章节"
       >
@@ -449,12 +487,20 @@ export default function NovelView() {
             placeholder="如：第一章 相遇"
             autoFocus
           />
+          <TextArea
+            label="章节摘要"
+            value={newChapterSummary}
+            onChange={(e) => setNewChapterSummary(e.target.value)}
+            placeholder="输入该章节的期望内容或大纲摘要..."
+            rows={3}
+          />
           <div className="flex justify-end gap-3 pt-4">
             <Button
               variant="secondary"
               onClick={() => {
                 setShowCreateModal(false)
                 setNewChapterTitle('')
+                setNewChapterSummary('')
               }}
             >
               取消

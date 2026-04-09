@@ -1,7 +1,7 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { Card, Button, Input, TextArea, Modal } from '@/components/ui'
 import PageLayout from '@/components/PageLayout'
-import { getHooks, createHook, updateHookStatus } from '@/api/chapters'
+import { getHooks, createHook, updateHook, updateHookStatus, deleteHook as deleteHookApi } from '@/api/chapters'
 import { Plus, Flag, CheckCircle, Clock, XCircle, Trash2, Edit, FolderOpen } from 'lucide-react'
 import { useProject } from '@/contexts/ProjectContext'
 import { useTheme } from '@/contexts/ThemeContext'
@@ -30,6 +30,7 @@ interface CreateHookDTO {
   hook_type?: string
   related_characters?: string[]
   priority?: number
+  project_id?: string
 }
 
 export default function Hooks() {
@@ -42,11 +43,12 @@ export default function Hooks() {
   const [editingHook, setEditingHook] = useState<Hook | null>(null)
   const [loading, setLoading] = useState(true)
   const [filterStatus, setFilterStatus] = useState<string>('all')
+  const [openDropdownId, setOpenDropdownId] = useState<string | null>(null)
 
   const [formData, setFormData] = useState<CreateHookDTO>({
     title: '',
     description: '',
-    hook_type: 'foreshadowing',
+    hook_type: 'custom',
     priority: 1,
   })
 
@@ -71,9 +73,18 @@ export default function Hooks() {
     loadHooks()
   }, [loadHooks])
 
+  // 点击外部关闭下拉菜单
+  useEffect(() => {
+    const handleClickOutside = () => setOpenDropdownId(null)
+    if (openDropdownId) {
+      document.addEventListener('click', handleClickOutside)
+      return () => document.removeEventListener('click', handleClickOutside)
+    }
+  }, [openDropdownId])
+
   const openCreateModal = () => {
     setEditingHook(null)
-    setFormData({ title: '', description: '', hook_type: 'foreshadowing', priority: 1 })
+    setFormData({ title: '', description: '', hook_type: 'custom', priority: 1 })
     setShowModal(true)
   }
 
@@ -82,17 +93,27 @@ export default function Hooks() {
     setFormData({
       title: hook.title,
       description: hook.description || '',
-      hook_type: hook.hook_type || 'foreshadowing',
+      hook_type: hook.hook_type || 'custom',
       priority: hook.priority || 1,
     })
     setShowModal(true)
   }
 
   const saveHook = async () => {
-    if (!formData.title) return
+    if (!formData.title || !currentProject) return
 
     try {
-      await createHook(formData)
+      if (editingHook?.id) {
+        // 编辑模式：更新现有伏笔
+        await updateHook(editingHook.id, {
+          ...formData,
+          project_id: currentProject.id,
+          status: editingHook.status,
+        })
+      } else {
+        // 新建模式：创建伏笔
+        await createHook({ ...formData, project_id: currentProject.id })
+      }
       await loadHooks()
       setShowModal(false)
     } catch (error) {
@@ -112,10 +133,15 @@ export default function Hooks() {
     }
   }
 
-  const deleteHook = async (hookId: string | undefined) => {
+  const deleteHookHandler = async (hookId: string | undefined) => {
     if (!hookId || !confirm('确定要删除这个伏笔吗？')) return
-    // TODO: add deleteHook API
-    alert('删除功能待实现')
+    try {
+      await deleteHookApi(hookId)
+      await loadHooks()
+    } catch (error) {
+      console.error('Failed to delete hook:', error)
+      alert('删除失败，请重试')
+    }
   }
 
   const getStatusIcon = (status: string) => {
@@ -159,13 +185,15 @@ export default function Hooks() {
 
   const getTypeLabel = (type?: string) => {
     const types: Record<string, string> = {
-      foreshadowing: '伏笔',
-      character: '角色线索',
-      plot: '剧情线索',
-      object: '物品线索',
-      location: '地点线索',
+      mystery: '谜团',
+      character: '角色相关',
+      event: '事件',
+      object: '物品',
+      location: '地点',
+      relationship: '关系',
+      custom: '自定义',
     }
-    return type ? types[type] || type : '伏笔'
+    return type ? types[type] || type : '自定义'
   }
 
   const filteredHooks = filterStatus === 'all'
@@ -198,8 +226,9 @@ export default function Hooks() {
         </div>
       ) : (
         <>
-          {/* 状态筛选 */}
-          <div className="mb-6 flex gap-2 flex-wrap">
+        <div className="flex flex-col h-[calc(100vh-200px)]">
+          {/* 状态筛选 - 固定在顶部 */}
+          <div className="flex gap-2 flex-wrap flex-shrink-0 mb-4">
             {[
               { key: 'all', label: '全部' },
               { key: 'planted', label: '已埋设' },
@@ -223,15 +252,17 @@ export default function Hooks() {
             ))}
           </div>
 
+          {/* 列表区域 - 填满剩余空间 */}
           {loading ? (
-            <div className="flex items-center justify-center py-20">
+            <div className="flex items-center justify-center py-20 flex-shrink-0">
               <Flag size={24} className="animate-spin mr-3" />
               <span className={isDark ? 'text-gray-400' : 'text-gray-500'}>加载伏笔...</span>
             </div>
           ) : (
-            <div className="grid grid-cols-1 gap-4">
-              {filteredHooks.length === 0 ? (
-                <Card>
+            <div className="flex-1 overflow-y-auto min-h-0">
+              <div className="grid grid-cols-1 gap-4">
+                {filteredHooks.length === 0 ? (
+                  <Card>
                   <div className={`text-center py-12 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
                     <Flag size={48} className="mx-auto mb-4 opacity-50" />
                     <p>暂无伏笔记录</p>
@@ -240,7 +271,7 @@ export default function Hooks() {
                 </Card>
               ) : (
                 filteredHooks.map((hook) => (
-                  <Card key={hook.id} className="hover:shadow-md transition-shadow">
+                  <Card key={hook.id} className="hover:shadow-md transition-shadow overflow-visible">
                     <div className="flex items-start justify-between">
                       <div className="flex items-start gap-4 flex-1">
                         <div className="mt-1">{getStatusIcon(hook.status)}</div>
@@ -274,41 +305,50 @@ export default function Hooks() {
                         </div>
                       </div>
                       <div className="flex items-center gap-2">
-                        <div className="relative group">
-                          <Button variant="secondary" size="sm">
+                        <div className="relative">
+                          <Button
+                            variant="secondary"
+                            size="sm"
+                            onClick={(e) => { e.stopPropagation(); setOpenDropdownId(openDropdownId === hook.id ? null : hook.id!) }}
+                          >
                             变更状态
                           </Button>
-                          <div className={`absolute right-0 top-full mt-1 rounded-lg shadow-lg border py-1 hidden group-hover:block z-10 min-w-[120px] ${isDark ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'}`}>
-                            <button
-                              onClick={() => updateStatus(hook.id, 'planted')}
-                              className={`w-full text-left px-4 py-2 text-sm hover:bg-gray-50 flex items-center gap-2 ${isDark ? 'hover:bg-gray-700 text-gray-300' : ''}`}
+                          {openDropdownId === hook.id && (
+                            <div
+                              className={`absolute right-0 top-full mt-1 rounded-lg shadow-lg border py-1 z-50 min-w-[120px] ${isDark ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'}`}
+                              onClick={(e) => e.stopPropagation()}
                             >
-                              <Clock size={14} /> 已埋设
-                            </button>
-                            <button
-                              onClick={() => updateStatus(hook.id, 'triggered')}
-                              className={`w-full text-left px-4 py-2 text-sm hover:bg-gray-50 flex items-center gap-2 ${isDark ? 'hover:bg-gray-700 text-gray-300' : ''}`}
-                            >
-                              <Flag size={14} /> 已触发
-                            </button>
-                            <button
-                              onClick={() => updateStatus(hook.id, 'resolved')}
-                              className={`w-full text-left px-4 py-2 text-sm hover:bg-gray-50 flex items-center gap-2 ${isDark ? 'hover:bg-gray-700 text-gray-300' : ''}`}
-                            >
-                              <CheckCircle size={14} /> 已回收
-                            </button>
-                            <button
-                              onClick={() => updateStatus(hook.id, 'dropped')}
-                              className={`w-full text-left px-4 py-2 text-sm hover:bg-gray-50 flex items-center gap-2 ${isDark ? 'hover:bg-gray-700 text-gray-300' : ''}`}
-                            >
-                              <XCircle size={14} /> 已废弃
-                            </button>
-                          </div>
+                              <button
+                                onClick={() => { updateStatus(hook.id, 'planted'); setOpenDropdownId(null); }}
+                                className={`w-full text-left px-4 py-2 text-sm hover:bg-gray-50 flex items-center gap-2 ${isDark ? 'hover:bg-gray-700 text-gray-300' : ''}`}
+                              >
+                                <Clock size={14} /> 已埋设
+                              </button>
+                              <button
+                                onClick={() => { updateStatus(hook.id, 'triggered'); setOpenDropdownId(null); }}
+                                className={`w-full text-left px-4 py-2 text-sm hover:bg-gray-50 flex items-center gap-2 ${isDark ? 'hover:bg-gray-700 text-gray-300' : ''}`}
+                              >
+                                <Flag size={14} /> 已触发
+                              </button>
+                              <button
+                                onClick={() => { updateStatus(hook.id, 'resolved'); setOpenDropdownId(null); }}
+                                className={`w-full text-left px-4 py-2 text-sm hover:bg-gray-50 flex items-center gap-2 ${isDark ? 'hover:bg-gray-700 text-gray-300' : ''}`}
+                              >
+                                <CheckCircle size={14} /> 已回收
+                              </button>
+                              <button
+                                onClick={() => { updateStatus(hook.id, 'dropped'); setOpenDropdownId(null); }}
+                                className={`w-full text-left px-4 py-2 text-sm hover:bg-gray-50 flex items-center gap-2 ${isDark ? 'hover:bg-gray-700 text-gray-300' : ''}`}
+                              >
+                                <XCircle size={14} /> 已废弃
+                              </button>
+                            </div>
+                          )}
                         </div>
                         <Button variant="secondary" size="sm" onClick={() => openEditModal(hook)}>
                           <Edit size={16} />
                         </Button>
-                        <Button variant="danger" size="sm" onClick={() => deleteHook(hook.id)}>
+                        <Button variant="danger" size="sm" onClick={() => deleteHookHandler(hook.id)}>
                           <Trash2 size={16} />
                         </Button>
                       </div>
@@ -316,10 +356,12 @@ export default function Hooks() {
                   </Card>
                 ))
               )}
+              </div>
             </div>
           )}
+        </div>
 
-          {/* 创建/编辑模态框 */}
+        {/* 创建/编辑模态框 */}
           <Modal
             isOpen={showModal}
             onClose={() => setShowModal(false)}
@@ -342,11 +384,13 @@ export default function Hooks() {
                     value={formData.hook_type}
                     onChange={(e) => setFormData({ ...formData, hook_type: e.target.value })}
                   >
-                    <option value="foreshadowing">伏笔</option>
-                    <option value="character">角色线索</option>
-                    <option value="plot">剧情线索</option>
-                    <option value="object">物品线索</option>
-                    <option value="location">地点线索</option>
+                    <option value="mystery">谜团</option>
+                    <option value="character">角色相关</option>
+                    <option value="event">事件</option>
+                    <option value="object">物品</option>
+                    <option value="location">地点</option>
+                    <option value="relationship">关系</option>
+                    <option value="custom">自定义</option>
                   </select>
                 </div>
                 <div>

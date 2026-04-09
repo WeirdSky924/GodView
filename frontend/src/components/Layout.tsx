@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
-import { NavLink } from 'react-router-dom'
+import { NavLink, useNavigate } from 'react-router-dom'
 import {
-  LayoutDashboard, Users, Globe, BookOpen, BookMarked, Sliders, FileText, Settings, Flag, GitCompare, ShieldAlert, Eye, Network, Mic2, CheckCircle2, FolderOpen, ChevronDown, Plus, Layers, MessageSquare, Bot, PenTool, Sparkles, Sun, Moon, Database, Server, AlertCircle, CheckCircle, XCircle
+  LayoutDashboard, Users, Globe, BookOpen, BookMarked, Sliders, FileText, Settings, Flag, GitCompare, ShieldAlert, Eye, Network, Mic2, CheckCircle2, FolderOpen, ChevronDown, Plus, Layers, MessageSquare, Bot, PenTool, Sparkles, Sun, Moon, Database, Server, AlertCircle, CheckCircle, XCircle, Clapperboard, Play
 } from 'lucide-react'
 import { useProject } from '@/contexts/ProjectContext'
 import { useTheme } from '@/contexts/ThemeContext'
@@ -27,7 +27,6 @@ const navItems: NavItem[] = [
   { path: '/simulator', icon: <Eye size={20} />, label: '读者模拟' },
   { path: '/visualize', icon: <Network size={20} />, label: '可视化工作台' },
   { path: '/chapter-evaluator', icon: <CheckCircle2 size={20} />, label: '章节判定器' },
-  { path: '/director', icon: <Sliders size={20} />, label: '导演模式' },
   { path: '/novel', icon: <FileText size={20} />, label: '小说编辑器' },
   { path: '/skills', icon: <Layers size={20} />, label: 'Agent Skills' },
   { path: '/prompts', icon: <MessageSquare size={20} />, label: 'Prompt 库' },
@@ -40,6 +39,7 @@ const navItems: NavItem[] = [
 export default function Layout({ children }: { children: React.ReactNode }) {
   const { currentProject, projects, setCurrentProject, loading } = useProject()
   const { theme, toggleTheme } = useTheme()
+  const navigate = useNavigate()
   const [showProjectMenu, setShowProjectMenu] = useState(false)
   const [dbStatus, setDbStatus] = useState<DatabaseStatusResponse | null>(null)
   const [showDbPopover, setShowDbPopover] = useState(false)
@@ -176,6 +176,76 @@ export default function Layout({ children }: { children: React.ReactNode }) {
                 )}
               </AnimatePresence>
             </div>
+          </div>
+
+          {/* 上帝模式入口 - 炫酷按钮 */}
+          <div className="p-4">
+            <motion.button
+              onClick={() => navigate('/director')}
+              className="relative w-full overflow-hidden rounded-xl"
+              whileHover={{ scale: 1.02 }}
+              whileTap={{ scale: 0.98 }}
+            >
+              {/* 背景动画层 */}
+              <div className="absolute inset-0 bg-gradient-to-r from-violet-600 via-purple-600 to-fuchsia-600 animate-pulse-slow" />
+
+              {/* 光效流动层 */}
+              <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/20 to-transparent animate-shimmer" />
+
+              {/* 星星粒子效果 */}
+              <div className="absolute inset-0 overflow-hidden">
+                {[...Array(6)].map((_, i) => (
+                  <motion.div
+                    key={i}
+                    className="absolute w-1 h-1 bg-white rounded-full"
+                    initial={{
+                      x: Math.random() * 100 + '%',
+                      y: '100%',
+                      opacity: 0
+                    }}
+                    animate={{
+                      y: '-10%',
+                      opacity: [0, 1, 0]
+                    }}
+                    transition={{
+                      duration: 2 + Math.random(),
+                      repeat: Infinity,
+                      delay: i * 0.3
+                    }}
+                  />
+                ))}
+              </div>
+
+              {/* 内容 */}
+              <div className="relative px-4 py-3 flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <motion.div
+                    animate={{ rotate: [0, 10, -10, 0] }}
+                    transition={{ duration: 2, repeat: Infinity, ease: "easeInOut" }}
+                  >
+                    <Clapperboard className="w-6 h-6 text-white" />
+                  </motion.div>
+                  <div className="text-left">
+                    <div className="text-white font-bold text-sm flex items-center gap-1.5">
+                      上帝模式
+                      <motion.span
+                        animate={{ scale: [1, 1.2, 1] }}
+                        transition={{ duration: 1.5, repeat: Infinity }}
+                      >
+                        ✨
+                      </motion.span>
+                    </div>
+                    <div className="text-white/70 text-xs">一键生成章节</div>
+                  </div>
+                </div>
+                <motion.div
+                  animate={{ x: [0, 4, 0] }}
+                  transition={{ duration: 1.5, repeat: Infinity }}
+                >
+                  <Play className="w-5 h-5 text-white" fill="white" />
+                </motion.div>
+              </div>
+            </motion.button>
           </div>
         </div>
 

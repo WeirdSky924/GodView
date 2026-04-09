@@ -2,6 +2,7 @@
 静态设定 (Lore) API 路由
 """
 
+import json
 import logging
 import uuid
 from datetime import datetime
@@ -35,13 +36,10 @@ class UpdateLoreDTO(BaseModel):
     forbidden_actions: Optional[List[str]] = None
     source: Optional[str] = None
 
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-
-
-# 模拟数据库（实际应用中应该使用真实数据库）
-_lore_store: Dict[str, LoreEntry] = {}
 
 
 # ==================== 静态路由（必须在动态路由之前） ====================
@@ -107,33 +105,45 @@ async def list_lore(
     Returns:
         List: 设定列表
     """
-    results = []
+    from app.api.app import postgres_db
 
-    for lore in _lore_store.values():
-        if lore.project_id != project_id:
-            continue
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
 
-        if category and lore.category != category:
-            continue
+    # 构建查询
+    conditions = ["project_id = CAST(:project_id AS UUID)"]
+    params: Dict[str, Any] = {"project_id": project_id, "limit": limit}
 
-        if priority and lore.priority != priority:
-            continue
+    if category:
+        conditions.append("category = :category")
+        params["category"] = category.value
 
-        if search and search.lower() not in lore.title.lower() and search.lower() not in lore.content.lower():
-            continue
+    if priority:
+        conditions.append("priority = :priority")
+        params["priority"] = priority.value
 
-        results.append(lore.model_dump(mode="json"))
+    if search:
+        conditions.append("(title ILIKE :search OR content ILIKE :search)")
+        params["search"] = f"%{search}%"
 
-    # 按优先级和创建时间排序
-    priority_order = {
-        LorePriority.CONSTITUTIONAL: 0,
-        LorePriority.CORE: 1,
-        LorePriority.STANDARD: 2,
-        LorePriority.FLEXIBLE: 3,
-    }
-    results.sort(key=lambda x: (priority_order.get(x.get("priority"), 99), x.get("created_at", "")))
+    where_clause = f"WHERE {' AND '.join(conditions)}"
+    query = f"""
+        SELECT * FROM lore_entries
+        {where_clause}
+        ORDER BY
+            CASE priority
+                WHEN 'constitutional' THEN 0
+                WHEN 'core' THEN 1
+                WHEN 'standard' THEN 2
+                WHEN 'flexible' THEN 3
+                ELSE 99
+            END,
+            created_at DESC
+        LIMIT :limit
+    """
 
-    return results[:limit]
+    results = await postgres_db.execute_query(query, params)
+    return results
 
 
 @router.post("", response_model=Dict[str, Any])
@@ -147,26 +157,56 @@ async def create_lore(lore: LoreEntry):
     Returns:
         Dict: 创建结果
     """
-    # 自动生成 ID（如果未提供）
-    lore_id = lore.id or str(uuid.uuid4())
+    from app.api.app import postgres_db
 
-    if lore_id in _lore_store:
-        raise HTTPException(status_code=400, detail="设定 ID 已存在")
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
 
-    # 更新 lore 对象的 ID
-    lore.id = lore_id
+    # 始终生成新的 UUID（忽略前端传入的 ID）
+    lore_id = str(uuid.uuid4())
 
     # 设置创建时间
-    if not hasattr(lore, 'created_at') or lore.created_at is None:
-        lore.created_at = datetime.now()
+    now = datetime.now()
 
-    _lore_store[lore_id] = lore
-
-    return {
-        "success": True,
+    params = {
         "id": lore_id,
-        "message": f"设定 '{lore.title}' 创建成功",
+        "project_id": lore.project_id,
+        "title": lore.title,
+        "category": lore.category.value if isinstance(lore.category, LoreCategory) else lore.category,
+        "priority": lore.priority.value if isinstance(lore.priority, LorePriority) else lore.priority,
+        "content": lore.content,
+        "summary": lore.summary or "",
+        "keywords": json.dumps(lore.keywords) if lore.keywords else "[]",
+        "tags": json.dumps(lore.tags) if lore.tags else "[]",
+        "constraints": json.dumps(lore.constraints) if lore.constraints else "[]",
+        "related_characters": json.dumps(lore.related_characters) if lore.related_characters else "[]",
+        "related_locations": json.dumps(lore.related_locations) if lore.related_locations else "[]",
+        "related_items": json.dumps(lore.related_items) if lore.related_items else "[]",
+        "created_at": now,
+        "updated_at": now,
     }
+
+    try:
+        await postgres_db.execute_write("""
+            INSERT INTO lore_entries (
+                id, project_id, title, category, priority, content, summary,
+                keywords, tags, constraints, related_characters, related_locations, related_items,
+                created_at, updated_at
+            ) VALUES (
+                CAST(:id AS UUID), CAST(:project_id AS UUID), :title, :category, :priority, :content, :summary,
+                :keywords, :tags, :constraints, :related_characters, :related_locations, :related_items,
+                :created_at, :updated_at
+            )
+        """, params)
+
+        return {
+            "success": True,
+            "id": lore_id,
+            "message": f"设定 '{lore.title}' 创建成功",
+        }
+    except Exception as e:
+        logger.error(f"创建设定失败：{e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/{lore_id}", response_model=Dict[str, Any])
@@ -180,10 +220,18 @@ async def get_lore(lore_id: str):
     Returns:
         Dict: 设定数据
     """
-    if lore_id not in _lore_store:
+    from app.api.app import postgres_db
+
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+
+    query = "SELECT * FROM lore_entries WHERE id = CAST(:id AS UUID)"
+    results = await postgres_db.execute_query(query, {"id": lore_id})
+
+    if not results:
         raise HTTPException(status_code=404, detail="设定不存在")
 
-    return _lore_store[lore_id].model_dump(mode="json")
+    return results[0]
 
 
 @router.put("/{lore_id}", response_model=Dict[str, Any])
@@ -198,27 +246,45 @@ async def update_lore(lore_id: str, lore_update: UpdateLoreDTO):
     Returns:
         Dict: 更新结果
     """
-    if lore_id not in _lore_store:
+    from app.api.app import postgres_db
+
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+
+    # 检查设定是否存在
+    existing = await postgres_db.execute_query(
+        "SELECT id FROM lore_entries WHERE id = CAST(:id AS UUID)",
+        {"id": lore_id}
+    )
+    if not existing:
         raise HTTPException(status_code=404, detail="设定不存在")
 
-    # 获取现有设定
-    existing = _lore_store[lore_id]
+    # 构建更新语句
+    update_fields = []
+    params: Dict[str, Any] = {"id": lore_id}
 
-    # 应用部分更新
     update_data = lore_update.model_dump(exclude_unset=True)
     for key, value in update_data.items():
         if value is not None:
-            setattr(existing, key, value)
+            if key in ["category", "priority"]:
+                update_fields.append(f"{key} = :{key}")
+                params[key] = value.value if hasattr(value, 'value') else value
+            else:
+                update_fields.append(f"{key} = :{key}")
+                params[key] = value
 
-    # 更新时间戳
-    existing.updated_at = datetime.now()
+    if not update_fields:
+        return {"success": True, "id": lore_id, "message": "没有需要更新的字段"}
 
-    _lore_store[lore_id] = existing
+    update_fields.append("updated_at = NOW()")
+
+    query = f"UPDATE lore_entries SET {', '.join(update_fields)} WHERE id = CAST(:id AS UUID)"
+    await postgres_db.execute_write(query, params)
 
     return {
         "success": True,
         "id": lore_id,
-        "message": f"设定 '{existing.title}' 更新成功",
+        "message": "设定更新成功",
     }
 
 
@@ -233,10 +299,15 @@ async def delete_lore(lore_id: str):
     Returns:
         Dict: 删除结果
     """
-    if lore_id not in _lore_store:
-        raise HTTPException(status_code=404, detail="设定不存在")
+    from app.api.app import postgres_db
 
-    del _lore_store[lore_id]
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+
+    await postgres_db.execute_write(
+        "DELETE FROM lore_entries WHERE id = CAST(:id AS UUID)",
+        {"id": lore_id}
+    )
 
     return {
         "success": True,
@@ -263,41 +334,44 @@ async def search_lore(
     Returns:
         List: 搜索结果
     """
-    results = []
+    from app.api.app import postgres_db
 
-    for lore in _lore_store.values():
-        if lore.project_id != project_id:
-            continue
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
 
-        if category and lore.category != category:
-            continue
+    conditions = ["project_id = CAST(:project_id AS UUID)"]
+    params: Dict[str, Any] = {"project_id": project_id, "limit": limit}
 
-        # 简单的关键词匹配
-        query_lower = query.lower()
-        score = 0.0
+    if category:
+        conditions.append("category = :category")
+        params["category"] = category.value
 
-        if query_lower in lore.title.lower():
-            score = 0.9
-        elif query_lower in lore.content.lower():
-            score = 0.7
-        elif any(query_lower in kw.lower() for kw in lore.keywords):
-            score = 0.8
+    # 简单的关键词匹配
+    conditions.append("(title ILIKE :query OR content ILIKE :query)")
+    params["query"] = f"%{query}%"
 
-        if score > 0:
-            results.append(LoreSearchResult(
-                id=lore.id,
-                title=lore.title,
-                category=lore.category,
-                priority=lore.priority,
-                summary=lore.summary,
-                score=score,
-                keywords=lore.keywords,
-            ))
+    where_clause = f"WHERE {' AND '.join(conditions)}"
+    sql = f"""
+        SELECT id, title, category, priority, summary, keywords
+        FROM lore_entries
+        {where_clause}
+        LIMIT :limit
+    """
 
-    # 按分数排序
-    results.sort(key=lambda x: x.score, reverse=True)
+    results = await postgres_db.execute_query(sql, params)
 
-    return results[:limit]
+    return [
+        LoreSearchResult(
+            id=row.get("id", ""),
+            title=row.get("title", ""),
+            category=row.get("category", "custom"),
+            priority=row.get("priority", "standard"),
+            summary=row.get("summary"),
+            score=0.8,  # 简单的固定分数
+            keywords=row.get("keywords", []),
+        )
+        for row in results
+    ]
 
 
 @router.post("/validate", response_model=LoreValidationResult)
@@ -317,22 +391,26 @@ async def validate_content(
     Returns:
         LoreValidationResult: 验证结果
     """
+    from app.api.app import postgres_db
+
     conflicts = []
     warnings = []
     suggestions = []
 
+    if not postgres_db:
+        return LoreValidationResult(valid=True, conflicts=[], warnings=[], suggestions=[])
+
     # 检查宪法级规则
     if check_constitutional:
-        for lore in _lore_store.values():
-            if lore.project_id != project_id:
-                continue
-            if lore.priority != LorePriority.CONSTITUTIONAL:
-                continue
+        lores = await postgres_db.execute_query(
+            "SELECT title, constraints FROM lore_entries WHERE project_id = CAST(:project_id AS UUID) AND priority = 'constitutional'",
+            {"project_id": project_id}
+        )
 
-            # 简单的约束检查
-            for constraint in lore.constraints:
+        for lore in lores:
+            for constraint in lore.get("constraints", []):
                 if constraint.lower() in content.lower():
-                    warnings.append(f"可能违反宪法级规则 '{lore.title}': {constraint}")
+                    warnings.append(f"可能违反宪法级规则 '{lore['title']}': {constraint}")
 
     return LoreValidationResult(
         valid=len(conflicts) == 0,

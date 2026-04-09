@@ -18,6 +18,9 @@ export type AgentType =
   | 'writer'
   | 'evaluator'
   | 'proc_gen'
+  | 'event_generator'
+  | 'dungeon_generator'
+  | 'world_map_manager'
 
 export interface PromptSlot {
   slot_name: string
@@ -36,11 +39,10 @@ export interface AgentTemplate {
   agent_type: AgentType
   prompt_slots: PromptSlot[]
   default_prompt_order: string[]
-  default_model: string
-  default_temperature: number
-  default_max_tokens: number
   tags: string[]
   is_system: boolean
+  is_optional: boolean
+  is_enabled: boolean
   version: string
   created_at: string
   updated_at: string
@@ -52,9 +54,6 @@ export interface CreateAgentTemplateDTO {
   agent_type: AgentType
   prompt_slots?: PromptSlot[]
   default_prompt_order?: string[]
-  default_model?: string
-  default_temperature?: number
-  default_max_tokens?: number
   tags?: string[]
 }
 
@@ -63,9 +62,6 @@ export interface UpdateAgentTemplateDTO {
   description?: string
   prompt_slots?: PromptSlot[]
   default_prompt_order?: string[]
-  default_model?: string
-  default_temperature?: number
-  default_max_tokens?: number
   tags?: string[]
   version?: string
 }
@@ -73,6 +69,7 @@ export interface UpdateAgentTemplateDTO {
 export interface PreviewResult {
   template_id: string
   template_name: string
+  project_id: string | null
   rendered_prompts: Array<{
     slot_name: string
     description: string
@@ -134,8 +131,15 @@ export async function deleteAgentTemplate(templateId: string): Promise<{ success
 /**
  * 预览 Agent 模板渲染结果
  */
-export async function previewAgentTemplate(templateId: string, variables: Record<string, any> = {}): Promise<PreviewResult> {
+export async function previewAgentTemplate(
+  templateId: string,
+  projectId?: string,
+  variables: Record<string, any> = {}
+): Promise<PreviewResult> {
   const params = new URLSearchParams()
+  if (projectId) {
+    params.append('project_id', projectId)
+  }
   Object.entries(variables).forEach(([key, value]) => {
     params.append(key, String(value))
   })
@@ -148,4 +152,25 @@ export async function previewAgentTemplate(templateId: string, variables: Record
  */
 export async function getAgentTemplateByType(agentType: AgentType): Promise<AgentTemplate> {
   return await api.get(`${API_BASE}/by-type/${agentType}`)
+}
+
+/**
+ * 切换可选 Agent 模板的启用状态
+ */
+export async function toggleAgentTemplate(templateId: string, enabled: boolean): Promise<{ success: boolean; message: string; template: AgentTemplate }> {
+  return await api.post(`${API_BASE}/${templateId}/toggle?enabled=${enabled}`)
+}
+
+/**
+ * 获取核心 Agent 类型列表
+ */
+export async function getCoreAgentTypes(): Promise<string[]> {
+  return await api.get(`${API_BASE}/core/list`)
+}
+
+/**
+ * 获取可选 Agent 类型列表
+ */
+export async function getOptionalAgentTypes(): Promise<string[]> {
+  return await api.get(`${API_BASE}/optional/list`)
 }

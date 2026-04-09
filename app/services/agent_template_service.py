@@ -40,9 +40,6 @@ class AgentTemplateService:
             tags=dto.tags,
             prompt_slots=dto.prompt_slots,
             default_prompt_order=dto.default_prompt_order,
-            default_model=dto.default_model,
-            default_temperature=dto.default_temperature,
-            default_max_tokens=dto.default_max_tokens,
             is_system=dto.is_system,
         )
 

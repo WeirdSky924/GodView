@@ -34,12 +34,48 @@ def _prepare_json_params(data: Dict[str, Any], json_fields: List[str]) -> Dict[s
     """
     result = data.copy()
     for field in json_fields:
-        if field in result and result[field] is not None:
+        if field in result:
             value = result[field]
-            # 如果是列表或字典，转换为 JSON 字符串
+            # 如果值是字符串，先尝试解析再重新序列化（确保格式正确）
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except (json.JSONDecodeError, TypeError):
+                    value = [] if field not in ['attributes'] else {}
+            # 转换为 JSON 字符串
             if isinstance(value, (list, dict)):
                 result[field] = json.dumps(value)
+            elif value is None:
+                result[field] = '[]' if field not in ['attributes'] else '{}'
+            else:
+                result[field] = json.dumps(value)
     return result
+
+
+def _to_postgres_array(items: List[str]) -> str:
+    """
+    将 Python 列表转换为 PostgreSQL 数组字面量格式
+
+    Args:
+        items: 字符串列表
+
+    Returns:
+        str: PostgreSQL 数组格式字符串，如 '{item1,item2}'
+    """
+    if not items:
+        return '{}'
+
+    # 转义单引号和特殊字符
+    escaped = []
+    for item in items:
+        if item is None:
+            escaped.append('NULL')
+        else:
+            # 转义单引号（PostgreSQL 数组中用双引号包裹元素）
+            item_str = str(item).replace('\\', '\\\\').replace('"', '\\"')
+            escaped.append(f'"{item_str}"')
+
+    return '{' + ','.join(escaped) + '}'
 
 
 class PostgresDatabase:
@@ -119,7 +155,32 @@ class PostgresDatabase:
         async with self.get_session() as session:
             result = await session.execute(text(query), params or {})
             columns = result.keys()
-            return [dict(zip(columns, row)) for row in result.fetchall()]
+            rows = [dict(zip(columns, row)) for row in result.fetchall()]
+
+            # 处理 JSONB 字段 - 确保返回正确的 Python 类型
+            jsonb_fields = [
+                'personality_traits', 'attributes', 'rules', 'factions', 'metadata',
+                'details', 'affected_hooks', 'affected_relationships', 'affected_characters',
+                'characters', 'relationships', 'regions', 'hooks',
+                'coordinates', 'terrain_features', 'landmarks', 'encounters', 'connections', 'local_rules',
+                'completed_events', 'character_locations',
+                # project_writing_configs 表的 JSONB 字段
+                'enabled_rule_ids', 'enabled_rule_set_ids', 'rule_overrides', 'rule_priorities',
+                # writing_rules 表的 JSONB 字段
+                'tags', 'examples', 'counter_examples', 'conditions', 'exceptions',
+                # writing_rule_sets 表的 JSONB 字段
+                'rule_ids', 'rule_overrides', 'target_genres',
+            ]
+
+            for row in rows:
+                for field in jsonb_fields:
+                    if field in row and isinstance(row[field], str):
+                        try:
+                            row[field] = json.loads(row[field])
+                        except (json.JSONDecodeError, TypeError):
+                            pass  # 保持原值
+
+            return rows
 
     async def execute_write(
         self, query: str, params: Optional[Dict[str, Any]] = None
@@ -169,14 +230,55 @@ class PostgresDatabase:
         """
         from datetime import datetime
 
-        # 处理 JSON 字段
-        params = _prepare_json_params(character_data, [
-            'personality_traits', 'lexicon', 'voice_samples', 'attributes', 'goals', 'inventory'
-        ])
+        params = character_data.copy()
+
+        # 处理 JSONB 字段 (包括数组和对象类型)
+        jsonb_list_fields = ['lexicon', 'forbidden_words', 'voice_samples', 'goals', 'inventory', 'agent_goals', 'agent_memory']
+        jsonb_dict_fields = ['personality_traits', 'attributes']
+
+        # 处理字段名映射 (background -> background_story)
+        if 'background' in params and 'background_story' not in params:
+            params['background_story'] = params.pop('background')
+
+        # 处理数组类型的 JSONB 字段
+        for field in jsonb_list_fields:
+            value = params.get(field)
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except:
+                    value = []
+            if not isinstance(value, list):
+                value = []
+            params[field] = json.dumps(value)
+
+        # 处理对象类型的 JSONB 字段
+        for field in jsonb_dict_fields:
+            value = params.get(field)
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except:
+                    value = {}
+            if not isinstance(value, dict):
+                value = {}
+            params[field] = json.dumps(value)
+
+        # 确保可选字段有默认值
+        if params.get('background_story') is None:
+            params['background_story'] = None
+        if params.get('speech_pattern') is None:
+            params['speech_pattern'] = None
+        if params.get('personality') is None:
+            params['personality'] = None
 
         # 处理可选的 UUID 字段
         if params.get('world_id') is None:
             params['world_id'] = None
+
+        # 处理布尔字段
+        params['has_agent'] = params.get('has_agent', False)
+        params['agent_enabled'] = params.get('agent_enabled', True)
 
         # 确保 datetime 字段是 datetime 对象
         for field in ['created_at', 'updated_at']:
@@ -188,13 +290,17 @@ class PostgresDatabase:
             elif field not in params or params[field] is None:
                 params[field] = datetime.now()
 
+        # 使用 SQLAlchemy text 查询
         query = """
         INSERT INTO characters (id, name, project_id, world_id, description, role, status, appearance, age, gender,
-                                personality_traits, background_story, speech_pattern, lexicon,
-                                forbidden_words, voice_samples, attributes, goals, inventory, current_location)
-        VALUES (CAST(:id AS UUID), :name, CAST(:project_id AS UUID), :world_id, :description, :role, :status, :appearance, :age, :gender,
-                :personality_traits, :background_story, :speech_pattern, :lexicon,
-                :forbidden_words, :voice_samples, :attributes, :goals, :inventory, :current_location)
+                                personality, personality_traits, background_story, speech_pattern, lexicon,
+                                forbidden_words, voice_samples, attributes, goals, inventory, current_location,
+                                has_agent, agent_enabled, agent_goals, agent_memory)
+        VALUES (:id, :name, :project_id, :world_id, :description, :role, :status, :appearance, :age, :gender,
+                :personality, CAST(:personality_traits AS jsonb), :background_story, :speech_pattern, CAST(:lexicon AS jsonb),
+                CAST(:forbidden_words AS jsonb), CAST(:voice_samples AS jsonb), CAST(:attributes AS jsonb),
+                CAST(:goals AS jsonb), CAST(:inventory AS jsonb), :current_location,
+                :has_agent, :agent_enabled, CAST(:agent_goals AS jsonb), CAST(:agent_memory AS jsonb))
         ON CONFLICT (id) DO UPDATE SET
             name = EXCLUDED.name,
             project_id = EXCLUDED.project_id,
@@ -205,6 +311,7 @@ class PostgresDatabase:
             appearance = EXCLUDED.appearance,
             age = EXCLUDED.age,
             gender = EXCLUDED.gender,
+            personality = EXCLUDED.personality,
             personality_traits = EXCLUDED.personality_traits,
             background_story = EXCLUDED.background_story,
             speech_pattern = EXCLUDED.speech_pattern,
@@ -215,6 +322,10 @@ class PostgresDatabase:
             goals = EXCLUDED.goals,
             inventory = EXCLUDED.inventory,
             current_location = EXCLUDED.current_location,
+            has_agent = EXCLUDED.has_agent,
+            agent_enabled = EXCLUDED.agent_enabled,
+            agent_goals = EXCLUDED.agent_goals,
+            agent_memory = EXCLUDED.agent_memory,
             updated_at = CURRENT_TIMESTAMP
         """
         await self.execute_write(query, params)
@@ -278,15 +389,17 @@ class PostgresDatabase:
 
     async def save_project(self, project_data: Dict[str, Any]) -> str:
         """保存项目数据"""
-        import json
-
         # 如果有 id，将其转换为 UUID
         project_id = project_data.get("id")
 
         # 处理 metadata，确保是 JSON 字符串
         metadata = project_data.get("metadata") or {}
-        if isinstance(metadata, dict):
-            metadata = json.dumps(metadata)
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except:
+                metadata = {}
+        metadata_str = json.dumps(metadata)
 
         params = {
             "id": project_data.get("id"),
@@ -295,7 +408,7 @@ class PostgresDatabase:
             "user_id": project_data.get("user_id"),
             "status": project_data.get("status", "draft"),
             "world_id": project_data.get("world_id"),
-            "metadata": metadata
+            "metadata": metadata_str
         }
 
         query = """
@@ -419,8 +532,8 @@ class PostgresDatabase:
         query = """
         INSERT INTO worlds (id, name, project_id, description, world_type, tone, rules, power_system,
                            technology_level, history, geography, factions, created_at, updated_at)
-        VALUES (:id, :name, :project_id, :description, :world_type, :tone, :rules, :power_system,
-                :technology_level, :history, :geography, :factions, :created_at, :updated_at)
+        VALUES (:id, :name, CAST(:project_id AS UUID), :description, :world_type, :tone, CAST(:rules AS jsonb), :power_system,
+                :technology_level, :history, :geography, CAST(:factions AS jsonb), :created_at, :updated_at)
         ON CONFLICT (id) DO UPDATE SET
             name = EXCLUDED.name,
             project_id = EXCLUDED.project_id,
@@ -488,12 +601,20 @@ class PostgresDatabase:
             region_data["atmosphere"] = ""
         logger.info(f"save_region after fix: area_size={region_data.get('area_size')}")
 
-        # 确保 JSONB 字段被正确序列化
+        # 处理 JSONB 字段 - 转换为 JSON 字符串
         json_fields = ['coordinates', 'terrain_features', 'landmarks', 'encounters', 'connections', 'local_rules']
         for field in json_fields:
             if field in region_data and region_data[field] is not None:
-                if isinstance(region_data[field], (list, dict)):
-                    region_data[field] = json.dumps(region_data[field])
+                value = region_data[field]
+                if isinstance(value, str):
+                    try:
+                        value = json.loads(value)
+                    except:
+                        value = {} if field == 'coordinates' else []
+                if isinstance(value, (list, dict)):
+                    region_data[field] = json.dumps(value)
+                elif value is None:
+                    region_data[field] = '{}' if field == 'coordinates' else '[]'
 
         # 确保 datetime 字段是 datetime 对象
         datetime_fields = ['created_at', 'updated_at']
@@ -510,9 +631,9 @@ class PostgresDatabase:
                             encounters, connections, local_rules, is_generated, visit_count,
                             created_at, updated_at)
         VALUES (:id, :name, :world_id, :region_type, :terrain_type, :description,
-                :atmosphere, :coordinates, :area_size, :terrain_features, :landmarks,
-                :encounters, :connections, :local_rules, :is_generated, :visit_count,
-                :created_at, :updated_at)
+                :atmosphere, CAST(:coordinates AS jsonb), :area_size, CAST(:terrain_features AS jsonb),
+                CAST(:landmarks AS jsonb), CAST(:encounters AS jsonb), CAST(:connections AS jsonb),
+                CAST(:local_rules AS jsonb), :is_generated, :visit_count, :created_at, :updated_at)
         ON CONFLICT (id) DO UPDATE SET
             name = EXCLUDED.name,
             world_id = EXCLUDED.world_id,
@@ -542,6 +663,12 @@ class PostgresDatabase:
 
     async def get_regions_by_world(self, world_id: str) -> List[Dict[str, Any]]:
         """获取世界的所有区域"""
+        # 验证 world_id 是否为有效的 UUID 格式
+        import uuid
+        try:
+            uuid.UUID(world_id)
+        except (ValueError, TypeError):
+            return []
         query = "SELECT * FROM regions WHERE world_id = CAST(:world_id AS UUID)"
         return await self.execute_query(query, {"world_id": world_id})
 
@@ -682,6 +809,8 @@ class PostgresDatabase:
         # 处理可选字段
         if params.get('world_id') is None:
             params['world_id'] = None
+        if params.get('project_id') is None:
+            params['project_id'] = None
 
         # 确保 datetime 字段是 datetime 对象
         for field in ['created_at', 'updated_at', 'completed_at']:
@@ -694,16 +823,17 @@ class PostgresDatabase:
                 params[field] = datetime.now()
 
         query = """
-        INSERT INTO chapters (id, title, project_id, world_id, content, word_count, status, events,
+        INSERT INTO chapters (id, title, project_id, world_id, summary, content, word_count, status, events,
                              hooks_planted, hooks_resolved, main_plot_progress, reader_scores,
                              created_at, updated_at, completed_at)
-        VALUES (:id, :title, CAST(:project_id AS UUID), :world_id, :content, :word_count, :status, :events,
+        VALUES (:id, :title, CAST(:project_id AS UUID), :world_id, :summary, :content, :word_count, :status, :events,
                 :hooks_planted, :hooks_resolved, :main_plot_progress, :reader_scores,
                 :created_at, :updated_at, :completed_at)
         ON CONFLICT (id) DO UPDATE SET
             title = EXCLUDED.title,
             project_id = EXCLUDED.project_id,
             world_id = EXCLUDED.world_id,
+            summary = EXCLUDED.summary,
             content = EXCLUDED.content,
             word_count = EXCLUDED.word_count,
             status = EXCLUDED.status,
@@ -726,6 +856,12 @@ class PostgresDatabase:
 
     async def get_chapters_by_world(self, world_id: str) -> List[Dict[str, Any]]:
         """获取世界的所有章节"""
+        # 验证 world_id 是否为有效的 UUID 格式
+        import uuid
+        try:
+            uuid.UUID(world_id)
+        except (ValueError, TypeError):
+            return []
         query = "SELECT * FROM chapters WHERE world_id = CAST(:world_id AS UUID) ORDER BY created_at ASC"
         return await self.execute_query(query, {"world_id": world_id})
 
@@ -762,15 +898,22 @@ class PostgresDatabase:
 
     async def save_snapshot(self, snapshot_data: Dict[str, Any]) -> str:
         """保存世界快照"""
-        import json
         from datetime import datetime
 
-        # 确保 JSONB 字段被正确序列化
+        # 处理 JSONB 字段 - 转换为 JSON 字符串
         json_fields = ['characters', 'relationships', 'regions', 'hooks', 'completed_events', 'character_locations']
         for field in json_fields:
             if field in snapshot_data and snapshot_data[field] is not None:
-                if isinstance(snapshot_data[field], (list, dict)):
-                    snapshot_data[field] = json.dumps(snapshot_data[field])
+                value = snapshot_data[field]
+                if isinstance(value, str):
+                    try:
+                        value = json.loads(value)
+                    except:
+                        value = {}
+                if isinstance(value, (list, dict)):
+                    snapshot_data[field] = json.dumps(value)
+                elif value is None:
+                    snapshot_data[field] = '{}'
 
         # 确保 created_at 是 datetime 对象
         if 'created_at' in snapshot_data and isinstance(snapshot_data['created_at'], str):
@@ -785,8 +928,9 @@ class PostgresDatabase:
                                      completed_events, character_locations, created_at, created_by,
                                      parent_snapshot_id, is_branch, branch_reason)
         VALUES (:id, :world_id, :chapter_id, :snapshot_type, :name, :description,
-                :characters, :relationships, :regions, :hooks, :main_plot_progress,
-                :completed_events, :character_locations, :created_at, :created_by,
+                CAST(:characters AS jsonb), CAST(:relationships AS jsonb), CAST(:regions AS jsonb),
+                CAST(:hooks AS jsonb), :main_plot_progress, CAST(:completed_events AS jsonb),
+                CAST(:character_locations AS jsonb), :created_at, :created_by,
                 :parent_snapshot_id, :is_branch, :branch_reason)
         """
         await self.execute_write(query, snapshot_data)
@@ -800,6 +944,13 @@ class PostgresDatabase:
 
     async def get_snapshots_by_world(self, world_id: str) -> List[Dict[str, Any]]:
         """获取世界的所有快照"""
+        # 验证 world_id 是否为有效的 UUID 格式
+        import uuid
+        try:
+            uuid.UUID(world_id)
+        except (ValueError, TypeError):
+            # 如果不是有效的 UUID，返回空列表
+            return []
         query = "SELECT * FROM world_snapshots WHERE world_id = CAST(:world_id AS UUID) ORDER BY created_at DESC"
         return await self.execute_query(query, {"world_id": world_id})
 
@@ -833,12 +984,27 @@ class PostgresDatabase:
 
     async def log_intervention(self, intervention_data: Dict[str, Any]) -> str:
         """记录干预日志"""
+        # 处理 JSONB 字段
+        json_fields = ['details', 'affected_hooks', 'affected_relationships', 'affected_characters']
+        for field in json_fields:
+            if field in intervention_data and intervention_data[field] is not None:
+                value = intervention_data[field]
+                if isinstance(value, str):
+                    try:
+                        value = json.loads(value)
+                    except:
+                        value = {} if field == 'details' else []
+                if isinstance(value, (list, dict)):
+                    intervention_data[field] = json.dumps(value)
+                elif value is None:
+                    intervention_data[field] = '{}' if field == 'details' else '[]'
+
         query = """
         INSERT INTO intervention_logs (id, snapshot_id, intervention_type, description, details,
                                        affected_hooks, affected_relationships, affected_characters,
                                        outcome_rating, outcome_notes, created_at)
-        VALUES (:id, :snapshot_id, :intervention_type, :description, :details,
-                :affected_hooks, :affected_relationships, :affected_characters,
+        VALUES (:id, :snapshot_id, :intervention_type, :description, CAST(:details AS jsonb),
+                CAST(:affected_hooks AS jsonb), CAST(:affected_relationships AS jsonb), CAST(:affected_characters AS jsonb),
                 :outcome_rating, :outcome_notes, :created_at)
         """
         await self.execute_write(query, intervention_data)
@@ -1036,15 +1202,24 @@ class PostgresDatabase:
         Returns:
             str: 记录 ID
         """
+        # 处理 metadata JSONB 字段
+        metadata = usage_data.get("metadata", {})
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except:
+                metadata = {}
+        usage_data["metadata"] = json.dumps(metadata) if isinstance(metadata, dict) else '{}'
+
         query = """
         INSERT INTO token_usage (
             id, project_id, input_tokens, output_tokens, total_tokens,
             provider, model, category, agent_name, session_id,
             chapter_id, character_id, estimated_cost, metadata, created_at
         ) VALUES (
-            :id, :project_id, :input_tokens, :output_tokens, :total_tokens,
+            CAST(:id AS UUID), CAST(:project_id AS UUID), :input_tokens, :output_tokens, :total_tokens,
             :provider, :model, :category, :agent_name, :session_id,
-            :chapter_id, :character_id, :estimated_cost, :metadata, :created_at
+            :chapter_id, :character_id, :estimated_cost, CAST(:metadata AS jsonb), :created_at
         )
         """
         await self.execute_write(query, usage_data)
@@ -1221,3 +1396,64 @@ class PostgresDatabase:
         ORDER BY p.total_tokens DESC NULLS LAST
         """
         return await self.execute_query(query, {})
+
+    # ==================== 全局统计操作 ====================
+
+    async def get_global_stats(self, project_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        获取统计数据
+
+        Args:
+            project_id: 项目 ID（可选，传入则返回该项目的统计）
+
+        Returns:
+            Dict: 统计数据
+        """
+        if project_id:
+            # 按项目过滤的统计
+            character_count = await self.execute_query(
+                "SELECT COUNT(*) as count FROM characters WHERE project_id = CAST(:project_id AS UUID)",
+                {"project_id": project_id}
+            )
+            world_count = await self.execute_query(
+                "SELECT COUNT(*) as count FROM worlds WHERE project_id = CAST(:project_id AS UUID)",
+                {"project_id": project_id}
+            )
+            chapter_count = await self.execute_query(
+                "SELECT COUNT(*) as count FROM chapters WHERE project_id = CAST(:project_id AS UUID)",
+                {"project_id": project_id}
+            )
+            token_stats = await self.execute_query(
+                "SELECT COALESCE(SUM(total_tokens), 0) as total_tokens, COALESCE(SUM(estimated_cost), 0) as total_cost FROM token_usage WHERE project_id = CAST(:project_id AS UUID)",
+                {"project_id": project_id}
+            )
+            # 单个项目时项目数为 1
+            return {
+                "project_count": 1,
+                "character_count": character_count[0]["count"] if character_count else 0,
+                "world_count": world_count[0]["count"] if world_count else 0,
+                "chapter_count": chapter_count[0]["count"] if chapter_count else 0,
+                "total_tokens": token_stats[0]["total_tokens"] if token_stats else 0,
+                "total_cost": float(token_stats[0]["total_cost"]) if token_stats else 0.0,
+            }
+        else:
+            # 全局统计
+            project_count = await self.execute_query("SELECT COUNT(*) as count FROM projects")
+            character_count = await self.execute_query("SELECT COUNT(*) as count FROM characters")
+            world_count = await self.execute_query("SELECT COUNT(*) as count FROM worlds")
+            chapter_count = await self.execute_query("SELECT COUNT(*) as count FROM chapters")
+            token_stats = await self.execute_query("""
+                SELECT
+                    COALESCE(SUM(total_tokens), 0) as total_tokens,
+                    COALESCE(SUM(estimated_cost), 0) as total_cost
+                FROM token_usage
+            """)
+
+            return {
+                "project_count": project_count[0]["count"] if project_count else 0,
+                "character_count": character_count[0]["count"] if character_count else 0,
+                "world_count": world_count[0]["count"] if world_count else 0,
+                "chapter_count": chapter_count[0]["count"] if chapter_count else 0,
+                "total_tokens": token_stats[0]["total_tokens"] if token_stats else 0,
+                "total_cost": float(token_stats[0]["total_cost"]) if token_stats else 0.0,
+            }

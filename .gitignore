@@ -94,24 +94,12 @@ models/
 *.safetensors
 *.gguf
 
-# ======================== 设计文档 ========================
-# GodView 设计文档
-/godView.md
-/godView_v2.md
-/godView_v3.md
-/godView_v4.md
-/godView_v5.md
-/godView_v6.md
-/godView_v7.md
+# ======================== 文档 ========================
+# 文档目录
+/docs/
 
-# 实现状态追踪文档
-/IMPLEMENTATION_STATUS.md
-/godView_v5_implementation_summary.md
-/godView_v6_implementation_summary.md
-/godView_v7_implementation_summary.md
-
-# 测试追踪文档
-/TEST_REPORT.md
+# 根目录下的 md 文件
+/*.md
 
 # ======================== Docker ========================
 # Docker volumes (如果使用本地目录)

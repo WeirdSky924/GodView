@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# 模拟服务实例（实际应该依赖注入）
+# 全局服务实例
 _prompt_service = None
 
 
@@ -34,6 +34,12 @@ def get_prompt_service():
     return _prompt_service
 
 
+def set_prompt_service(service):
+    """设置 Prompt 服务实例（用于初始化）"""
+    global _prompt_service
+    _prompt_service = service
+
+
 # ==================== Prompt CRUD API ====================
 
 @router.get("/prompts", response_model=List[Dict[str, Any]])
@@ -42,7 +48,7 @@ async def list_prompts(
     tags: Optional[List[str]] = Query(default=None, description="按标签过滤"),
     is_system: Optional[bool] = Query(default=None, description="是否系统内置"),
     search: Optional[str] = Query(default=None, description="搜索关键词"),
-    limit: int = Query(default=50, le=100, description="返回数量限制"),
+    limit: int = Query(default=50, le=500, description="返回数量限制"),
     offset: int = Query(default=0, ge=0, description="偏移量"),
 ):
     """
@@ -62,7 +68,13 @@ async def list_prompts(
     service = get_prompt_service()
 
     # 构建过滤条件
-    category_enum = PromptCategory(category) if category else None
+    category_enum = None
+    if category:
+        try:
+            category_enum = PromptCategory(category)
+        except ValueError:
+            pass  # 忽略无效的分类值
+
     filters = PromptFilter(
         category=category_enum,
         tags=tags,
@@ -203,7 +215,7 @@ async def delete_prompt(prompt_id: str):
 async def search_prompts(
     query: str = Query(..., description="搜索关键词"),
     category: Optional[str] = Query(default=None, description="分类过滤"),
-    limit: int = Query(default=50, le=100, description="返回数量限制"),
+    limit: int = Query(default=50, le=500, description="返回数量限制"),
 ):
     """
     搜索 Prompt 模板
@@ -218,7 +230,12 @@ async def search_prompts(
     """
     service = get_prompt_service()
 
-    category_enum = PromptCategory(category) if category else None
+    category_enum = None
+    if category:
+        try:
+            category_enum = PromptCategory(category)
+        except ValueError:
+            pass  # 忽略无效的分类值
 
     try:
         templates = await service.search_templates(

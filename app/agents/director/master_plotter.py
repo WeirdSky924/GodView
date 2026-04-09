@@ -67,21 +67,32 @@ class MasterPlotterAgent(BaseAgent):
 
     async def execute(self, input_data: Dict[str, Any]) -> AgentResponse:
         """
-        执行主线剧情评估
+        执行主线剧情评估或规划
 
         Args:
             input_data: 包含以下字段
+                - task: 任务类型（"advance" 或 "plan_plot"）
                 - main_plot_progress: 主线进度 (0-1)
                 - pending_hooks: 已埋设未回收的伏笔列表
                 - chapter_goal: 当前章节目标
                 - recent_events: 最近发生的事件
                 - interaction_turns: 当前交互轮次
                 - max_turns_threshold: 最大轮次阈值
+                - initial_plot: 初始剧情设定（plan_plot 任务）
+                - chapter_count: 章节数量（plan_plot 任务）
+                - characters: 角色列表（plan_plot 任务）
+                - world_info: 世界观信息（plan_plot 任务）
 
         Returns:
-            AgentResponse: 剧情推进决策
+            AgentResponse: 剧情推进决策或规划结果
         """
         try:
+            task = input_data.get("task", "advance")
+
+            if task == "plan_plot":
+                return await self._execute_plot_planning(input_data)
+
+            # 默认：剧情推进评估
             main_plot_progress = input_data.get("main_plot_progress", 0.0)
             pending_hooks = input_data.get("pending_hooks", [])
             chapter_goal = input_data.get("chapter_goal", "")
@@ -127,6 +138,83 @@ class MasterPlotterAgent(BaseAgent):
         except Exception as e:
             logger.error(f"MasterPlotterAgent 执行失败：{e}")
             return AgentResponse(success=False, error=str(e))
+
+    async def _execute_plot_planning(self, input_data: Dict[str, Any]) -> AgentResponse:
+        """
+        执行整体剧情规划
+
+        Args:
+            input_data: 包含初始剧情、章节数、角色、世界观
+
+        Returns:
+            AgentResponse: 剧情规划结果
+        """
+        initial_plot = input_data.get("initial_plot", "")
+        chapter_count = input_data.get("chapter_count", 3)
+        characters = input_data.get("characters", [])
+        world_info = input_data.get("world_info", {})
+        main_plot_progress = input_data.get("main_plot_progress", 0.0)
+
+        prompt = f"""请根据以下信息，规划一部小说的整体剧情大纲：
+
+【世界观】
+名称：{world_info.get('name', '未知世界')}
+类型：{world_info.get('world_type', '奇幻')}
+描述：{world_info.get('description', '无')}
+
+【主要角色】
+{chr(10).join([f'- {c}' for c in characters]) if characters else '暂无角色信息'}
+
+【初始剧情设定】
+{initial_plot}
+
+【当前主线进度】
+{main_plot_progress * 100:.1f}%
+
+【目标】
+规划 {chapter_count} 个章节的大纲
+
+请输出 JSON 格式：
+{{
+    "overall_summary": "整体剧情概述（100字以内）",
+    "chapter_titles": ["第一章标题", "第二章标题", ...],
+    "chapter_goals": ["第一章目标/大纲", "第二章目标/大纲", ...],
+    "main_conflicts": ["主要冲突1", "主要冲突2", ...],
+    "climax_chapter": 高潮章节编号,
+    "ending_hint": "结局暗示"
+}}
+
+要求：
+1. 章节标题要吸引人，符合网文风格
+2. 每章目标要具体，包含冲突和转折
+3. 确保有起承转合
+4. 伏笔和悬念要合理安排"""
+
+        try:
+            response_text = await self._call_llm(
+                messages=[HumanMessage(content=prompt)], temperature=0.7
+            )
+            result = self._parse_json_response(response_text)
+
+            # 确保返回必要字段
+            if not result.get("chapter_titles"):
+                result["chapter_titles"] = [f"第{i+1}章" for i in range(chapter_count)]
+            if not result.get("chapter_goals"):
+                result["chapter_goals"] = [initial_plot for _ in range(chapter_count)]
+
+            return AgentResponse(success=True, data=result)
+
+        except Exception as e:
+            logger.error(f"剧情规划失败: {e}")
+            # 返回默认规划
+            return AgentResponse(
+                success=True,
+                data={
+                    "chapter_titles": [f"第{i+1}章" for i in range(chapter_count)],
+                    "chapter_goals": [initial_plot for _ in range(chapter_count)],
+                    "overall_summary": initial_plot,
+                },
+            )
 
     def _build_user_message(
         self,

@@ -9,9 +9,10 @@ interface CardProps {
   description?: string
   action?: ReactNode
   hover?: boolean
+  noPadding?: boolean
 }
 
-export function Card({ children, className = '', title, description, action, hover = false }: CardProps) {
+export function Card({ children, className = '', title, description, action, hover = false, noPadding = false }: CardProps) {
   const { theme } = useTheme()
   const isDark = theme === 'dark'
 
@@ -38,7 +39,7 @@ export function Card({ children, className = '', title, description, action, hov
           {action && <div>{action}</div>}
         </div>
       )}
-      <div className="p-6">{children}</div>
+      {noPadding ? children : <div className="p-6">{children}</div>}
     </motion.div>
   )
 }

@@ -238,13 +238,14 @@ async def create_chapter(chapter: CreateChapterDTO):
 
     # 生成 UUID 作为章节 ID
     chapter_id = str(uuid.uuid4())
-    now = datetime.now()  # 使用 datetime 对象
+    now = datetime.now()
     content = chapter.content or ""
 
-    # 从 world_id 获取 project_id（如果可能）
-    project_id = None
+    # 优先使用传入的 project_id，否则从 world_id 获取
+    project_id = chapter.project_id
     world_id = chapter.world_id
-    if world_id and world_id != "default_world":
+
+    if not project_id and world_id:
         try:
             world = await postgres_db.get_world(world_id)
             if world:
@@ -256,7 +257,8 @@ async def create_chapter(chapter: CreateChapterDTO):
         "id": chapter_id,
         "title": chapter.title,
         "project_id": project_id,
-        "world_id": world_id if world_id != "default_world" else None,
+        "world_id": world_id,
+        "summary": chapter.summary or "",
         "content": content,
         "word_count": len(content),
         "status": chapter.status.value if hasattr(chapter.status, "value") else chapter.status,
@@ -617,7 +619,7 @@ async def delete_hook(hook_id: str):
     Returns:
         Dict: 删除结果
     """
-    from app.database.postgres import postgres_db
+    from app.api.app import postgres_db
 
     if not postgres_db:
         raise HTTPException(status_code=503, detail="数据库未连接")

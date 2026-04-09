@@ -12,6 +12,7 @@ import {
   updateAgentTemplate,
   deleteAgentTemplate,
   previewAgentTemplate,
+  toggleAgentTemplate,
   AgentTemplate,
   AgentType,
   PromptSlot,
@@ -19,7 +20,7 @@ import {
   UpdateAgentTemplateDTO,
 } from '@/api/agentTemplates'
 import { getPrompts, PromptTemplate } from '@/api/prompts'
-import { Search, Plus, Edit2, Trash2, Eye, GripVertical, ChevronDown, ChevronUp, Settings } from 'lucide-react'
+import { Search, Plus, Edit2, Trash2, Eye, GripVertical, ChevronDown, ChevronUp, Settings, Lock, ToggleLeft, ToggleRight } from 'lucide-react'
 import { useTheme } from '@/contexts/ThemeContext'
 
 const AGENT_TYPE_LABELS: Record<AgentType, string> = {
@@ -31,7 +32,22 @@ const AGENT_TYPE_LABELS: Record<AgentType, string> = {
   writer: '作家 Agent',
   evaluator: '评估 Agent',
   proc_gen: '过程生成 Agent',
+  event_generator: '事件生成 Agent',
+  dungeon_generator: '副本生成 Agent',
+  world_map_manager: '世界地图 Agent',
 }
+
+// 核心 Agent 列表（不可关闭）
+const CORE_AGENT_TYPES: AgentType[] = [
+  'setting',
+  'writer',
+  'master_plotter',
+  'summarizer',
+  'evaluator',
+  'hook_manager',
+  'event_generator',
+  'world_map_manager',
+]
 
 export default function AgentTemplates() {
   const { theme } = useTheme()
@@ -59,9 +75,6 @@ export default function AgentTemplates() {
     agent_type: 'character',
     prompt_slots: [],
     default_prompt_order: [],
-    default_model: 'gpt-4o-mini',
-    default_temperature: 0.7,
-    default_max_tokens: 4096,
     tags: [],
   })
 
@@ -74,21 +87,27 @@ export default function AgentTemplates() {
     setLoading(true)
     try {
       const data = await getAgentTemplates(selectedType || undefined)
-      // 前端搜索过滤
-      if (searchQuery) {
-        const query = searchQuery.toLowerCase()
-        const filtered = data.filter(
-          (t) =>
-            t.name.toLowerCase().includes(query) ||
-            t.description.toLowerCase().includes(query) ||
-            t.tags.some((tag) => tag.toLowerCase().includes(query))
-        )
-        setTemplates(filtered)
+      // 确保返回的是数组
+      if (Array.isArray(data)) {
+        // 前端搜索过滤
+        if (searchQuery) {
+          const query = searchQuery.toLowerCase()
+          const filtered = data.filter(
+            (t) =>
+              t.name.toLowerCase().includes(query) ||
+              t.description.toLowerCase().includes(query) ||
+              t.tags.some((tag) => tag.toLowerCase().includes(query))
+          )
+          setTemplates(filtered)
+        } else {
+          setTemplates(data)
+        }
       } else {
-        setTemplates(data)
+        setTemplates([])
       }
     } catch (error) {
       console.error('Failed to load templates:', error)
+      setTemplates([])
     } finally {
       setLoading(false)
     }
@@ -97,9 +116,14 @@ export default function AgentTemplates() {
   const loadPrompts = async () => {
     try {
       const data = await getPrompts({ limit: 200 })
-      setPrompts(data)
+      if (Array.isArray(data)) {
+        setPrompts(data)
+      } else {
+        setPrompts([])
+      }
     } catch (error) {
       console.error('Failed to load prompts:', error)
+      setPrompts([])
     }
   }
 
@@ -111,9 +135,6 @@ export default function AgentTemplates() {
       agent_type: 'character',
       prompt_slots: [],
       default_prompt_order: [],
-      default_model: 'gpt-4o-mini',
-      default_temperature: 0.7,
-      default_max_tokens: 4096,
       tags: [],
     })
     setShowEditModal(true)
@@ -127,9 +148,6 @@ export default function AgentTemplates() {
       agent_type: template.agent_type,
       prompt_slots: template.prompt_slots || [],
       default_prompt_order: template.default_prompt_order || [],
-      default_model: template.default_model,
-      default_temperature: template.default_temperature,
-      default_max_tokens: template.default_max_tokens,
       tags: template.tags || [],
     })
     setShowEditModal(true)
@@ -153,6 +171,15 @@ export default function AgentTemplates() {
       setPreviewResult(result)
     } catch (error) {
       console.error('Failed to preview template:', error)
+    }
+  }
+
+  const handleToggle = async (template: AgentTemplate) => {
+    try {
+      await toggleAgentTemplate(template.id, !template.is_enabled)
+      loadTemplates()
+    } catch (error) {
+      console.error('Failed to toggle template:', error)
     }
   }
 
@@ -263,13 +290,21 @@ export default function AgentTemplates() {
         ) : (
           <div className="space-y-4">
             {templates.map((template) => (
-              <Card key={template.id} className="p-4">
+              <Card key={template.id} className={`p-4 ${!template.is_enabled && template.is_optional ? 'opacity-60' : ''}`}>
                 <div className="flex items-start justify-between">
                   <div className="flex-1">
                     <div className="flex items-center gap-2 mb-1">
                       <h3 className={`font-semibold text-lg ${isDark ? 'text-white' : 'text-gray-800'}`}>{template.name}</h3>
                       {template.is_system && (
                         <span className="px-2 py-1 text-xs bg-blue-900 text-blue-300 rounded">系统</span>
+                      )}
+                      {template.is_optional && (
+                        <span className="px-2 py-1 text-xs bg-purple-900 text-purple-300 rounded">可选</span>
+                      )}
+                      {!CORE_AGENT_TYPES.includes(template.agent_type) && template.is_optional && (
+                        <span className={`px-2 py-1 text-xs rounded ${template.is_enabled ? 'bg-green-900 text-green-300' : 'bg-gray-700 text-gray-400'}`}>
+                          {template.is_enabled ? '已启用' : '已禁用'}
+                        </span>
                       )}
                       <span className={`px-2 py-1 text-xs rounded ${isDark ? 'bg-gray-700' : 'bg-gray-200'}`}>
                         {AGENT_TYPE_LABELS[template.agent_type]}
@@ -301,14 +336,34 @@ export default function AgentTemplates() {
                         )}
                       </div>
                     </div>
-
-                    {/* 模型配置 */}
-                    <div className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
-                      模型：{template.default_model} | 温度：{template.default_temperature} | 最大 Token：{template.default_max_tokens}
-                    </div>
                   </div>
 
-                  <div className="flex gap-2">
+                  <div className="flex gap-2 items-center">
+                    {/* 可选 Agent 的启用/禁用开关 */}
+                    {template.is_optional && (
+                      <Button
+                        size="sm"
+                        variant={template.is_enabled ? 'primary' : 'secondary'}
+                        onClick={() => handleToggle(template)}
+                        title={template.is_enabled ? '点击禁用' : '点击启用'}
+                      >
+                        {template.is_enabled ? (
+                          <ToggleRight className="w-4 h-4 mr-1" />
+                        ) : (
+                          <ToggleLeft className="w-4 h-4 mr-1" />
+                        )}
+                        {template.is_enabled ? '启用' : '禁用'}
+                      </Button>
+                    )}
+
+                    {/* 核心 Agent 显示锁定图标 */}
+                    {!template.is_optional && CORE_AGENT_TYPES.includes(template.agent_type) && (
+                      <span className={`flex items-center gap-1 text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+                        <Lock className="w-3 h-3" />
+                        核心
+                      </span>
+                    )}
+
                     <Button size="sm" variant="secondary" onClick={() => handlePreview(template)}>
                       <Eye className="w-4 h-4 mr-1" />
                       预览
@@ -337,7 +392,7 @@ export default function AgentTemplates() {
         isOpen={showEditModal}
         onClose={() => setShowEditModal(false)}
         title={editingTemplate ? '编辑模板' : '新建模板'}
-        className="max-w-4xl"
+        size="2xl"
       >
         <div className="space-y-4">
           <div className="grid grid-cols-2 gap-4">
@@ -375,45 +430,10 @@ export default function AgentTemplates() {
             />
           </div>
 
-          {/* 模型配置 */}
-          <div className="grid grid-cols-3 gap-4">
-            <div>
-              <label className={`block text-sm mb-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>默认模型</label>
-              <Input
-                value={formData.default_model}
-                onChange={(e) => setFormData({ ...formData, default_model: e.target.value })}
-                placeholder="gpt-4o-mini"
-              />
-            </div>
-            <div>
-              <label className={`block text-sm mb-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>温度</label>
-              <Input
-                type="number"
-                value={formData.default_temperature}
-                onChange={(e) =>
-                  setFormData({ ...formData, default_temperature: parseFloat(e.target.value) || 0.7 })
-                }
-                min={0}
-                max={2}
-                step={0.1}
-              />
-            </div>
-            <div>
-              <label className={`block text-sm mb-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>最大 Token</label>
-              <Input
-                type="number"
-                value={formData.default_max_tokens}
-                onChange={(e) =>
-                  setFormData({ ...formData, default_max_tokens: parseInt(e.target.value) || 4096 })
-                }
-              />
-            </div>
-          </div>
-
           {/* Prompt 插槽 */}
           <div>
             <div className="flex items-center justify-between mb-2">
-              <label className={`block text-sm ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>Prompt 插槽</label>
+              <label className={`block text-sm font-medium ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>Prompt 插槽</label>
               <Button size="sm" variant="secondary" onClick={handleAddSlot}>
                 <Plus className="w-4 h-4 mr-1" />
                 添加插槽
@@ -421,18 +441,21 @@ export default function AgentTemplates() {
             </div>
 
             {(formData.prompt_slots?.length ?? 0) > 0 && (
-              <div className="space-y-2">
+              <div className="space-y-3">
                 {(formData.prompt_slots || []).map((slot, index) => (
-                  <div key={index} className={`p-3 rounded ${isDark ? 'bg-gray-800' : 'bg-gray-100'}`}>
-                    <div className="flex items-center gap-2 mb-2">
-                      <GripVertical className={`w-4 h-4 cursor-move ${isDark ? 'text-gray-500' : 'text-gray-400'}`} />
-                      <Input
-                        value={slot.slot_name}
-                        onChange={(e) => handleUpdateSlot(index, 'slot_name', e.target.value)}
-                        placeholder="插槽名称"
-                        className="flex-1"
-                      />
-                      <div className="flex gap-1">
+                  <div key={index} className={`p-4 rounded-lg border ${isDark ? 'bg-gray-800 border-gray-700' : 'bg-gray-50 border-gray-200'}`}>
+                    {/* 插槽第一行：名称和操作按钮 */}
+                    <div className="flex items-center gap-3 mb-3">
+                      <GripVertical className={`w-4 h-4 cursor-move flex-shrink-0 ${isDark ? 'text-gray-500' : 'text-gray-400'}`} />
+                      <div className="flex-1">
+                        <label className={`block text-xs mb-1 ${isDark ? 'text-gray-500' : 'text-gray-500'}`}>插槽名称</label>
+                        <Input
+                          value={slot.slot_name}
+                          onChange={(e) => handleUpdateSlot(index, 'slot_name', e.target.value)}
+                          placeholder="如：role_definition"
+                        />
+                      </div>
+                      <div className="flex gap-1 flex-shrink-0">
                         <Button
                           size="sm"
                           variant="secondary"
@@ -450,30 +473,34 @@ export default function AgentTemplates() {
                           <ChevronDown className="w-4 h-4" />
                         </Button>
                       </div>
-                      <label className={`flex items-center gap-1 text-sm ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
+                      <label className={`flex items-center gap-1 text-sm flex-shrink-0 ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
                         <input
                           type="checkbox"
                           checked={slot.is_enabled}
                           onChange={(e) => handleUpdateSlot(index, 'is_enabled', e.target.checked)}
+                          className="w-4 h-4"
                         />
                         启用
                       </label>
-                      <Button size="sm" variant="danger" onClick={() => handleRemoveSlot(index)}>
+                      <Button size="sm" variant="danger" onClick={() => handleRemoveSlot(index)} className="flex-shrink-0">
                         <Trash2 className="w-4 h-4" />
                       </Button>
                     </div>
 
-                    <div className="grid grid-cols-2 gap-2">
+                    {/* 插槽第二行：描述和 Prompt 模板选择 */}
+                    <div className="grid grid-cols-2 gap-3">
                       <div>
+                        <label className={`block text-xs mb-1 ${isDark ? 'text-gray-500' : 'text-gray-500'}`}>插槽描述</label>
                         <Input
                           value={slot.description}
                           onChange={(e) => handleUpdateSlot(index, 'description', e.target.value)}
-                          placeholder="插槽描述"
+                          placeholder="描述这个插槽的用途"
                         />
                       </div>
                       <div>
+                        <label className={`block text-xs mb-1 ${isDark ? 'text-gray-500' : 'text-gray-500'}`}>关联 Prompt 模板</label>
                         <select
-                          className={`w-full border rounded px-2 py-1 text-sm ${isDark ? 'bg-gray-700 border-gray-600 text-white' : 'bg-white border-gray-300 text-gray-800'}`}
+                          className={`w-full border rounded px-3 py-2 text-sm ${isDark ? 'bg-gray-700 border-gray-600 text-white' : 'bg-white border-gray-300 text-gray-800'}`}
                           value={slot.prompt_template_id || ''}
                           onChange={(e) =>
                             handleUpdateSlot(index, 'prompt_template_id', e.target.value || null)
@@ -495,16 +522,16 @@ export default function AgentTemplates() {
           </div>
 
           <div className="flex justify-end gap-2 pt-4">
-            <Button variant="secondary" onClick={() => setShowEditModal(false)}>
+            <Button variant="secondary" onClick={() => setShowEditModal(false)} className="whitespace-nowrap">
               取消
             </Button>
-            <Button onClick={handleSave}>{editingTemplate ? '保存' : '创建'}</Button>
+            <Button onClick={handleSave} className="whitespace-nowrap">{editingTemplate ? '保存' : '创建'}</Button>
           </div>
         </div>
       </Modal>
 
       {/* 预览 Modal */}
-      <Modal isOpen={showPreviewModal} onClose={() => setShowPreviewModal(false)} title="模板预览" className="max-w-4xl">
+      <Modal isOpen={showPreviewModal} onClose={() => setShowPreviewModal(false)} title="模板预览" size="xl">
         {previewResult ? (
           <div className="space-y-4">
             <div>

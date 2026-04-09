@@ -9,8 +9,8 @@ const API_BASE = ''
 
 // ==================== 类型定义 ====================
 
-export type WritingRuleCategory = 'dialogue' | 'structure' | 'style' | 'pacing'
-export type RuleSeverity = 'required' | 'recommended' | 'optional'
+export type WritingRuleCategory = 'dialogue' | 'structure' | 'style' | 'pacing' | 'character' | 'plot' | 'format' | 'grammar'
+export type RuleSeverity = 'required' | 'strong' | 'recommended' | 'optional' | 'info'
 
 export interface WritingRule {
   id: string
@@ -20,11 +20,12 @@ export interface WritingRule {
   severity: RuleSeverity
   content: string
   examples: string[]
-  anti_patterns: string[]
+  counter_examples?: string[]
+  anti_patterns?: string[]
   tags: string[]
   is_system: boolean
-  created_at: string
-  updated_at: string
+  created_at?: string
+  updated_at?: string
 }
 
 export interface WritingRuleSet {
@@ -103,6 +104,7 @@ export async function getWritingRules(
   tags?: string[],
   isSystem?: boolean,
   search?: string,
+  source?: string,
   limit: number = 50,
   offset: number = 0
 ): Promise<WritingRule[]> {
@@ -112,6 +114,7 @@ export async function getWritingRules(
   if (tags) params.append('tags', tags.join(','))
   if (isSystem !== undefined) params.append('is_system', String(isSystem))
   if (search) params.append('search', search)
+  if (source) params.append('source', source)
   params.append('limit', String(limit))
   params.append('offset', String(offset))
 
@@ -176,6 +179,27 @@ export async function createWritingRuleSet(dto: CreateWritingRuleSetDTO): Promis
 }
 
 /**
+ * 获取写作规则集详情
+ */
+export async function getWritingRuleSet(ruleSetId: string): Promise<WritingRuleSet & { rules?: WritingRule[] }> {
+  return await api.get(`${API_BASE}/writing-rule-sets/${ruleSetId}`)
+}
+
+/**
+ * 更新写作规则集
+ */
+export async function updateWritingRuleSet(ruleSetId: string, dto: CreateWritingRuleSetDTO): Promise<{ success: boolean; message: string }> {
+  return await api.put(`${API_BASE}/writing-rule-sets/${ruleSetId}`, dto)
+}
+
+/**
+ * 删除写作规则集
+ */
+export async function deleteWritingRuleSet(ruleSetId: string): Promise<{ success: boolean; message: string }> {
+  return await api.delete(`${API_BASE}/writing-rule-sets/${ruleSetId}`)
+}
+
+/**
  * 获取项目写作配置
  */
 export async function getProjectWritingConfig(projectId: string): Promise<ProjectWritingConfig> {
@@ -200,4 +224,45 @@ export async function previewWritingPrompt(
   context?: Record<string, any>
 ): Promise<PreviewResult> {
   return await api.post(`${API_BASE}/projects/${projectId}/writing-config/preview`, context)
+}
+
+// ==================== Agent Prompt API ====================
+
+export type AgentPromptType = 'summarizer' | 'master_plotter' | 'hook_manager' | 'writer' | 'evaluator' | 'proc_gen' | 'character' | 'setting'
+
+export interface AgentTemplateSummary {
+  id: string
+  name: string
+  slots: string[]
+  model: string
+  temperature: number
+}
+
+export interface AgentPromptPreview {
+  agent_type: AgentPromptType
+  project_id?: string
+  prompt: string
+  prompt_length: number
+}
+
+/**
+ * 获取所有 Agent 模板摘要
+ */
+export async function getAgentTemplateSummaries(): Promise<Record<string, AgentTemplateSummary>> {
+  const result = await api.get<{ templates: Record<string, AgentTemplateSummary> }>(`${API_BASE}/agent-prompts`)
+  return result.templates
+}
+
+/**
+ * 预览 Agent 完整 system prompt
+ */
+export async function previewAgentPrompt(
+  agentType: AgentPromptType,
+  projectId?: string,
+  variables?: Record<string, any>
+): Promise<AgentPromptPreview> {
+  const params = new URLSearchParams()
+  if (projectId) params.append('project_id', projectId)
+
+  return await api.post(`${API_BASE}/agent-prompts/${agentType}/preview?${params.toString()}`, variables)
 }

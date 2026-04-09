@@ -214,6 +214,12 @@ async def websocket_connect(websocket: WebSocket, client_id: str):
                     await handle_remove_character(websocket, message, client_id)
                 elif message_type == "get_characters":
                     await handle_get_characters(websocket, message, client_id)
+                elif message_type == "auto_write_chapter":
+                    await handle_auto_write_chapter(websocket, message, client_id)
+                elif message_type == "start_auto_mode":
+                    await handle_start_auto_mode(websocket, message, client_id)
+                elif message_type == "stop_auto_mode":
+                    await handle_stop_auto_mode(websocket, message, client_id)
                 else:
                     await send_error(websocket, f"未知消息类型：{message_type}")
             except json.JSONDecodeError:
@@ -571,6 +577,193 @@ async def handle_get_characters(websocket: WebSocket, message: dict, client_id: 
         "status": "success",
         "data": {"characters": characters, "count": len(characters)},
     })
+
+
+async def handle_auto_write_chapter(websocket: WebSocket, message: dict, client_id: str):
+    """
+    自动写作完整章节
+
+    消息格式:
+    {
+        "type": "auto_write_chapter",
+        "chapter_title": "章节标题",
+        "chapter_goal": "章节目标/大纲",
+        "target_word_count": 2000,  // 可选，默认2000
+        "style_reference": "风格参考文本"  // 可选
+    }
+    """
+    from app.api.app import postgres_db
+
+    director = get_or_create_director(client_id)
+
+    chapter_title = message.get("chapter_title", "未命名章节")
+    chapter_goal = message.get("chapter_goal", "推进剧情")
+    target_word_count = message.get("target_word_count", 2000)
+    style_reference = message.get("style_reference")
+
+    await send_agent_update(websocket, "Writer", "working", f"正在自动写作章节: {chapter_title}", 20)
+    await send_log(websocket, f"开始自动写作章节: {chapter_title}")
+    await send_log(websocket, f"章节目标: {chapter_goal}")
+    await send_log(websocket, f"目标字数: {target_word_count}")
+
+    try:
+        result = await director.auto_write_chapter(
+            chapter_title=chapter_title,
+            chapter_goal=chapter_goal,
+            target_word_count=target_word_count,
+            style_reference=style_reference,
+        )
+
+        if result.get("success"):
+            # 保存到数据库
+            await _persist_runtime_state(director)
+
+            # 创建快照
+            snapshot = await _create_auto_snapshot(director, snapshot_type="auto", created_by="auto_write")
+
+            await send_agent_update(websocket, "Writer", "completed", f"章节写作完成: {result.get('word_count', 0)} 字", 100)
+            await send_log(websocket, f"章节写作完成，实际字数: {result.get('word_count', 0)}")
+
+            await websocket.send_json({
+                "type": "auto_write_chapter_result",
+                "status": "success",
+                "data": {
+                    "chapter_id": result.get("chapter_id"),
+                    "title": result.get("title"),
+                    "content": result.get("content"),
+                    "word_count": result.get("word_count"),
+                    "goal": result.get("goal"),
+                    "snapshot_id": snapshot.get("id") if snapshot else None,
+                },
+            })
+        else:
+            await send_agent_update(websocket, "Writer", "error", f"写作失败: {result.get('error')}", 0)
+            await websocket.send_json({
+                "type": "auto_write_chapter_result",
+                "status": "error",
+                "error": result.get("error"),
+            })
+
+    except Exception as e:
+        logger.error(f"自动写作章节失败: {e}")
+        await send_agent_update(websocket, "Writer", "error", f"写作异常: {str(e)}", 0)
+        await websocket.send_json({
+            "type": "auto_write_chapter_result",
+            "status": "error",
+            "error": str(e),
+        })
+
+
+async def handle_start_auto_mode(websocket: WebSocket, message: dict, client_id: str):
+    """
+    启动全自动创作模式
+
+    消息格式:
+    {
+        "type": "start_auto_mode",
+        "initial_plot": "初始剧情设定/大纲",
+        "chapter_count": 3,  // 可选，默认3
+        "words_per_chapter": 2000,  // 可选，默认2000
+        "style_reference": "风格参考文本"  // 可选
+    }
+    """
+    director = get_or_create_director(client_id)
+
+    initial_plot = message.get("initial_plot", "一个精彩的冒险故事")
+    chapter_count = message.get("chapter_count", 3)
+    words_per_chapter = message.get("words_per_chapter", 2000)
+    style_reference = message.get("style_reference")
+
+    await send_log(websocket, "🚀 启动全自动创作模式")
+    await send_log(websocket, f"📚 计划生成 {chapter_count} 个章节，每章约 {words_per_chapter} 字")
+
+    # 定义回调函数，用于发送进度更新
+    async def callback(event_type: str, data: dict):
+        if event_type == "phase":
+            await send_log(websocket, f"📋 {data.get('message', '')}")
+        elif event_type == "plot_planned":
+            await send_log(websocket, "✅ 剧情规划完成")
+            await send_agent_update(websocket, "Master Plotter", "completed", "剧情规划完成", 20)
+        elif event_type == "chapter_start":
+            await send_log(websocket, f"📖 开始写作: {data.get('title', '')}")
+            await websocket.send_json({
+                "type": "auto_mode_chapter_start",
+                "chapter_num": data.get("chapter_num"),
+                "title": data.get("title"),
+                "goal": data.get("goal"),
+            })
+        elif event_type == "agent_working":
+            agent = data.get("agent", "Agent")
+            msg = data.get("message", "")
+            await send_agent_update(websocket, agent, "working", msg, 50)
+            await send_log(websocket, f"🤖 {agent}: {msg}")
+        elif event_type == "plot_advanced":
+            await send_agent_update(websocket, "Master Plotter", "completed", "剧情推进完成", 60)
+        elif event_type == "hooks_managed":
+            await send_agent_update(websocket, "Hook Manager", "completed", "伏笔管理完成", 70)
+        elif event_type == "chapter_completed":
+            await send_agent_update(websocket, "Writer", "completed", f"章节完成: {data.get('word_count', 0)} 字", 90)
+            await send_log(websocket, f"✅ 章节 {data.get('chapter_num')} 完成: {data.get('title')} ({data.get('word_count')} 字)")
+            # 保存到数据库
+            await _persist_runtime_state(director)
+            await websocket.send_json({
+                "type": "auto_mode_chapter_completed",
+                "chapter_num": data.get("chapter_num"),
+                "title": data.get("title"),
+                "word_count": data.get("word_count"),
+                "content": data.get("content"),
+            })
+        elif event_type == "chapter_error":
+            await send_log(websocket, f"❌ 章节 {data.get('chapter_num')} 失败: {data.get('error')}")
+        elif event_type == "chapter_evaluated":
+            await send_agent_update(websocket, "Evaluator", "completed", "章节评估完成", 95)
+        elif event_type == "snapshot_created":
+            await send_log(websocket, f"📸 快照已创建: {data.get('snapshot_id', '')}")
+        elif event_type == "stopped":
+            await send_log(websocket, f"⏹️ 自动模式已停止，完成 {data.get('chapters_completed', 0)} 章")
+        elif event_type == "completed":
+            await send_log(websocket, f"🎉 全自动创作完成！共 {data.get('total_chapters', 0)} 章，{data.get('total_words', 0)} 字")
+            await send_log(websocket, f"📊 伏笔埋设: {data.get('hooks_planted', 0)} 个，回收: {data.get('hooks_resolved', 0)} 个")
+        elif event_type == "error":
+            await send_log(websocket, f"❌ 错误: {data.get('error', '')}")
+
+    try:
+        result = await director.start_auto_mode(
+            initial_plot=initial_plot,
+            chapter_count=chapter_count,
+            words_per_chapter=words_per_chapter,
+            style_reference=style_reference,
+            callback=callback,
+        )
+
+        # 重置所有 Agent 状态
+        for agent in ["Summarizer", "Master Plotter", "Hook Manager", "Writer", "Evaluator", "Character Agent", "ProcGen"]:
+            await send_agent_update(websocket, agent, "completed", f"{agent} 已完成", 100)
+
+        await websocket.send_json({
+            "type": "auto_mode_completed",
+            "status": "success",
+            "data": {
+                "chapters": result.get("chapters", []),
+                "total_words": result.get("total_words", 0),
+                "total_chapters": len(result.get("chapters", [])),
+            },
+        })
+
+    except Exception as e:
+        logger.error(f"自动模式运行失败: {e}")
+        await send_log(websocket, f"❌ 自动模式运行失败: {str(e)}")
+        await websocket.send_json({
+            "type": "auto_mode_error",
+            "error": str(e),
+        })
+
+
+async def handle_stop_auto_mode(websocket: WebSocket, message: dict, client_id: str):
+    """停止自动运行模式"""
+    director = get_or_create_director(client_id)
+    director.stop_auto_mode()
+    await send_log(websocket, "⏹️ 正在停止自动模式...")
 
 
 async def send_error(websocket: WebSocket, error_message: str):

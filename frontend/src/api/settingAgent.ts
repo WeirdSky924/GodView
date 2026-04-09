@@ -13,6 +13,7 @@ export interface ChatResponse {
   response: string
   session_id: string
   mode: string
+  lore_saved?: boolean
 }
 
 export interface SettingConflict {

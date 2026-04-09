@@ -5,9 +5,11 @@ import { evaluateChapter, getChapters } from '@/api/chapters'
 import type { Chapter, ChapterEvaluationResult } from '@/api/chapters'
 import { CheckCircle2, Gauge, Sparkles, BookOpen, AlertCircle } from 'lucide-react'
 import { useTheme } from '@/contexts/ThemeContext'
+import { useProject } from '@/contexts/ProjectContext'
 
 export default function ChapterEvaluator() {
   const { theme } = useTheme()
+  const { currentProject } = useProject()
   const isDark = theme === 'dark'
 
   const [chapters, setChapters] = useState<Chapter[]>([])
@@ -17,14 +19,16 @@ export default function ChapterEvaluator() {
 
   useEffect(() => {
     loadChapters()
-  }, [])
+  }, [currentProject])
 
   const loadChapters = async () => {
     try {
-      const data = await getChapters()
+      const data = await getChapters(currentProject?.id)
       setChapters(data)
       if (data.length > 0) {
         setSelectedChapterId(data[0].id || '')
+      } else {
+        setSelectedChapterId('')
       }
     } catch (error) {
       console.error('Failed to load chapters:', error)
@@ -69,38 +73,39 @@ export default function ChapterEvaluator() {
         </Button>
       }
     >
-      <Card className="mb-6">
-        <div className="flex items-center gap-4">
-          <label className={`text-sm font-medium ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>选择章节：</label>
-          <select
-            className={`px-3 py-2 border rounded-lg flex-1 max-w-md ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
-            value={selectedChapterId}
-            onChange={(e) => setSelectedChapterId(e.target.value)}
-          >
-            <option value="">请选择章节...</option>
-            {chapters.map((chapter) => (
-              <option key={chapter.id} value={chapter.id}>
-                {chapter.title}
-              </option>
-            ))}
-          </select>
-          {selectedChapter && (
-            <span className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>{(selectedChapter.content || '').length} 字符</span>
-          )}
-        </div>
-      </Card>
-
-      {!result ? (
-        <Card>
-          <div className={`text-center py-12 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
-            <CheckCircle2 size={64} className="mx-auto mb-4 opacity-50" />
-            <p className="text-lg">选择一个章节并点击"开始评估"</p>
-            <p className="text-sm mt-2">系统会从信息增量、悬念、节奏与完整度四个维度给出建议</p>
+      <div className="flex flex-col h-[calc(100vh-200px)]">
+        <Card className="mb-4 flex-shrink-0">
+          <div className="flex items-center gap-4">
+            <label className={`text-sm font-medium ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>选择章节：</label>
+            <select
+              className={`px-3 py-2 border rounded-lg flex-1 max-w-md ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
+              value={selectedChapterId}
+              onChange={(e) => setSelectedChapterId(e.target.value)}
+            >
+              <option value="">请选择章节...</option>
+              {chapters.map((chapter) => (
+                <option key={chapter.id} value={chapter.id}>
+                  {chapter.title}
+                </option>
+              ))}
+            </select>
+            {selectedChapter && (
+              <span className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>{(selectedChapter.content || '').length} 字符</span>
+            )}
           </div>
         </Card>
+
+        {!result ? (
+          <Card className="flex-1 min-h-0">
+            <div className={`text-center py-12 h-full flex flex-col items-center justify-center ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+              <CheckCircle2 size={64} className="mb-4 opacity-50" />
+              <p className="text-lg">选择一个章节并点击"开始评估"</p>
+              <p className="text-sm mt-2">系统会从信息增量、悬念、节奏与完整度四个维度给出建议</p>
+            </div>
+          </Card>
       ) : (
-        <>
-          <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+        <div className="flex-1 min-h-0 overflow-y-auto space-y-4">
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
             <Card className="p-5">
               <div className="flex items-center gap-3 mb-2">
                 <Sparkles size={22} className="text-blue-500" />
@@ -176,8 +181,9 @@ export default function ChapterEvaluator() {
               )}
             </div>
           </Card>
-        </>
+        </div>
       )}
+      </div>
     </PageLayout>
   )
 }

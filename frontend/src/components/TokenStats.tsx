@@ -178,7 +178,7 @@ export default function TokenStats() {
                   plot: '剧情生成',
                   chapter: '章节生成',
                   hook: '伏笔管理',
-                  director: '导演模式',
+                  director: '上帝模式',
                   setting_agent: '设定代理',
                   skill: 'Skill 执行',
                   rag: 'RAG 检索',

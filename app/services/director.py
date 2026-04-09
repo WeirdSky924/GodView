@@ -550,9 +550,12 @@ class DirectorSystem:
         if qdrant_db and (context or dialogue):
             query_text = f"{context}\n{dialogue}".strip()
             try:
+                # 获取角色的 project_id 用于过滤
+                project_id = agent.character.project_id
                 vector_hits = await qdrant_db.get_similar_voice_samples_by_text(
                     query_text=query_text,
                     character_id=agent.character.id,
+                    project_id=project_id,
                     limit=limit,
                 )
             except Exception as exc:
@@ -915,3 +918,342 @@ class DirectorSystem:
             "personality_traits": agent.character.personality_traits,
             "skills": agent.character.skills,
         }
+
+    # ==================== 自动写作 ====================
+
+    async def auto_write_chapter(
+        self,
+        chapter_title: str,
+        chapter_goal: str,
+        target_word_count: int = 2000,
+        style_reference: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        自动写作完整章节
+
+        Args:
+            chapter_title: 章节标题
+            chapter_goal: 章节目标/大纲
+            target_word_count: 目标字数
+            style_reference: 风格参考文本
+
+        Returns:
+            Dict: 包含生成的章节内容
+        """
+        if not self.writer:
+            raise RuntimeError("导演系统未初始化")
+
+        # 启动新章节
+        await self.start_chapter(title=chapter_title, goal=chapter_goal)
+
+        # 获取可用角色信息
+        characters_info = []
+        for char_id, agent in self.character_agents.items():
+            characters_info.append({
+                "id": char_id,
+                "name": agent.character.name,
+                "role": agent.character.role,
+                "description": agent.character.description,
+                "speech_pattern": agent.character.speech_pattern,
+            })
+
+        # 获取世界观信息
+        world_info = self._build_world_payload()
+
+        # 构建写作提示
+        writing_prompt = self._build_auto_write_prompt(
+            chapter_title=chapter_title,
+            chapter_goal=chapter_goal,
+            characters_info=characters_info,
+            world_info=world_info,
+            target_word_count=target_word_count,
+            style_reference=style_reference,
+        )
+
+        # 调用 Writer Agent 生成章节
+        result = await self.writer.execute({
+            "intents": [chapter_goal],
+            "environment": f"世界观：{world_info.get('name', '未知世界')}，类型：{world_info.get('world_type', '奇幻')}",
+            "character_moods": {},
+            "hooks": [],
+            "previous_style": style_reference or "",
+            "word_count": target_word_count,
+            "auto_write_mode": True,
+            "writing_prompt": writing_prompt,
+        })
+
+        if result.success:
+            chapter_content = result.data.get("content", "")
+            self.current_chapter["content"] = chapter_content
+            self.current_chapter["word_count"] = len(chapter_content)
+            self.current_chapter["status"] = "completed"
+
+            return {
+                "success": True,
+                "chapter_id": self.current_chapter["id"],
+                "title": chapter_title,
+                "content": chapter_content,
+                "word_count": len(chapter_content),
+                "goal": chapter_goal,
+            }
+
+        return {"success": False, "error": result.error}
+
+    # ==================== 全自动运行模式 ====================
+
+    _auto_running: bool = False
+    _auto_stop_flag: bool = False
+
+    async def start_auto_mode(
+        self,
+        initial_plot: str,
+        chapter_count: int = 3,
+        words_per_chapter: int = 2000,
+        style_reference: Optional[str] = None,
+        callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    ) -> Dict[str, Any]:
+        """
+        启动全自动创作模式
+
+        Args:
+            initial_plot: 初始剧情设定/大纲
+            chapter_count: 目标章节数
+            words_per_chapter: 每章目标字数
+            style_reference: 风格参考文本
+            callback: 进度回调函数 (event_type, data)
+
+        Returns:
+            Dict: 运行结果
+        """
+        if self._auto_running:
+            return {"success": False, "error": "自动模式已在运行中"}
+
+        self._auto_running = True
+        self._auto_stop_flag = False
+
+        results = {
+            "chapters": [],
+            "total_words": 0,
+            "plots_advanced": [],
+            "hooks_planted": [],
+            "hooks_resolved": [],
+        }
+
+        try:
+            # 1. 初始剧情规划
+            if callback:
+                callback("phase", {"phase": "plot_planning", "message": "正在规划整体剧情..."})
+
+            plot_plan = await self._plan_overall_plot(
+                initial_plot=initial_plot,
+                chapter_count=chapter_count,
+            )
+
+            if callback:
+                callback("plot_planned", {"plan": plot_plan})
+
+            # 2. 逐章生成
+            for chapter_num in range(1, chapter_count + 1):
+                if self._auto_stop_flag:
+                    if callback:
+                        callback("stopped", {"reason": "用户停止", "chapters_completed": chapter_num - 1})
+                    break
+
+                chapter_title = f"第{chapter_num}章 {plot_plan.get('chapter_titles', [f'第{chapter_num}章'])[chapter_num - 1] if chapter_num <= len(plot_plan.get('chapter_titles', [])) else f'第{chapter_num}章'}"
+                chapter_goal = plot_plan.get("chapter_goals", [initial_plot])[chapter_num - 1] if chapter_num <= len(plot_plan.get("chapter_goals", [])) else initial_plot
+
+                if callback:
+                    callback("chapter_start", {
+                        "chapter_num": chapter_num,
+                        "title": chapter_title,
+                        "goal": chapter_goal,
+                    })
+
+                # 2.1 剧情推进
+                if callback:
+                    callback("agent_working", {"agent": "Master Plotter", "message": "正在推进剧情..."})
+
+                plot_result = await self.advance_plot()
+                results["plots_advanced"].append(plot_result)
+
+                if callback:
+                    callback("plot_advanced", {"chapter_num": chapter_num, "result": plot_result})
+
+                # 2.2 伏笔管理
+                if callback:
+                    callback("agent_working", {"agent": "Hook Manager", "message": "正在管理伏笔..."})
+
+                hooks_result = await self.manage_hooks()
+                if hooks_result.get("hooks_to_plant"):
+                    results["hooks_planted"].extend(hooks_result["hooks_to_plant"])
+                if hooks_result.get("hooks_to_resolve"):
+                    results["hooks_resolved"].extend(hooks_result["hooks_to_resolve"])
+
+                if callback:
+                    callback("hooks_managed", {"chapter_num": chapter_num, "result": hooks_result})
+
+                # 2.3 自动写作章节
+                if callback:
+                    callback("agent_working", {"agent": "Writer", "message": f"正在写作: {chapter_title}..."})
+
+                chapter_result = await self.auto_write_chapter(
+                    chapter_title=chapter_title,
+                    chapter_goal=chapter_goal,
+                    target_word_count=words_per_chapter,
+                    style_reference=style_reference,
+                )
+
+                if chapter_result.get("success"):
+                    results["chapters"].append(chapter_result)
+                    results["total_words"] += chapter_result.get("word_count", 0)
+
+                    if callback:
+                        callback("chapter_completed", {
+                            "chapter_num": chapter_num,
+                            "title": chapter_title,
+                            "word_count": chapter_result.get("word_count", 0),
+                            "content": chapter_result.get("content", ""),
+                        })
+                else:
+                    if callback:
+                        callback("chapter_error", {
+                            "chapter_num": chapter_num,
+                            "error": chapter_result.get("error"),
+                        })
+
+                # 2.4 章节评估
+                if callback:
+                    callback("agent_working", {"agent": "Evaluator", "message": "正在评估章节..."})
+
+                evaluation = await self.check_chapter_end()
+                if callback:
+                    callback("chapter_evaluated", {"chapter_num": chapter_num, "evaluation": evaluation})
+
+                # 2.5 创建快照
+                snapshot = await self.create_snapshot(
+                    snapshot_type="auto_chapter",
+                    name=f"{chapter_title} 自动快照",
+                )
+                if callback:
+                    callback("snapshot_created", {"chapter_num": chapter_num, "snapshot_id": snapshot.get("id")})
+
+            # 3. 完成
+            self._auto_running = False
+            if callback:
+                callback("completed", {
+                    "total_chapters": len(results["chapters"]),
+                    "total_words": results["total_words"],
+                    "plots_count": len(results["plots_advanced"]),
+                    "hooks_planted": len(results["hooks_planted"]),
+                    "hooks_resolved": len(results["hooks_resolved"]),
+                })
+
+            return {"success": True, **results}
+
+        except Exception as e:
+            self._auto_running = False
+            logger.error(f"自动模式运行失败: {e}")
+            if callback:
+                callback("error", {"error": str(e)})
+            return {"success": False, "error": str(e)}
+
+    def stop_auto_mode(self):
+        """停止自动运行模式"""
+        self._auto_stop_flag = True
+
+    def is_auto_running(self) -> bool:
+        """检查是否正在自动运行"""
+        return self._auto_running
+
+    async def _plan_overall_plot(
+        self,
+        initial_plot: str,
+        chapter_count: int,
+    ) -> Dict[str, Any]:
+        """
+        规划整体剧情大纲
+
+        Args:
+            initial_plot: 初始剧情设定
+            chapter_count: 章节数量
+
+        Returns:
+            Dict: 剧情规划结果
+        """
+        if not self.master_plotter:
+            # 如果没有 Master Plotter，返回简单规划
+            return {
+                "chapter_titles": [f"第{i+1}章" for i in range(chapter_count)],
+                "chapter_goals": [initial_plot for _ in range(chapter_count)],
+            }
+
+        # 获取角色信息
+        characters_summary = []
+        for char_id, agent in self.character_agents.items():
+            characters_summary.append(f"{agent.character.name}（{agent.character.role}）")
+
+        # 获取世界观信息
+        world_info = self._build_world_payload()
+
+        result = await self.master_plotter.execute({
+            "task": "plan_plot",
+            "initial_plot": initial_plot,
+            "chapter_count": chapter_count,
+            "characters": characters_summary,
+            "world_info": world_info,
+            "main_plot_progress": self.main_plot_progress,
+        })
+
+        if result.success:
+            return result.data
+
+        # 回退到简单规划
+        return {
+            "chapter_titles": [f"第{i+1}章" for i in range(chapter_count)],
+            "chapter_goals": [initial_plot for _ in range(chapter_count)],
+        }
+
+    def _build_auto_write_prompt(
+        self,
+        chapter_title: str,
+        chapter_goal: str,
+        characters_info: List[Dict[str, Any]],
+        world_info: Dict[str, Any],
+        target_word_count: int,
+        style_reference: Optional[str],
+    ) -> str:
+        """构建自动写作提示"""
+        prompt_parts = [
+            f"【章节标题】\n{chapter_title}",
+            f"\n【章节目标/大纲】\n{chapter_goal}",
+            f"\n【目标字数】\n约 {target_word_count} 字",
+        ]
+
+        if characters_info:
+            chars_text = "\n".join([
+                f"- {c['name']}（{c['role']}）：{c.get('description', '无描述')}"
+                for c in characters_info[:5]  # 最多显示5个主要角色
+            ])
+            prompt_parts.append(f"\n【主要角色】\n{chars_text}")
+
+        if world_info:
+            prompt_parts.append(f"\n【世界观】\n名称：{world_info.get('name', '未知')}")
+            if world_info.get('description'):
+                prompt_parts.append(f"描述：{world_info['description']}")
+
+        if style_reference:
+            prompt_parts.append(f"\n【风格参考】\n{style_reference[:500]}")
+
+        prompt_parts.append("""
+【写作要求】
+1. 展示而非告知 (Show, Don't Tell)
+2. 描写比例：动作 35% + 神态 35% + 对话 30%
+3. 段落简短有力，便于移动端阅读
+4. 使用生动的感官描写
+5. 对话要符合角色性格
+6. 安排适当的冲突和转折
+7. 结尾要有悬念或伏笔
+
+请生成完整的章节正文。""")
+
+        return "\n".join(prompt_parts)

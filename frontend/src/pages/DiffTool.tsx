@@ -3,12 +3,12 @@ import { Card, Button, Modal, TextArea } from '@/components/ui'
 import PageLayout from '@/components/PageLayout'
 import { getChapters } from '@/api/chapters'
 import { getWorlds } from '@/api/worlds'
-import { getSnapshotTree } from '@/api/director'
 import { compareSnapshots } from '@/api/visualization'
 import { FileText, GitCompare, Copy, GitBranch } from 'lucide-react'
 import type { Chapter } from '@/api/chapters'
 import type { World } from '@/api/worlds'
 import { useTheme } from '@/contexts/ThemeContext'
+import { useProject } from '@/contexts/ProjectContext'
 
 interface DiffResult {
   added: string[]
@@ -48,6 +48,7 @@ function computeTextDiff(oldText: string, newText: string): DiffResult {
 export default function DiffTool() {
   const { theme } = useTheme()
   const isDark = theme === 'dark'
+  const { currentProject } = useProject()
 
   const [chapters, setChapters] = useState<Chapter[]>([])
   const [worlds, setWorlds] = useState<World[]>([])
@@ -65,16 +66,11 @@ export default function DiffTool() {
   useEffect(() => {
     loadChapters()
     loadWorlds()
-    loadSnapshots()
-  }, [])
-
-  const flattenSnapshots = (nodes: any[]): any[] => {
-    return nodes.flatMap((node) => [node, ...(node.children ? flattenSnapshots(node.children) : [])])
-  }
+  }, [currentProject?.id])
 
   const loadChapters = async () => {
     try {
-      const data = await getChapters()
+      const data = await getChapters(currentProject?.id)
       setChapters(data)
     } catch (error) {
       console.error('Failed to load chapters:', error)
@@ -83,19 +79,12 @@ export default function DiffTool() {
 
   const loadWorlds = async () => {
     try {
-      const data = await getWorlds()
+      const data = await getWorlds(currentProject?.id)
       setWorlds(data)
+      // 快照暂时置空，需要有效的 world_id 才能加载
+      setSnapshots([])
     } catch (error) {
       console.error('Failed to load worlds:', error)
-    }
-  }
-
-  const loadSnapshots = async () => {
-    try {
-      const result = await getSnapshotTree('default-world')
-      setSnapshots(flattenSnapshots(result.data || []))
-    } catch (error) {
-      console.error('Failed to load snapshots:', error)
     }
   }
 

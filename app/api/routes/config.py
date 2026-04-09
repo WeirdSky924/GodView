@@ -894,3 +894,26 @@ async def get_database_status() -> Dict[str, Any]:
             "status": "healthy" if connected_count == total_count else "degraded" if connected_count > 0 else "error",
         },
     }
+
+
+@router.get("/stats")
+async def get_global_stats(project_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    获取统计数据
+
+    Args:
+        project_id: 项目 ID（可选，传入则返回该项目的统计）
+
+    返回项目数、角色数、世界设定数、章节数、Token消耗等统计
+    """
+    from app.api.app import postgres_db
+
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+
+    try:
+        stats = await postgres_db.get_global_stats(project_id)
+        return stats
+    except Exception as e:
+        logger.error(f"获取统计失败：{e}")
+        raise HTTPException(status_code=500, detail=str(e))

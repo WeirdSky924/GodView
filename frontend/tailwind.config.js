@@ -37,6 +37,20 @@ export default {
           foreground: 'hsl(var(--card-foreground))',
         },
       },
+      animation: {
+        'shimmer': 'shimmer 2s infinite',
+        'pulse-slow': 'pulse-slow 3s ease-in-out infinite',
+      },
+      keyframes: {
+        shimmer: {
+          '0%': { transform: 'translateX(-100%)' },
+          '100%': { transform: 'translateX(100%)' },
+        },
+        'pulse-slow': {
+          '0%, 100%': { opacity: '1' },
+          '50%': { opacity: '0.8' },
+        },
+      },
     },
   },
   plugins: [],

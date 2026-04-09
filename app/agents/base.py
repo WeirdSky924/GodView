@@ -81,8 +81,43 @@ class BaseAgent(ABC):
         if not self.project_id or not self.AGENT_TYPE:
             return ""
 
-        # TODO: 调用 AgentConfigService 获取最终 prompt
-        # 目前返回空字符串，等待服务注入
+        # 尝试从 AgentPromptService 加载
+        try:
+            import asyncio
+            from app.services.agent_prompt_service import get_agent_prompt_service
+
+            service = get_agent_prompt_service()
+
+            # 尝试在已有事件循环中运行
+            try:
+                loop = asyncio.get_running_loop()
+                # 如果已有事件循环，创建一个任务
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(
+                        asyncio.run,
+                        service.build_agent_prompt(
+                            agent_type=self.AGENT_TYPE,
+                            project_id=self.project_id,
+                        )
+                    )
+                    prompt = future.result(timeout=5)
+            except RuntimeError:
+                # 没有运行中的事件循环
+                prompt = asyncio.run(
+                    service.build_agent_prompt(
+                        agent_type=self.AGENT_TYPE,
+                        project_id=self.project_id,
+                    )
+                )
+
+            if prompt:
+                logger.debug(f"Agent {self.name} 从模板加载 prompt 成功 (project={self.project_id}, type={self.AGENT_TYPE})")
+                return prompt
+
+        except Exception as e:
+            logger.warning(f"Agent {self.name} 加载 prompt 失败: {e}")
+
         logger.debug(f"Agent {self.name} 尝试从模板加载 prompt (project={self.project_id}, type={self.AGENT_TYPE})")
         return ""
 

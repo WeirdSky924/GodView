@@ -5,6 +5,7 @@ v6 核心需求：持续设定管理、冲突检测、协商解决
 
 import json
 import logging
+import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -451,6 +452,9 @@ class SettingAgentService:
 
         session.last_activity_at = datetime.now()
 
+        # 检查是否需要提取并保存设定
+        lore_saved = await self._check_and_save_lore_from_conversation(project_id, session)
+
         # 自动分析并更新项目元数据（每5次对话触发一次）
         if len(session.conversation_history) % 10 == 0:  # 每5次用户消息
             metadata_results = await self.analyze_and_update_project_metadata(
@@ -460,11 +464,131 @@ class SettingAgentService:
             if metadata_results.get("updated"):
                 logger.info(f"自动更新项目 {project_id} 元数据: {metadata_results}")
 
-        return {
+        result = {
             "response": response,
             "session_id": session.id,
             "mode": session.mode.value,
         }
+
+        if lore_saved:
+            result["lore_saved"] = True
+
+        return result
+
+    async def _check_and_save_lore_from_conversation(
+        self,
+        project_id: str,
+        session: SettingAgentSession,
+    ) -> bool:
+        """
+        检查对话中是否包含新设定，如果有则保存到设定库
+
+        Args:
+            project_id: 项目 ID
+            session: 会话对象
+
+        Returns:
+            bool: 是否保存了新设定
+        """
+        # 获取最近的对话
+        recent_messages = session.conversation_history[-6:]  # 最近3轮对话
+        if len(recent_messages) < 2:
+            return False
+
+        # 构建提取提示
+        history_text = "\n".join([
+            f"{msg['role']}: {msg['content']}"
+            for msg in recent_messages
+        ])
+
+        extraction_prompt = f"""分析以下对话，判断是否有新的世界观设定被确认。
+
+如果有新设定（例如力量等级、地理、势力、规则、物品等），请提取为 JSON 数组。
+如果没有新设定，返回空数组 []。
+
+输出格式：
+```json
+[
+  {{
+    "title": "设定标题",
+    "category": "world_rule|geography|history|faction|culture|race|profession|item|skill|custom",
+    "priority": "constitutional|core|standard|flexible",
+    "content": "设定详细内容",
+    "summary": "简短摘要",
+    "keywords": ["关键词1", "关键词2"]
+  }}
+]
+```
+
+对话内容：
+{history_text}
+
+只输出 JSON 数组，不要其他内容。如果没有新设定，输出 []。
+"""
+
+        try:
+            response = await self._call_llm_simple(extraction_prompt)
+
+            # 解析 JSON
+            if "```json" in response:
+                response = response.split("```json")[1].split("```")[0]
+            elif "```" in response:
+                response = response.split("```")[1].split("```")[0]
+
+            response = response.strip()
+            if not response or response == "[]":
+                return False
+
+            lores = json.loads(response)
+            if not isinstance(lores, list) or len(lores) == 0:
+                return False
+
+            # 保存到数据库
+            from app.api.app import postgres_db
+            if not postgres_db:
+                return False
+
+            saved_count = 0
+            for lore_data in lores:
+                if not lore_data.get("title") or not lore_data.get("content"):
+                    continue
+
+                lore_entry = {
+                    "id": str(uuid.uuid4()),
+                    "project_id": project_id,
+                    "title": lore_data.get("title", ""),
+                    "category": lore_data.get("category", "custom"),
+                    "priority": lore_data.get("priority", "standard"),
+                    "content": lore_data.get("content", ""),
+                    "summary": lore_data.get("summary", ""),
+                    "keywords": json.dumps(lore_data.get("keywords", [])),
+                    "tags": json.dumps(lore_data.get("tags", [])),
+                    "constraints": json.dumps(lore_data.get("constraints", [])),
+                    "related_characters": json.dumps(lore_data.get("related_characters", [])),
+                    "related_locations": json.dumps(lore_data.get("related_locations", [])),
+                    "related_items": json.dumps(lore_data.get("related_items", [])),
+                    "created_at": datetime.now(),
+                    "updated_at": datetime.now(),
+                }
+
+                try:
+                    await postgres_db.execute_write("""
+                        INSERT INTO lore_entries (id, project_id, title, category, priority, content, summary, keywords, tags, constraints, related_characters, related_locations, related_items, created_at, updated_at)
+                        VALUES (:id, CAST(:project_id AS UUID), :title, :category, :priority, :content, :summary, :keywords, :tags, :constraints, :related_characters, :related_locations, :related_items, :created_at, :updated_at)
+                    """, lore_entry)
+                    saved_count += 1
+                    logger.info(f"从对话中保存设定: {lore_entry['title']}")
+                except Exception as e:
+                    logger.error(f"保存设定失败: {e}")
+
+            return saved_count > 0
+
+        except json.JSONDecodeError:
+            logger.warning("解析设定 JSON 失败")
+            return False
+        except Exception as e:
+            logger.error(f"提取设定失败: {e}")
+            return False
 
     # ==================== 智能推断方法 ====================
 
@@ -669,6 +793,182 @@ class SettingAgentService:
             results["updated"] = success
 
         return results
+
+    # ==================== 角色性格生成 ====================
+
+    async def generate_character_personality(
+        self,
+        project_id: str,
+        character_data: Dict[str, Any],
+        existing_characters: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """
+        为角色生成性格建议
+
+        Args:
+            project_id: 项目 ID
+            character_data: 角色数据（name, role, description, background 等）
+            existing_characters: 现有角色列表（用于避免重复）
+
+        Returns:
+            Dict: 生成的性格数据
+        """
+        # 获取项目设定作为上下文
+        project_context = await self._get_project_context(project_id)
+
+        # 构建提示
+        prompt = self._build_personality_generation_prompt(character_data, existing_characters, project_context)
+
+        try:
+            response = await self._call_llm_simple(prompt)
+
+            # 解析 JSON
+            if "```json" in response:
+                response = response.split("```json")[1].split("```")[0]
+            elif "```" in response:
+                response = response.split("```")[1].split("```")[0]
+
+            personality_data = json.loads(response.strip())
+
+            logger.info(f"为角色 '{character_data.get('name')}' 生成性格: {personality_data.get('personality', '')[:50]}...")
+
+            return {
+                "success": True,
+                "personality": personality_data.get("personality", ""),
+                "speech_pattern": personality_data.get("speech_pattern", ""),
+                "personality_traits": personality_data.get("personality_traits", []),
+                "agent_goals": personality_data.get("agent_goals", []),
+                "agent_memory": personality_data.get("agent_memory", []),
+            }
+
+        except json.JSONDecodeError as e:
+            logger.error(f"解析性格 JSON 失败: {e}")
+            return {
+                "success": False,
+                "error": "解析失败",
+                "personality": "",
+                "speech_pattern": "",
+            }
+        except Exception as e:
+            logger.error(f"生成角色性格失败: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "personality": "",
+                "speech_pattern": "",
+            }
+
+    async def _get_project_context(self, project_id: str) -> str:
+        """获取项目设定上下文"""
+        try:
+            from app.api.app import postgres_db
+            if not postgres_db:
+                return ""
+
+            # 获取项目信息
+            project = await postgres_db.get_project(project_id)
+            if not project:
+                return ""
+
+            context_parts = []
+
+            # 添加项目基本信息
+            if project.get("title"):
+                context_parts.append(f"作品名称：{project['title']}")
+            if project.get("description"):
+                context_parts.append(f"作品简介：{project['description']}")
+
+            # 添加世界类型和基调
+            metadata = project.get("metadata", {})
+            if metadata.get("world_type"):
+                context_parts.append(f"世界类型：{metadata['world_type']}")
+            if metadata.get("tone"):
+                context_parts.append(f"叙事基调：{metadata['tone']}")
+
+            # 获取关键设定
+            lores = await postgres_db.get_all_lore_entries(project_id, limit=10)
+            if lores:
+                lore_titles = [l.get("title", "") for l in lores[:5]]
+                context_parts.append(f"关键设定：{', '.join(lore_titles)}")
+
+            return "\n".join(context_parts)
+
+        except Exception as e:
+            logger.warning(f"获取项目上下文失败: {e}")
+            return ""
+
+    def _build_personality_generation_prompt(
+        self,
+        character_data: Dict[str, Any],
+        existing_characters: Optional[List[Dict[str, Any]]] = None,
+        project_context: str = "",
+    ) -> str:
+        """构建性格生成提示"""
+
+        name = character_data.get("name", "")
+        role = character_data.get("role", "supporting")
+        description = character_data.get("description", "")
+        background = character_data.get("background", "")
+
+        # 角色定位说明
+        role_descriptions = {
+            "main": "主角 - 故事的核心人物，需要鲜明的性格和成长空间",
+            "antagonist": "反派 - 与主角对立的角色，需要有魅力的反派特质",
+            "supporting": "重要配角 - 支持主线发展，有自己的人物弧光",
+            "npc": "普通配角 - 丰富故事世界，性格可以相对简单",
+        }
+
+        # 现有角色性格（避免重复）
+        existing_personalities = ""
+        if existing_characters:
+            personalities = []
+            for char in existing_characters[:5]:
+                if char.get("personality"):
+                    personalities.append(f"- {char.get('name')}: {char.get('personality')}")
+            if personalities:
+                existing_personalities = f"\n\n现有角色性格（避免过于相似）：\n" + "\n".join(personalities)
+
+        prompt = f"""你是一个专业的小说角色设定专家。请为以下角色生成性格设定。
+
+【项目背景】
+{project_context if project_context else "通用小说设定"}
+
+【角色信息】
+- 姓名：{name}
+- 定位：{role_descriptions.get(role, role)}
+- 描述：{description}
+- 背景：{background if background else "暂无详细背景"}
+{existing_personalities}
+
+【输出要求】
+请生成以下内容，以 JSON 格式输出：
+
+1. **personality**: 性格描述（2-3句话，描述核心性格特点）
+2. **speech_pattern**: 说话风格（如：简短凌厉、幽默风趣、文绉绉等）
+3. **personality_traits**: 性格特质列表（3-5个，如["勇敢", "冲动", "正义感强"]）
+4. **agent_goals**: 作为角色 Agent 的目标（2-3个，用于驱动角色行为）
+5. **agent_memory**: 角色应记住的关键信息（1-2条，如重要经历、关系等）
+
+【输出格式】
+```json
+{{
+  "personality": "性格描述",
+  "speech_pattern": "说话风格",
+  "personality_traits": ["特质1", "特质2", "特质3"],
+  "agent_goals": ["目标1", "目标2"],
+  "agent_memory": ["记忆1"]
+}}
+```
+
+请确保：
+- 性格与角色定位相符
+- 与现有角色有区分度
+- 性格要有优缺点，避免脸谱化
+- 说话风格要与身份背景匹配
+
+只输出 JSON，不要其他内容。
+"""
+        return prompt
 
     def _build_management_system_prompt(self, session: SettingAgentSession) -> str:
         """构建管理模式系统提示"""

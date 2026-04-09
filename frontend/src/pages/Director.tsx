@@ -4,9 +4,10 @@ import PageLayout from '@/components/PageLayout'
 import { useDynamicWebSocket } from '@/hooks/useWebSocket'
 import { getDirectorState, getSnapshotTree, getWorkflowGraph } from '@/api/director'
 import { getCharacters } from '@/api/characters'
-import { Play, Pause, RotateCcw, Zap, Target, BookOpen, MessageSquare, Map, GitBranch, RefreshCcw, Workflow, Mic, PenLine, FolderOpen, UserPlus, UserMinus, Users } from 'lucide-react'
+import { Play, Pause, RotateCcw, Zap, Target, BookOpen, MessageSquare, Map, GitBranch, RefreshCcw, Workflow, Mic, PenLine, FolderOpen, UserPlus, UserMinus, Users, ChevronDown, ChevronUp, Settings, Sparkles, FileText } from 'lucide-react'
 import { useProject } from '@/contexts/ProjectContext'
 import { useTheme } from '@/contexts/ThemeContext'
+import { motion, AnimatePresence } from 'framer-motion'
 
 interface AgentStatus {
   name: string
@@ -82,13 +83,13 @@ interface NarrativePanelState {
 }
 
 const defaultAgents: AgentStatus[] = [
-  { name: 'Summarizer', status: 'idle', message: '剧情总结员 - 待命', progress: 0 },
-  { name: 'Master Plotter', status: 'idle', message: '总编剧 - 待命', progress: 0 },
-  { name: 'Hook Manager', status: 'idle', message: '伏笔管理员 - 待命', progress: 0 },
-  { name: 'Writer', status: 'idle', message: '内容执行官 - 待命', progress: 0 },
-  { name: 'Evaluator', status: 'idle', message: '剧情评估员 - 待命', progress: 0 },
-  { name: 'Character Agent', status: 'idle', message: '角色演绎 - 待命', progress: 0 },
-  { name: 'ProcGen', status: 'idle', message: '世界生成 - 待命', progress: 0 },
+  { name: 'Summarizer', status: 'idle', message: '剧情总结员', progress: 0 },
+  { name: 'Master Plotter', status: 'idle', message: '总编剧', progress: 0 },
+  { name: 'Hook Manager', status: 'idle', message: '伏笔管理员', progress: 0 },
+  { name: 'Writer', status: 'idle', message: '内容执行官', progress: 0 },
+  { name: 'Evaluator', status: 'idle', message: '剧情评估员', progress: 0 },
+  { name: 'Character Agent', status: 'idle', message: '角色演绎', progress: 0 },
+  { name: 'ProcGen', status: 'idle', message: '世界生成', progress: 0 },
 ]
 
 function splitMultiline(value: string) {
@@ -149,13 +150,43 @@ export default function Director() {
     background_story: '',
     speech_pattern: '',
   })
+  const [showAutoWriteModal, setShowAutoWriteModal] = useState(false)
+  const [autoWriteForm, setAutoWriteForm] = useState({
+    chapter_title: '',
+    chapter_goal: '',
+    target_word_count: 2000,
+    style_reference: '',
+  })
+  const [autoWriteResult, setAutoWriteResult] = useState<{
+    chapter_id?: string
+    title?: string
+    content?: string
+    word_count?: number
+  } | null>(null)
+  const [showAutoModeModal, setShowAutoModeModal] = useState(false)
+  const [autoModeForm, setAutoModeForm] = useState({
+    initial_plot: '',
+    chapter_count: 3,
+    words_per_chapter: 2000,
+    style_reference: '',
+  })
+  const [autoModeRunning, setAutoModeRunning] = useState(false)
+  const [autoModeChapters, setAutoModeChapters] = useState<Array<{
+    chapter_num: number
+    title: string
+    word_count: number
+    content: string
+  }>>([])
+
+  // 高级设置折叠状态
+  const [showAdvancedControls, setShowAdvancedControls] = useState(false)
+  const [showLogs, setShowLogs] = useState(true)
 
   const addLog = (message: string) => {
     const timestamp = new Date().toLocaleTimeString()
     setLogs((prev) => [`[${timestamp}] ${message}`, ...prev.slice(0, 199)])
   }
 
-  // 使用相对路径，WebSocket 基础 URL 从配置获取
   const wsPath = useMemo(
     () => (sessionId.trim() ? `/api/ws/connect/${sessionId.trim()}` : ''),
     [sessionId]
@@ -191,7 +222,6 @@ export default function Director() {
     }
   }, [sessionId])
 
-  // 加载项目角色列表
   useEffect(() => {
     const loadCharacters = async () => {
       if (!currentProject) {
@@ -242,7 +272,7 @@ export default function Director() {
           loadRuntimePanels()
           break
         case 'dialogue_generated':
-          addLog(`对话生成完成: ${data.data?.dialogue || ''}`)
+          addLog(`对话生成完成`)
           setDialoguePanel(data.data || null)
           loadRuntimePanels()
           break
@@ -282,7 +312,6 @@ export default function Director() {
           break
         case 'character_added':
           addLog(`角色已添加: ${data.data?.name || data.data?.character_id}`)
-          // 刷新角色列表
           if (currentProject) {
             getCharacters(currentProject.id).then((chars: any[]) => {
               setAvailableCharacters(chars.map((c) => ({ id: c.id, name: c.name })))
@@ -291,7 +320,6 @@ export default function Director() {
           break
         case 'character_removed':
           addLog(`角色已移除: ${data.data?.character_id}`)
-          // 刷新角色列表
           if (currentProject) {
             getCharacters(currentProject.id).then((chars: any[]) => {
               setAvailableCharacters(chars.map((c) => ({ id: c.id, name: c.name })))
@@ -300,6 +328,36 @@ export default function Director() {
           break
         case 'characters_list':
           addLog(`角色列表: ${data.data?.count || 0} 个角色`)
+          break
+        case 'auto_write_chapter_result':
+          if (data.status === 'success') {
+            addLog(`章节自动写作完成: ${data.data?.title} (${data.data?.word_count} 字)`)
+            setAutoWriteResult(data.data)
+          } else {
+            addLog(`章节自动写作失败: ${data.error}`)
+          }
+          loadRuntimePanels()
+          break
+        case 'auto_mode_chapter_start':
+          addLog(`📖 开始写作第 ${data.chapter_num} 章: ${data.title}`)
+          break
+        case 'auto_mode_chapter_completed':
+          addLog(`✅ 第 ${data.chapter_num} 章完成: ${data.title} (${data.word_count} 字)`)
+          setAutoModeChapters(prev => [...prev, {
+            chapter_num: data.chapter_num,
+            title: data.title,
+            word_count: data.word_count,
+            content: data.content,
+          }])
+          break
+        case 'auto_mode_completed':
+          setAutoModeRunning(false)
+          addLog(`🎉 全自动创作完成！共 ${data.data?.total_chapters} 章，${data.data?.total_words} 字`)
+          loadRuntimePanels()
+          break
+        case 'auto_mode_error':
+          setAutoModeRunning(false)
+          addLog(`❌ 自动模式错误: ${data.error}`)
           break
         case 'error':
           addLog(`错误: ${data.message}`)
@@ -322,7 +380,7 @@ export default function Director() {
     setIsGenerating(true)
     const worldId = currentProject.world_id || `project-${currentProject.id}`
     const characterIds = availableCharacters.map((c) => c.id)
-    addLog(`启动会话: 项目 ${currentProject.name}, 世界 ${worldId}, 角色 ${characterIds.length} 个`)
+    addLog(`启动会话: 项目 ${currentProject.name}`)
     send({ type: 'start_session', world_id: worldId, character_ids: characterIds })
   }
 
@@ -339,6 +397,8 @@ export default function Director() {
     setWorkflowGraph(null)
     setDialoguePanel(null)
     setNarrativePanel(null)
+    setAutoWriteResult(null)
+    setAutoModeChapters([])
   }
 
   const executeAgentCommand = () => {
@@ -346,7 +406,6 @@ export default function Director() {
       addLog('请选择 Agent 并输入命令')
       return
     }
-
     send({
       type: 'agent_command',
       agent: selectedAgent,
@@ -398,7 +457,6 @@ export default function Director() {
       addLog('请先选择项目')
       return
     }
-
     send({
       type: 'add_character',
       character_data: {
@@ -410,8 +468,6 @@ export default function Director() {
         project_id: currentProject.id,
       },
     })
-
-    // 重置表单并关闭 Modal
     setNewCharacterForm({
       name: '',
       description: '',
@@ -430,16 +486,51 @@ export default function Director() {
     })
   }
 
-  const quickActions = [
-    { icon: <Zap size={18} />, label: '推进剧情', command: 'advance_plot' },
-    { icon: <Target size={18} />, label: '管理伏笔', command: 'manage_hooks' },
-    { icon: <BookOpen size={18} />, label: '检查章节结束', command: 'chapter_end_check' },
-  ]
+  const handleAutoWriteChapter = () => {
+    if (!autoWriteForm.chapter_title.trim()) {
+      addLog('请输入章节标题')
+      return
+    }
+    if (!autoWriteForm.chapter_goal.trim()) {
+      addLog('请输入章节目标/大纲')
+      return
+    }
+    send({
+      type: 'auto_write_chapter',
+      chapter_title: autoWriteForm.chapter_title.trim(),
+      chapter_goal: autoWriteForm.chapter_goal.trim(),
+      target_word_count: autoWriteForm.target_word_count,
+      style_reference: autoWriteForm.style_reference.trim(),
+    })
+    setShowAutoWriteModal(false)
+  }
+
+  const handleStartAutoMode = () => {
+    if (!autoModeForm.initial_plot.trim()) {
+      addLog('请输入初始剧情设定')
+      return
+    }
+    setAutoModeRunning(true)
+    setAutoModeChapters([])
+    send({
+      type: 'start_auto_mode',
+      initial_plot: autoModeForm.initial_plot.trim(),
+      chapter_count: autoModeForm.chapter_count,
+      words_per_chapter: autoModeForm.words_per_chapter,
+      style_reference: autoModeForm.style_reference.trim(),
+    })
+    setShowAutoModeModal(false)
+  }
+
+  const handleStopAutoMode = () => {
+    send({ type: 'stop_auto_mode' })
+    setAutoModeRunning(false)
+  }
 
   const getAgentColor = (status: AgentStatus['status']) => {
     switch (status) {
       case 'idle':
-        return 'bg-gray-400'
+        return isDark ? 'bg-gray-600' : 'bg-gray-300'
       case 'working':
         return 'bg-blue-500 animate-pulse'
       case 'completed':
@@ -447,26 +538,28 @@ export default function Director() {
       case 'error':
         return 'bg-red-500'
       default:
-        return 'bg-gray-400'
+        return isDark ? 'bg-gray-600' : 'bg-gray-300'
     }
   }
+
+  const getWorkingAgentName = () => agents.find(a => a.status === 'working')?.message || null
 
   const renderSnapshotTree = (nodes: SnapshotNode[], depth = 0): React.ReactNode => {
     return nodes.map((node) => (
       <div key={node.id} className="space-y-2">
-        <div className={`rounded-lg border p-3 ${isDark ? 'border-gray-700' : 'border-gray-200'}`} style={{ marginLeft: `${depth * 16}px` }}>
-          <div className="flex items-center justify-between gap-3">
+        <div className={`rounded-lg border p-2 ${isDark ? 'border-gray-700' : 'border-gray-200'}`} style={{ marginLeft: `${depth * 12}px` }}>
+          <div className="flex items-center justify-between gap-2">
             <div>
-              <p className={`text-sm font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>{node.name || node.id}</p>
-              <p className={`text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>{node.snapshot_type} {node.is_branch ? '· 分支' : ''}</p>
-              {node.branch_reason && <p className="text-xs text-purple-600 mt-1">{node.branch_reason}</p>}
+              <p className={`text-xs font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>{node.name || node.id}</p>
             </div>
             <Button
               variant="secondary"
+              size="sm"
               onClick={() => setRollbackSnapshotId(node.id)}
               disabled={!isGenerating || wsStatus !== 'connected'}
+              className="text-xs px-2 py-1"
             >
-              选择回档
+              回档
             </Button>
           </div>
         </div>
@@ -476,7 +569,17 @@ export default function Director() {
   }
 
   const headerActions = (
-    <div className="flex items-center gap-4">
+    <div className="flex items-center gap-3">
+      {/* Agent状态指示器 */}
+      <div className="flex items-center gap-1.5">
+        {agents.map((agent) => (
+          <div
+            key={agent.name}
+            className={`w-3 h-3 rounded-full ${getAgentColor(agent.status)} cursor-pointer transition-transform hover:scale-125`}
+            title={`${agent.name}: ${agent.message}`}
+          />
+        ))}
+      </div>
       <span
         className={`px-3 py-1 rounded-full text-sm ${
           wsStatus === 'connected'
@@ -493,7 +596,7 @@ export default function Director() {
 
   return (
     <PageLayout
-      title="导演模式"
+      title="上帝模式"
       description={currentProject ? `项目: ${currentProject.name}` : undefined}
       actions={headerActions}
     >
@@ -503,400 +606,429 @@ export default function Director() {
           <p>请先在侧边栏选择一个项目</p>
         </div>
       ) : (
-        <>
-          <Card title="会话控制" className="mb-6">
-            <div className="flex gap-4 flex-wrap">
-              <Input placeholder="输入会话 ID" value={sessionId} onChange={(e) => setSessionId(e.target.value)} />
+        <div className="space-y-6">
+          {/* 顶部控制栏 */}
+          <Card className="p-4">
+            <div className="flex items-center gap-4 flex-wrap">
+              <Input
+                placeholder="输入会话 ID"
+                value={sessionId}
+                onChange={(e) => setSessionId(e.target.value)}
+                className="w-48"
+              />
               {!isGenerating ? (
                 <Button onClick={startSession} disabled={!currentProject}>
-                  <Play size={18} className="mr-2" />开始生成
+                  <Play size={18} className="mr-2" />启动会话
                 </Button>
               ) : (
                 <Button variant="danger" onClick={stopSession}>
-                  <Pause size={18} className="mr-2" />停止生成
+                  <Pause size={18} className="mr-2" />停止会话
                 </Button>
               )}
               <Button variant="secondary" onClick={resetAll}>
                 <RotateCcw size={18} className="mr-2" />重置
-          </Button>
-          <Button variant="secondary" onClick={loadRuntimePanels}>
-            <RefreshCcw size={18} className="mr-2" />刷新状态
-          </Button>
-          <Button onClick={() => setShowCommandModal(true)}>手动指令</Button>
-        </div>
-      </Card>
-
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
-        <div className="lg:col-span-2">
-          <Card title="Agent 状态" className="mb-6">
-            <div className="space-y-3">
-              {agents.map((agent) => (
-                <div key={agent.name} className={`flex items-center gap-3 p-3 rounded-lg ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
-                  <div className={`w-3 h-3 rounded-full ${getAgentColor(agent.status)}`} />
-                  <div className="flex-1">
-                    <p className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>{agent.name}</p>
-                    <p className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>{agent.message}</p>
-                  </div>
-                  {agent.progress !== undefined && (
-                    <div className="w-32">
-                      <div className={`h-2 rounded-full overflow-hidden ${isDark ? 'bg-gray-700' : 'bg-gray-200'}`}>
-                        <div className="h-full bg-blue-500 transition-all" style={{ width: `${agent.progress}%` }} />
-                      </div>
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
-          </Card>
-
-          <Card title="对话 / 工作流输入" className="mb-6">
-            <div className="space-y-4">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <Input
-                  label="speaker_id"
-                  value={dialogueForm.speakerId}
-                  onChange={(e) => setDialogueForm((prev) => ({ ...prev, speakerId: e.target.value }))}
-                  placeholder="如：narrator / char_001"
-                />
-                <Input
-                  label="present_characters"
-                  value={dialogueForm.presentCharacters}
-                  onChange={(e) => setDialogueForm((prev) => ({ ...prev, presentCharacters: e.target.value }))}
-                  placeholder="逗号分隔，如：char_001,char_002"
-                />
-              </div>
-              <TextArea
-                label="context"
-                value={dialogueForm.context}
-                onChange={(e) => setDialogueForm((prev) => ({ ...prev, context: e.target.value }))}
-                placeholder="当前场景上下文"
-              />
-              <TextArea
-                label="intents"
-                value={dialogueForm.intents}
-                onChange={(e) => setDialogueForm((prev) => ({ ...prev, intents: e.target.value }))}
-                placeholder="逗号或换行分隔，如：推进剧情，制造冲突"
-              />
-              <TextArea
-                label="environment"
-                value={dialogueForm.environment}
-                onChange={(e) => setDialogueForm((prev) => ({ ...prev, environment: e.target.value }))}
-                placeholder="环境描写，如：夜雨、空旷仓库、压抑气氛"
-              />
-              <TextArea
-                label="character_moods"
-                value={dialogueForm.characterMoods}
-                onChange={(e) => setDialogueForm((prev) => ({ ...prev, characterMoods: e.target.value }))}
-                placeholder={"每行一条，格式：角色ID:情绪\nchar_001:愤怒\nchar_002:警惕"}
-              />
-              <div className="flex gap-3 flex-wrap">
-                <Button onClick={triggerDialogue} disabled={!isGenerating || wsStatus !== 'connected'}>
-                  <MessageSquare size={18} className="mr-2" />生成对话
-                </Button>
-                <Button variant="secondary" onClick={triggerNarrative} disabled={!isGenerating || wsStatus !== 'connected'}>
-                  <PenLine size={18} className="mr-2" />生成叙事
-                </Button>
-                <Button variant="secondary" onClick={triggerWorkflowCycle} disabled={!isGenerating || wsStatus !== 'connected'}>
-                  <Workflow size={18} className="mr-2" />执行工作流
-                </Button>
-              </div>
-            </div>
-          </Card>
-
-          <Card title="快速操作" className="mb-6">
-            <div className="grid grid-cols-2 gap-3">
-              {quickActions.map((action) => (
-                <Button
-                  key={action.label}
-                  variant="secondary"
-                  onClick={() => send({ type: action.command })}
-                  disabled={!isGenerating || wsStatus !== 'connected'}
-                  className="justify-start"
-                >
-                  {action.icon}
-                  <span className="ml-2">{action.label}</span>
-                </Button>
-              ))}
-            </div>
-          </Card>
-
-          <Card title="角色管理" className="mb-6">
-            <div className="space-y-4">
-              <div className="flex items-center justify-between">
-                <div className={`flex items-center gap-2 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>
-                  <Users size={18} />
-                  <span>当前角色 ({availableCharacters.length})</span>
-                </div>
-                <Button
-                  size="sm"
-                  onClick={() => setShowAddCharacterModal(true)}
-                  disabled={!isGenerating || wsStatus !== 'connected'}
-                >
-                  <UserPlus size={16} className="mr-1" /> 添加角色
-                </Button>
-              </div>
-
-              {availableCharacters.length === 0 ? (
-                <p className={`text-sm text-center py-4 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>暂无角色，请先在项目中创建角色</p>
-              ) : (
-                <div className="space-y-2 max-h-48 overflow-y-auto">
-                  {availableCharacters.map((char) => (
-                    <div
-                      key={char.id}
-                      className={`flex items-center justify-between p-3 rounded-lg ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}
-                    >
-                      <div>
-                        <span className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>{char.name}</span>
-                        <span className={`text-xs ml-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>{char.id}</span>
-                      </div>
-                      <Button
-                        variant="secondary"
-                        size="sm"
-                        onClick={() => handleRemoveCharacter(char.id)}
-                        disabled={!isGenerating || wsStatus !== 'connected'}
-                      >
-                        <UserMinus size={14} />
-                      </Button>
-                    </div>
-                  ))}
+              </Button>
+              <div className="flex-1" />
+              {/* 运行时状态摘要 */}
+              {runtimeState && (
+                <div className={`flex items-center gap-4 text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+                  <span>阶段: <strong className={isDark ? 'text-white' : 'text-gray-800'}>{runtimeState?.state_machine?.phase || '-'}</strong></span>
+                  <span>进度: <strong className={isDark ? 'text-white' : 'text-gray-800'}>{typeof runtimeState?.main_plot_progress === 'number' ? `${Math.round(runtimeState.main_plot_progress * 100)}%` : '-'}</strong></span>
+                  <span>伏笔: <strong className={isDark ? 'text-white' : 'text-gray-800'}>{runtimeState?.hooks_planted?.length || 0}/{(runtimeState?.hooks_planted?.length || 0) + (runtimeState?.hooks_resolved?.length || 0)}</strong></span>
                 </div>
               )}
             </div>
-          </Card>
-
-          <Card title="声音审查面板" className="mb-6">
-            {!dialoguePanel ? (
-              <p className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>暂无对话结果。执行"生成对话"或工作流后会显示声音审查数据。</p>
-            ) : (
-              <div className="space-y-4 text-sm">
-                <div className={`rounded-lg p-4 ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
-                  <div className={`flex items-center gap-2 mb-2 font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>
-                    <Mic size={16} /> 最新对话
-                  </div>
-                  <p><span className="font-medium">角色：</span>{dialoguePanel.speaker_id || '-'}</p>
-                  <p className={`mt-2 whitespace-pre-wrap ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>{dialoguePanel.dialogue || '-'}</p>
-                  {dialoguePanel.action ? <p className={`mt-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>动作：{dialoguePanel.action}</p> : null}
-                  {dialoguePanel.emotion ? <p className={isDark ? 'text-gray-400' : 'text-gray-500'}>情绪：{dialoguePanel.emotion}</p> : null}
-                </div>
-
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div className={`rounded-lg border p-4 ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
-                    <h3 className={`font-medium mb-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>声音上下文</h3>
-                    <p className={isDark ? 'text-gray-300' : 'text-gray-700'}>向量检索：{dialoguePanel.voice_context?.used_qdrant ? '已启用' : '未启用'}</p>
-                    <p className={isDark ? 'text-gray-300' : 'text-gray-700'}>命中样本数：{dialoguePanel.voice_context?.retrieved_count || 0}</p>
-                    <div className="mt-2 space-y-2">
-                      {(dialoguePanel.voice_context?.retrieved_samples || []).length === 0 ? (
-                        <p className={isDark ? 'text-gray-400' : 'text-gray-500'}>暂无参考样本</p>
-                      ) : (
-                        dialoguePanel.voice_context?.retrieved_samples?.map((sample, index) => (
-                          <div key={`${sample}-${index}`} className={`rounded p-2 ${isDark ? 'bg-gray-700 text-gray-300' : 'bg-gray-50 text-gray-700'}`}>
-                            {sample}
-                          </div>
-                        ))
-                      )}
-                    </div>
-                  </div>
-
-                  <div className={`rounded-lg border p-4 ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
-                    <h3 className={`font-medium mb-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>OOC 审查</h3>
-                    <p className={isDark ? 'text-gray-300' : 'text-gray-700'}>已审查：{dialoguePanel.voice_review?.checked ? '是' : '否'}</p>
-                    <p className={isDark ? 'text-gray-300' : 'text-gray-700'}>结果：{dialoguePanel.voice_review?.is_ooc ? '检测到 OOC' : '通过'}</p>
-                    <p className={isDark ? 'text-gray-300' : 'text-gray-700'}>置信度：{typeof dialoguePanel.voice_review?.confidence === 'number' ? dialoguePanel.voice_review.confidence.toFixed(3) : '-'}</p>
-                    {dialoguePanel.voice_review?.suggestion ? (
-                      <p className="mt-2 text-amber-700">建议：{dialoguePanel.voice_review.suggestion}</p>
-                    ) : null}
-                    <div className="mt-2 space-y-2">
-                      {(dialoguePanel.voice_review?.issues || []).length === 0 ? (
-                        <p className={isDark ? 'text-gray-400' : 'text-gray-500'}>无明显问题</p>
-                      ) : (
-                        dialoguePanel.voice_review?.issues?.map((issue, index) => (
-                          <div key={`${issue}-${index}`} className={`rounded p-2 ${isDark ? 'bg-red-900 text-red-300' : 'bg-red-50 text-red-700'}`}>
-                            {issue}
-                          </div>
-                        ))
-                      )}
-                    </div>
-                  </div>
-                </div>
-
-                <div className={`rounded-lg border p-4 ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
-                  <h3 className={`font-medium mb-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>自动重写结果</h3>
-                  <p className={isDark ? 'text-gray-300' : 'text-gray-700'}>是否重写：{dialoguePanel.rewrite_result?.applied ? '已重写' : '未触发'}</p>
-                  {dialoguePanel.rewrite_result?.original_dialogue ? (
-                    <div className="mt-3 rounded bg-amber-50 p-3">
-                      <p className="text-xs font-medium text-amber-800 mb-1">重写前</p>
-                      <p className="text-sm text-amber-900 whitespace-pre-wrap">{dialoguePanel.rewrite_result.original_dialogue}</p>
-                    </div>
-                  ) : null}
-                  {(dialoguePanel.rewrite_result?.changes_made || []).length > 0 ? (
-                    <div className="mt-3 space-y-2">
-                      {dialoguePanel.rewrite_result?.changes_made?.map((change, index) => (
-                        <div key={`${change}-${index}`} className={`rounded p-2 ${isDark ? 'bg-green-900 text-green-300' : 'bg-green-50 text-green-700'}`}>
-                          {change}
-                        </div>
-                      ))}
-                    </div>
-                  ) : null}
-                </div>
-              </div>
+            {/* 当前工作状态 */}
+            {isGenerating && getWorkingAgentName() && (
+              <motion.div
+                initial={{ opacity: 0, y: -10 }}
+                animate={{ opacity: 1, y: 0 }}
+                className={`mt-3 flex items-center gap-2 text-sm ${isDark ? 'text-blue-400' : 'text-blue-600'}`}
+              >
+                <div className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
+                <span>{getWorkingAgentName()} 正在工作...</span>
+              </motion.div>
             )}
           </Card>
 
-          <Card title="叙事闭环面板" className="mb-6">
-            {!narrativePanel ? (
-              <p className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>暂无叙事结果。执行"生成叙事"或工作流后会显示叙事闭环数据。</p>
-            ) : (
-              <div className="space-y-4 text-sm">
-                <div className={`rounded-lg p-4 ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
-                  <div className={`flex items-center gap-2 mb-2 font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>
-                    <PenLine size={16} /> 最新叙事
+          {/* 核心功能区 */}
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            {/* 左侧：全自动创作（核心功能） */}
+            <div className="lg:col-span-2 space-y-6">
+              {/* 全自动创作卡片 */}
+              <Card className={`overflow-hidden ${autoModeRunning ? 'ring-2 ring-purple-500' : ''}`}>
+                <div className="p-6">
+                  <div className="flex items-center gap-3 mb-4">
+                    <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center">
+                      <Sparkles className="w-6 h-6 text-white" />
+                    </div>
+                    <div>
+                      <h2 className={`text-xl font-bold ${isDark ? 'text-white' : 'text-gray-800'}`}>全自动创作</h2>
+                      <p className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>一键生成完整章节，AI 自动协调所有 Agent</p>
+                    </div>
                   </div>
-                  <p className={`text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>字数：{narrativePanel.word_count || 0}</p>
-                  <p className={`mt-2 whitespace-pre-wrap ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>{narrativePanel.content || '-'}</p>
-                </div>
 
-                <div className={`rounded-lg border p-4 ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
-                  <h3 className={`font-medium mb-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>叙事声音审查</h3>
-                  <p className={isDark ? 'text-gray-300' : 'text-gray-700'}>已审查：{narrativePanel.voice_review?.checked ? '是' : '否'}</p>
-                  <p className={isDark ? 'text-gray-300' : 'text-gray-700'}>是否存在 OOC：{narrativePanel.voice_review?.has_ooc ? '是' : '否'}</p>
-                  {narrativePanel.voice_review?.reason ? (
-                    <p className={`mt-1 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>原因：{narrativePanel.voice_review.reason}</p>
-                  ) : null}
-                  <div className="mt-3 space-y-3">
-                    {(narrativePanel.voice_review?.results || []).length === 0 ? (
-                      <p className={isDark ? 'text-gray-400' : 'text-gray-500'}>暂无角色级审查结果</p>
-                    ) : (
-                      narrativePanel.voice_review?.results?.map((entry, index) => (
-                        <div key={`${entry.character_id || 'entry'}-${index}`} className={`rounded border p-3 ${isDark ? 'bg-gray-800 border-gray-700' : 'bg-gray-50 border-gray-200'}`}>
-                          <p className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>{entry.character_name || entry.character_id || '未知角色'}</p>
-                          <p className={`text-xs mt-1 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>Qdrant：{entry.voice_context?.used_qdrant ? '已启用' : '未启用'} / 命中样本：{entry.voice_context?.retrieved_count || 0}</p>
-                          <p className={`mt-2 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>结果：{entry.voice_review?.is_ooc ? '检测到 OOC' : '通过'}</p>
-                          {entry.voice_review?.suggestion ? <p className="text-amber-700 mt-1">建议：{entry.voice_review.suggestion}</p> : null}
-                          {(entry.voice_review?.issues || []).length > 0 ? (
-                            <div className="mt-2 space-y-1">
-                              {entry.voice_review?.issues?.map((issue, issueIndex) => (
-                                <div key={`${issue}-${issueIndex}`} className={`rounded p-2 ${isDark ? 'bg-red-900 text-red-300' : 'bg-red-50 text-red-700'}`}>
-                                  {issue}
-                                </div>
-                              ))}
-                            </div>
-                          ) : null}
+                  {autoModeRunning ? (
+                    <div className="space-y-4">
+                      <div className={`p-4 rounded-lg ${isDark ? 'bg-purple-900/30' : 'bg-purple-50'}`}>
+                        <div className="flex items-center justify-between">
+                          <span className={`font-medium ${isDark ? 'text-purple-300' : 'text-purple-700'}`}>
+                            正在自动创作中...
+                          </span>
+                          <Button variant="danger" size="sm" onClick={handleStopAutoMode}>
+                            <Pause size={16} className="mr-1" /> 停止
+                          </Button>
                         </div>
-                      ))
+                        <div className="mt-2 text-sm">
+                          已完成: {autoModeChapters.length} 章
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <Button
+                      onClick={() => setShowAutoModeModal(true)}
+                      disabled={!isGenerating || wsStatus !== 'connected'}
+                      className="w-full justify-center py-3 text-lg"
+                      size="lg"
+                    >
+                      <Play size={20} className="mr-2" />
+                      开始全自动创作
+                    </Button>
+                  )}
+                </div>
+              </Card>
+
+              {/* 快速操作 */}
+              <Card title="快速操作">
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                  <Button
+                    variant="secondary"
+                    onClick={() => send({ type: 'advance_plot' })}
+                    disabled={!isGenerating || wsStatus !== 'connected' || autoModeRunning}
+                    className="justify-center"
+                  >
+                    <Zap size={16} className="mr-2" />推进剧情
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    onClick={() => send({ type: 'manage_hooks' })}
+                    disabled={!isGenerating || wsStatus !== 'connected' || autoModeRunning}
+                    className="justify-center"
+                  >
+                    <Target size={16} className="mr-2" />管理伏笔
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    onClick={() => setShowAutoWriteModal(true)}
+                    disabled={!isGenerating || wsStatus !== 'connected' || autoModeRunning}
+                    className="justify-center"
+                  >
+                    <FileText size={16} className="mr-2" />写作章节
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    onClick={() => send({ type: 'chapter_end_check' })}
+                    disabled={!isGenerating || wsStatus !== 'connected' || autoModeRunning}
+                    className="justify-center"
+                  >
+                    <BookOpen size={16} className="mr-2" />章节判定
+                  </Button>
+                </div>
+              </Card>
+
+              {/* 自动创作结果 */}
+              {autoModeChapters.length > 0 && (
+                <Card title={`📚 已生成章节 (${autoModeChapters.length} 章)`}>
+                  <div className="space-y-3 max-h-96 overflow-y-auto">
+                    {autoModeChapters.map((chapter, index) => (
+                      <details key={index} className={`rounded-lg border ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+                        <summary className={`flex items-center justify-between p-3 cursor-pointer ${isDark ? 'hover:bg-gray-800' : 'hover:bg-gray-50'}`}>
+                          <div className="flex items-center gap-2">
+                            <span className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>
+                              {chapter.title}
+                            </span>
+                            <span className={`text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+                              {chapter.word_count} 字
+                            </span>
+                          </div>
+                          <Button
+                            variant="secondary"
+                            size="sm"
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              navigator.clipboard.writeText(chapter.content)
+                              addLog(`已复制: ${chapter.title}`)
+                            }}
+                          >
+                            复制
+                          </Button>
+                        </summary>
+                        <div className={`p-3 border-t ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+                          <pre className={`text-sm whitespace-pre-wrap max-h-60 overflow-y-auto ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+                            {chapter.content}
+                          </pre>
+                        </div>
+                      </details>
+                    ))}
+                  </div>
+                </Card>
+              )}
+
+              {/* 自动写作结果 */}
+              {autoWriteResult && (
+                <Card title={`📝 ${autoWriteResult.title}`}>
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between">
+                      <span className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+                        {autoWriteResult.word_count} 字 | ID: {autoWriteResult.chapter_id}
+                      </span>
+                      <div className="flex gap-2">
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          onClick={() => {
+                            navigator.clipboard.writeText(autoWriteResult.content || '')
+                            addLog('内容已复制')
+                          }}
+                        >
+                          复制
+                        </Button>
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          onClick={() => setAutoWriteResult(null)}
+                        >
+                          关闭
+                        </Button>
+                      </div>
+                    </div>
+                    <div className={`max-h-80 overflow-y-auto p-4 rounded-lg ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
+                      <pre className={`text-sm whitespace-pre-wrap ${isDark ? 'text-gray-200' : 'text-gray-700'}`}>
+                        {autoWriteResult.content}
+                      </pre>
+                    </div>
+                  </div>
+                </Card>
+              )}
+
+              {/* 生成结果：声音审查 + 叙事 */}
+              {(dialoguePanel || narrativePanel) && (
+                <Card title="生成结果">
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {/* 对话结果 */}
+                    {dialoguePanel && (
+                      <div className={`p-4 rounded-lg border ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+                        <div className="flex items-center gap-2 mb-2">
+                          <MessageSquare size={16} />
+                          <span className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>对话</span>
+                        </div>
+                        <p className={`text-sm ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+                          <span className="font-medium">{dialoguePanel.speaker_id}:</span> {dialoguePanel.dialogue}
+                        </p>
+                        {dialoguePanel.voice_review?.is_ooc && (
+                          <p className="text-xs text-red-500 mt-2">⚠️ 检测到 OOC</p>
+                        )}
+                      </div>
+                    )}
+                    {/* 叙事结果 */}
+                    {narrativePanel && (
+                      <div className={`p-4 rounded-lg border ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+                        <div className="flex items-center justify-between mb-2">
+                          <div className="flex items-center gap-2">
+                            <PenLine size={16} />
+                            <span className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>叙事</span>
+                          </div>
+                          <span className={`text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+                            {narrativePanel.word_count} 字
+                          </span>
+                        </div>
+                        <p className={`text-sm line-clamp-3 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+                          {narrativePanel.content}
+                        </p>
+                      </div>
                     )}
                   </div>
-                </div>
+                </Card>
+              )}
 
-                <div className={`rounded-lg border p-4 ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
-                  <h3 className={`font-medium mb-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>叙事自动重写</h3>
-                  <p className={isDark ? 'text-gray-300' : 'text-gray-700'}>是否重写：{narrativePanel.rewrite_result?.applied ? '已重写' : '未触发'}</p>
-                  {narrativePanel.rewrite_result?.target_character_name ? (
-                    <p className={`mt-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>目标角色：{narrativePanel.rewrite_result.target_character_name}</p>
-                  ) : null}
-                  {narrativePanel.rewrite_result?.original_content ? (
-                    <div className="mt-3 rounded bg-amber-50 p-3">
-                      <p className="text-xs font-medium text-amber-800 mb-1">重写前</p>
-                      <p className="text-sm text-amber-900 whitespace-pre-wrap">{narrativePanel.rewrite_result.original_content}</p>
-                    </div>
-                  ) : null}
-                  {(narrativePanel.rewrite_result?.changes_made || []).length > 0 ? (
-                    <div className="mt-3 space-y-2">
-                      {narrativePanel.rewrite_result?.changes_made?.map((change, index) => (
-                        <div key={`${change}-${index}`} className={`rounded p-2 ${isDark ? 'bg-green-900 text-green-300' : 'bg-green-50 text-green-700'}`}>
-                          {change}
+              {/* 高级控制（可折叠） */}
+              <Card>
+                <button
+                  onClick={() => setShowAdvancedControls(!showAdvancedControls)}
+                  className={`w-full flex items-center justify-between p-4 ${isDark ? 'hover:bg-gray-800' : 'hover:bg-gray-50'}`}
+                >
+                  <span className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>高级控制</span>
+                  {showAdvancedControls ? <ChevronUp size={18} /> : <ChevronDown size={18} />}
+                </button>
+                <AnimatePresence>
+                  {showAdvancedControls && (
+                    <motion.div
+                      initial={{ height: 0, opacity: 0 }}
+                      animate={{ height: 'auto', opacity: 1 }}
+                      exit={{ height: 0, opacity: 0 }}
+                      className="overflow-hidden"
+                    >
+                      <div className="p-4 pt-0 space-y-4">
+                        {/* 角色管理 */}
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <Users size={16} />
+                            <span className={`text-sm ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+                              角色 ({availableCharacters.length})
+                            </span>
+                          </div>
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            onClick={() => setShowAddCharacterModal(true)}
+                            disabled={!isGenerating || wsStatus !== 'connected'}
+                          >
+                            <UserPlus size={14} className="mr-1" /> 添加
+                          </Button>
                         </div>
-                      ))}
-                    </div>
-                  ) : null}
+                        <div className="flex flex-wrap gap-2">
+                          {availableCharacters.map((char) => (
+                            <span
+                              key={char.id}
+                              className={`px-2 py-1 rounded text-sm flex items-center gap-1 ${isDark ? 'bg-gray-700 text-gray-300' : 'bg-gray-100 text-gray-700'}`}
+                            >
+                              {char.name}
+                              <button
+                                onClick={() => handleRemoveCharacter(char.id)}
+                                className="hover:text-red-500"
+                              >
+                                <UserMinus size={12} />
+                              </button>
+                            </span>
+                          ))}
+                        </div>
+
+                        {/* 对话/工作流输入 */}
+                        <div className="grid grid-cols-2 gap-3">
+                          <Input
+                            placeholder="speaker_id"
+                            value={dialogueForm.speakerId}
+                            onChange={(e) => setDialogueForm(prev => ({ ...prev, speakerId: e.target.value }))}
+                          />
+                          <Input
+                            placeholder="present_characters"
+                            value={dialogueForm.presentCharacters}
+                            onChange={(e) => setDialogueForm(prev => ({ ...prev, presentCharacters: e.target.value }))}
+                          />
+                        </div>
+                        <TextArea
+                          placeholder="context / intents"
+                          value={dialogueForm.context}
+                          onChange={(e) => setDialogueForm(prev => ({ ...prev, context: e.target.value }))}
+                          rows={2}
+                        />
+                        <div className="flex gap-2">
+                          <Button size="sm" variant="secondary" onClick={triggerDialogue} disabled={!isGenerating || wsStatus !== 'connected'}>
+                            生成对话
+                          </Button>
+                          <Button size="sm" variant="secondary" onClick={triggerNarrative} disabled={!isGenerating || wsStatus !== 'connected'}>
+                            生成叙事
+                          </Button>
+                          <Button size="sm" variant="secondary" onClick={triggerWorkflowCycle} disabled={!isGenerating || wsStatus !== 'connected'}>
+                            执行工作流
+                          </Button>
+                        </div>
+
+                        {/* 其他操作 */}
+                        <div className="flex gap-2 flex-wrap">
+                          <Button size="sm" variant="secondary" onClick={() => send({ type: 'create_snapshot', snapshot_type: 'manual', is_branch: true })} disabled={!isGenerating || wsStatus !== 'connected'}>
+                            <GitBranch size={14} className="mr-1" />创建快照
+                          </Button>
+                          <Button size="sm" variant="secondary" onClick={() => setShowCommandModal(true)}>
+                            <Settings size={14} className="mr-1" />手动指令
+                          </Button>
+                        </div>
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </Card>
+            </div>
+
+            {/* 右侧：日志 + 快照 */}
+            <div className="space-y-6">
+              {/* 实时日志 */}
+              <Card>
+                <button
+                  onClick={() => setShowLogs(!showLogs)}
+                  className={`w-full flex items-center justify-between p-4 ${isDark ? 'hover:bg-gray-800' : 'hover:bg-gray-50'}`}
+                >
+                  <span className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>实时日志</span>
+                  <div className="flex items-center gap-2">
+                    <span className={`text-xs px-2 py-0.5 rounded ${isDark ? 'bg-gray-700 text-gray-300' : 'bg-gray-100 text-gray-600'}`}>
+                      {logs.length} 条
+                    </span>
+                    {showLogs ? <ChevronUp size={18} /> : <ChevronDown size={18} />}
+                  </div>
+                </button>
+                <AnimatePresence>
+                  {showLogs && (
+                    <motion.div
+                      initial={{ height: 0, opacity: 0 }}
+                      animate={{ height: 'auto', opacity: 1 }}
+                      exit={{ height: 0, opacity: 0 }}
+                      className="overflow-hidden"
+                    >
+                      <div className="p-4 pt-0">
+                        <div className={`h-80 overflow-y-auto space-y-1 font-mono text-xs p-3 rounded-lg ${isDark ? 'bg-gray-900 text-green-400' : 'bg-gray-900 text-green-400'}`}>
+                          {logs.length === 0 ? (
+                            <p className="text-gray-500">暂无日志...</p>
+                          ) : (
+                            logs.map((log, i) => <p key={i}>{log}</p>)
+                          )}
+                        </div>
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </Card>
+
+              {/* 版本树 */}
+              <Card title="快照版本">
+                <div className="space-y-2 max-h-60 overflow-y-auto">
+                  {snapshotTree.length > 0 ? (
+                    renderSnapshotTree(snapshotTree)
+                  ) : (
+                    <p className={`text-sm text-center py-4 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+                      暂无快照
+                    </p>
+                  )}
                 </div>
-              </div>
-            )}
-          </Card>
-
-          <Card title="第三阶段控制台">
-            <div className="space-y-4">
-              <div>
-                <label className={`block text-sm font-medium mb-2 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>区域生成提示</label>
-                <TextArea value={regionPrompt} onChange={(e) => setRegionPrompt(e.target.value)} />
-              </div>
-              <div className="flex gap-3 flex-wrap">
-                <Button
-                  variant="secondary"
-                  onClick={() => send({ type: 'generate_region', exploration_direction: regionPrompt })}
-                  disabled={!isGenerating || wsStatus !== 'connected'}
-                >
-                  <Map size={18} className="mr-2" />生成区域
-                </Button>
-                <Button
-                  variant="secondary"
-                  onClick={() => send({ type: 'create_snapshot', snapshot_type: 'manual', is_branch: true, branch_reason: 'manual branch' })}
-                  disabled={!isGenerating || wsStatus !== 'connected'}
-                >
-                  <GitBranch size={18} className="mr-2" />创建分支快照
-                </Button>
-                <Button
-                  variant="secondary"
-                  onClick={() => rollbackSnapshotId && send({ type: 'rollback_snapshot', snapshot_id: rollbackSnapshotId })}
-                  disabled={!rollbackSnapshotId || !isGenerating || wsStatus !== 'connected'}
-                >
-                  <RotateCcw size={18} className="mr-2" />回档到所选快照
-                </Button>
-              </div>
+                {rollbackSnapshotId && (
+                  <div className="mt-3 pt-3 border-t flex gap-2">
+                    <Input
+                      value={rollbackSnapshotId}
+                      onChange={(e) => setRollbackSnapshotId(e.target.value)}
+                      placeholder="snapshot_id"
+                      className="flex-1 text-sm"
+                    />
+                    <Button
+                      size="sm"
+                      onClick={() => send({ type: 'rollback_snapshot', snapshot_id: rollbackSnapshotId })}
+                      disabled={!isGenerating || wsStatus !== 'connected'}
+                    >
+                      回档
+                    </Button>
+                  </div>
+                )}
+              </Card>
             </div>
-          </Card>
+          </div>
         </div>
+      )}
 
-        <div>
-          <Card title="实时日志" className="h-[600px] flex flex-col mb-6">
-            <div className="flex-1 overflow-y-auto space-y-2 font-mono text-sm bg-gray-900 text-green-400 p-4 rounded-lg">
-              {logs.length === 0 ? <p className="text-gray-500">暂无日志...</p> : logs.map((log, i) => <p key={i}>{log}</p>)}
-            </div>
-          </Card>
-        </div>
-      </div>
-
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <Card title="运行时状态">
-          <div className={`space-y-2 text-sm ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
-            <p>阶段：{runtimeState?.state_machine?.phase || '-'}</p>
-            <p>当前快照：{runtimeState?.current_snapshot_id || '-'}</p>
-            <p>主线进度：{typeof runtimeState?.main_plot_progress === 'number' ? `${Math.round(runtimeState.main_plot_progress * 100)}%` : '-'}</p>
-            <p>区域数：{runtimeState?.regions?.length || 0}</p>
-            <p>已埋设伏笔：{runtimeState?.hooks_planted?.length || 0}</p>
-            <p>已回收伏笔：{runtimeState?.hooks_resolved?.length || 0}</p>
-          </div>
-        </Card>
-
-        <Card title="工作流图">
-          <div className={`space-y-2 text-sm ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
-            <div className={`flex items-center gap-2 mb-2 font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>
-              <Workflow size={16} />工作流节点
-            </div>
-            {workflowGraph?.nodes?.map((node) => (
-              <div key={node.id} className={`rounded px-3 py-2 border ${isDark ? 'bg-gray-800 border-gray-700' : 'bg-gray-50 border-gray-200'}`}>
-                {node.label}
-              </div>
-            )) || <p className={isDark ? 'text-gray-400' : 'text-gray-500'}>暂无工作流数据</p>}
-          </div>
-        </Card>
-
-        <Card title="版本树 / 快照树">
-          <div className="space-y-3 max-h-[360px] overflow-y-auto">
-            {snapshotTree.length > 0 ? renderSnapshotTree(snapshotTree) : <p className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>暂无快照树数据</p>}
-            <div className={`pt-2 border-t ${isDark ? 'border-gray-700' : 'border-gray-100'}`}>
-              <p className={`text-xs mb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>当前选择回档快照</p>
-              <Input value={rollbackSnapshotId} onChange={(e) => setRollbackSnapshotId(e.target.value)} placeholder="snapshot_id" />
-            </div>
-          </div>
-        </Card>
-      </div>
-
+      {/* Modals */}
       <Modal isOpen={showCommandModal} onClose={() => setShowCommandModal(false)} title="手动 Agent 指令">
         <div className="space-y-4">
           <div>
             <label className={`block text-sm font-medium mb-2 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>选择 Agent</label>
             <select
-              className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
+              className={`w-full px-3 py-2 border rounded-lg ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
               value={selectedAgent}
               onChange={(e) => setSelectedAgent(e.target.value)}
             >
@@ -908,13 +1040,13 @@ export default function Director() {
           </div>
           <TextArea
             label="指令内容"
-            placeholder='例如：{"action": "plant_hook", "description": "..."}'
+            placeholder='{"action": "..."}'
             value={agentCommand}
             onChange={(e) => setAgentCommand(e.target.value)}
           />
           <div className="flex justify-end gap-3">
             <Button variant="secondary" onClick={() => setShowCommandModal(false)}>取消</Button>
-            <Button onClick={executeAgentCommand}>发送指令</Button>
+            <Button onClick={executeAgentCommand}>发送</Button>
           </div>
         </div>
       </Modal>
@@ -930,7 +1062,7 @@ export default function Director() {
           <div>
             <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>角色类型</label>
             <select
-              className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
+              className={`w-full px-3 py-2 border rounded-lg ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
               value={newCharacterForm.role}
               onChange={(e) => setNewCharacterForm({ ...newCharacterForm, role: e.target.value })}
             >
@@ -943,32 +1075,105 @@ export default function Director() {
             label="角色描述"
             value={newCharacterForm.description}
             onChange={(e) => setNewCharacterForm({ ...newCharacterForm, description: e.target.value })}
-            placeholder="描述角色的外貌、性格等"
-            rows={3}
-          />
-          <TextArea
-            label="背景故事"
-            value={newCharacterForm.background_story}
-            onChange={(e) => setNewCharacterForm({ ...newCharacterForm, background_story: e.target.value })}
-            placeholder="角色的背景故事"
-            rows={3}
-          />
-          <Input
-            label="说话风格"
-            value={newCharacterForm.speech_pattern}
-            onChange={(e) => setNewCharacterForm({ ...newCharacterForm, speech_pattern: e.target.value })}
-            placeholder="例如：说话带古风，喜欢用成语"
+            rows={2}
           />
           <div className="flex justify-end gap-3">
             <Button variant="secondary" onClick={() => setShowAddCharacterModal(false)}>取消</Button>
-            <Button onClick={handleAddCharacter} disabled={!newCharacterForm.name.trim()}>
-              添加角色
+            <Button onClick={handleAddCharacter} disabled={!newCharacterForm.name.trim()}>添加</Button>
+          </div>
+        </div>
+      </Modal>
+
+      <Modal isOpen={showAutoWriteModal} onClose={() => setShowAutoWriteModal(false)} title="自动写作章节">
+        <div className="space-y-4">
+          <Input
+            label="章节标题 *"
+            value={autoWriteForm.chapter_title}
+            onChange={(e) => setAutoWriteForm({ ...autoWriteForm, chapter_title: e.target.value })}
+            placeholder="如：第一章 相遇"
+          />
+          <TextArea
+            label="章节目标/大纲 *"
+            value={autoWriteForm.chapter_goal}
+            onChange={(e) => setAutoWriteForm({ ...autoWriteForm, chapter_goal: e.target.value })}
+            placeholder="描述本章的主要内容、情节走向..."
+            rows={4}
+          />
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>目标字数</label>
+              <input
+                type="number"
+                value={autoWriteForm.target_word_count}
+                onChange={(e) => setAutoWriteForm({ ...autoWriteForm, target_word_count: parseInt(e.target.value) || 2000 })}
+                className={`w-full px-3 py-2 border rounded-lg ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
+                min={500}
+                max={10000}
+              />
+            </div>
+          </div>
+          <div className="flex justify-end gap-3 pt-4">
+            <Button variant="secondary" onClick={() => setShowAutoWriteModal(false)}>取消</Button>
+            <Button onClick={handleAutoWriteChapter} disabled={!autoWriteForm.chapter_title.trim() || !autoWriteForm.chapter_goal.trim()}>
+              开始写作
             </Button>
           </div>
         </div>
       </Modal>
-        </>
-      )}
+
+      <Modal isOpen={showAutoModeModal} onClose={() => setShowAutoModeModal(false)} title="🚀 全自动创作模式" size="lg">
+        <div className="space-y-4">
+          <div className={`p-4 rounded-lg ${isDark ? 'bg-purple-900/30' : 'bg-purple-50'}`}>
+            <p className={`text-sm ${isDark ? 'text-purple-300' : 'text-purple-700'}`}>
+              全自动创作将自动规划剧情、逐章写作、管理伏笔。你只需要提供初始设定，剩下的交给 AI。
+            </p>
+          </div>
+          <TextArea
+            label="初始剧情设定/大纲 *"
+            value={autoModeForm.initial_plot}
+            onChange={(e) => setAutoModeForm({ ...autoModeForm, initial_plot: e.target.value })}
+            placeholder="描述整体故事设定、主角、目标、世界观等...&#10;例如：少年林风偶然获得神秘玉佩，踏上修仙之路..."
+            rows={5}
+          />
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>章节数量</label>
+              <input
+                type="number"
+                value={autoModeForm.chapter_count}
+                onChange={(e) => setAutoModeForm({ ...autoModeForm, chapter_count: parseInt(e.target.value) || 3 })}
+                className={`w-full px-3 py-2 border rounded-lg ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
+                min={1}
+                max={20}
+              />
+            </div>
+            <div>
+              <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>每章字数</label>
+              <input
+                type="number"
+                value={autoModeForm.words_per_chapter}
+                onChange={(e) => setAutoModeForm({ ...autoModeForm, words_per_chapter: parseInt(e.target.value) || 2000 })}
+                className={`w-full px-3 py-2 border rounded-lg ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
+                min={500}
+                max={5000}
+              />
+            </div>
+          </div>
+          <TextArea
+            label="风格参考（可选）"
+            value={autoModeForm.style_reference}
+            onChange={(e) => setAutoModeForm({ ...autoModeForm, style_reference: e.target.value })}
+            placeholder="粘贴一段你希望模仿风格的文字..."
+            rows={2}
+          />
+          <div className="flex justify-end gap-3 pt-4">
+            <Button variant="secondary" onClick={() => setShowAutoModeModal(false)}>取消</Button>
+            <Button onClick={handleStartAutoMode} disabled={!autoModeForm.initial_plot.trim()}>
+              <Play size={16} className="mr-1" /> 开始自动创作
+            </Button>
+          </div>
+        </div>
+      </Modal>
     </PageLayout>
   )
 }

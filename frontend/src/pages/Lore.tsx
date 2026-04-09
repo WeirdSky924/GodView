@@ -417,27 +417,26 @@ export default function Lore() {
                 <Card className="h-[calc(100vh-200px)] overflow-y-auto">
                   <div className="p-6">
                     {/* 头部 */}
-                    <div className="flex items-start justify-between mb-6">
-                      <div>
-                        <div className="flex items-center gap-3 mb-2">
-                          {categoryIcons[selectedLore.category]}
-                          <span className={`text-xs px-2 py-0.5 rounded border ${getPriorityColors(selectedLore.priority)}`}>
-                            {priorityLabels[selectedLore.priority]}
-                          </span>
+                    <div className="mb-6">
+                      <div className="flex items-center gap-3 mb-2">
+                        {categoryIcons[selectedLore.category]}
+                        <span className={`text-xs px-2 py-0.5 rounded border ${getPriorityColors(selectedLore.priority)}`}>
+                          {priorityLabels[selectedLore.priority]}
+                        </span>
+                        <div className="flex-1" />
+                        <div className="flex gap-2 flex-shrink-0">
+                          <Button variant="secondary" size="sm" onClick={() => openEditModal(selectedLore)}>
+                            <Edit size={16} className="mr-1" /> 编辑
+                          </Button>
+                          <Button variant="danger" size="sm" onClick={() => handleDelete(selectedLore.id)}>
+                            <Trash2 size={16} className="mr-1" /> 删除
+                          </Button>
                         </div>
-                        <h2 className={`text-2xl font-bold ${isDark ? 'text-white' : 'text-gray-800'}`}>{selectedLore.title}</h2>
-                        {selectedLore.summary && (
-                          <p className={`mt-2 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>{selectedLore.summary}</p>
-                        )}
                       </div>
-                      <div className="flex gap-2">
-                        <Button variant="secondary" size="sm" onClick={() => openEditModal(selectedLore)}>
-                          <Edit size={16} className="mr-1" /> 编辑
-                        </Button>
-                        <Button variant="danger" size="sm" onClick={() => handleDelete(selectedLore.id)}>
-                          <Trash2 size={16} className="mr-1" /> 删除
-                        </Button>
-                      </div>
+                      <h2 className={`text-2xl font-bold ${isDark ? 'text-white' : 'text-gray-800'}`}>{selectedLore.title}</h2>
+                      {selectedLore.summary && (
+                        <p className={`mt-2 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>{selectedLore.summary}</p>
+                      )}
                     </div>
 
                     {/* 内容 */}

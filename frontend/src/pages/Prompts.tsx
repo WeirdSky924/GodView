@@ -386,15 +386,29 @@ export default function Prompts() {
         )}
 
       {/* 编辑/创建 Modal */}
-      <Modal isOpen={showEditModal} onClose={() => setShowEditModal(false)} title={editingPrompt ? '编辑 Prompt' : '新建 Prompt'}>
+      <Modal isOpen={showEditModal} onClose={() => setShowEditModal(false)} title={editingPrompt ? '编辑 Prompt' : '新建 Prompt'} size="xl">
         <div className="space-y-4">
-          <div>
-            <label className={`block text-sm mb-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>名称</label>
-            <Input
-              value={formData.name}
-              onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-              placeholder="Prompt 名称"
-            />
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className={`block text-sm mb-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>名称</label>
+              <Input
+                value={formData.name}
+                onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+                placeholder="Prompt 名称"
+              />
+            </div>
+            <div>
+              <label className={`block text-sm mb-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>分类</label>
+              <select
+                className={`w-full border rounded px-3 py-2 ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'bg-white border-gray-300 text-gray-800'}`}
+                value={formData.category}
+                onChange={(e) => setFormData({ ...formData, category: e.target.value as PromptCategory })}
+              >
+                {Object.entries(CATEGORY_LABELS).map(([key, label]) => (
+                  <option key={key} value={key}>{label}</option>
+                ))}
+              </select>
+            </div>
           </div>
 
           <div>
@@ -404,19 +418,6 @@ export default function Prompts() {
               onChange={(e) => setFormData({ ...formData, description: e.target.value })}
               placeholder="简要描述此 Prompt 的用途"
             />
-          </div>
-
-          <div>
-            <label className={`block text-sm mb-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>分类</label>
-            <select
-              className={`w-full border rounded px-3 py-2 ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'bg-white border-gray-300 text-gray-800'}`}
-              value={formData.category}
-              onChange={(e) => setFormData({ ...formData, category: e.target.value as PromptCategory })}
-            >
-              {Object.entries(CATEGORY_LABELS).map(([key, label]) => (
-                <option key={key} value={key}>{label}</option>
-              ))}
-            </select>
           </div>
 
           <div>
@@ -438,6 +439,7 @@ export default function Prompts() {
                 onChange={(e) => setTagInput(e.target.value)}
                 placeholder="输入标签"
                 onKeyDown={(e) => e.key === 'Enter' && (e.preventDefault(), handleAddTag())}
+                className="flex-1"
               />
               <Button variant="secondary" onClick={handleAddTag}>添加</Button>
             </div>
@@ -456,7 +458,7 @@ export default function Prompts() {
           {/* 变量定义 */}
           <div>
             <div className="flex items-center justify-between mb-2">
-              <label className={`block text-sm ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>变量定义</label>
+              <label className={`block text-sm font-medium ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>变量定义</label>
               <Button size="sm" variant="secondary" onClick={handleAddVariable}>
                 <Plus className="w-4 h-4 mr-1" />
                 添加变量
@@ -465,67 +467,79 @@ export default function Prompts() {
             {(formData.variables?.length ?? 0) > 0 && (
               <div className="space-y-2">
                 {(formData.variables || []).map((variable, index) => (
-                  <div key={index} className={`flex gap-2 items-start p-2 rounded ${isDark ? 'bg-gray-800' : 'bg-gray-100'}`}>
-                    <Input
-                      value={variable.name}
-                      onChange={(e) => handleUpdateVariable(index, 'name', e.target.value)}
-                      placeholder="变量名"
-                      className="w-24"
-                    />
-                    <select
-                      className={`border rounded px-2 py-1 text-sm ${isDark ? 'bg-gray-700 border-gray-600 text-white' : 'bg-white border-gray-300 text-gray-800'}`}
-                      value={variable.type}
-                      onChange={(e) => handleUpdateVariable(index, 'type', e.target.value)}
-                    >
-                      <option value="string">字符串</option>
-                      <option value="number">数字</option>
-                      <option value="boolean">布尔</option>
-                      <option value="array">数组</option>
-                      <option value="object">对象</option>
-                    </select>
-                    <Input
-                      value={variable.description}
-                      onChange={(e) => handleUpdateVariable(index, 'description', e.target.value)}
-                      placeholder="描述"
-                      className="flex-1"
-                    />
-                    <label className={`flex items-center gap-1 text-sm ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
-                      <input
-                        type="checkbox"
-                        checked={variable.required}
-                        onChange={(e) => handleUpdateVariable(index, 'required', e.target.checked)}
+                  <div key={index} className={`flex gap-2 items-start p-3 rounded-lg border ${isDark ? 'bg-gray-800 border-gray-700' : 'bg-gray-50 border-gray-200'}`}>
+                    <div className="flex-1">
+                      <label className={`block text-xs mb-1 ${isDark ? 'text-gray-500' : 'text-gray-500'}`}>变量名</label>
+                      <Input
+                        value={variable.name}
+                        onChange={(e) => handleUpdateVariable(index, 'name', e.target.value)}
+                        placeholder="如：character_name"
                       />
-                      必填
-                    </label>
-                    <Button size="sm" variant="danger" onClick={() => handleRemoveVariable(index)}>
-                      <Trash2 className="w-4 h-4" />
-                    </Button>
+                    </div>
+                    <div className="w-28">
+                      <label className={`block text-xs mb-1 ${isDark ? 'text-gray-500' : 'text-gray-500'}`}>类型</label>
+                      <select
+                        className={`w-full border rounded px-2 py-2 text-sm ${isDark ? 'bg-gray-700 border-gray-600 text-white' : 'bg-white border-gray-300 text-gray-800'}`}
+                        value={variable.type}
+                        onChange={(e) => handleUpdateVariable(index, 'type', e.target.value)}
+                      >
+                        <option value="string">字符串</option>
+                        <option value="number">数字</option>
+                        <option value="boolean">布尔</option>
+                        <option value="array">数组</option>
+                        <option value="object">对象</option>
+                      </select>
+                    </div>
+                    <div className="flex-1">
+                      <label className={`block text-xs mb-1 ${isDark ? 'text-gray-500' : 'text-gray-500'}`}>描述</label>
+                      <Input
+                        value={variable.description}
+                        onChange={(e) => handleUpdateVariable(index, 'description', e.target.value)}
+                        placeholder="变量描述"
+                      />
+                    </div>
+                    <div className="flex items-end gap-2 pb-1">
+                      <label className={`flex items-center gap-1 text-sm ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
+                        <input
+                          type="checkbox"
+                          checked={variable.required}
+                          onChange={(e) => handleUpdateVariable(index, 'required', e.target.checked)}
+                          className="w-4 h-4"
+                        />
+                        必填
+                      </label>
+                      <Button size="sm" variant="danger" onClick={() => handleRemoveVariable(index)}>
+                        <Trash2 className="w-4 h-4" />
+                      </Button>
+                    </div>
                   </div>
                 ))}
               </div>
             )}
           </div>
 
-          <div>
-            <label className={`block text-sm mb-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>优先级 (1-100)</label>
-            <Input
-              type="number"
-              value={formData.priority}
-              onChange={(e) => setFormData({ ...formData, priority: parseInt(e.target.value) || 50 })}
-              min={1}
-              max={100}
-            />
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className={`block text-sm mb-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>优先级 (1-100)</label>
+              <Input
+                type="number"
+                value={formData.priority}
+                onChange={(e) => setFormData({ ...formData, priority: parseInt(e.target.value) || 50 })}
+                min={1}
+                max={100}
+              />
+            </div>
           </div>
 
           <div className="flex justify-end gap-2 pt-4">
-            <Button variant="secondary" onClick={() => setShowEditModal(false)}>取消</Button>
-            <Button onClick={handleSave}>{editingPrompt ? '保存' : '创建'}</Button>
+            <Button variant="secondary" onClick={() => setShowEditModal(false)} className="whitespace-nowrap">取消</Button>
+            <Button onClick={handleSave} className="whitespace-nowrap">{editingPrompt ? '保存' : '创建'}</Button>
           </div>
         </div>
       </Modal>
 
       {/* 预览 Modal */}
-      <Modal isOpen={showPreviewModal} onClose={() => setShowPreviewModal(false)} title="Prompt 预览" className="max-w-4xl">
+      <Modal isOpen={showPreviewModal} onClose={() => setShowPreviewModal(false)} title="Prompt 预览" size="xl">
         <div className="space-y-4">
           {editingPrompt && editingPrompt.variables.length > 0 && (
             <div>

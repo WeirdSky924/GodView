@@ -2,7 +2,7 @@ export interface Character {
   id?: string
   name: string
   role: string
-  status: 'active' | 'inactive' | 'deceased'
+  status: 'active' | 'inactive' | 'dead' | 'paused'
   description: string
   personality?: string
   appearance?: string

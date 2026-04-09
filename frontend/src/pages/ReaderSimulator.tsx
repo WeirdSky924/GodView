@@ -5,6 +5,7 @@ import { getChapters, simulateReader } from '@/api/chapters'
 import { Eye, TrendingUp, AlertTriangle, Heart, Zap, Clock } from 'lucide-react'
 import type { Chapter, ReaderSimulationResult } from '@/api/chapters'
 import { useTheme } from '@/contexts/ThemeContext'
+import { useProject } from '@/contexts/ProjectContext'
 
 interface ReaderMetrics {
   engagement_score: number
@@ -55,6 +56,7 @@ function mapReaderMetrics(chapter: Chapter | undefined, result: ReaderSimulation
 
 export default function ReaderSimulator() {
   const { theme } = useTheme()
+  const { currentProject } = useProject()
   const isDark = theme === 'dark'
 
   const [chapters, setChapters] = useState<Chapter[]>([])
@@ -64,14 +66,16 @@ export default function ReaderSimulator() {
 
   useEffect(() => {
     loadChapters()
-  }, [])
+  }, [currentProject])
 
   const loadChapters = async () => {
     try {
-      const data = await getChapters()
+      const data = await getChapters(currentProject?.id)
       setChapters(data)
       if (data.length > 0) {
         setSelectedChapter(data[0].id || '')
+      } else {
+        setSelectedChapter('')
       }
     } catch (error) {
       console.error('Failed to load chapters:', error)
@@ -112,39 +116,40 @@ export default function ReaderSimulator() {
         </Button>
       }
     >
-      <Card className="mb-6">
-        <div className="flex items-center gap-4">
-          <label className={`text-sm font-medium ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>选择章节：</label>
-          <select
-            className={`px-3 py-2 border rounded-lg flex-1 max-w-md ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
-            value={selectedChapter}
-            onChange={(e) => setSelectedChapter(e.target.value)}
-          >
-            <option value="">请选择章节...</option>
-            {chapters.map((chapter) => (
-              <option key={chapter.id} value={chapter.id}>
-                {chapter.title}
-              </option>
-            ))}
-          </select>
-          {selectedChapterData && (
-            <span className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
-              {selectedChapterData.content ? `${wordCount(selectedChapterData.content)} 字` : '无内容'}
-            </span>
-          )}
-        </div>
-      </Card>
-
-      {!metrics ? (
-        <Card>
-          <div className={`text-center py-12 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
-            <Eye size={64} className="mx-auto mb-4 opacity-50" />
-            <p className="text-lg">选择一个章节并点击"开始阅读模拟"</p>
-            <p className="text-sm mt-2">系统会分析章节内容并预测读者反应</p>
+      <div className="flex flex-col h-[calc(100vh-200px)]">
+        <Card className="mb-4 flex-shrink-0">
+          <div className="flex items-center gap-4">
+            <label className={`text-sm font-medium ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>选择章节：</label>
+            <select
+              className={`px-3 py-2 border rounded-lg flex-1 max-w-md ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
+              value={selectedChapter}
+              onChange={(e) => setSelectedChapter(e.target.value)}
+            >
+              <option value="">请选择章节...</option>
+              {chapters.map((chapter) => (
+                <option key={chapter.id} value={chapter.id}>
+                  {chapter.title}
+                </option>
+              ))}
+            </select>
+            {selectedChapterData && (
+              <span className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+                {selectedChapterData.content ? `${wordCount(selectedChapterData.content)} 字` : '无内容'}
+              </span>
+            )}
           </div>
         </Card>
-      ) : (
-        <>
+
+        {!metrics ? (
+          <Card className="flex-1 min-h-0">
+            <div className={`text-center py-12 h-full flex flex-col items-center justify-center ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+              <Eye size={64} className="mb-4 opacity-50" />
+              <p className="text-lg">选择一个章节并点击"开始阅读模拟"</p>
+              <p className="text-sm mt-2">系统会分析章节内容并预测读者反应</p>
+            </div>
+          </Card>
+        ) : (
+          <div className="flex-1 min-h-0 overflow-y-auto space-y-4">
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
             <Card className="p-6">
               <div className="flex items-center gap-3 mb-2">
@@ -271,8 +276,9 @@ export default function ReaderSimulator() {
               ))}
             </div>
           </Card>
-        </>
+        </div>
       )}
+      </div>
     </PageLayout>
   )
 }

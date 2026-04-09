@@ -40,7 +40,7 @@ async def list_agent_configs(
     project_id: str,
     agent_type: Optional[str] = Query(default=None, description="按 Agent 类型过滤"),
     is_active: Optional[bool] = Query(default=None, description="按激活状态过滤"),
-    limit: int = Query(default=50, le=100, description="返回数量限制"),
+    limit: int = Query(default=50, le=500, description="返回数量限制"),
     offset: int = Query(default=0, ge=0, description="偏移量"),
 ):
     """

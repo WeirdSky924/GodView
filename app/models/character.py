@@ -56,16 +56,26 @@ class Character(BaseModel):
     gender: Optional[str] = Field(None, description="性别")
 
     # 性格设定
+    personality: Optional[str] = Field(None, description="性格特点描述")
     personality_traits: List[PersonalityTrait] = Field(
         default_factory=list, description="性格特质列表"
     )
-    background_story: Optional[str] = Field(None, description="背景故事")
+    background: Optional[str] = Field(None, description="背景故事")
+
+    class Config:
+        populate_by_name = True  # 允许通过别名填充
 
     # 语言风格
     speech_pattern: Optional[str] = Field(None, description="说话风格描述")
     lexicon: List[str] = Field(default_factory=list, description="常用词汇表")
     forbidden_words: List[str] = Field(default_factory=list, description="禁用语")
     voice_samples: List[str] = Field(default_factory=list, description="典型台词样本")
+
+    # Agent 配置（角色专属 Agent）
+    has_agent: bool = Field(default=False, description="是否启用角色 Agent")
+    agent_enabled: bool = Field(default=True, description="Agent 是否激活")
+    agent_goals: List[str] = Field(default_factory=list, description="Agent 当前目标")
+    agent_memory: List[str] = Field(default_factory=list, description="Agent 记忆要点")
 
     # 状态属性
     attributes: Dict[str, Any] = Field(default_factory=dict, description="属性面板")
@@ -116,6 +126,7 @@ class CharacterVoiceSample(BaseModel):
 
     id: str = Field(..., description="样本 ID")
     character_id: str = Field(..., description="所属角色 ID")
+    project_id: Optional[str] = Field(None, description="所属项目 ID")
     text: str = Field(..., description="台词文本")
     context: Optional[str] = Field(None, description="台词上下文")
     embedding: Optional[List[float]] = Field(None, description="向量嵌入")
@@ -126,6 +137,7 @@ class CharacterVoiceSample(BaseModel):
             "example": {
                 "id": "sample_001",
                 "character_id": "char_001",
+                "project_id": "proj_001",
                 "text": "路见不平，岂能袖手旁观！",
                 "context": "看到恶霸欺负老人时所说",
             }
