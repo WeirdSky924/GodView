@@ -29,21 +29,40 @@ class SettingAgent:
         self.llm_max_tokens = llm_config.get("max_tokens", 4096)
         self._sessions: Dict[str, BootstrapSession] = {}
 
-    async def process_message(self, session_id: str, message: str) -> Dict[str, Any]:
+    async def process_message(self, session_id: str, message: str, project_id: Optional[str] = None) -> Dict[str, Any]:
         """
         处理用户消息，与用户多轮对话并提炼设定
 
         Args:
             session_id: Bootstrap 会话 ID
             message: 用户消息
+            project_id: 项目 ID（可选，用于会话恢复）
 
         Returns:
             Dict: Agent 响应
         """
-        # 获取或创建会话
-        session = self._sessions.get(session_id)
+        # 始终从 BootstrapOrchestrator 获取会话（确保单例一致性）
+        from app.services.bootstrap_orchestrator import get_bootstrap_orchestrator
+        orchestrator = get_bootstrap_orchestrator()
+        session = await orchestrator.get_session(session_id)
+
         if not session:
-            raise ValueError(f"Session {session_id} not found")
+            logger.warning(f"Session {session_id} not found in orchestrator. Available sessions: {list(orchestrator._sessions.keys())}")
+            # 尝试恢复会话（服务重启后内存会话丢失）
+            if project_id:
+                logger.info(f"Attempting to recover session {session_id} with project_id {project_id}")
+                session = BootstrapSession(
+                    id=session_id,
+                    project_id=project_id,
+                    status=BootstrapStage.COLLECTING_SETTING,
+                    current_stage=BootstrapStage.COLLECTING_SETTING,
+                    progress=0.1,
+                )
+                # 保存恢复的会话
+                orchestrator._sessions[session_id] = session
+                logger.info(f"Session {session_id} recovered")
+            else:
+                raise ValueError(f"Session {session_id} not found and no project_id provided for recovery")
 
         # 添加用户消息到历史
         user_msg = BootstrapMessage(
@@ -85,26 +104,52 @@ class SettingAgent:
 
     def _build_system_prompt(self, session: BootstrapSession) -> str:
         """构建系统提示词"""
-        return """你是一个小说设定专家（Setting Agent）。你的职责是：
+        return """你是一个长篇网络小说设定专家（Setting Agent）。你的职责是：
 
-1. 与用户沟通，了解他们想要创作的小说世界观、主线、风格、角色等设定
+1. 与用户沟通，了解他们想要创作的长篇网络小说世界观、主线、风格、角色等设定
 2. 通过多轮对话发现信息缺口并追问用户
 3. 提炼出结构化的项目 seed，为后续 bootstrap 提供可靠输入
 
+【重要：本项目定位为长篇网络小说】
+- 目标篇幅：百万字以上，多卷结构
+- 目标读者：网络小说读者，注重节奏感和爽点
+- 创作周期：长期连载，需要完善的设定支撑
+
 请遵循以下原则：
 - 保持友好、耐心的态度
-- 每次回答后，可以主动追问用户尚未提供的关键信息
+- 每次回答后，主动追问用户尚未提供的关键信息
 - 使用清晰的结构化格式组织信息
 - 不要直接写入正式世界，而是形成"待确认草案"
 
-关键信息包括：
-- 世界设定摘要（名称、类型、基调）
-- 世界规则（物理法则、魔法体系、社会规则等）
-- 力量体系/技术水平
-- 主要角色候选（至少 2-3 个核心角色）
-- 初始区域候选
-- 故事主线和冲突
-- 叙事风格（基调、目标读者群）
+【长篇网文关键设定要素】
+
+一、世界设定
+- 世界名称、类型（玄幻/仙侠/都市/科幻等）
+- 世界规则与底层逻辑
+- 力量体系（等级划分、升级路径、境界设定）
+- 势力分布与格局
+
+二、主角设定（核心）
+- 主角姓名、背景、初始状态
+- 金手指/特殊能力/独特优势
+- 主角成长路线与目标
+- 性格特点与行事风格
+
+三、配角体系
+- 核心配角（3-5人，有完整成长线）
+- 重要配角（导师、对手、红颜/知己等）
+- 势力角色（宗门长老、家族成员等）
+
+四、剧情架构
+- 主线剧情（贯穿全书的终极目标）
+- 卷级剧情（每卷的主要冲突与高潮）
+- 前期爽点设计（前三章抓住读者）
+- 伏笔规划（重要伏笔埋设计划）
+
+五、节奏与风格
+- 整体基调（热血/轻松/黑暗/爽文等）
+- 章节节奏（爽点频率、高潮安排）
+- 叙事风格与语言特色
 
 当你认为已经收集到足够的信息时，可以请求用户确认设定的完整性。
 """

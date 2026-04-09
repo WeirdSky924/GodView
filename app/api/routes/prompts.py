@@ -105,6 +105,26 @@ async def create_prompt(request: PromptTemplateCreate):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# 注意：/prompts/categories-list 避免与 /prompts/{prompt_id} 冲突
+
+@router.get("/prompts/categories-list", response_model=Dict[str, int])
+async def get_categories():
+    """
+    获取分类统计信息
+
+    Returns:
+        Dict: 分类名称 -> 数量
+    """
+    service = get_prompt_service()
+
+    try:
+        categories = await service.get_categories()
+        return categories
+    except Exception as e:
+        logger.error(f"获取分类统计失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/prompts/{prompt_id}", response_model=Dict[str, Any])
 async def get_prompt(prompt_id: str):
     """
@@ -209,24 +229,6 @@ async def search_prompts(
         return [t.dict() for t in templates]
     except Exception as e:
         logger.error(f"搜索 Prompt 失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/prompts/categories", response_model=Dict[str, int])
-async def get_categories():
-    """
-    获取分类统计信息
-
-    Returns:
-        Dict: 分类名称 -> 数量
-    """
-    service = get_prompt_service()
-
-    try:
-        categories = await service.get_categories()
-        return categories
-    except Exception as e:
-        logger.error(f"获取分类统计失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

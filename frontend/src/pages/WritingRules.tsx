@@ -240,11 +240,11 @@ export default function WritingRules() {
 
   // 过滤规则
   const filteredRules = searchQuery
-    ? rules.filter(r =>
+    ? (rules || []).filter(r =>
         r.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
         r.description.toLowerCase().includes(searchQuery.toLowerCase())
       )
-    : rules
+    : (rules || [])
 
   return (
     <div className="h-full flex flex-col">

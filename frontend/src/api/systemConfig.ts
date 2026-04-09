@@ -24,8 +24,7 @@ export async function getSystemConfig(): Promise<SystemConfig> {
   }
 
   try {
-    const response = await api.get<SystemConfig>('/config/system')
-    cachedConfig = response.data
+    cachedConfig = await api.get<SystemConfig>('/config/system')
     return cachedConfig
   } catch (error) {
     console.error('Failed to fetch system config, using defaults:', error)

@@ -54,20 +54,18 @@ export async function getProjectTokenSummary(
   if (endDate) params.append('end_date', endDate)
 
   const query = params.toString() ? `?${params.toString()}` : ''
-  const response = await api.get<TokenUsageSummary>(
+  return await api.get<TokenUsageSummary>(
     `/token-usage/projects/${projectId}/summary${query}`
   )
-  return response.data
 }
 
 /**
  * 获取项目 Token 统计
  */
 export async function getProjectTokenStats(projectId: string): Promise<ProjectTokenStats> {
-  const response = await api.get<ProjectTokenStats>(
+  return await api.get<ProjectTokenStats>(
     `/token-usage/projects/${projectId}/stats`
   )
-  return response.data
 }
 
 /**
@@ -77,18 +75,16 @@ export async function getProjectDailyStats(
   projectId: string,
   days: number = 7
 ): Promise<DailyTokenStats[]> {
-  const response = await api.get<DailyTokenStats[]>(
+  return await api.get<DailyTokenStats[]>(
     `/token-usage/projects/${projectId}/daily?days=${days}`
   )
-  return response.data
 }
 
 /**
  * 获取所有项目的 Token 统计
  */
 export async function getAllTokenStats(): Promise<ProjectTokenStats[]> {
-  const response = await api.get<ProjectTokenStats[]>('/token-usage/stats')
-  return response.data
+  return await api.get<ProjectTokenStats[]>('/token-usage/stats')
 }
 
 /**
@@ -104,10 +100,9 @@ export async function getTokenByCategory(
   if (endDate) params.append('end_date', endDate)
 
   const query = params.toString() ? `?${params.toString()}` : ''
-  const response = await api.get(
+  return await api.get(
     `/token-usage/projects/${projectId}/by-category${query}`
   )
-  return response.data
 }
 
 /**
@@ -123,8 +118,7 @@ export async function getTokenByModel(
   if (endDate) params.append('end_date', endDate)
 
   const query = params.toString() ? `?${params.toString()}` : ''
-  const response = await api.get(
+  return await api.get(
     `/token-usage/projects/${projectId}/by-model${query}`
   )
-  return response.data
 }

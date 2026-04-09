@@ -52,6 +52,7 @@ class BootstrapOrchestrator:
         )
 
         self._sessions[session_id] = session
+        logger.info(f"Created bootstrap session: {session_id}, total sessions: {len(self._sessions)}")
 
         # 如果有初始消息，进入收集设定阶段
         if initial_message:
@@ -63,7 +64,10 @@ class BootstrapOrchestrator:
 
     async def get_session(self, session_id: str) -> Optional[BootstrapSession]:
         """获取 Bootstrap 会话"""
-        return self._sessions.get(session_id)
+        session = self._sessions.get(session_id)
+        if not session:
+            logger.warning(f"Session {session_id} not found. Available: {list(self._sessions.keys())}")
+        return session
 
     async def update_session_stage(
         self,
@@ -129,6 +133,18 @@ class BootstrapOrchestrator:
         session = self._sessions.get(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
+
+        # Debug: 检查 seed_data 类型
+        logger.info(f"confirm_seed: seed_data type = {type(seed_data)}, value = {seed_data}")
+
+        # 确保 seed_data 是字典
+        if isinstance(seed_data, str):
+            logger.error(f"seed_data is a string: {seed_data[:100]}...")
+            import json
+            try:
+                seed_data = json.loads(seed_data)
+            except json.JSONDecodeError:
+                raise ValueError("seed_data 是字符串但无法解析为 JSON")
 
         # 保存确认的 seed
         session.confirmed_seed = seed_data
@@ -257,9 +273,21 @@ class BootstrapOrchestrator:
         if not session:
             raise ValueError(f"Session {session_id} not found")
 
+        # Debug: 检查 confirmed_seed
+        logger.info(f"run_bootstrap: confirmed_seed type = {type(session.confirmed_seed)}")
+
         # 检查是否已确认 seed
         if not session.confirmed_seed:
             raise ValueError("Seed 尚未确认，请先确认 seed 后再执行 Bootstrap")
+
+        # 确保 confirmed_seed 是字典
+        if isinstance(session.confirmed_seed, str):
+            logger.error(f"confirmed_seed is a string: {session.confirmed_seed[:100]}...")
+            import json
+            try:
+                session.confirmed_seed = json.loads(session.confirmed_seed)
+            except json.JSONDecodeError:
+                raise ValueError("confirmed_seed 是字符串但无法解析为 JSON")
 
         try:
             # 阶段 1: 创建世界
@@ -296,6 +324,9 @@ class BootstrapOrchestrator:
             # 更新项目状态
             await self._update_project_status(session.project_id, ProjectStatus.ACTIVE)
 
+            # Debug: 检查返回前的 confirmed_seed
+            logger.info(f"Before return: confirmed_seed type = {type(session.confirmed_seed)}, world_id = {session.confirmed_seed.get('world_id', 'N/A')}")
+
             return {
                 "success": True,
                 "project_id": session.project_id,
@@ -317,9 +348,21 @@ class BootstrapOrchestrator:
         seed = session.confirmed_seed
         project_id = session.project_id
 
+        # Debug: 检查关键字段类型
+        logger.info(f"_bootstrap_world: world_setting type = {type(seed.get('world_setting'))}")
+        logger.info(f"_bootstrap_world: world_rules type = {type(seed.get('world_rules'))}")
+        logger.info(f"_bootstrap_world: main_characters type = {type(seed.get('main_characters'))}")
+
         # 获取 world 数据
         world_setting = seed.get("world_setting", {})
-        world_id = f"world_{uuid.uuid4().hex[:12]}"
+
+        # 检查 world_setting 是否是字典
+        if not isinstance(world_setting, dict):
+            logger.error(f"world_setting is not dict: {world_setting}")
+            world_setting = {}
+
+        # 使用标准 UUID 格式
+        world_id = str(uuid.uuid4())
 
         # 创建 World 对象
         world = World(
@@ -338,16 +381,34 @@ class BootstrapOrchestrator:
 
         # 添加世界规则
         world_rules = seed.get("world_rules", [])
-        for rule_data in world_rules:
-            rule = WorldRule(
-                id=f"rule_{uuid.uuid4().hex[:8]}",
-                name=rule_data.get("name", ""),
-                description=rule_data.get("description", ""),
-                category=rule_data.get("category", "general"),
-                priority=rule_data.get("priority", 0),
-                is_absolute=rule_data.get("is_absolute", False),
-            )
-            world.rules.append(rule)
+        if not isinstance(world_rules, list):
+            logger.error(f"world_rules is not list: {world_rules}")
+            world_rules = []
+
+        for idx, rule_data in enumerate(world_rules):
+            # 如果是字符串，转换为规则对象
+            if isinstance(rule_data, str):
+                rule = WorldRule(
+                    id=str(uuid.uuid4()),
+                    name=f"规则 {idx + 1}",
+                    description=rule_data,
+                    category="general",
+                    priority=0,
+                    is_absolute=False,
+                )
+                world.rules.append(rule)
+            elif isinstance(rule_data, dict):
+                rule = WorldRule(
+                    id=str(uuid.uuid4()),
+                    name=rule_data.get("name", f"规则 {idx + 1}"),
+                    description=rule_data.get("description", ""),
+                    category=rule_data.get("category", "general"),
+                    priority=rule_data.get("priority", 0),
+                    is_absolute=rule_data.get("is_absolute", False),
+                )
+                world.rules.append(rule)
+            else:
+                logger.warning(f"rule_data is unknown type: {type(rule_data)}, skipping")
 
         # 保存到数据库
         from app.api.app import postgres_db
@@ -368,14 +429,48 @@ class BootstrapOrchestrator:
         seed = session.confirmed_seed
         regions_data = seed.get("regions", [])
 
+        if not isinstance(regions_data, list):
+            logger.error(f"regions_data is not list: {regions_data}")
+            return
+
         from app.models.world import Region, RegionType
 
         for region_data in regions_data:
+            if not isinstance(region_data, dict):
+                logger.warning(f"region_data is not dict: {region_data}, skipping")
+                continue
+
+            # 安全处理 region_type
+            region_type_str = region_data.get("region_type", "custom")
+            try:
+                region_type = RegionType(region_type_str)
+            except ValueError:
+                # 尝试匹配部分字符串
+                region_type_str_lower = region_type_str.lower()
+                if "city" in region_type_str_lower:
+                    region_type = RegionType.CITY
+                elif "village" in region_type_str_lower:
+                    region_type = RegionType.VILLAGE
+                elif "wilderness" in region_type_str_lower:
+                    region_type = RegionType.WILDERNESS
+                elif "dungeon" in region_type_str_lower:
+                    region_type = RegionType.DUNGEON
+                elif "forest" in region_type_str_lower:
+                    region_type = RegionType.FOREST
+                elif "mountain" in region_type_str_lower:
+                    region_type = RegionType.MOUNTAIN
+                elif "water" in region_type_str_lower:
+                    region_type = RegionType.WATER
+                elif "building" in region_type_str_lower:
+                    region_type = RegionType.BUILDING
+                else:
+                    region_type = RegionType.CUSTOM
+
             region = Region(
-                id=f"region_{uuid.uuid4().hex[:12]}",
+                id=str(uuid.uuid4()),
                 name=region_data.get("name", ""),
                 world_id=world_id,
-                region_type=RegionType(region_data.get("region_type", "custom")),
+                region_type=region_type,
                 description=region_data.get("description"),
             )
 
@@ -401,6 +496,15 @@ class BootstrapOrchestrator:
         # 获取角色数据
         main_characters = seed.get("main_characters", [])
         supporting_characters = seed.get("supporting_characters", [])
+
+        # 确保是列表
+        if not isinstance(main_characters, list):
+            logger.error(f"main_characters is not list: {main_characters}")
+            main_characters = []
+        if not isinstance(supporting_characters, list):
+            logger.error(f"supporting_characters is not list: {supporting_characters}")
+            supporting_characters = []
+
         all_characters = main_characters + supporting_characters
 
         from app.models.character import Character, CharacterStatus
@@ -408,8 +512,11 @@ class BootstrapOrchestrator:
         created_character_ids = []
 
         for char_data in all_characters:
+            if not isinstance(char_data, dict):
+                logger.warning(f"char_data is not dict: {char_data}, skipping")
+                continue
             character = Character(
-                id=f"char_{uuid.uuid4().hex[:12]}",
+                id=str(uuid.uuid4()),
                 name=char_data.get("name", ""),
                 description=char_data.get("description"),
                 role=char_data.get("role", "supporting"),
@@ -440,13 +547,24 @@ class BootstrapOrchestrator:
             raise ValueError("World 尚未创建")
 
         snapshot_data = {
-            "id": f"snapshot_{uuid.uuid4().hex[:12]}",
+            "id": str(uuid.uuid4()),
             "world_id": world_id,
+            "chapter_id": None,  # 初始快照没有章节
+            "snapshot_type": "initial",
             "name": "Bootstrap 初始快照",
             "description": "项目初始化时的世界状态快照",
-            "snapshot_type": "initial",
-            "world_state": {},
+            "characters": {},
+            "relationships": {},
+            "regions": {},
+            "hooks": {},
+            "main_plot_progress": 0.0,
+            "completed_events": [],
+            "character_locations": {},
             "created_at": datetime.now().isoformat(),
+            "created_by": "bootstrap",
+            "parent_snapshot_id": None,
+            "is_branch": False,
+            "branch_reason": None,
         }
 
         from app.api.app import postgres_db

@@ -3,9 +3,9 @@
  * Agent 模板管理接口
  */
 
-import axios from 'axios'
+import { api } from './client'
 
-const API_BASE = '/api/agent-templates'
+const API_BASE = '/agent-templates'
 
 // ==================== 类型定义 ====================
 
@@ -100,40 +100,35 @@ export async function getAgentTemplates(
   params.append('limit', String(limit))
   params.append('offset', String(offset))
 
-  const response = await axios.get(`${API_BASE}?${params.toString()}`)
-  return response.data
+  return await api.get(`${API_BASE}?${params.toString()}`)
 }
 
 /**
  * 创建 Agent 模板
  */
 export async function createAgentTemplate(dto: CreateAgentTemplateDTO): Promise<{ success: boolean; message: string; template: AgentTemplate }> {
-  const response = await axios.post(`${API_BASE}`, dto)
-  return response.data
+  return await api.post(`${API_BASE}`, dto)
 }
 
 /**
  * 获取 Agent 模板详情
  */
 export async function getAgentTemplate(templateId: string): Promise<AgentTemplate> {
-  const response = await axios.get(`${API_BASE}/${templateId}`)
-  return response.data
+  return await api.get(`${API_BASE}/${templateId}`)
 }
 
 /**
  * 更新 Agent 模板
  */
 export async function updateAgentTemplate(templateId: string, dto: UpdateAgentTemplateDTO): Promise<{ success: boolean; message: string; template: AgentTemplate }> {
-  const response = await axios.put(`${API_BASE}/${templateId}`, dto)
-  return response.data
+  return await api.put(`${API_BASE}/${templateId}`, dto)
 }
 
 /**
  * 删除 Agent 模板
  */
 export async function deleteAgentTemplate(templateId: string): Promise<{ success: boolean; message: string }> {
-  const response = await axios.delete(`${API_BASE}/${templateId}`)
-  return response.data
+  return await api.delete(`${API_BASE}/${templateId}`)
 }
 
 /**
@@ -145,14 +140,12 @@ export async function previewAgentTemplate(templateId: string, variables: Record
     params.append(key, String(value))
   })
 
-  const response = await axios.post(`${API_BASE}/${templateId}/preview?${params.toString()}`)
-  return response.data
+  return await api.post(`${API_BASE}/${templateId}/preview?${params.toString()}`)
 }
 
 /**
  * 按类型获取 Agent 模板
  */
 export async function getAgentTemplateByType(agentType: AgentType): Promise<AgentTemplate> {
-  const response = await axios.get(`${API_BASE}/by-type/${agentType}`)
-  return response.data
+  return await api.get(`${API_BASE}/by-type/${agentType}`)
 }

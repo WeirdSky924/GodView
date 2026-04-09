@@ -181,8 +181,7 @@ export async function setTickInterval(
  * 获取模拟状态
  */
 export async function getSimulationStatus(worldId: string): Promise<SimulationStatusResponse> {
-  const response = await api.get('/simulation/status/' + worldId)
-  return response.data
+  return await api.get('/simulation/status/' + worldId)
 }
 
 /**
@@ -219,8 +218,7 @@ export async function listSimulationEngines(): Promise<{
     performance: PerformanceStats
   }>
 }> {
-  const response = await api.get('/simulation/engines')
-  return response.data
+  return await api.get('/simulation/engines')
 }
 
 // WebSocket 相关类型

@@ -3,9 +3,9 @@
  * Prompt 模板管理接口
  */
 
-import axios from 'axios'
+import { api } from './client'
 
-const API_BASE = '/api/prompts'
+const API_BASE = '/prompts'
 
 // ==================== 类型定义 ====================
 
@@ -93,40 +93,35 @@ export async function getPrompts(filters?: PromptFilter): Promise<PromptTemplate
   params.append('limit', String(filters?.limit || 50))
   params.append('offset', String(filters?.offset || 0))
 
-  const response = await axios.get(`${API_BASE}?${params.toString()}`)
-  return response.data
+  return await api.get(`${API_BASE}?${params.toString()}`)
 }
 
 /**
  * 创建 Prompt
  */
 export async function createPrompt(dto: CreatePromptDTO): Promise<{ success: boolean; message: string; template: PromptTemplate }> {
-  const response = await axios.post(`${API_BASE}`, dto)
-  return response.data
+  return await api.post(`${API_BASE}`, dto)
 }
 
 /**
  * 获取 Prompt 详情
  */
 export async function getPrompt(promptId: string): Promise<PromptTemplate> {
-  const response = await axios.get(`${API_BASE}/${promptId}`)
-  return response.data
+  return await api.get(`${API_BASE}/${promptId}`)
 }
 
 /**
  * 更新 Prompt
  */
 export async function updatePrompt(promptId: string, dto: UpdatePromptDTO): Promise<{ success: boolean; message: string; template: PromptTemplate }> {
-  const response = await axios.put(`${API_BASE}/${promptId}`, dto)
-  return response.data
+  return await api.put(`${API_BASE}/${promptId}`, dto)
 }
 
 /**
  * 删除 Prompt
  */
 export async function deletePrompt(promptId: string): Promise<{ success: boolean; message: string }> {
-  const response = await axios.delete(`${API_BASE}/${promptId}`)
-  return response.data
+  return await api.delete(`${API_BASE}/${promptId}`)
 }
 
 /**
@@ -138,16 +133,14 @@ export async function searchPrompts(query: string, category?: PromptCategory, li
   params.append('limit', String(limit))
   if (category) params.append('category', category)
 
-  const response = await axios.post(`${API_BASE}/search?${params.toString()}`)
-  return response.data
+  return await api.post(`${API_BASE}/search?${params.toString()}`)
 }
 
 /**
  * 获取分类列表
  */
 export async function getCategories(): Promise<Record<string, number>> {
-  const response = await axios.get(`${API_BASE}/categories`)
-  return response.data
+  return await api.get(`${API_BASE}/categories-list`)
 }
 
 /**
@@ -159,6 +152,5 @@ export async function renderPrompt(promptId: string, variables: Record<string, a
     params.append(key, String(value))
   })
 
-  const response = await axios.post(`${API_BASE}/${promptId}/render?${params.toString()}`)
-  return response.data
+  return await api.post(`${API_BASE}/${promptId}/render?${params.toString()}`)
 }

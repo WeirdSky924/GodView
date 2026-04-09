@@ -11,7 +11,6 @@ from typing import Any, Dict, Set
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from app.api.app import postgres_db
 from app.config import settings
 from app.services.director import DirectorSystem
 from app.services.model_router import create_model_factory
@@ -62,6 +61,8 @@ async def send_agent_update(websocket: WebSocket, agent: str, status: str, messa
 
 
 async def _load_characters(present_characters: list[str] | None = None) -> list[dict[str, Any]]:
+    from app.api.app import postgres_db
+
     if not postgres_db:
         return []
 
@@ -77,6 +78,8 @@ async def _load_characters(present_characters: list[str] | None = None) -> list[
 
 
 async def _persist_runtime_state(director: DirectorSystem):
+    from app.api.app import postgres_db
+
     if not postgres_db:
         return
 
@@ -139,6 +142,8 @@ async def _persist_runtime_state(director: DirectorSystem):
 
 
 async def _create_auto_snapshot(director: DirectorSystem, snapshot_type: str, created_by: str = "system", is_branch: bool = False, branch_reason: str | None = None):
+    from app.api.app import postgres_db
+
     if not postgres_db:
         return None
 
@@ -308,6 +313,8 @@ async def handle_chapter_end_check(websocket: WebSocket, message: dict, client_i
 
 
 async def handle_intervention(websocket: WebSocket, message: dict, client_id: str):
+    from app.api.app import postgres_db
+
     director = get_or_create_director(client_id)
     await send_log(websocket, f"正在执行干预：{message.get('intervention_type', 'unknown')}...")
     snapshot = await _create_auto_snapshot(
@@ -372,6 +379,8 @@ async def handle_agent_command(websocket: WebSocket, message: dict, client_id: s
 
 
 async def handle_workflow_cycle(websocket: WebSocket, message: dict, client_id: str):
+    from app.api.app import postgres_db
+
     director = get_or_create_director(client_id)
     await send_agent_update(websocket, "DirectorWorkflow", "working", "正在执行编排工作流", 25)
     result = await director.run_workflow_cycle(
@@ -403,6 +412,8 @@ async def handle_create_snapshot(websocket: WebSocket, message: dict, client_id:
 
 
 async def handle_rollback_snapshot(websocket: WebSocket, message: dict, client_id: str):
+    from app.api.app import postgres_db
+
     director = get_or_create_director(client_id)
     snapshot_id = message.get("snapshot_id")
     if not snapshot_id:
@@ -444,6 +455,7 @@ async def handle_add_character(websocket: WebSocket, message: dict, client_id: s
     }
     """
     import uuid
+    from app.api.app import postgres_db
     from app.models.character import Character, CharacterStatus
 
     director = get_or_create_director(client_id)
@@ -505,6 +517,8 @@ async def handle_remove_character(websocket: WebSocket, message: dict, client_id
         "character_id": "角色ID"
     }
     """
+    from app.api.app import postgres_db
+
     director = get_or_create_director(client_id)
     await send_agent_update(websocket, "Character Agent", "working", "正在移除角色", 30)
 
@@ -540,6 +554,8 @@ async def handle_get_characters(websocket: WebSocket, message: dict, client_id: 
         "project_id": "项目ID"  // 可选
     }
     """
+    from app.api.app import postgres_db
+
     director = get_or_create_director(client_id)
 
     project_id = message.get("project_id")

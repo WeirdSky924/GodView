@@ -4,6 +4,7 @@
 
 import json
 import logging
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
@@ -88,11 +89,25 @@ async def create_hook(hook: Hook):
         Dict: 创建结果
     """
     from app.api.app import postgres_db
+    import uuid
+    from datetime import datetime
 
     if not postgres_db:
         raise HTTPException(status_code=503, detail="数据库未连接")
 
     hook_data = hook.model_dump(mode="json")
+
+    # 自动生成 ID（如果未提供）
+    if not hook_data.get("id"):
+        hook_data["id"] = str(uuid.uuid4())
+
+    # 设置默认值和时间戳（使用 datetime 对象）
+    now = datetime.now()
+    if not hook_data.get("status"):
+        hook_data["status"] = "planted"
+    if not hook_data.get("priority"):
+        hook_data["priority"] = 5
+    hook_data["created_at"] = now
 
     try:
         await postgres_db.save_hook(hook_data)
@@ -215,25 +230,41 @@ async def create_chapter(chapter: CreateChapterDTO):
         Dict: 创建结果
     """
     from app.api.app import postgres_db
+    import uuid
+    from datetime import datetime
 
     if not postgres_db:
         raise HTTPException(status_code=503, detail="数据库未连接")
 
-    chapter_id = f"chapter_{chapter.world_id}_{abs(hash((chapter.title, chapter.content or '')))}"
-    now = datetime.utcnow().isoformat()
+    # 生成 UUID 作为章节 ID
+    chapter_id = str(uuid.uuid4())
+    now = datetime.now()  # 使用 datetime 对象
     content = chapter.content or ""
+
+    # 从 world_id 获取 project_id（如果可能）
+    project_id = None
+    world_id = chapter.world_id
+    if world_id and world_id != "default_world":
+        try:
+            world = await postgres_db.get_world(world_id)
+            if world:
+                project_id = world.get("project_id")
+        except:
+            pass
+
     chapter_data = {
         "id": chapter_id,
         "title": chapter.title,
-        "world_id": chapter.world_id,
+        "project_id": project_id,
+        "world_id": world_id if world_id != "default_world" else None,
         "content": content,
         "word_count": len(content),
         "status": chapter.status.value if hasattr(chapter.status, "value") else chapter.status,
         "events": [],
         "hooks_planted": [],
         "hooks_resolved": [],
-        "main_plot_progress": 0.0,
-        "reader_scores": None,
+        "main_plot_progress": {},
+        "reader_scores": {},
         "created_at": now,
         "updated_at": now,
         "completed_at": None,
@@ -271,7 +302,7 @@ async def update_chapter(chapter_id: str, chapter: UpdateChapterDTO):
     update_payload = chapter.model_dump(mode="json", exclude_unset=True)
     merged = {**existing, **update_payload}
     merged["word_count"] = len(merged.get("content") or "")
-    merged["updated_at"] = datetime.utcnow().isoformat()
+    merged["updated_at"] = datetime.now()  # 使用 datetime 对象而非字符串
 
     try:
         await postgres_db.save_chapter(merged)
@@ -296,27 +327,32 @@ async def evaluate_chapter(chapter_id: str):
     if not chapter:
         raise HTTPException(status_code=404, detail="章节不存在")
 
-    director = DirectorSystem(
-        world_data={"id": chapter.get("world_id") or "default_world", "name": "Evaluation World"},
-        config={
-            "max_turns_threshold": settings.max_turns_threshold,
-            "target_word_count_per_intent": settings.target_word_count_per_intent,
-        },
-    )
-    await director.initialize(create_model_factory(), characters=[])
-    director.current_chapter = {
-        "id": chapter.get("id"),
-        "title": chapter.get("title"),
-        "goal": "评估章节",
-        "word_count": chapter.get("word_count") or len(chapter.get("content") or ""),
-        "status": chapter.get("status", "draft"),
-        "content": chapter.get("content") or "",
-    }
-    director.chapter_events = chapter.get("events") or []
-    director.hooks_planted = chapter.get("hooks_planted") or []
-    director.main_plot_progress = chapter.get("main_plot_progress") or 0.0
+    try:
+        director = DirectorSystem(
+            world_data={"id": chapter.get("world_id") or "default_world", "name": "Evaluation World"},
+            config={
+                "max_turns_threshold": getattr(settings, 'max_turns_threshold', 20),
+                "target_word_count_per_intent": getattr(settings, 'target_word_count_per_intent', 2000),
+            },
+        )
+        await director.initialize(create_model_factory(), characters=[])
+        director.current_chapter = {
+            "id": chapter.get("id"),
+            "title": chapter.get("title"),
+            "goal": "评估章节",
+            "word_count": chapter.get("word_count") or len(chapter.get("content") or ""),
+            "status": chapter.get("status", "draft"),
+            "content": chapter.get("content") or "",
+        }
+        director.chapter_events = chapter.get("events") or []
+        director.hooks_planted = chapter.get("hooks_planted") or []
+        director.main_plot_progress = chapter.get("main_plot_progress") or 0.0
 
-    return await director.check_chapter_end(chapter_content=chapter.get("content") or "")
+        result = await director.check_chapter_end(chapter_content=chapter.get("content") or "")
+        return result
+    except Exception as e:
+        logger.error(f"评估章节失败：{e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"评估失败：{str(e)}")
 
 
 
@@ -335,18 +371,23 @@ async def simulate_reader_for_chapter(chapter_id: str):
     if not chapter:
         raise HTTPException(status_code=404, detail="章节不存在")
 
-    director = DirectorSystem(
-        world_data={"id": chapter.get("world_id") or "default_world", "name": "Reader Simulation World"},
-        config={
-            "max_turns_threshold": settings.max_turns_threshold,
-            "target_word_count_per_intent": settings.target_word_count_per_intent,
-        },
-    )
-    await director.initialize(create_model_factory(), characters=[])
-    return await director.simulate_reader_feedback(
-        chapter_content=chapter.get("content") or "",
-        chapter_title=chapter.get("title") or "无标题",
-    )
+    try:
+        director = DirectorSystem(
+            world_data={"id": chapter.get("world_id") or "default_world", "name": "Reader Simulation World"},
+            config={
+                "max_turns_threshold": getattr(settings, 'max_turns_threshold', 20),
+                "target_word_count_per_intent": getattr(settings, 'target_word_count_per_intent', 2000),
+            },
+        )
+        await director.initialize(create_model_factory(), characters=[])
+        result = await director.simulate_reader_feedback(
+            chapter_content=chapter.get("content") or "",
+            chapter_title=chapter.get("title") or "无标题",
+        )
+        return result
+    except Exception as e:
+        logger.error(f"模拟读者失败：{e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"模拟失败：{str(e)}")
 
 
 @router.get("/snapshots/diff", response_model=Dict[str, Any])
@@ -548,6 +589,11 @@ async def update_hook(hook_id: str, hook: Hook):
 
     hook_data = hook.model_dump(mode="json")
 
+    # 确保使用正确的 ID 和保留原有的创建时间
+    hook_data["id"] = hook_id
+    if existing.get("created_at"):
+        hook_data["created_at"] = existing["created_at"]
+
     try:
         await postgres_db.save_hook(hook_data)
         return {
@@ -576,8 +622,8 @@ async def delete_hook(hook_id: str):
     if not postgres_db:
         raise HTTPException(status_code=503, detail="数据库未连接")
 
-    query = "DELETE FROM hooks WHERE id = :id"
-    await postgres_db.execute_query(query, {"id": hook_id})
+    query = "DELETE FROM hooks WHERE id = CAST(:id AS UUID)"
+    await postgres_db.execute_write(query, {"id": hook_id})
 
     return {
         "success": True,
@@ -605,8 +651,8 @@ async def delete_chapter(chapter_id: str):
     if not existing:
         raise HTTPException(status_code=404, detail="章节不存在")
 
-    query = "DELETE FROM chapters WHERE id = :id"
-    await postgres_db.execute_query(query, {"id": chapter_id})
+    query = "DELETE FROM chapters WHERE id = CAST(:id AS UUID)"
+    await postgres_db.execute_write(query, {"id": chapter_id})
 
     return {
         "success": True,

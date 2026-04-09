@@ -33,7 +33,7 @@ class HookType(str, Enum):
 class Hook(BaseModel):
     """伏笔模型"""
 
-    id: str = Field(..., description="伏笔唯一 ID")
+    id: Optional[str] = Field(None, description="伏笔唯一 ID（创建时自动生成）")
     title: str = Field(..., description="伏笔标题")
     description: str = Field(..., description="伏笔描述")
 
@@ -53,7 +53,7 @@ class Hook(BaseModel):
     related_objects: List[str] = Field(default_factory=list, description="相关物品 ID")
 
     # 内容
-    plant_context: str = Field(..., description="埋设时的情境")
+    plant_context: Optional[str] = Field(None, description="埋设时的情境")
     plant_chapter: Optional[str] = Field(None, description="埋设章节 ID")
     resolution_hint: Optional[str] = Field(None, description="回收提示（给作者看）")
     resolution_context: Optional[str] = Field(None, description="回收时的情境")

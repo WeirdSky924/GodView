@@ -3,9 +3,12 @@
 """
 
 import logging
+import uuid
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel
 
 from app.models.lore import (
     LoreCategory,
@@ -15,6 +18,23 @@ from app.models.lore import (
     LoreValidationResult,
 )
 
+
+class UpdateLoreDTO(BaseModel):
+    """更新设定的数据传输对象（所有字段可选）"""
+    title: Optional[str] = None
+    category: Optional[LoreCategory] = None
+    priority: Optional[LorePriority] = None
+    content: Optional[str] = None
+    summary: Optional[str] = None
+    keywords: Optional[List[str]] = None
+    tags: Optional[List[str]] = None
+    related_characters: Optional[List[str]] = None
+    related_locations: Optional[List[str]] = None
+    related_items: Optional[List[str]] = None
+    constraints: Optional[List[str]] = None
+    forbidden_actions: Optional[List[str]] = None
+    source: Optional[str] = None
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
@@ -23,6 +43,48 @@ router = APIRouter()
 # 模拟数据库（实际应用中应该使用真实数据库）
 _lore_store: Dict[str, LoreEntry] = {}
 
+
+# ==================== 静态路由（必须在动态路由之前） ====================
+
+@router.get("/categories", response_model=List[Dict[str, str]])
+async def get_lore_categories():
+    """
+    获取设定类别列表
+
+    Returns:
+        List: 类别列表
+    """
+    return [
+        {"value": "world_rule", "label": "世界规则"},
+        {"value": "geography", "label": "地理设定"},
+        {"value": "history", "label": "历史背景"},
+        {"value": "faction", "label": "势力体系"},
+        {"value": "culture", "label": "文化习俗"},
+        {"value": "race", "label": "种族设定"},
+        {"value": "profession", "label": "职业/阶层"},
+        {"value": "item", "label": "物品/装备"},
+        {"value": "skill", "label": "技能/能力"},
+        {"value": "custom", "label": "自定义"},
+    ]
+
+
+@router.get("/priorities", response_model=List[Dict[str, str]])
+async def get_lore_priorities():
+    """
+    获取设定优先级列表
+
+    Returns:
+        List: 优先级列表
+    """
+    return [
+        {"value": "constitutional", "label": "宪法级（不可违反）"},
+        {"value": "core", "label": "核心设定"},
+        {"value": "standard", "label": "标准设定"},
+        {"value": "flexible", "label": "灵活设定"},
+    ]
+
+
+# ==================== 动态路由 ====================
 
 @router.get("", response_model=List[Dict[str, Any]])
 async def list_lore(
@@ -85,14 +147,24 @@ async def create_lore(lore: LoreEntry):
     Returns:
         Dict: 创建结果
     """
-    if lore.id in _lore_store:
+    # 自动生成 ID（如果未提供）
+    lore_id = lore.id or str(uuid.uuid4())
+
+    if lore_id in _lore_store:
         raise HTTPException(status_code=400, detail="设定 ID 已存在")
 
-    _lore_store[lore.id] = lore
+    # 更新 lore 对象的 ID
+    lore.id = lore_id
+
+    # 设置创建时间
+    if not hasattr(lore, 'created_at') or lore.created_at is None:
+        lore.created_at = datetime.now()
+
+    _lore_store[lore_id] = lore
 
     return {
         "success": True,
-        "id": lore.id,
+        "id": lore_id,
         "message": f"设定 '{lore.title}' 创建成功",
     }
 
@@ -115,13 +187,13 @@ async def get_lore(lore_id: str):
 
 
 @router.put("/{lore_id}", response_model=Dict[str, Any])
-async def update_lore(lore_id: str, lore: LoreEntry):
+async def update_lore(lore_id: str, lore_update: UpdateLoreDTO):
     """
-    更新设定
+    更新设定（支持部分更新）
 
     Args:
         lore_id: 设定 ID
-        lore: 新设定数据
+        lore_update: 更新数据
 
     Returns:
         Dict: 更新结果
@@ -129,15 +201,24 @@ async def update_lore(lore_id: str, lore: LoreEntry):
     if lore_id not in _lore_store:
         raise HTTPException(status_code=404, detail="设定不存在")
 
-    from datetime import datetime
-    lore.updated_at = datetime.utcnow()
+    # 获取现有设定
+    existing = _lore_store[lore_id]
 
-    _lore_store[lore_id] = lore
+    # 应用部分更新
+    update_data = lore_update.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        if value is not None:
+            setattr(existing, key, value)
+
+    # 更新时间戳
+    existing.updated_at = datetime.now()
+
+    _lore_store[lore_id] = existing
 
     return {
         "success": True,
         "id": lore_id,
-        "message": f"设定 '{lore.title}' 更新成功",
+        "message": f"设定 '{existing.title}' 更新成功",
     }
 
 
@@ -165,9 +246,9 @@ async def delete_lore(lore_id: str):
 
 @router.post("/search", response_model=List[LoreSearchResult])
 async def search_lore(
-    project_id: str,
-    query: str,
-    category: Optional[LoreCategory] = None,
+    project_id: str = Query(..., description="项目 ID"),
+    query: str = Query(..., description="搜索查询"),
+    category: Optional[LoreCategory] = Query(None, description="类别过滤"),
     limit: int = Query(default=10, le=50),
 ):
     """
@@ -259,41 +340,3 @@ async def validate_content(
         warnings=warnings,
         suggestions=suggestions,
     )
-
-
-@router.get("/categories", response_model=List[Dict[str, str]])
-async def get_lore_categories():
-    """
-    获取设定类别列表
-
-    Returns:
-        List: 类别列表
-    """
-    return [
-        {"value": "world_rule", "label": "世界规则"},
-        {"value": "geography", "label": "地理设定"},
-        {"value": "history", "label": "历史背景"},
-        {"value": "faction", "label": "势力体系"},
-        {"value": "culture", "label": "文化习俗"},
-        {"value": "race", "label": "种族设定"},
-        {"value": "profession", "label": "职业/阶层"},
-        {"value": "item", "label": "物品/装备"},
-        {"value": "skill", "label": "技能/能力"},
-        {"value": "custom", "label": "自定义"},
-    ]
-
-
-@router.get("/priorities", response_model=List[Dict[str, str]])
-async def get_lore_priorities():
-    """
-    获取设定优先级列表
-
-    Returns:
-        List: 优先级列表
-    """
-    return [
-        {"value": "constitutional", "label": "宪法级（不可违反）"},
-        {"value": "core", "label": "核心设定"},
-        {"value": "standard", "label": "标准设定"},
-        {"value": "flexible", "label": "灵活设定"},
-    ]

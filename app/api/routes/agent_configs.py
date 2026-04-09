@@ -27,7 +27,9 @@ def get_agent_config_service():
     global _agent_config_service
     if _agent_config_service is None:
         from app.services.agent_config_service import AgentConfigService
-        _agent_config_service = AgentConfigService()
+        from app.services.agent_template_service import AgentTemplateService
+        template_service = AgentTemplateService()
+        _agent_config_service = AgentConfigService(agent_template_service=template_service)
     return _agent_config_service
 
 

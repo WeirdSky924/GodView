@@ -337,6 +337,66 @@ async def get_embedding_config() -> Dict[str, Any]:
     return config
 
 
+@router.get("/embedding/cache-status")
+async def get_embedding_cache_status(
+    provider: str,
+    model: str = "",
+    cache_folder: str = "",
+) -> Dict[str, Any]:
+    """
+    检查 Embedding 模型是否已在本地缓存
+
+    Args:
+        provider: 提供商 ID (sentence_transformers, ollama)
+        model: 模型名称
+        cache_folder: 自定义缓存路径（可选）
+
+    Returns:
+        Dict: 包含 is_cached 状态和相关信息
+    """
+    from app.config import settings
+
+    # 只有 sentence_transformers 需要检查本地缓存
+    if provider != "sentence_transformers":
+        return {
+            "provider": provider,
+            "model": model,
+            "is_cached": None,  # 不适用
+            "message": "该提供商不需要检查本地缓存",
+        }
+
+    # 获取模型名称
+    if not model:
+        provider_config = settings.get_embedding_config(provider)
+        model = provider_config.get("model", "all-MiniLM-L6-v2")
+
+    # 获取缓存路径
+    cache_path = cache_folder if cache_folder else None
+
+    try:
+        from app.services.embedding_service import SentenceTransformersEmbeddingService
+
+        is_cached = SentenceTransformersEmbeddingService.is_model_cached(model, cache_path)
+
+        # 尝试获取维度
+        dimension = SentenceTransformersEmbeddingService.get_known_dimension(model, cache_path)
+
+        return {
+            "provider": provider,
+            "model": model,
+            "is_cached": is_cached,
+            "dimension": dimension,
+            "message": "模型已缓存" if is_cached else "模型未缓存，需要下载",
+        }
+    except Exception as e:
+        return {
+            "provider": provider,
+            "model": model,
+            "is_cached": False,
+            "message": f"检查失败：{str(e)}",
+        }
+
+
 @router.get("/embedding/{provider}")
 async def get_embedding_provider_config(provider: str) -> Dict[str, Any]:
     """获取指定 Embedding Provider 的配置"""
@@ -752,20 +812,34 @@ async def get_database_status() -> Dict[str, Any]:
         if settings.qdrant_url:
             qdrant_status["host"] = settings.qdrant_url.replace("http://", "").replace("https://", "")
 
-            # 尝试直接连接
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                try:
-                    response = await client.get(f"{settings.qdrant_url}/collections")
-                    if response.status_code == 200:
-                        qdrant_status["status"] = "connected"
-                        qdrant_status["message"] = "连接正常"
-                    else:
-                        qdrant_status["status"] = "reachable"
-                        qdrant_status["message"] = f"HTTP {response.status_code}"
-                except httpx.ConnectError:
-                    qdrant_status["message"] = "无法连接"
-                except Exception as e:
-                    qdrant_status["message"] = str(e)[:30]
+            # 尝试直接连接（带重试机制）
+            # trust_env=False 避免 httpx 使用系统代理导致本地连接失败
+            max_retries = 3
+            retry_delay = 1.0
+            for attempt in range(max_retries):
+                async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
+                    try:
+                        response = await client.get(f"{settings.qdrant_url}/collections")
+                        if response.status_code == 200:
+                            qdrant_status["status"] = "connected"
+                            qdrant_status["message"] = "连接正常"
+                            break
+                        elif response.status_code == 502 and attempt < max_retries - 1:
+                            # 502 通常是启动中的临时状态，等待后重试
+                            await asyncio.sleep(retry_delay)
+                            continue
+                        else:
+                            qdrant_status["status"] = "reachable"
+                            qdrant_status["message"] = f"HTTP {response.status_code}"
+                            break
+                    except httpx.ConnectError:
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(retry_delay)
+                            continue
+                        qdrant_status["message"] = "无法连接"
+                    except Exception as e:
+                        qdrant_status["message"] = str(e)[:30]
+                        break
         else:
             qdrant_status["message"] = "未配置"
     except Exception as e:

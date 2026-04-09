@@ -103,8 +103,14 @@ export default function BootstrapPage() {
         tone: 'serious'
       })
       setProjects([...projects, project])
-      setSelectedProjectId(project.id)
       setNewProjectName('')
+
+      // 创建项目后自动启动 Bootstrap 流程
+      const result = await startBootstrap(project.id)
+      const newSession = result.session
+      setSession(newSession)
+      setStage('setting_agent')
+      navigate(`/bootstrap/${newSession.id}`)
     } catch (err) {
       console.error('Failed to create project:', err)
       setError('创建项目失败')
@@ -139,7 +145,7 @@ export default function BootstrapPage() {
 
     setLoading(true)
     try {
-      await sendBootstrapMessage(session.id, userMessage)
+      await sendBootstrapMessage(session.id, userMessage, session.project_id)
       const updatedSession = await getBootstrapSession(session.id)
       setSession(updatedSession)
       setUserMessage('')
@@ -256,8 +262,8 @@ export default function BootstrapPage() {
     <div className="max-w-4xl mx-auto">
       <div className="text-center mb-10">
         <Globe className="w-16 h-16 text-blue-600 mx-auto mb-4" />
-        <h1 className="text-3xl font-bold text-gray-800">项目初始化</h1>
-        <p className="text-gray-600 mt-2">选择现有项目或创建新项目开始引导流程</p>
+        <h1 className="text-3xl font-bold text-gray-800">长篇网文创作初始化</h1>
+        <p className="text-gray-600 mt-2">选择现有项目或创建新项目，开始你的长篇网络小说创作之旅</p>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
@@ -298,14 +304,14 @@ export default function BootstrapPage() {
           <div className="space-y-4">
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">
-                项目名称
+                书名/项目名称
               </label>
               <input
                 type="text"
                 value={newProjectName}
                 onChange={(e) => setNewProjectName(e.target.value)}
                 className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-                placeholder="例如：星辰之誓"
+                placeholder="例如：诸天万界兑换系统"
               />
             </div>
             <button
@@ -313,7 +319,7 @@ export default function BootstrapPage() {
               disabled={creatingProject || !newProjectName.trim()}
               className="w-full py-3 bg-blue-600 text-white font-medium rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {creatingProject ? '创建中...' : '创建项目'}
+              {creatingProject ? '创建中...' : '创建并开始设定'}
             </button>
           </div>
         </div>
@@ -335,7 +341,7 @@ export default function BootstrapPage() {
     <div className="max-w-4xl mx-auto">
       <div className="flex items-center gap-3 mb-6">
         <Bot className="w-8 h-8 text-blue-600" />
-        <h1 className="text-2xl font-bold text-gray-800">小说设定 Agent</h1>
+        <h1 className="text-2xl font-bold text-gray-800">长篇网文设定 Agent</h1>
       </div>
 
       <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6 mb-6">
@@ -347,8 +353,17 @@ export default function BootstrapPage() {
         <div className="mb-6 p-4 bg-gray-50 rounded-lg border border-gray-200">
           <div className="text-sm text-gray-600 mb-2">Agent 提示：</div>
           <div className="text-gray-800">
-            请描述你的小说设定：世界观、主要角色、故事主线、风格基调等。
+            请描述你的长篇网络小说设定：世界观、力量体系、主角（含金手指）、配角、故事主线、风格基调等。
             我会通过多轮对话帮助你完善设定，并提取结构化的项目种子。
+          </div>
+          <div className="text-sm text-gray-500 mt-3 border-t border-gray-200 pt-3">
+            <strong>长篇网文核心要素：</strong>
+            <ul className="mt-1 space-y-1">
+              <li>• 世界观与力量体系（等级、境界、升级路径）</li>
+              <li>• 主角设定（背景、金手指、成长路线）</li>
+              <li>• 配角体系（核心配角、反派、势力）</li>
+              <li>• 剧情架构（主线、分卷规划、爽点设计）</li>
+            </ul>
           </div>
         </div>
 
@@ -378,7 +393,7 @@ export default function BootstrapPage() {
           <textarea
             value={userMessage}
             onChange={(e) => setUserMessage(e.target.value)}
-            placeholder="输入你的设定描述..."
+            placeholder="输入你的网文设定描述（如：我想写一本玄幻小说，主角穿越到修仙世界，拥有一个能够兑换诸天万界物品的系统...）"
             className="flex-1 px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"
             rows={3}
           />

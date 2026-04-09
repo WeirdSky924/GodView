@@ -12,6 +12,17 @@ from pydantic import Field
 # 显式加载 .env 文件，override=True 确保 .env 文件值覆盖系统环境变量
 load_dotenv(override=True)
 
+# 设置 NO_PROXY 环境变量，避免 httpx/QdrantClient 使用系统代理访问本地服务
+# Windows 系统代理可能设置了 127.0.0.1 代理，导致本地连接失败
+existing_no_proxy = os.environ.get('NO_PROXY', '') or os.environ.get('no_proxy', '')
+local_hosts = 'localhost,127.0.0.1,::1'
+if existing_no_proxy:
+    os.environ['NO_PROXY'] = f"{existing_no_proxy},{local_hosts}"
+    os.environ['no_proxy'] = f"{existing_no_proxy},{local_hosts}"
+else:
+    os.environ['NO_PROXY'] = local_hosts
+    os.environ['no_proxy'] = local_hosts
+
 
 class Settings(BaseSettings):
     """应用配置"""

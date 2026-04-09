@@ -42,6 +42,7 @@ async def list_worlds(
 async def update_world(world_id: str, world: World):
     """更新世界数据"""
     from app.api.app import postgres_db
+    from datetime import datetime
 
     if not postgres_db:
         raise HTTPException(status_code=503, detail="数据库未连接")
@@ -51,6 +52,14 @@ async def update_world(world_id: str, world: World):
         raise HTTPException(status_code=404, detail="世界不存在")
 
     world_data = world.model_dump(mode="json")
+
+    # 确保使用正确的 ID 和时间戳
+    world_data["id"] = world_id
+    world_data["updated_at"] = datetime.now()
+
+    # 保留原有的 created_at（如果存在）
+    if existing.get("created_at"):
+        world_data["created_at"] = existing["created_at"]
 
     try:
         await postgres_db.save_world(world_data)
@@ -108,17 +117,28 @@ async def create_world(world: World):
         Dict: 创建结果
     """
     from app.api.app import postgres_db
+    import uuid
+    from datetime import datetime
 
     if not postgres_db:
         raise HTTPException(status_code=503, detail="数据库未连接")
 
     world_data = world.model_dump(mode="json")
 
+    # 自动生成 ID（如果未提供）
+    if not world_data.get("id"):
+        world_data["id"] = str(uuid.uuid4())
+
+    # 设置时间戳（使用 datetime 对象，不要转换为字符串）
+    now = datetime.now()
+    world_data["created_at"] = now
+    world_data["updated_at"] = now
+
     try:
         await postgres_db.save_world(world_data)
         return {
             "success": True,
-            "id": world.id,
+            "id": world_data["id"],
             "message": f"世界 '{world.name}' 创建成功",
         }
     except Exception as e:
@@ -159,6 +179,7 @@ async def create_region(world_id: str, region: Region):
         Dict: 创建结果
     """
     from app.api.app import postgres_db
+    import uuid
 
     if not postgres_db:
         raise HTTPException(status_code=503, detail="数据库未连接")
@@ -166,11 +187,30 @@ async def create_region(world_id: str, region: Region):
     region_data = region.model_dump(mode="json")
     region_data["world_id"] = world_id
 
+    # 确保所有字段都有值（数据库需要）
+    if region_data.get("area_size") is None:
+        region_data["area_size"] = 0.0
+    if region_data.get("atmosphere") is None:
+        region_data["atmosphere"] = ""
+    if region_data.get("coordinates") is None:
+        region_data["coordinates"] = {}
+
+    # 确保 encounters 被序列化为 JSON 字符串
+    if "encounters" in region_data and isinstance(region_data["encounters"], list):
+        import json
+        region_data["encounters"] = json.dumps(region_data["encounters"])
+
+    # 自动生成 ID（如果未提供）
+    if not region_data.get("id"):
+        region_data["id"] = str(uuid.uuid4())
+
+    logger.info(f"Region data keys: {list(region_data.keys())}")
+
     try:
         await postgres_db.save_region(region_data)
         return {
             "success": True,
-            "id": region.id,
+            "id": region_data["id"],
             "message": f"区域 '{region.name}' 创建成功",
         }
     except Exception as e:
@@ -211,11 +251,34 @@ async def create_snapshot(world_id: str, snapshot_data: Dict[str, Any]):
         Dict: 创建结果
     """
     from app.api.app import postgres_db
+    import uuid
+    from datetime import datetime
+    import json
 
     if not postgres_db:
         raise HTTPException(status_code=503, detail="数据库未连接")
 
+    # 自动生成 ID（如果未提供）
+    if not snapshot_data.get("id"):
+        snapshot_data["id"] = str(uuid.uuid4())
+
     snapshot_data["world_id"] = world_id
+    snapshot_data["created_at"] = datetime.utcnow().isoformat()
+
+    # 设置默认值 - JSON 字段需要序列化
+    snapshot_data.setdefault("chapter_id", None)
+    snapshot_data.setdefault("snapshot_type", "manual")
+    snapshot_data.setdefault("characters", {})
+    snapshot_data.setdefault("relationships", {})
+    snapshot_data.setdefault("regions", {})
+    snapshot_data.setdefault("hooks", {})
+    snapshot_data.setdefault("main_plot_progress", 0.0)
+    snapshot_data.setdefault("completed_events", [])
+    snapshot_data.setdefault("character_locations", {})
+    snapshot_data.setdefault("created_by", "system")
+    snapshot_data.setdefault("parent_snapshot_id", None)
+    snapshot_data.setdefault("is_branch", False)
+    snapshot_data.setdefault("branch_reason", None)
 
     try:
         snapshot_id = await postgres_db.save_snapshot(snapshot_data)

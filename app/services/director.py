@@ -719,8 +719,13 @@ class DirectorSystem:
         }
 
     def _build_world_payload(self) -> Dict[str, Any]:
+        # 转换 UUID 对象为字符串（asyncpg 返回 UUID 作为 Python UUID 对象）
+        world_id = self.world_id
+        if hasattr(world_id, 'hex'):  # UUID object has .hex attribute
+            world_id = str(world_id)
+
         return {
-            "id": self.world_id,
+            "id": world_id,
             "name": self.world_data.get("name", "Default World"),
             "description": self.world_data.get("description"),
             "world_type": self.world_data.get("world_type", "fantasy"),

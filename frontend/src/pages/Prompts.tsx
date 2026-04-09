@@ -226,7 +226,7 @@ export default function Prompts() {
   }
 
   // 获取所有标签
-  const allTags = Array.from(new Set(prompts.flatMap(p => p.tags)))
+  const allTags = Array.from(new Set((prompts || []).flatMap(p => p.tags || [])))
 
   // 获取所有标签
   return (
@@ -319,7 +319,7 @@ export default function Prompts() {
     >
       {loading ? (
         <div className={`text-center py-8 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>加载中...</div>
-      ) : prompts.length === 0 ? (
+      ) : (!prompts || prompts.length === 0) ? (
         <div className={`text-center py-8 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>暂无数据</div>
       ) : (
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">

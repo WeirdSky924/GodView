@@ -4,6 +4,7 @@ Qdrant 向量数据库操作层
 """
 
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from qdrant_client import QdrantClient
@@ -56,6 +57,31 @@ class QdrantDatabase:
         self._client = QdrantClient(url=self.url)
         logger.info(f"Qdrant 连接成功：{self.url}")
 
+    def _check_connection_with_retry(self, max_retries: int = 3, retry_delay: float = 2.0) -> bool:
+        """
+        带重试的连接检查
+
+        Args:
+            max_retries: 最大重试次数
+            retry_delay: 重试间隔（秒）
+
+        Returns:
+            bool: 连接是否成功
+        """
+        for attempt in range(max_retries):
+            try:
+                # 尝试获取集合列表来验证连接
+                self._client.get_collections()
+                return True
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"Qdrant 连接检查失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+                    time.sleep(retry_delay)
+                else:
+                    logger.error(f"Qdrant 连接检查最终失败: {e}")
+                    return False
+        return False
+
     async def disconnect(self):
         """关闭数据库连接"""
         if self._client:
@@ -66,6 +92,10 @@ class QdrantDatabase:
         """初始化向量集合"""
         if not self._client:
             await self.connect()
+
+        # 使用重试机制检查连接
+        if not self._check_connection_with_retry(max_retries=3, retry_delay=2.0):
+            raise ConnectionError(f"无法连接到 Qdrant 服务：{self.url}")
 
         # 检查集合是否存在
         collections = self._client.get_collections().collections

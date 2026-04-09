@@ -3,9 +3,9 @@
  * Agent Skill 管理接口
  */
 
-import axios from 'axios'
+import { api } from './client'
 
-const API_BASE = '/api/skills'
+const API_BASE = '/skills'
 
 // ==================== 类型定义 ====================
 
@@ -138,64 +138,56 @@ export async function getSkills(
   params.append('limit', String(limit))
   params.append('offset', String(offset))
 
-  const response = await axios.get(`${API_BASE}/?${params.toString()}`)
-  return response.data
+  return await api.get(`${API_BASE}/?${params.toString()}`)
 }
 
 /**
  * 创建 Skill
  */
 export async function createSkill(dto: CreateSkillDTO): Promise<Skill> {
-  const response = await axios.post(`${API_BASE}/`, dto)
-  return response.data
+  return await api.post(`${API_BASE}/`, dto)
 }
 
 /**
  * 获取 Skill 详情
  */
 export async function getSkill(skillId: string): Promise<Skill> {
-  const response = await axios.get(`${API_BASE}/${skillId}`)
-  return response.data
+  return await api.get(`${API_BASE}/${skillId}`)
 }
 
 /**
  * 更新 Skill
  */
 export async function updateSkill(skillId: string, dto: UpdateSkillDTO): Promise<Skill> {
-  const response = await axios.put(`${API_BASE}/${skillId}`, dto)
-  return response.data
+  return await api.put(`${API_BASE}/${skillId}`, dto)
 }
 
 /**
  * 删除 Skill
  */
 export async function deleteSkill(skillId: string): Promise<{ success: boolean; message: string }> {
-  const response = await axios.delete(`${API_BASE}/${skillId}`)
-  return response.data
+  return await api.delete(`${API_BASE}/${skillId}`)
 }
 
 /**
  * 搜索 Skill
  */
 export async function searchSkills(query: string, limit: number = 10): Promise<Skill[]> {
-  const response = await axios.post(`${API_BASE}/search?query=${encodeURIComponent(query)}&limit=${limit}`)
-  return response.data
+  return await api.post(`${API_BASE}/search?query=${encodeURIComponent(query)}&limit=${limit}`)
 }
 
 /**
  * AI 生成 Skill
  */
 export async function generateSkill(description: string, skillType: SkillType = 'prompt'): Promise<Skill> {
-  const response = await axios.post(`${API_BASE}/generate?description=${encodeURIComponent(description)}&skill_type=${skillType}`)
-  return response.data
+  return await api.post(`${API_BASE}/generate?description=${encodeURIComponent(description)}&skill_type=${skillType}`)
 }
 
 /**
  * 测试 Skill
  */
 export async function testSkill(skillId: string, parameters: Record<string, any> = {}): Promise<SkillTestResult> {
-  const response = await axios.post(`${API_BASE}/${skillId}/test`, parameters)
-  return response.data
+  return await api.post(`${API_BASE}/${skillId}/test`, parameters)
 }
 
 /**
@@ -211,16 +203,14 @@ export async function executeSkill(
   if (projectId) params.append('project_id', projectId)
   if (agentId) params.append('agent_id', agentId)
 
-  const response = await axios.post(`${API_BASE}/${skillId}/execute?${params.toString()}`, parameters)
-  return response.data
+  return await api.post(`${API_BASE}/${skillId}/execute?${params.toString()}`, parameters)
 }
 
 /**
  * 分配 Skill 给 Agent
  */
 export async function assignSkill(dto: AssignSkillDTO): Promise<SkillAssignment> {
-  const response = await axios.post(`${API_BASE}/assign`, dto)
-  return response.data
+  return await api.post(`${API_BASE}/assign`, dto)
 }
 
 /**
@@ -231,24 +221,21 @@ export async function unassignSkill(
   projectId: string,
   agentId: string
 ): Promise<{ success: boolean; message: string }> {
-  const response = await axios.delete(`${API_BASE}/assign?skill_id=${skillId}&project_id=${projectId}&agent_id=${agentId}`)
-  return response.data
+  return await api.delete(`${API_BASE}/assign?skill_id=${skillId}&project_id=${projectId}&agent_id=${agentId}`)
 }
 
 /**
  * 获取 Skill 的分配列表
  */
 export async function getSkillAssignments(skillId: string): Promise<SkillAssignment[]> {
-  const response = await axios.get(`${API_BASE}/${skillId}/assignments`)
-  return response.data
+  return await api.get(`${API_BASE}/${skillId}/assignments`)
 }
 
 /**
  * 获取 Agent 已分配的 Skills
  */
 export async function getAgentSkills(projectId: string, agentId: string): Promise<Skill[]> {
-  const response = await axios.get(`${API_BASE}/agent/${projectId}/${agentId}`)
-  return response.data
+  return await api.get(`${API_BASE}/agent/${projectId}/${agentId}`)
 }
 
 /**
@@ -265,8 +252,7 @@ export async function getSkillLogs(
   if (agentId) params.append('agent_id', agentId)
   params.append('limit', String(limit))
 
-  const response = await axios.get(`${API_BASE}/${skillId}/logs?${params.toString()}`)
-  return response.data
+  return await api.get(`${API_BASE}/${skillId}/logs?${params.toString()}`)
 }
 
 /**
@@ -282,14 +268,12 @@ export async function getAllLogs(
   if (agentId) params.append('agent_id', agentId)
   params.append('limit', String(limit))
 
-  const response = await axios.get(`${API_BASE}/logs/all?${params.toString()}`)
-  return response.data
+  return await api.get(`${API_BASE}/logs/all?${params.toString()}`)
 }
 
 /**
  * 获取 Skill 统计
  */
 export async function getSkillsStats(): Promise<SkillStats> {
-  const response = await axios.get(`${API_BASE}/stats/overview`)
-  return response.data
+  return await api.get(`${API_BASE}/stats/overview`)
 }

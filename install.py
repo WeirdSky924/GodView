@@ -1484,6 +1484,7 @@ class GodViewInstaller:
             "仅安装 Python 环境",
             "仅安装/管理数据库",
             "仅安装 Docker",
+            "更新 pip 并补安装缺失依赖",
         ]
 
         mode_idx = print_menu(modes)
@@ -1497,6 +1498,9 @@ class GodViewInstaller:
             return False
         elif mode_idx == 3:  # 仅 Docker
             self.install_docker_only()
+            return False
+        elif mode_idx == 4:  # 更新 pip 并补缺
+            self.update_pip_and_fix_deps()
             return False
 
         # 选择环境类型
@@ -1608,6 +1612,236 @@ class GodViewInstaller:
             else:
                 print_error("Docker 安装失败")
 
+    def update_pip_and_fix_deps(self):
+        """更新 pip 并补安装缺失依赖"""
+        self.project_dir = Path(__file__).parent.resolve()
+
+        print(f"\n{Colors.BOLD}更新 Pip 并补安装缺失依赖{Colors.END}\n")
+
+        # 选择 Python 环境
+        print(f"{Colors.BOLD}选择 Python 环境：{Colors.END}\n")
+        env_types = [
+            "Conda 环境",
+            "系统 Python + venv",
+            "当前系统 Python",
+        ]
+        env_idx = print_menu(env_types)
+
+        if env_idx == 0:  # Conda
+            self.use_conda = True
+            print_info("使用 Conda 环境")
+            # 列出可用的 conda 环境
+            result = subprocess.run(['conda', 'env', 'list'], capture_output=True, text=True)
+            if result.returncode == 0:
+                print(f"\n{Colors.BOLD}可用的 Conda 环境：{Colors.END}")
+                lines = result.stdout.strip().split('\n')
+                envs = []
+                for line in lines:
+                    if line and not line.startswith('#'):
+                        parts = line.split()
+                        if parts:
+                            env_name = parts[0]
+                            if env_name:
+                                envs.append(env_name)
+                                print(f"  {len(envs)}. {env_name}")
+
+                if envs:
+                    print()
+                    choice = input(f"选择环境编号 [默认: godview]: ").strip()
+                    if choice:
+                        try:
+                            idx = int(choice) - 1
+                            if 0 <= idx < len(envs):
+                                self.conda_env_name = envs[idx]
+                        except ValueError:
+                            pass
+                    print_info(f"使用环境: {self.conda_env_name}")
+            else:
+                self.conda_env_name = "godview"
+
+        elif env_idx == 1:  # venv
+            self.use_conda = False
+            # 查找 venv - 扩展搜索范围
+            possible_venvs = [
+                # 项目目录下的 venv
+                self.project_dir / "venv",
+                # 同级目录的 _env/venv 模式
+                self.project_dir.parent / f"{self.project_dir.name}_env" / "venv",
+                # 父目录下以项目名命名的 venv
+                self.project_dir.parent / f"{self.project_dir.name}_venv",
+                # 兄弟目录中查找
+                self.project_dir.parent / "venv",
+                # 常见的虚拟环境目录名
+                self.project_dir / ".venv",
+                self.project_dir.parent / f"{self.project_dir.name}_env",
+            ]
+
+            # 去重并检查存在性
+            found_venvs = []
+            seen = set()
+            for venv_path in possible_venvs:
+                venv_str = str(venv_path)
+                if venv_path.exists() and venv_str not in seen:
+                    # 验证是否是有效的 venv（检查是否有 Scripts/python.exe 或 bin/python）
+                    if self.is_windows:
+                        python_check = venv_path / "Scripts" / "python.exe"
+                    else:
+                        python_check = venv_path / "bin" / "python"
+                    if python_check.exists():
+                        found_venvs.append(venv_path)
+                        seen.add(venv_str)
+
+            # 显示找到的 venv 并让用户选择
+            if found_venvs:
+                print(f"\n{Colors.BOLD}找到以下虚拟环境：{Colors.END}")
+                for i, venv in enumerate(found_venvs, 1):
+                    print(f"  {i}. {venv}")
+                print(f"  {len(found_venvs) + 1}. 手动输入路径")
+                print()
+                choice = input(f"请选择 [1-{len(found_venvs) + 1}]: ").strip()
+                try:
+                    idx = int(choice) - 1
+                    if 0 <= idx < len(found_venvs):
+                        self.venv_path = found_venvs[idx]
+                        print_success(f"选择虚拟环境: {self.venv_path}")
+                    else:
+                        # 手动输入
+                        venv_input = input("请输入 venv 路径: ").strip()
+                        if venv_input:
+                            self.venv_path = Path(venv_input)
+                            if not self.venv_path.exists():
+                                print_error(f"路径不存在: {self.venv_path}")
+                                return
+                        else:
+                            print_error("未输入有效路径")
+                            return
+                except ValueError:
+                    print_error("无效输入")
+                    return
+            else:
+                print_warning("未自动找到虚拟环境")
+                venv_input = input("请输入 venv 路径: ").strip()
+                if venv_input:
+                    self.venv_path = Path(venv_input)
+                    if not self.venv_path.exists():
+                        print_error(f"路径不存在: {self.venv_path}")
+                        return
+                else:
+                    print_error("未指定有效的虚拟环境路径")
+                    return
+
+        else:  # 系统 Python
+            self.use_conda = False
+            self.venv_path = None
+            print_info("使用当前系统 Python")
+
+        # 获取 pip 和 python 路径
+        pip_path = self.get_pip_path()
+        python_path = self.get_python_path()
+
+        print_info(f"Python: {python_path}")
+        print_info(f"Pip: {pip_path}")
+
+        # 步骤 1: 更新 pip
+        print_step("更新 pip...")
+        success, output = run_command(
+            [python_path, '-m', 'pip', 'install', '--upgrade', 'pip'],
+            capture=True,
+            timeout=120
+        )
+        if success or 'Successfully installed' in output:
+            print_success("pip 已更新到最新版本")
+        else:
+            print_warning(f"pip 更新可能失败: {output[:200]}")
+
+        # 步骤 2: 读取 requirements.txt
+        print_step("检查依赖...")
+        requirements_file = self.project_dir / "requirements.txt"
+        if not requirements_file.exists():
+            print_error("未找到 requirements.txt")
+            return
+
+        # 解析 requirements.txt
+        required_packages = []
+        with open(requirements_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    # 简单解析包名（去掉版本约束）
+                    pkg_name = line.split('>=')[0].split('==')[0].split('<')[0].split('>')[0].split('[')[0]
+                    required_packages.append((pkg_name, line))
+
+        print_info(f"requirements.txt 中共有 {len(required_packages)} 个依赖")
+
+        # 步骤 3: 检查已安装的包
+        print_info("检查已安装的包...")
+        success, output = run_command([pip_path, 'list', '--format=freeze'], capture=True)
+
+        installed_packages = set()
+        if success:
+            for line in output.strip().split('\n'):
+                if '==' in line:
+                    pkg_name = line.split('==')[0].lower().replace('-', '_')
+                    installed_packages.add(pkg_name)
+
+        # 步骤 4: 找出缺失的包
+        missing_packages = []
+        for pkg_name, full_spec in required_packages:
+            normalized_name = pkg_name.lower().replace('-', '_')
+            if normalized_name not in installed_packages:
+                missing_packages.append(full_spec)
+
+        if not missing_packages:
+            print_success("所有依赖都已安装，无需补安装")
+            return
+
+        print_info(f"发现 {len(missing_packages)} 个缺失的依赖：")
+        for pkg in missing_packages:
+            print(f"  - {pkg}")
+
+        # 步骤 5: 安装缺失的包
+        print_step("安装缺失的依赖...")
+        print_info("这可能需要几分钟...")
+
+        success, output = run_command(
+            [pip_path, 'install'] + missing_packages,
+            capture=True,
+            timeout=600
+        )
+
+        if success or 'Successfully installed' in output:
+            print_success("缺失依赖安装完成")
+
+            # 显示安装结果
+            if 'Successfully installed' in output:
+                for line in output.split('\n'):
+                    if 'Successfully installed' in line:
+                        print_info(line.strip())
+        else:
+            print_error("部分依赖安装失败")
+            print_info(output[:500])
+
+        # 步骤 6: 验证
+        print_step("验证安装...")
+        still_missing = []
+        for pkg_name, full_spec in required_packages:
+            normalized_name = pkg_name.lower().replace('-', '_')
+            if normalized_name not in installed_packages:
+                # 重新检查
+                success, _ = run_command(
+                    [python_path, '-c', f'import {pkg_name.replace("-", "_")}'],
+                    capture=True
+                )
+                if not success:
+                    still_missing.append(full_spec)
+
+        if still_missing:
+            print_warning(f"以下包可能需要手动安装：")
+            for pkg in still_missing:
+                print(f"  - {pkg}")
+        else:
+            print_success("所有依赖验证通过")
+
     def check_conda(self) -> bool:
         if check_command_exists('conda'):
             print_success("Conda 已安装")
@@ -1672,6 +1906,8 @@ class GodViewInstaller:
     def get_pip_path(self) -> str:
         if self.use_conda:
             return 'pip'
+        if self.venv_path is None:
+            return 'pip'  # 系统 Python
         if self.is_windows:
             return str(self.venv_path / "Scripts" / "pip.exe")
         return str(self.venv_path / "bin" / "pip")
@@ -1679,6 +1915,8 @@ class GodViewInstaller:
     def get_python_path(self) -> str:
         if self.use_conda:
             return 'python'
+        if self.venv_path is None:
+            return sys.executable  # 系统 Python
         if self.is_windows:
             return str(self.venv_path / "Scripts" / "python.exe")
         return str(self.venv_path / "bin" / "python")
@@ -1749,10 +1987,11 @@ FRONTEND_URL=http://localhost:5173
 #   用户: postgres
 #   密码: password
 #   数据库: godview
-DATABASE_URL=postgresql+asyncpg://postgres:password@localhost:5432/godview
+# 注意: Windows 上使用 127.0.0.1 而非 localhost，避免 IPv6 解析问题
+DATABASE_URL=postgresql+asyncpg://postgres:password@127.0.0.1:5432/godview
 
 # NebulaGraph 图数据库 (docker 启动)
-#   地址: localhost:9669
+#   地址: 127.0.0.1:9669
 #   用户: root
 #   密码: nebula
 NEBULA_HOST=127.0.0.1
@@ -1761,8 +2000,9 @@ NEBULA_USER=root
 NEBULA_PASSWORD=nebula
 
 # Qdrant 向量数据库 (docker 启动)
-#   地址: http://localhost:6333
-QDRANT_URL=http://localhost:6333
+#   地址: http://127.0.0.1:6333
+# 注意: Windows 上使用 127.0.0.1 而非 localhost，避免 IPv6 解析问题
+QDRANT_URL=http://127.0.0.1:6333
 
 # ======================== Embedding 配置 ========================
 # 当前使用的 Provider (openai / sentence_transformers / ollama)
@@ -1778,8 +2018,9 @@ EMBEDDING_ST_MODEL=all-MiniLM-L6-v2
 EMBEDDING_ST_CACHE_FOLDER=
 
 # Ollama Embedding 配置
+# 注意: Windows 上使用 127.0.0.1 而非 localhost，避免 IPv6 解析问题
 EMBEDDING_OLLAMA_MODEL=nomic-embed-text
-EMBEDDING_OLLAMA_BASE_URL=http://localhost:11434
+EMBEDDING_OLLAMA_BASE_URL=http://127.0.0.1:11434
 
 # ======================== LLM 配置 ========================
 # 当前使用的 Provider

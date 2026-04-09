@@ -37,9 +37,9 @@ async def create_project(request: CreateProjectRequest):
     if not postgres_db:
         raise HTTPException(status_code=503, detail="数据库未连接")
 
-    # 生成项目 ID
+    # 生成项目 ID (UUID)
     import uuid
-    project_id = f"project_{uuid.uuid4().hex[:12]}"
+    project_id = str(uuid.uuid4())
 
     # 创建项目对象
     project = Project(

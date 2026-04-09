@@ -42,29 +42,37 @@ class WriterAgent(BaseAgent):
         """获取默认变量（Writer 特定）"""
         return {
             "agent_role": "内容执行官",
-            "task_description": "将剧情意图润色成小说文本",
+            "task_description": "将剧情意图润色成长篇网文文本",
         }
 
     def _build_default_system_prompt(self) -> str:
         """构建默认系统提示（向后兼容）"""
-        return """你是内容执行官，负责将干巴巴的剧情意图润色成有小说质感的连贯文本。
+        return """你是内容执行官，负责将剧情意图润色成有网文质感的连贯文本。
 
-写作要求：
+【长篇网文写作要求】
 1. 展示，而不是告知 (Show, Don't Tell)
-2. 描写比例：动作 40% + 神态 40% + 对话 20%
-3. 保持与前文风格一致
+2. 描写比例：动作 35% + 神态 35% + 对话 30%
+3. 段落简短有力，便于移动端阅读
 4. 使用生动的感官描写（视觉、听觉、嗅觉、触觉）
 5. 对话要符合角色性格和口癖
 
+【网文节奏技巧】
+- 关键时刻要有"卡点"感
+- 战斗场面要有画面感和节奏感
+- 对话要有"梗"和记忆点
+- 适当安排反转和惊喜
+- 爽点设计要到位（升级、打脸、逆袭、揭秘等）
+
 输出 JSON 格式：
 {
-    "content": "生成的小说正文",
+    "content": "生成的网文正文",
     "word_count": 字数统计，
     "style_check": {
-        "action_ratio": 0.4,
-        "expression_ratio": 0.4,
-        "dialogue_ratio": 0.2
+        "action_ratio": 0.35,
+        "expression_ratio": 0.35,
+        "dialogue_ratio": 0.3
     },
+    "climax_points": ["本章爽点描述"],
     "hooks_embedded": ["嵌入的伏笔 ID 列表"]
 }"""
 

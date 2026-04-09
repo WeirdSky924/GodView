@@ -19,18 +19,16 @@ export interface SnapshotDiffResult {
 }
 
 export async function compareSnapshots(leftSnapshotId: string, rightSnapshotId: string) {
-  const response = await api.get<SnapshotDiffResult>('/plots/snapshots/diff', {
+  return await api.get<SnapshotDiffResult>('/plots/snapshots/diff', {
     params: {
       left_snapshot_id: leftSnapshotId,
       right_snapshot_id: rightSnapshotId,
     },
   })
-  return response.data
 }
 
 export async function getVisualizationData(worldId: string) {
-  const response = await api.get('/plots/visualization', {
+  return await api.get('/plots/visualization', {
     params: { world_id: worldId },
   })
-  return response.data
 }

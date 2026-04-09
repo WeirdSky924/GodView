@@ -1,19 +1,17 @@
-import axios from 'axios'
+import axios, { AxiosInstance, AxiosRequestConfig, InternalAxiosRequestConfig } from 'axios'
 
 const API_BASE_URL = '/api'
 
-export const api = axios.create({
+// Create the axios instance
+const axiosInstance = axios.create({
   baseURL: API_BASE_URL,
   headers: {
     'Content-Type': 'application/json',
   },
 })
 
-// Alias for backward compatibility
-export const client = api
-
 // Request interceptor
-api.interceptors.request.use(
+axiosInstance.interceptors.request.use(
   (config) => {
     // Add auth token if available
     const token = localStorage.getItem('token')
@@ -27,9 +25,9 @@ api.interceptors.request.use(
   }
 )
 
-// Response interceptor
-api.interceptors.response.use(
-  (response) => response,
+// Response interceptor - extracts data from response
+axiosInstance.interceptors.response.use(
+  (response) => response.data,
   (error) => {
     if (error.response?.status === 401) {
       // Handle unauthorized - clear token and redirect to login
@@ -39,3 +37,18 @@ api.interceptors.response.use(
     return Promise.reject(error)
   }
 )
+
+// Create a typed wrapper that returns the data directly
+interface ApiClient {
+  get<T = any>(url: string, config?: AxiosRequestConfig): Promise<T>
+  post<T = any>(url: string, data?: any, config?: AxiosRequestConfig): Promise<T>
+  put<T = any>(url: string, data?: any, config?: AxiosRequestConfig): Promise<T>
+  delete<T = any>(url: string, config?: AxiosRequestConfig): Promise<T>
+  patch<T = any>(url: string, data?: any, config?: AxiosRequestConfig): Promise<T>
+}
+
+// Cast to our custom type that returns data directly
+export const api = axiosInstance as ApiClient
+
+// Alias for backward compatibility
+export const client = api

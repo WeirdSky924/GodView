@@ -24,7 +24,9 @@ from app.models.setting_agent import (
     NegotiationMessage,
 )
 from app.models.lore import LoreEntry, LorePriority
+from app.models.token_usage import UsageCategory
 from app.services.conflict_detector import ConflictDetector, get_conflict_detector
+from app.services.token_tracker import token_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -437,8 +439,8 @@ class SettingAgentService:
         # 构建上下文
         context_str = await self._build_chat_context(session, context)
 
-        # 调用 LLM
-        response = await self._call_llm(system_prompt, message, context_str)
+        # 调用 LLM（传入 project_id 以记录 token）
+        response = await self._call_llm(system_prompt, message, context_str, project_id=project_id)
 
         # 添加助手回复到历史
         session.conversation_history.append({
@@ -670,25 +672,34 @@ class SettingAgentService:
 
     def _build_management_system_prompt(self, session: SettingAgentSession) -> str:
         """构建管理模式系统提示"""
-        return """你是一个专业的小说设定管理者（Setting Agent）。你的职责是：
+        return """你是一个专业的长篇网络小说设定管理者（Setting Agent）。你的职责是：
 
-1. 维护项目的世界观设定，确保设定的一致性
+1. 维护项目的世界观设定，确保长篇连载中设定的一致性
 2. 帮助用户添加、修改、删除设定
 3. 检测和处理设定冲突
 4. 提供设定建议和优化方案
 
+【长篇网文设定管理要点】
+- 力量体系一致性：确保等级、境界、能力设定前后一致
+- 角色成长线：追踪主角和核心配角的成长轨迹
+- 伏笔管理：记录重要伏笔的埋设和回收状态
+- 势力演变：追踪各势力的变化和关系发展
+- 剧情连贯：确保多卷剧情之间的衔接合理
+
 请遵循以下原则：
-- 保持设定的内在一致性
+- 保持设定的内在一致性，这对长篇连载尤为重要
 - 注意宪法级规则，任何新设定都不能违反它们
 - 当发现潜在冲突时，及时提醒用户并提供解决方案
 - 用清晰、结构化的方式组织信息
+- 考虑长篇创作的可持续性和扩展性
 
 你可以帮助用户：
-- 添加新设定（世界规则、地理、势力、种族等）
-- 修改现有设定
-- 解决设定冲突
+- 添加新设定（力量等级、地理、势力、功法、装备等）
+- 修改现有设定（注意影响范围和连带修改）
+- 解决设定冲突（提供多种解决方案）
 - 查询和检索设定
 - 分析设定的一致性
+- 规划伏笔和剧情线
 """
 
     async def _build_chat_context(
@@ -728,6 +739,7 @@ class SettingAgentService:
         system_prompt: str,
         user_message: str,
         context: str,
+        project_id: Optional[str] = None,
     ) -> str:
         """调用 LLM 生成响应"""
         messages = [
@@ -736,16 +748,49 @@ class SettingAgentService:
             {"role": "user", "content": user_message},
         ]
 
+        # 计算输入 token（估算）
+        input_tokens = sum(len(m.get("content", "")) // 4 for m in messages)
+
         try:
             if self.llm_provider == "openai":
-                return await self._call_openai(messages)
+                response, usage = await self._call_openai_with_usage(messages)
             elif self.llm_provider == "anthropic":
-                return await self._call_anthropic(messages)
+                response, usage = await self._call_anthropic_with_usage(messages)
             else:
-                return await self._call_openai(messages)
+                response, usage = await self._call_openai_with_usage(messages)
+
+            # 记录 token 使用
+            if project_id and usage:
+                await self._record_token_usage(project_id, usage, input_tokens)
+
+            return response
         except Exception as e:
             logger.error(f"LLM 调用失败：{e}")
             return "抱歉，我现在无法处理你的请求。请稍后再试。"
+
+    async def _record_token_usage(
+        self,
+        project_id: str,
+        usage: Dict[str, Any],
+        input_tokens_estimate: int,
+    ):
+        """记录 token 使用量"""
+        try:
+            # 使用实际的使用量（如果有）
+            input_tokens = usage.get("input_tokens", input_tokens_estimate)
+            output_tokens = usage.get("output_tokens", 0)
+
+            await token_tracker.record_usage(
+                project_id=project_id,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                provider=self.llm_provider,
+                model=self.llm_model,
+                category=UsageCategory.SETTING_AGENT,
+                agent_name="setting_agent",
+            )
+        except Exception as e:
+            logger.warning(f"记录 token 使用失败: {e}")
 
     async def _call_llm_simple(self, prompt: str) -> str:
         """简化的 LLM 调用"""
@@ -757,10 +802,15 @@ class SettingAgentService:
 
     async def _call_openai(self, messages: List[Dict[str, Any]]) -> str:
         """调用 OpenAI API"""
+        result, _ = await self._call_openai_with_usage(messages)
+        return result
+
+    async def _call_openai_with_usage(self, messages: List[Dict[str, Any]]) -> tuple:
+        """调用 OpenAI API 并返回使用量"""
         try:
             from openai import AsyncOpenAI
         except ImportError:
-            return self._fallback_response(messages)
+            return self._fallback_response(messages), {}
 
         client = AsyncOpenAI(
             api_key=self.llm_api_key,
@@ -774,14 +824,28 @@ class SettingAgentService:
             max_tokens=self.llm_max_tokens,
         )
 
-        return response.choices[0].message.content
+        # 提取 token 使用量
+        usage = {}
+        if response.usage:
+            usage = {
+                "input_tokens": response.usage.prompt_tokens or 0,
+                "output_tokens": response.usage.completion_tokens or 0,
+                "total_tokens": response.usage.total_tokens or 0,
+            }
+
+        return response.choices[0].message.content, usage
 
     async def _call_anthropic(self, messages: List[Dict[str, Any]]) -> str:
         """调用 Anthropic API"""
+        result, _ = await self._call_anthropic_with_usage(messages)
+        return result
+
+    async def _call_anthropic_with_usage(self, messages: List[Dict[str, Any]]) -> tuple:
+        """调用 Anthropic API 并返回使用量"""
         try:
             import anthropic
         except ImportError:
-            return self._fallback_response(messages)
+            return self._fallback_response(messages), {}
 
         client = anthropic.AsyncAnthropic(
             api_key=self.llm_api_key,
@@ -802,7 +866,16 @@ class SettingAgentService:
             max_tokens=self.llm_max_tokens,
         )
 
-        return response.content[0].text
+        # 提取 token 使用量
+        usage = {}
+        if hasattr(response, 'usage') and response.usage:
+            usage = {
+                "input_tokens": response.usage.input_tokens or 0,
+                "output_tokens": response.usage.output_tokens or 0,
+                "total_tokens": (response.usage.input_tokens or 0) + (response.usage.output_tokens or 0),
+            }
+
+        return response.content[0].text, usage
 
     def _fallback_response(self, messages: List[Dict[str, Any]]) -> str:
         """回退响应"""
@@ -833,8 +906,8 @@ class SettingAgentService:
         system_prompt = self._build_bootstrap_prompt(session)
         context = self._build_conversation_context(session)
 
-        # 调用 LLM
-        response = await self._call_llm(system_prompt, message, context)
+        # 调用 LLM（传入 project_id 以记录 token）
+        response = await self._call_llm(system_prompt, message, context, project_id=session.project_id)
 
         # 添加助手回复
         assistant_msg = BootstrapMessage(
@@ -857,16 +930,28 @@ class SettingAgentService:
 
     def _build_bootstrap_prompt(self, session: BootstrapSession) -> str:
         """构建 Bootstrap 提示"""
-        return """你是一个小说设定专家（Setting Agent）。你的职责是：
+        return """你是一个长篇网络小说设定专家（Setting Agent）。你的职责是：
 
-1. 与用户沟通，了解他们想要创作的小说世界观、主线、风格、角色等设定
+1. 与用户沟通，了解他们想要创作的长篇网络小说世界观、主线、风格、角色等设定
 2. 通过多轮对话发现信息缺口并追问用户
 3. 提炼出结构化的项目 seed，为后续 bootstrap 提供可靠输入
 
+【重要：本项目定位为长篇网络小说】
+- 目标篇幅：百万字以上，多卷结构
+- 目标读者：网络小说读者，注重节奏感和爽点
+- 创作周期：长期连载，需要完善的设定支撑
+
 请遵循以下原则：
 - 保持友好、耐心的态度
-- 每次回答后，可以主动追问用户尚未提供的关键信息
+- 每次回答后，主动追问用户尚未提供的关键信息
 - 使用清晰的结构化格式组织信息
+
+【长篇网文核心设定要素】
+1. 世界观：类型、规则、力量体系、势力格局
+2. 主角：背景、金手指、成长路线、性格
+3. 配角体系：核心配角、重要NPC、对手反派
+4. 剧情架构：主线、分卷规划、爽点设计、伏笔计划
+5. 风格基调：热血/轻松/黑暗/爽文等
 """
 
     def _build_conversation_context(self, session: BootstrapSession) -> str:

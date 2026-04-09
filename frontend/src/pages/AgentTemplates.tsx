@@ -258,7 +258,7 @@ export default function AgentTemplates() {
       <div className="flex-1 overflow-auto p-4">
         {loading ? (
           <div className={`text-center py-8 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>加载中...</div>
-        ) : templates.length === 0 ? (
+        ) : (!templates || templates.length === 0) ? (
           <div className={`text-center py-8 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>暂无数据</div>
         ) : (
           <div className="space-y-4">

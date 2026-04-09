@@ -3,9 +3,9 @@
  * 项目 Agent 配置管理接口
  */
 
-import axios from 'axios'
+import { api } from './client'
 
-const API_BASE = '/api'
+const API_BASE = ''
 
 // ==================== 类型定义 ====================
 
@@ -94,16 +94,14 @@ export async function getAgentConfigs(
   params.append('limit', String(limit))
   params.append('offset', String(offset))
 
-  const response = await axios.get(`${API_BASE}/projects/${projectId}/agents?${params.toString()}`)
-  return response.data
+  return await api.get(`${API_BASE}/projects/${projectId}/agents?${params.toString()}`)
 }
 
 /**
  * 获取项目特定 Agent 类型的配置
  */
 export async function getAgentConfig(projectId: string, agentType: string): Promise<AgentConfig> {
-  const response = await axios.get(`${API_BASE}/projects/${projectId}/agents/${agentType}`)
-  return response.data
+  return await api.get(`${API_BASE}/projects/${projectId}/agents/${agentType}`)
 }
 
 /**
@@ -114,8 +112,7 @@ export async function updateAgentConfig(
   agentType: string,
   dto: UpdateAgentConfigDTO
 ): Promise<{ success: boolean; message: string; config: AgentConfig }> {
-  const response = await axios.put(`${API_BASE}/projects/${projectId}/agents/${agentType}`, dto)
-  return response.data
+  return await api.put(`${API_BASE}/projects/${projectId}/agents/${agentType}`, dto)
 }
 
 /**
@@ -131,8 +128,7 @@ export async function previewAgentConfig(
     params.append(key, String(value))
   })
 
-  const response = await axios.post(`${API_BASE}/projects/${projectId}/agents/${agentType}/preview?${params.toString()}`)
-  return response.data
+  return await api.post(`${API_BASE}/projects/${projectId}/agents/${agentType}/preview?${params.toString()}`)
 }
 
 /**
@@ -154,6 +150,5 @@ export async function resetAgentConfigs(
   const params = new URLSearchParams()
   if (agentType) params.append('agent_type', agentType)
 
-  const response = await axios.post(`${API_BASE}/projects/${projectId}/agents/reset?${params.toString()}`)
-  return response.data
+  return await api.post(`${API_BASE}/projects/${projectId}/agents/reset?${params.toString()}`)
 }

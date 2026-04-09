@@ -8,13 +8,14 @@ import {
   getEmbeddingConfig,
   getEmbeddingProviderConfig,
   getEmbeddingDownloadProgress,
+  getEmbeddingCacheStatus,
   getLLMConfig,
   getLLMProviderConfig,
   updateLLMConfig,
   testLLMConfig,
 } from '@/api/config'
 import type { EmbeddingProviderInfo, DownloadProgress } from '@/api/config'
-import { Check, RefreshCw, Zap, Bot, Download, Loader2 } from 'lucide-react'
+import { Check, RefreshCw, Zap, Bot, Download, Loader2, HardDrive } from 'lucide-react'
 import { useTheme } from '@/contexts/ThemeContext'
 
 export default function Settings() {
@@ -29,6 +30,7 @@ export default function Settings() {
     base_url: '',
   })
   const [embeddingDimension, setEmbeddingDimension] = useState<number | null>(null)
+  const [embeddingCached, setEmbeddingCached] = useState<boolean | null>(null)  // null = 未检查
   const [llmConfig, setLlmConfig] = useState({
     provider: '',
     model: '',
@@ -104,6 +106,20 @@ export default function Settings() {
         temperature: llmConfigData.temperature,
         max_tokens: llmConfigData.max_tokens,
       })
+
+      // 如果当前是 sentence_transformers，检查缓存状态
+      if (embeddingConfigData.provider === 'sentence_transformers') {
+        try {
+          const status = await getEmbeddingCacheStatus(
+            embeddingConfigData.provider,
+            embeddingConfigData.model,
+            embeddingConfigData.base_url
+          )
+          setEmbeddingCached(status.is_cached)
+        } catch (e) {
+          console.error('Failed to check cache status:', e)
+        }
+      }
     } catch (error) {
       console.error('Failed to load settings:', error)
     } finally {
@@ -111,19 +127,55 @@ export default function Settings() {
     }
   }
 
+  // 检查模型缓存状态
+  const checkCacheStatus = async (provider: string, model: string) => {
+    if (provider !== 'sentence_transformers') {
+      setEmbeddingCached(null)
+      return
+    }
+
+    try {
+      const status = await getEmbeddingCacheStatus(provider, model, embeddingConfig.base_url)
+      setEmbeddingCached(status.is_cached)
+    } catch (e) {
+      console.error('Failed to check cache status:', e)
+      setEmbeddingCached(null)
+    }
+  }
+
   const handleEmbeddingTest = async () => {
     setTestingEmbedding(true)
     setEmbeddingResult(null)
-    // 如果是 sentence_transformers，开始轮询进度
+
+    // 如果是 sentence_transformers，先检查缓存状态
     if (embeddingConfig.provider === 'sentence_transformers') {
-      startProgressPolling()
+      try {
+        const status = await getEmbeddingCacheStatus(
+          embeddingConfig.provider,
+          embeddingConfig.model,
+          embeddingConfig.base_url
+        )
+        const isCached = status.is_cached
+        setEmbeddingCached(isCached)
+
+        // 只有模型未缓存时才启动进度轮询
+        if (!isCached) {
+          startProgressPolling()
+        }
+      } catch (e) {
+        // 如果检查失败，仍然启动进度轮询（兼容旧逻辑）
+        startProgressPolling()
+      }
     }
+
     try {
       const result = await testEmbeddingConfig(embeddingConfig)
       setEmbeddingResult(result)
       if (result.dimension) {
         setEmbeddingDimension(result.dimension)
       }
+      // 测试完成后更新缓存状态
+      setEmbeddingCached(true)
     } catch (error) {
       setEmbeddingResult({ success: false, message: String(error) })
     } finally {
@@ -160,24 +212,33 @@ export default function Settings() {
     }
 
     // 切换到新 provider 时，从后端加载该 provider 的独立配置
+    let newConfig = {
+      provider: provider.id,
+      model: provider.default_model,
+      api_key: '',
+      base_url: provider.default_url || '',
+    }
+
     try {
       const providerConfig = await getEmbeddingProviderConfig(provider.id)
-      setEmbeddingConfig({
+      newConfig = {
         provider: provider.id,
         model: providerConfig.model || provider.default_model,
         api_key: providerConfig.api_key || '',
         base_url: providerConfig.base_url || '',
-      })
+      }
       setEmbeddingDimension(providerConfig.dimension || null)
     } catch (error) {
-      // 如果加载失败，使用默认值
-      setEmbeddingConfig({
-        provider: provider.id,
-        model: provider.default_model,
-        api_key: '',
-        base_url: provider.default_url || '',
-      })
       setEmbeddingDimension(null)
+    }
+
+    setEmbeddingConfig(newConfig)
+
+    // 检查新 provider 的缓存状态
+    if (provider.id === 'sentence_transformers') {
+      checkCacheStatus(provider.id, newConfig.model)
+    } else {
+      setEmbeddingCached(null)
     }
     setEmbeddingResult(null)
   }
@@ -411,6 +472,22 @@ export default function Settings() {
                   </div>
                 )}
 
+                {/* 显示缓存状态 (仅 sentence_transformers) */}
+                {embeddingConfig.provider === 'sentence_transformers' && embeddingCached !== null && (
+                  <div className={`p-3 rounded-lg flex items-center gap-2 ${
+                    embeddingCached
+                      ? (isDark ? 'bg-green-900/20 text-green-300' : 'bg-green-50 text-green-700')
+                      : (isDark ? 'bg-yellow-900/20 text-yellow-300' : 'bg-yellow-50 text-yellow-700')
+                  }`}>
+                    <HardDrive size={16} />
+                    <span className="text-sm">
+                      {embeddingCached
+                        ? '模型已缓存，可直接使用'
+                        : '模型未下载，测试时将自动下载'}
+                    </span>
+                  </div>
+                )}
+
                 {/* 根据服务类型显示不同配置 */}
                 {embeddingConfig.provider === 'openai' && (
                   <>
@@ -469,15 +546,30 @@ export default function Settings() {
                       </div>
                     )}
 
-                    <div className={`p-4 rounded-lg text-sm ${isDark ? 'bg-green-900/20 text-green-300' : 'bg-green-50 text-green-700'}`}>
+                    <div className={`p-4 rounded-lg text-sm ${
+                      embeddingCached === true
+                        ? (isDark ? 'bg-green-900/20 text-green-300' : 'bg-green-50 text-green-700')
+                        : (isDark ? 'bg-blue-900/20 text-blue-300' : 'bg-blue-50 text-blue-700')
+                    }`}>
                       <p className="font-medium flex items-center gap-2">
-                        <Download size={16} />
+                        {embeddingCached === true ? <HardDrive size={16} /> : <Download size={16} />}
                         本地模式说明
                       </p>
-                      <p className="mt-1">首次使用会自动下载模型文件，下载完成后可完全离线使用。</p>
-                      <p className={`mt-1 text-xs ${isDark ? 'text-green-400' : 'text-green-600'}`}>
-                        默认存储路径: ~/.cache/huggingface/hub
-                      </p>
+                      {embeddingCached === true ? (
+                        <>
+                          <p className="mt-1">模型已在本地缓存，可直接使用，无需下载。</p>
+                          <p className={`mt-1 text-xs ${isDark ? 'text-green-400' : 'text-green-600'}`}>
+                            完全离线可用
+                          </p>
+                        </>
+                      ) : (
+                        <>
+                          <p className="mt-1">首次使用会自动下载模型文件，下载完成后可完全离线使用。</p>
+                          <p className={`mt-1 text-xs ${isDark ? 'text-blue-400' : 'text-blue-600'}`}>
+                            默认存储路径: ~/.cache/huggingface/hub
+                          </p>
+                        </>
+                      )}
                     </div>
                   </>
                 )}

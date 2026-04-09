@@ -94,6 +94,7 @@ class SendMessageRequest(BaseModel):
 
     message: str = Field(..., min_length=1, description="消息内容")
     session_id: str = Field(..., description="会话ID")
+    project_id: Optional[str] = Field(None, description="项目ID（用于会话恢复）")
 
 
 class UploadOutlineRequest(BaseModel):

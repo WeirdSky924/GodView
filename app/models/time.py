@@ -87,7 +87,7 @@ class TimeUpdateModel(BaseModel):
 
 class TimeSystemConfig(BaseModel):
     """时间系统配置"""
-    world_id: str = Field(..., description="世界ID")
+    world_id: Optional[str] = Field(None, description="世界ID")
     time_scale: float = Field(default=1.0, ge=0.1, le=100.0, description="时间流速")
     time_mode: TimeModeEnum = Field(default=TimeModeEnum.LINEAR, description="时间模式")
     day_length: int = Field(default=24, ge=1, le=48, description="一天的小时数")

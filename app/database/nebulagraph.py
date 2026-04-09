@@ -6,6 +6,7 @@ NebulaGraph 数据库操作层
 import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+from contextlib import contextmanager
 
 from nebula3.gclient.net import ConnectionPool
 from nebula3.Config import Config
@@ -45,8 +46,23 @@ class NebulaGraphDatabase:
         self.timeout_ms = timeout_ms
 
         self._pool: Optional[ConnectionPool] = None
-        self._session_pool = None
         self._connected = False
+
+    @contextmanager
+    def _get_session(self):
+        """获取会话的上下文管理器"""
+        session = None
+        try:
+            if self._pool is None:
+                raise RuntimeError("NebulaGraph 连接池未初始化，请先调用 connect()")
+            session = self._pool.get_session(self.user, self.password)
+            yield session
+        finally:
+            if session:
+                try:
+                    session.release()
+                except Exception:
+                    pass
 
     async def connect(self):
         """建立数据库连接"""
@@ -61,10 +77,6 @@ class NebulaGraphDatabase:
             if not init_result:
                 raise ConnectionError(f"无法连接到 NebulaGraph: {self.host}:{self.port}")
 
-            # 认证并创建会话
-            session = self._pool.get_session(self.user, self.password)
-            self._session_pool = session
-
             # 确保空间存在
             await self._ensure_space()
 
@@ -73,9 +85,6 @@ class NebulaGraphDatabase:
 
     async def disconnect(self):
         """关闭数据库连接"""
-        if self._session_pool:
-            self._session_pool.release()
-            self._session_pool = None
         if self._pool:
             self._pool.close()
             self._pool = None
@@ -86,186 +95,188 @@ class NebulaGraphDatabase:
         """确保图空间存在"""
         import asyncio
 
-        # 先添加存储主机（NebulaGraph v3 必需）
-        add_hosts_result = self._session_pool.execute('ADD HOSTS IF NOT EXISTS "nebula-storaged":9779;')
-        if add_hosts_result.is_succeeded():
-            logger.info("存储主机已添加: nebula-storaged:9779")
+        with self._get_session() as session:
+            # 先添加存储主机（NebulaGraph v3 必需）
+            add_hosts_result = session.execute('ADD HOSTS IF NOT EXISTS "nebula-storaged":9779;')
+            if add_hosts_result.is_succeeded():
+                logger.info("存储主机已添加: nebula-storaged:9779")
 
-        # 检查空间是否存在
-        result = self._session_pool.execute(
-            f"SHOW SPACES LIKE '{self.space_name}'"
-        )
-
-        space_exists = False
-        if result.is_succeeded():
-            rows = result.data.rows()
-            space_exists = len(rows) > 0
-
-        if not space_exists:
-            # 创建空间
-            create_space = f"""
-            CREATE SPACE IF NOT EXISTS {self.space_name} (
-                vid_type = FIXED_STRING(64),
-                partition_num = 10,
-                replica_factor = 1
+            # 检查空间是否存在
+            result = session.execute(
+                f"SHOW SPACES LIKE '{self.space_name}'"
             )
-            """
-            result = self._session_pool.execute(create_space)
-            if result.is_succeeded():
-                logger.info(f"图空间 '{self.space_name}' 创建成功")
-                # 等待空间创建完成
-                await asyncio.sleep(5)
-            else:
-                logger.error(f"图空间创建失败：{result.error_msg()}")
-                return
 
-        # 使用空间
-        result = self._session_pool.execute(f"USE {self.space_name}")
-        if not result.is_succeeded():
-            logger.error(f"使用图空间失败：{result.error_msg()}")
-        else:
-            logger.info(f"已切换到图空间: {self.space_name}")
+            space_exists = False
+            if result.is_succeeded():
+                rows = result.data.rows()
+                space_exists = len(rows) > 0
+
+            if not space_exists:
+                # 创建空间
+                create_space = f"""
+                CREATE SPACE IF NOT EXISTS {self.space_name} (
+                    vid_type = FIXED_STRING(64),
+                    partition_num = 10,
+                    replica_factor = 1
+                )
+                """
+                result = session.execute(create_space)
+                if result.is_succeeded():
+                    logger.info(f"图空间 '{self.space_name}' 创建成功")
+                    # 等待空间创建完成
+                    await asyncio.sleep(5)
+                else:
+                    logger.error(f"图空间创建失败：{result.error_msg()}")
+                    return
+
+            # 使用空间
+            result = session.execute(f"USE {self.space_name}")
+            if not result.is_succeeded():
+                logger.error(f"使用图空间失败：{result.error_msg()}")
+            else:
+                logger.info(f"已切换到图空间: {self.space_name}")
 
     async def init_schema(self):
         """初始化图 schema（Tag 和 Edge）"""
         await self.connect()
 
-        # 确保使用了正确的空间
-        result = self._session_pool.execute(f"USE {self.space_name}")
-        if not result.is_succeeded():
-            logger.error(f"切换图空间失败：{result.error_msg()}")
-            return
+        with self._get_session() as session:
+            # 确保使用了正确的空间
+            result = session.execute(f"USE {self.space_name}")
+            if not result.is_succeeded():
+                logger.error(f"切换图空间失败：{result.error_msg()}")
+                return
 
-        # 创建 Tag
-        tags = [
-            # 角色
-            """
-            CREATE TAG IF NOT EXISTS character (
-                name STRING,
-                description STRING,
-                role STRING,
-                status STRING,
-                personality_traits STRING,
-                created_at TIMESTAMP,
-                updated_at TIMESTAMP
-            )
-            """,
-            # 世界
-            """
-            CREATE TAG IF NOT EXISTS world (
-                name STRING,
-                world_type STRING,
-                description STRING,
-                created_at TIMESTAMP
-            )
-            """,
-            # 区域
-            """
-            CREATE TAG IF NOT EXISTS region (
-                name STRING,
-                region_type STRING,
-                description STRING,
-                world_id STRING
-            )
-            """,
-            # 伏笔
-            """
-            CREATE TAG IF NOT EXISTS hook (
-                title STRING,
-                hook_type STRING,
-                status STRING,
-                priority INT,
-                created_at TIMESTAMP
-            )
-            """,
-            # 事件
-            """
-            CREATE TAG IF NOT EXISTS event (
-                summary STRING,
-                event_type STRING,
-                timestamp TIMESTAMP
-            )
-            """,
-            # 记忆
-            """
-            CREATE TAG IF NOT EXISTS memory (
-                content STRING,
-                memory_type STRING,
-                importance FLOAT,
-                created_at TIMESTAMP
-            )
-            """,
-        ]
+            # 创建 Tag
+            tags = [
+                # 角色
+                """
+                CREATE TAG IF NOT EXISTS character (
+                    name STRING,
+                    description STRING,
+                    role STRING,
+                    status STRING,
+                    personality_traits STRING,
+                    created_at TIMESTAMP,
+                    updated_at TIMESTAMP
+                )
+                """,
+                # 世界
+                """
+                CREATE TAG IF NOT EXISTS world (
+                    name STRING,
+                    world_type STRING,
+                    description STRING,
+                    created_at TIMESTAMP
+                )
+                """,
+                # 区域
+                """
+                CREATE TAG IF NOT EXISTS region (
+                    name STRING,
+                    region_type STRING,
+                    description STRING,
+                    world_id STRING
+                )
+                """,
+                # 伏笔
+                """
+                CREATE TAG IF NOT EXISTS hook (
+                    title STRING,
+                    hook_type STRING,
+                    status STRING,
+                    priority INT,
+                    created_at TIMESTAMP
+                )
+                """,
+                # 事件
+                """
+                CREATE TAG IF NOT EXISTS event (
+                    summary STRING,
+                    event_type STRING,
+                    timestamp TIMESTAMP
+                )
+                """,
+                # 记忆
+                """
+                CREATE TAG IF NOT EXISTS memory (
+                    content STRING,
+                    memory_type STRING,
+                    importance FLOAT,
+                    created_at TIMESTAMP
+                )
+                """,
+            ]
 
-        for tag_sql in tags:
-            result = self._session_pool.execute(tag_sql)
-            if result.is_succeeded():
-                logger.info(f"Tag 创建成功：{tag_sql.split()[2]}")
-            else:
-                logger.warning(f"Tag 可能已存在：{result.error_msg()}")
+            for tag_sql in tags:
+                result = session.execute(tag_sql)
+                if result.is_succeeded():
+                    logger.info(f"Tag 创建成功：{tag_sql.split()[2]}")
+                else:
+                    logger.warning(f"Tag 可能已存在：{result.error_msg()}")
 
-        # 创建 Edge
-        edges = [
-            # 角色关系
-            """
-            CREATE EDGE IF NOT EXISTS knows (
-                relationship_type STRING,
-                strength FLOAT,
-                since TIMESTAMP
-            )
-            """,
-            # 角色在区域
-            """
-            CREATE EDGE IF NOT EXISTS located_in (
-                since TIMESTAMP
-            )
-            """,
-            # 角色属于世界
-            """
-            CREATE EDGE IF NOT EXISTS belongs_to (
-                since TIMESTAMP
-            )
-            """,
-            # 区域连接
-            """
-            CREATE EDGE IF NOT EXISTS connects_to (
-                distance FLOAT
-            )
-            """,
-            # 伏笔关联角色
-            """
-            CREATE EDGE IF NOT EXISTS involves_character (
-                role STRING
-            )
-            """,
-            # 伏笔关联区域
-            """
-            CREATE EDGE IF NOT EXISTS involves_location (
-                context STRING
-            )
-            """,
-            # 记忆归属
-            """
-            CREATE EDGE IF NOT EXISTS remembers (
-                created_at TIMESTAMP
-            )
-            """,
-            # 事件参与
-            """
-            CREATE EDGE IF NOT EXISTS participated_in (
-                role STRING
-            )
-            """,
-        ]
+            # 创建 Edge
+            edges = [
+                # 角色关系
+                """
+                CREATE EDGE IF NOT EXISTS knows (
+                    relationship_type STRING,
+                    strength FLOAT,
+                    since TIMESTAMP
+                )
+                """,
+                # 角色在区域
+                """
+                CREATE EDGE IF NOT EXISTS located_in (
+                    since TIMESTAMP
+                )
+                """,
+                # 角色属于世界
+                """
+                CREATE EDGE IF NOT EXISTS belongs_to (
+                    since TIMESTAMP
+                )
+                """,
+                # 区域连接
+                """
+                CREATE EDGE IF NOT EXISTS connects_to (
+                    distance FLOAT
+                )
+                """,
+                # 伏笔关联角色
+                """
+                CREATE EDGE IF NOT EXISTS involves_character (
+                    role STRING
+                )
+                """,
+                # 伏笔关联区域
+                """
+                CREATE EDGE IF NOT EXISTS involves_location (
+                    context STRING
+                )
+                """,
+                # 记忆归属
+                """
+                CREATE EDGE IF NOT EXISTS remembers (
+                    created_at TIMESTAMP
+                )
+                """,
+                # 事件参与
+                """
+                CREATE EDGE IF NOT EXISTS participated_in (
+                    role STRING
+                )
+                """,
+            ]
 
-        for edge_sql in edges:
-            result = self._session_pool.execute(edge_sql)
-            if result.is_succeeded():
-                logger.info(f"Edge 创建成功：{edge_sql.split()[2]}")
-            else:
-                logger.warning(f"Edge 可能已存在：{result.error_msg()}")
+            for edge_sql in edges:
+                result = session.execute(edge_sql)
+                if result.is_succeeded():
+                    logger.info(f"Edge 创建成功：{edge_sql.split()[2]}")
+                else:
+                    logger.warning(f"Edge 可能已存在：{result.error_msg()}")
 
-        logger.info("NebulaGraph Schema 初始化完成")
+            logger.info("NebulaGraph Schema 初始化完成")
 
     async def init_lore_schema(self):
         """
@@ -275,118 +286,124 @@ class NebulaGraphDatabase:
         """
         await self.connect()
 
-        # Lore Tags - 按类别分组的设定节点
-        lore_tags = [
-            # 世界规则
-            """
-            CREATE TAG IF NOT EXISTS lore_world_rule (
-                title STRING,
-                content STRING,
-                priority STRING,
-                keywords STRING,
-                constraints STRING,
-                project_id STRING,
-                created_at TIMESTAMP,
-                updated_at TIMESTAMP
-            )
-            """,
-            # 地理设定
-            """
-            CREATE TAG IF NOT EXISTS lore_geography (
-                title STRING,
-                content STRING,
-                priority STRING,
-                keywords STRING,
-                location_type STRING,
-                parent_location STRING,
-                project_id STRING,
-                created_at TIMESTAMP
-            )
-            """,
-            # 势力/组织
-            """
-            CREATE TAG IF NOT EXISTS lore_faction (
-                title STRING,
-                content STRING,
-                priority STRING,
-                keywords STRING,
-                faction_type STRING,
-                power_level STRING,
-                project_id STRING,
-                created_at TIMESTAMP
-            )
-            """,
-            # 种族
-            """
-            CREATE TAG IF NOT EXISTS lore_race (
-                title STRING,
-                content STRING,
-                priority STRING,
-                keywords STRING,
-                traits STRING,
-                project_id STRING,
-                created_at TIMESTAMP
-            )
-            """,
-            # 物品
-            """
-            CREATE TAG IF NOT EXISTS lore_item (
-                title STRING,
-                content STRING,
-                priority STRING,
-                keywords STRING,
-                item_type STRING,
-                rarity STRING,
-                project_id STRING,
-                created_at TIMESTAMP
-            )
-            """,
-        ]
+        with self._get_session() as session:
+            result = session.execute(f"USE {self.space_name}")
+            if not result.is_succeeded():
+                logger.error(f"切换图空间失败：{result.error_msg()}")
+                return
 
-        for tag_sql in lore_tags:
-            result = self._session_pool.execute(tag_sql)
-            if result.is_succeeded():
-                tag_name = tag_sql.split()[5]  # 提取 Tag 名称
-                logger.info(f"Lore Tag 创建成功：{tag_name}")
-            else:
-                logger.warning(f"Lore Tag 可能已存在：{result.error_msg()}")
+            # Lore Tags - 按类别分组的设定节点
+            lore_tags = [
+                # 世界规则
+                """
+                CREATE TAG IF NOT EXISTS lore_world_rule (
+                    title STRING,
+                    content STRING,
+                    priority STRING,
+                    keywords STRING,
+                    constraints STRING,
+                    project_id STRING,
+                    created_at TIMESTAMP,
+                    updated_at TIMESTAMP
+                )
+                """,
+                # 地理设定
+                """
+                CREATE TAG IF NOT EXISTS lore_geography (
+                    title STRING,
+                    content STRING,
+                    priority STRING,
+                    keywords STRING,
+                    location_type STRING,
+                    parent_location STRING,
+                    project_id STRING,
+                    created_at TIMESTAMP
+                )
+                """,
+                # 势力/组织
+                """
+                CREATE TAG IF NOT EXISTS lore_faction (
+                    title STRING,
+                    content STRING,
+                    priority STRING,
+                    keywords STRING,
+                    faction_type STRING,
+                    power_level STRING,
+                    project_id STRING,
+                    created_at TIMESTAMP
+                )
+                """,
+                # 种族
+                """
+                CREATE TAG IF NOT EXISTS lore_race (
+                    title STRING,
+                    content STRING,
+                    priority STRING,
+                    keywords STRING,
+                    traits STRING,
+                    project_id STRING,
+                    created_at TIMESTAMP
+                )
+                """,
+                # 物品
+                """
+                CREATE TAG IF NOT EXISTS lore_item (
+                    title STRING,
+                    content STRING,
+                    priority STRING,
+                    keywords STRING,
+                    item_type STRING,
+                    rarity STRING,
+                    project_id STRING,
+                    created_at TIMESTAMP
+                )
+                """,
+            ]
 
-        # Lore Edges - 设定之间的关系
-        lore_edges = [
-            # 父子关系（层级结构）
-            """
-            CREATE EDGE IF NOT EXISTS lore_parent_of (
-                relationship_type STRING,
-                created_at TIMESTAMP
-            )
-            """,
-            # 相互关联
-            """
-            CREATE EDGE IF NOT EXISTS lore_related_to (
-                relationship_strength FLOAT,
-                description STRING,
-                created_at TIMESTAMP
-            )
-            """,
-            # 约束关系
-            """
-            CREATE EDGE IF NOT EXISTS lore_constrains (
-                constraint_type STRING,
-                constraint_value STRING,
-                created_at TIMESTAMP
-            )
-            """,
-        ]
+            for tag_sql in lore_tags:
+                result = session.execute(tag_sql)
+                if result.is_succeeded():
+                    tag_name = tag_sql.split()[5]  # 提取 Tag 名称
+                    logger.info(f"Lore Tag 创建成功：{tag_name}")
+                else:
+                    logger.warning(f"Lore Tag 可能已存在：{result.error_msg()}")
 
-        for edge_sql in lore_edges:
-            result = self._session_pool.execute(edge_sql)
-            if result.is_succeeded():
-                edge_name = edge_sql.split()[5]
-                logger.info(f"Lore Edge 创建成功：{edge_name}")
-            else:
-                logger.warning(f"Lore Edge 可能已存在：{result.error_msg()}")
+            # Lore Edges - 设定之间的关系
+            lore_edges = [
+                # 父子关系（层级结构）
+                """
+                CREATE EDGE IF NOT EXISTS lore_parent_of (
+                    relationship_type STRING,
+                    created_at TIMESTAMP
+                )
+                """,
+                # 相互关联
+                """
+                CREATE EDGE IF NOT EXISTS lore_related_to (
+                    relationship_strength FLOAT,
+                    description STRING,
+                    created_at TIMESTAMP
+                )
+                """,
+                # 约束关系
+                """
+                CREATE EDGE IF NOT EXISTS lore_constrains (
+                    constraint_type STRING,
+                    constraint_value STRING,
+                    created_at TIMESTAMP
+                )
+                """,
+            ]
 
-        logger.info("NebulaGraph Lore Schema 初始化完成")
+            for edge_sql in lore_edges:
+                result = session.execute(edge_sql)
+                if result.is_succeeded():
+                    edge_name = edge_sql.split()[5]
+                    logger.info(f"Lore Edge 创建成功：{edge_name}")
+                else:
+                    logger.warning(f"Lore Edge 可能已存在：{result.error_msg()}")
+
+            logger.info("NebulaGraph Lore Schema 初始化完成")
 
     async def init_narrative_schema(self):
         """
@@ -396,100 +413,106 @@ class NebulaGraphDatabase:
         """
         await self.connect()
 
-        # Narrative Tags
-        narrative_tags = [
-            # 叙事事件
-            """
-            CREATE TAG IF NOT EXISTS narrative_event (
-                event_id STRING,
-                event_type STRING,
-                summary STRING,
-                chapter INT,
-                scene INT,
-                timestamp STRING,
-                importance FLOAT,
-                project_id STRING,
-                created_at TIMESTAMP
-            )
-            """,
-            # 状态变化
-            """
-            CREATE TAG IF NOT EXISTS narrative_state_change (
-                change_id STRING,
-                entity_type STRING,
-                entity_id STRING,
-                attribute STRING,
-                old_value STRING,
-                new_value STRING,
-                reason STRING,
-                project_id STRING,
-                created_at TIMESTAMP
-            )
-            """,
-            # 关系变化
-            """
-            CREATE TAG IF NOT EXISTS narrative_relationship_change (
-                change_id STRING,
-                character1_id STRING,
-                character2_id STRING,
-                relationship_type STRING,
-                old_strength FLOAT,
-                new_strength FLOAT,
-                reason STRING,
-                project_id STRING,
-                created_at TIMESTAMP
-            )
-            """,
-        ]
+        with self._get_session() as session:
+            result = session.execute(f"USE {self.space_name}")
+            if not result.is_succeeded():
+                logger.error(f"切换图空间失败：{result.error_msg()}")
+                return
 
-        for tag_sql in narrative_tags:
-            result = self._session_pool.execute(tag_sql)
-            if result.is_succeeded():
-                tag_name = tag_sql.split()[5]
-                logger.info(f"Narrative Tag 创建成功：{tag_name}")
-            else:
-                logger.warning(f"Narrative Tag 可能已存在：{result.error_msg()}")
+            # Narrative Tags
+            narrative_tags = [
+                # 叙事事件
+                """
+                CREATE TAG IF NOT EXISTS narrative_event (
+                    event_id STRING,
+                    event_type STRING,
+                    summary STRING,
+                    chapter INT,
+                    scene INT,
+                    timestamp STRING,
+                    importance FLOAT,
+                    project_id STRING,
+                    created_at TIMESTAMP
+                )
+                """,
+                # 状态变化
+                """
+                CREATE TAG IF NOT EXISTS narrative_state_change (
+                    change_id STRING,
+                    entity_type STRING,
+                    entity_id STRING,
+                    attribute STRING,
+                    old_value STRING,
+                    new_value STRING,
+                    reason STRING,
+                    project_id STRING,
+                    created_at TIMESTAMP
+                )
+                """,
+                # 关系变化
+                """
+                CREATE TAG IF NOT EXISTS narrative_relationship_change (
+                    change_id STRING,
+                    character1_id STRING,
+                    character2_id STRING,
+                    relationship_type STRING,
+                    old_strength FLOAT,
+                    new_strength FLOAT,
+                    reason STRING,
+                    project_id STRING,
+                    created_at TIMESTAMP
+                )
+                """,
+            ]
 
-        # Narrative Edges
-        narrative_edges = [
-            # 因果关系
-            """
-            CREATE EDGE IF NOT EXISTS causes (
-                causality_strength FLOAT,
-                description STRING
-            )
-            """,
-            # 参与事件
-            """
-            CREATE EDGE IF NOT EXISTS participates_in (
-                role STRING,
-                involvement_level STRING
-            )
-            """,
-            # 发生地点
-            """
-            CREATE EDGE IF NOT EXISTS occurs_at (
-                location_name STRING
-            )
-            """,
-            # 引用设定
-            """
-            CREATE EDGE IF NOT EXISTS references_lore (
-                reference_type STRING,
-                relevance FLOAT
-            )
-            """,
-        ]
+            for tag_sql in narrative_tags:
+                result = session.execute(tag_sql)
+                if result.is_succeeded():
+                    tag_name = tag_sql.split()[5]
+                    logger.info(f"Narrative Tag 创建成功：{tag_name}")
+                else:
+                    logger.warning(f"Narrative Tag 可能已存在：{result.error_msg()}")
 
-        for edge_sql in narrative_edges:
-            result = self._session_pool.execute(edge_sql)
-            if result.is_succeeded():
-                edge_name = edge_sql.split()[5]
-                logger.info(f"Narrative Edge 创建成功：{edge_name}")
-            else:
-                logger.warning(f"Narrative Edge 可能已存在：{result.error_msg()}")
+            # Narrative Edges
+            narrative_edges = [
+                # 因果关系
+                """
+                CREATE EDGE IF NOT EXISTS causes (
+                    causality_strength FLOAT,
+                    description STRING
+                )
+                """,
+                # 参与事件
+                """
+                CREATE EDGE IF NOT EXISTS participates_in (
+                    role STRING,
+                    involvement_level STRING
+                )
+                """,
+                # 发生地点
+                """
+                CREATE EDGE IF NOT EXISTS occurs_at (
+                    location_name STRING
+                )
+                """,
+                # 引用设定
+                """
+                CREATE EDGE IF NOT EXISTS references_lore (
+                    reference_type STRING,
+                    relevance FLOAT
+                )
+                """,
+            ]
 
-        logger.info("NebulaGraph Narrative Schema 初始化完成")
+            for edge_sql in narrative_edges:
+                result = session.execute(edge_sql)
+                if result.is_succeeded():
+                    edge_name = edge_sql.split()[5]
+                    logger.info(f"Narrative Edge 创建成功：{edge_name}")
+                else:
+                    logger.warning(f"Narrative Edge 可能已存在：{result.error_msg()}")
+
+            logger.info("NebulaGraph Narrative Schema 初始化完成")
 
     # ==================== Lore 图操作 ====================
 
@@ -541,8 +564,10 @@ class NebulaGraphDatabase:
         VALUES "{lore_id}": ({props_str})
         """
 
-        result = self._session_pool.execute(query)
-        return result.is_succeeded()
+        with self._get_session() as session:
+            session.execute(f"USE {self.space_name}")
+            result = session.execute(query)
+            return result.is_succeeded()
 
     async def create_lore_relationship(
         self,
@@ -586,8 +611,10 @@ class NebulaGraphDatabase:
         VALUES "{lore_id_1}" -> "{lore_id_2}": ({props_str})
         """
 
-        result = self._session_pool.execute(query)
-        return result.is_succeeded()
+        with self._get_session() as session:
+            session.execute(f"USE {self.space_name}")
+            result = session.execute(query)
+            return result.is_succeeded()
 
     async def get_lore_tree(
         self,
@@ -609,11 +636,12 @@ class NebulaGraphDatabase:
         YIELD vertices AS v, edges AS e
         """
 
-        result = self._session_pool.execute(query)
-        if not result.is_succeeded():
-            return {"nodes": [], "edges": []}
-
-        return self._parse_path(result.data)
+        with self._get_session() as session:
+            session.execute(f"USE {self.space_name}")
+            result = session.execute(query)
+            if not result.is_succeeded():
+                return {"nodes": [], "edges": []}
+            return self._parse_path(result.data)
 
     # ==================== Narrative 图操作 ====================
 
@@ -650,8 +678,10 @@ class NebulaGraphDatabase:
         VALUES "{event_id}": ({props_str})
         """
 
-        result = self._session_pool.execute(query)
-        return result.is_succeeded()
+        with self._get_session() as session:
+            session.execute(f"USE {self.space_name}")
+            result = session.execute(query)
+            return result.is_succeeded()
 
     async def link_event_causality(
         self,
@@ -677,8 +707,10 @@ class NebulaGraphDatabase:
         VALUES "{cause_event_id}" -> "{effect_event_id}": ({strength}, "{description}")
         """
 
-        result = self._session_pool.execute(query)
-        return result.is_succeeded()
+        with self._get_session() as session:
+            session.execute(f"USE {self.space_name}")
+            result = session.execute(query)
+            return result.is_succeeded()
 
     async def link_event_to_character(
         self,
@@ -704,8 +736,10 @@ class NebulaGraphDatabase:
         VALUES "{character_id}" -> "{event_id}": ("{role}", "{involvement_level}")
         """
 
-        result = self._session_pool.execute(query)
-        return result.is_succeeded()
+        with self._get_session() as session:
+            session.execute(f"USE {self.space_name}")
+            result = session.execute(query)
+            return result.is_succeeded()
 
     async def link_event_to_lore(
         self,
@@ -731,8 +765,10 @@ class NebulaGraphDatabase:
         VALUES "{event_id}" -> "{lore_id}": ("{reference_type}", {relevance})
         """
 
-        result = self._session_pool.execute(query)
-        return result.is_succeeded()
+        with self._get_session() as session:
+            session.execute(f"USE {self.space_name}")
+            result = session.execute(query)
+            return result.is_succeeded()
 
     async def get_event_chain(
         self,
@@ -773,19 +809,21 @@ class NebulaGraphDatabase:
                   $$.narrative_event.chapter AS chapter
             """
 
-        result = self._session_pool.execute(query)
-        if not result.is_succeeded():
-            return []
+        with self._get_session() as session:
+            session.execute(f"USE {self.space_name}")
+            result = session.execute(query)
+            if not result.is_succeeded():
+                return []
 
-        events = []
-        for row in result.data.rows():
-            events.append({
-                "event_id": str(row.values[0]),
-                "summary": str(row.values[1]),
-                "chapter": row.values[2].as_int() if row.values[2].is_int() else None,
-            })
+            events = []
+            for row in result.data.rows():
+                events.append({
+                    "event_id": str(row.values[0]),
+                    "summary": str(row.values[1]),
+                    "chapter": row.values[2].as_int() if row.values[2].is_int() else None,
+                })
 
-        return events
+            return events
 
     # ==================== 角色相关操作 ====================
 
@@ -800,27 +838,21 @@ class NebulaGraphDatabase:
         Returns:
             bool: 是否成功
         """
-        # 处理时间字段
-        now = datetime.utcnow().isoformat()
-        props = {
-            "name": f"'{properties.get('name', '')}'",
-            "description": f"'{properties.get('description', '')}'",
-            "role": f"'{properties.get('role', 'supporting')}'",
-            "status": f"'{properties.get('status', 'active')}'",
-            "personality_traits": f"'{properties.get('personality_traits', '[]')}'",
-            "created_at": f"'{properties.get('created_at', now)}'",
-            "updated_at": f"'{now}'",
-        }
-
-        props_str = ", ".join([f"{k}: {v}" for k, v in props.items()])
+        await self.connect()
+        # 只使用 schema 中定义的字段
+        name = properties.get('name', '').replace("'", "\\'")
+        description = properties.get('description', '').replace("'", "\\'")
+        role = properties.get('role', 'supporting').replace("'", "\\'")
 
         query = f"""
-        INSERT VERTEX IF NOT EXISTS character ({props_str})
-        VALUES "{character_id}": ({props_str})
+        INSERT VERTEX IF NOT EXISTS character (name, description, role)
+        VALUES "{character_id}": ('{name}', '{description}', '{role}')
         """
 
-        result = self._session_pool.execute(query)
-        return result.is_succeeded()
+        with self._get_session() as session:
+            session.execute(f"USE {self.space_name}")
+            result = session.execute(query)
+            return result.is_succeeded()
 
     async def get_character(self, character_id: str) -> Optional[Dict[str, Any]]:
         """获取角色信息"""
@@ -828,11 +860,14 @@ class NebulaGraphDatabase:
         FETCH PROP ON character("{character_id}")
         YIELD vertex AS v
         """
-        result = self._session_pool.execute(query)
 
-        if result.is_succeeded() and result.data.rows():
-            return self._parse_vertex(result.data.rows()[0])
-        return None
+        with self._get_session() as session:
+            session.execute(f"USE {self.space_name}")
+            result = session.execute(query)
+
+            if result.is_succeeded() and result.data.rows():
+                return self._parse_vertex(result.data.rows()[0])
+            return None
 
     async def get_character_neighbors(
         self,
@@ -860,11 +895,13 @@ class NebulaGraphDatabase:
         YIELD vertices AS vertices, edges AS edges
         """
 
-        result = self._session_pool.execute(query)
-        if not result.is_succeeded():
-            return {"vertices": [], "edges": []}
+        with self._get_session() as session:
+            session.execute(f"USE {self.space_name}")
+            result = session.execute(query)
+            if not result.is_succeeded():
+                return {"vertices": [], "edges": []}
 
-        return self._parse_path(result.data)
+            return self._parse_path(result.data)
 
     # ==================== 关系相关操作 ====================
 
@@ -894,8 +931,10 @@ class NebulaGraphDatabase:
         VALUES "{character_id_1}" -> "{character_id_2}": ("{relationship_type}", {strength}, "{now}")
         """
 
-        result = self._session_pool.execute(query)
-        return result.is_succeeded()
+        with self._get_session() as session:
+            session.execute(f"USE {self.space_name}")
+            result = session.execute(query)
+            return result.is_succeeded()
 
     async def get_relationships(
         self, character_id: str
@@ -907,20 +946,23 @@ class NebulaGraphDatabase:
               knows.strength AS strength, knows.since AS since
         """
 
-        result = self._session_pool.execute(query)
-        if not result.is_succeeded():
-            return []
+        with self._get_session() as session:
+            session.execute(f"USE {self.space_name}")
+            result = session.execute(query)
+            if not result.is_succeeded():
+                return []
 
-        relationships = []
-        for row in result.data.rows():
-            relationships.append({
-                "target_name": str(row.values[0]),
-                "type": str(row.values[1]),
-                "strength": float(row.values[2]) if row.values[2].is_double() else 0.0,
-                "since": str(row.values[3]),
-            })
+            relationships = []
+            for i in range(result.row_size()):
+                row_values = result.row_values(i)
+                relationships.append({
+                    "target_name": str(row_values[0]),
+                    "type": str(row_values[1]),
+                    "strength": float(row_values[2].as_double()) if len(row_values) > 2 and row_values[2].is_double() else 0.0,
+                    "since": str(row_values[3]) if len(row_values) > 3 else "",
+                })
 
-        return relationships
+            return relationships
 
     # ==================== 记忆相关操作 ====================
 
@@ -943,27 +985,35 @@ class NebulaGraphDatabase:
         Returns:
             bool: 是否成功
         """
-        now = datetime.utcnow().isoformat()
-        memory_id = f"mem_{character_id}_{int(datetime.utcnow().timestamp())}"
+        await self.connect()
 
-        # 插入记忆节点
-        insert_memory = f"""
-        INSERT VERTEX IF NOT EXISTS memory (content, memory_type, importance, created_at)
-        VALUES "{memory_id}": ("{content}", "{memory_type}", {importance}, "{now}")
-        """
+        import time
+        timestamp = int(time.time())
+        memory_id = f"mem_{character_id}_{timestamp}"
 
-        result = self._session_pool.execute(insert_memory)
-        if not result.is_succeeded():
-            return False
+        # 转义内容中的特殊字符
+        content_escaped = content.replace('\\', '\\\\').replace('"', '\\"')
 
-        # 创建关系
-        link_query = f"""
-        INSERT EDGE IF NOT EXISTS remembers (created_at)
-        VALUES "{character_id}" -> "{memory_id}": ("{now}")
-        """
+        with self._get_session() as session:
+            # 确保使用正确的空间
+            session.execute(f"USE {self.space_name}")
 
-        result = self._session_pool.execute(link_query)
-        return result.is_succeeded()
+            # 插入记忆节点 (TIMESTAMP 使用整数时间戳)
+            insert_memory = f'INSERT VERTEX IF NOT EXISTS memory (content, memory_type, importance, created_at) VALUES "{memory_id}": ("{content_escaped}", "{memory_type}", {importance}, {timestamp})'
+
+            result = session.execute(insert_memory)
+            if not result.is_succeeded():
+                logger.error(f"插入记忆节点失败: {result.error_msg()}")
+                return False
+
+            # 创建关系 (TIMESTAMP 使用整数时间戳)
+            link_query = f'INSERT EDGE IF NOT EXISTS remembers (created_at) VALUES "{character_id}"->"{memory_id}": ({timestamp})'
+
+            result = session.execute(link_query)
+            if not result.is_succeeded():
+                logger.error(f"创建记忆关系失败: {result.error_msg()}")
+                return False
+            return True
 
     async def get_memories(
         self,
@@ -982,27 +1032,28 @@ class NebulaGraphDatabase:
         Returns:
             List: 记忆列表
         """
-        query = f"""
-        GO FROM "{character_id}" OVER remembers
-        WHERE $$.memory.importance >= {min_importance}
-        YIELD $$.memory.content AS content, $$.memory.memory_type AS type,
-              $$.memory.importance AS importance
-        LIMIT {limit}
-        """
+        await self.connect()
+        with self._get_session() as session:
+            # 确保使用正确的空间
+            session.execute(f"USE {self.space_name}")
 
-        result = self._session_pool.execute(query)
-        if not result.is_succeeded():
-            return []
+            query = f'GO FROM "{character_id}" OVER remembers WHERE $$.memory.importance >= {min_importance} YIELD $$.memory.content AS content, $$.memory.memory_type AS type, $$.memory.importance AS importance | LIMIT {limit}'
 
-        memories = []
-        for row in result.data.rows():
-            memories.append({
-                "content": str(row.values[0]),
-                "type": str(row.values[1]),
-                "importance": float(row.values[2]) if row.values[2].is_double() else 0.0,
-            })
+            result = session.execute(query)
+            if not result.is_succeeded():
+                logger.error(f"获取记忆失败: {result.error_msg()}")
+                return []
 
-        return memories
+            memories = []
+            for i in range(result.row_size()):
+                row_values = result.row_values(i)
+                memories.append({
+                    "content": str(row_values[0]),
+                    "type": str(row_values[1]),
+                    "importance": float(row_values[2].as_double()) if len(row_values) > 2 and row_values[2].is_double() else 0.0,
+                })
+
+            return memories
 
     # ==================== 伏笔追踪相关操作 ====================
 
@@ -1021,8 +1072,10 @@ class NebulaGraphDatabase:
         VALUES "{hook_id}": ("{title}", "{hook_type}", "planted", {priority}, "{now}")
         """
 
-        result = self._session_pool.execute(query)
-        return result.is_succeeded()
+        with self._get_session() as session:
+            session.execute(f"USE {self.space_name}")
+            result = session.execute(query)
+            return result.is_succeeded()
 
     async def link_hook_to_character(
         self, hook_id: str, character_id: str, role: str = "involved"
@@ -1033,8 +1086,10 @@ class NebulaGraphDatabase:
         VALUES "{hook_id}" -> "{character_id}": ("{role}")
         """
 
-        result = self._session_pool.execute(query)
-        return result.is_succeeded()
+        with self._get_session() as session:
+            session.execute(f"USE {self.space_name}")
+            result = session.execute(query)
+            return result.is_succeeded()
 
     async def link_hook_to_location(
         self, hook_id: str, region_id: str, context: str = ""
@@ -1045,8 +1100,10 @@ class NebulaGraphDatabase:
         VALUES "{hook_id}" -> "{region_id}": ("{context}")
         """
 
-        result = self._session_pool.execute(query)
-        return result.is_succeeded()
+        with self._get_session() as session:
+            session.execute(f"USE {self.space_name}")
+            result = session.execute(query)
+            return result.is_succeeded()
 
     async def get_hook_connections(self, hook_id: str) -> Dict[str, List[str]]:
         """获取伏笔的所有关联"""
@@ -1055,20 +1112,22 @@ class NebulaGraphDatabase:
         YIELD step, type AS edge_type, dstid AS destination
         """
 
-        result = self._session_pool.execute(query)
-        if not result.is_succeeded():
-            return {"characters": [], "locations": []}
+        with self._get_session() as session:
+            session.execute(f"USE {self.space_name}")
+            result = session.execute(query)
+            if not result.is_succeeded():
+                return {"characters": [], "locations": []}
 
-        connections = {"characters": [], "locations": []}
-        for row in result.data.rows():
-            edge_type = str(row.values[1])
-            dest = str(row.values[2])
-            if edge_type == "involves_character":
-                connections["characters"].append(dest)
-            elif edge_type == "involves_location":
-                connections["locations"].append(dest)
+            connections = {"characters": [], "locations": []}
+            for row in result.data.rows():
+                edge_type = str(row.values[1])
+                dest = str(row.values[2])
+                if edge_type == "involves_character":
+                    connections["characters"].append(dest)
+                elif edge_type == "involves_location":
+                    connections["locations"].append(dest)
 
-        return connections
+            return connections
 
     # ==================== 工具方法 ====================
 
@@ -1092,12 +1151,14 @@ class NebulaGraphDatabase:
         Returns:
             Dict: 查询结果
         """
-        result = self._session_pool.execute(query_string)
-        return {
-            "success": result.is_succeeded(),
-            "error": result.error_msg() if not result.is_succeeded() else None,
-            "data": self._parse_result(result.data) if result.is_succeeded() else None,
-        }
+        with self._get_session() as session:
+            session.execute(f"USE {self.space_name}")
+            result = session.execute(query_string)
+            return {
+                "success": result.is_succeeded(),
+                "error": result.error_msg() if not result.is_succeeded() else None,
+                "data": self._parse_result(result.data) if result.is_succeeded() else None,
+            }
 
     def _parse_result(self, data) -> List[Dict[str, Any]]:
         """解析查询结果"""

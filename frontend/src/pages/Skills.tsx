@@ -298,11 +298,11 @@ export default function Skills() {
             <Card className="h-[calc(100vh-200px)] overflow-y-auto">
               <div className={`p-4 border-b sticky top-0 ${isDark ? 'bg-gray-900 border-gray-700' : 'bg-white border-gray-200'}`}>
                 <h3 className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>
-                  Skill 列表 ({skills.length})
+                  Skill 列表 ({(skills || []).length})
                 </h3>
               </div>
               <div className="divide-y">
-                {skills.length === 0 ? (
+                {(!skills || skills.length === 0) ? (
                   <div className={`p-8 text-center ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>暂无 Skill</div>
                 ) : (
                   skills.map(skill => (

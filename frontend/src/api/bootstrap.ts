@@ -66,10 +66,11 @@ export async function getBootstrapStatus(sessionId: string): Promise<BootstrapSt
   return client.get(`/bootstrap/${sessionId}/status`)
 }
 
-export async function sendBootstrapMessage(sessionId: string, message: string): Promise<any> {
+export async function sendBootstrapMessage(sessionId: string, message: string, projectId?: string): Promise<any> {
   return client.post('/bootstrap/message', {
     session_id: sessionId,
     message,
+    project_id: projectId,
   })
 }
 

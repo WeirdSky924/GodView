@@ -286,9 +286,16 @@ class TimeSystem:
     def _get_season(self) -> Season:
         """获取季节"""
         month = self.current_time.month
+        # 使用英文键名映射到枚举
+        season_map = {
+            "spring": Season.SPRING,
+            "summer": Season.SUMMER,
+            "autumn": Season.AUTUMN,
+            "winter": Season.WINTER,
+        }
         for season_name, config in self.seasons_config.items():
             if month in config["months"]:
-                return Season[config["name"].upper()]
+                return season_map.get(season_name.lower(), Season.SPRING)
         return Season.SPRING  # 默认返回春天
 
     def get_formatted_time(self) -> str:

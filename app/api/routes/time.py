@@ -252,7 +252,7 @@ async def time_jump(request: TimeJumpRequest):
         if request.jump_type == "forward":
             if request.delta_minutes is None:
                 raise HTTPException(status_code=400, detail="缺少 delta_minutes 参数")
-            jump_result = time_system.jump_forward(delta_time=request.delta_minutes)
+            jump_result = time_system.jump_forward(timedelta(minutes=request.delta_minutes))
             result = {
                 "action": "forward_jump",
                 "delta_minutes": request.delta_minutes,

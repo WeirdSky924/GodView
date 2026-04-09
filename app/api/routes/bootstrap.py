@@ -155,6 +155,7 @@ async def send_message(request: SendMessageRequest):
         response = await agent.process_message(
             session_id=request.session_id,
             message=request.message,
+            project_id=request.project_id,
         )
         return {
             "success": True,

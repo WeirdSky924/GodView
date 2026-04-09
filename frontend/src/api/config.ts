@@ -73,64 +73,73 @@ export interface DownloadProgress {
   model: string
 }
 
+// Note: api interceptor already returns response.data, so we don't need .data here
 export async function getEmbeddingProviders(): Promise<EmbeddingProviderInfo[]> {
-  const response = await api.get<EmbeddingProviderInfo[]>('/config/embedding/providers')
-  return response.data
+  return await api.get<EmbeddingProviderInfo[]>('/config/embedding/providers')
 }
 
 export async function getEmbeddingConfig(): Promise<EmbeddingConfig & { dimension: number }> {
-  const response = await api.get<EmbeddingConfig & { dimension: number }>('/config/embedding')
-  return response.data
+  return await api.get<EmbeddingConfig & { dimension: number }>('/config/embedding')
 }
 
 export async function getEmbeddingProviderConfig(provider: string): Promise<EmbeddingConfig & { dimension?: number }> {
-  const response = await api.get<EmbeddingConfig & { dimension?: number }>(`/config/embedding/${provider}`)
-  return response.data
+  return await api.get<EmbeddingConfig & { dimension?: number }>(`/config/embedding/${provider}`)
 }
 
 export async function updateEmbeddingConfig(config: EmbeddingConfig): Promise<ConfigResult> {
-  const response = await api.put<ConfigResult>('/config/embedding', config)
-  return response.data
+  return await api.put<ConfigResult>('/config/embedding', config)
 }
 
 export async function testEmbeddingConfig(config?: Partial<EmbeddingConfig>): Promise<ConfigResult> {
-  const response = await api.post<ConfigResult>('/config/embedding/test', config || {})
-  return response.data
+  return await api.post<ConfigResult>('/config/embedding/test', config || {})
 }
 
 export async function getEmbeddingDownloadProgress(): Promise<DownloadProgress> {
-  const response = await api.get<DownloadProgress>('/config/embedding/download-progress')
-  return response.data
+  return await api.get<DownloadProgress>('/config/embedding/download-progress')
+}
+
+export interface CacheStatus {
+  provider: string
+  model: string
+  is_cached: boolean | null
+  dimension?: number
+  message: string
+}
+
+export async function getEmbeddingCacheStatus(
+  provider: string,
+  model?: string,
+  cacheFolder?: string
+): Promise<CacheStatus> {
+  const params = new URLSearchParams()
+  params.append('provider', provider)
+  if (model) params.append('model', model)
+  if (cacheFolder) params.append('cache_folder', cacheFolder)
+  return await api.get<CacheStatus>(`/config/embedding/cache-status?${params.toString()}`)
 }
 
 export async function getLLMProviders(): Promise<LLMProviderInfo[]> {
-  const response = await api.get<LLMProviderInfo[]>('/config/llm/providers')
-  return response.data
+  return await api.get<LLMProviderInfo[]>('/config/llm/providers')
 }
 
 export async function getLLMConfig(): Promise<LLMConfig> {
-  const response = await api.get<LLMConfig>('/config/llm')
-  return response.data
+  return await api.get<LLMConfig>('/config/llm')
 }
 
 export async function getLLMProviderConfig(provider: string): Promise<LLMConfig> {
-  const response = await api.get<LLMConfig>(`/config/llm/${provider}`)
-  return response.data
+  return await api.get<LLMConfig>(`/config/llm/${provider}`)
 }
 
 export async function updateLLMConfig(config: LLMConfig): Promise<ConfigResult> {
-  const response = await api.put<ConfigResult>('/config/llm', config)
-  return response.data
+  return await api.put<ConfigResult>('/config/llm', config)
 }
 
 export async function testLLMConfig(config?: Partial<LLMConfig>): Promise<ConfigResult> {
-  const response = await api.post<ConfigResult>('/config/llm/test', config || {})
-  return response.data
+  return await api.post<ConfigResult>('/config/llm/test', config || {})
 }
 
 export async function getProviderModels(providerId: string): Promise<ProviderModelsResponse> {
-  const response = await api.get<ProviderModelsResponse>(`/config/llm/providers/${providerId}/models`)
-  return response.data
+  return await api.get<ProviderModelsResponse>(`/config/llm/providers/${providerId}/models`)
 }
 
 export interface DatabaseStatus {
@@ -151,6 +160,5 @@ export interface DatabaseStatusResponse {
 }
 
 export async function getDatabaseStatus(): Promise<DatabaseStatusResponse> {
-  const response = await api.get<DatabaseStatusResponse>('/config/database/status')
-  return response.data
+  return await api.get<DatabaseStatusResponse>('/config/database/status')
 }

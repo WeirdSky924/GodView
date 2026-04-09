@@ -225,7 +225,7 @@ class TokenTracker:
                     month_cost += cost
 
             return ProjectTokenStats(
-                project_id=project_id,
+                project_id=str(project_id),  # 确保转换为字符串
                 project_name=project.get("name", ""),
                 total_tokens=project.get("total_tokens", 0) or 0,
                 total_cost=float(project.get("total_cost", 0) or 0),

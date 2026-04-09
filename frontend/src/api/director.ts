@@ -30,18 +30,15 @@ export interface DirectorRuntimeState {
 }
 
 export async function getWorkflowGraph(sessionId: string) {
-  const response = await api.get<WorkflowGraph>(`/ws/workflow/${sessionId}`)
-  return response.data
+  return await api.get<WorkflowGraph>(`/ws/workflow/${sessionId}`)
 }
 
 export async function getDirectorState(sessionId: string) {
-  const response = await api.get<{ success: boolean; data: DirectorRuntimeState }>(`/ws/snapshots/${sessionId}`)
-  return response.data
+  return await api.get<{ success: boolean; data: DirectorRuntimeState }>(`/ws/snapshots/${sessionId}`)
 }
 
 export async function getSnapshotTree(worldId: string) {
-  const response = await api.get<{ success: boolean; data: SnapshotTreeNode[] }>(`/plots/snapshots/tree`, {
+  return await api.get<{ success: boolean; data: SnapshotTreeNode[] }>(`/plots/snapshots/tree`, {
     params: { world_id: worldId },
   })
-  return response.data
 }

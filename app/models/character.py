@@ -38,7 +38,7 @@ class PersonalityTrait(BaseModel):
 class Character(BaseModel):
     """角色模型"""
 
-    id: str = Field(..., description="角色唯一 ID")
+    id: Optional[str] = Field(None, description="角色唯一 ID（创建时自动生成）")
     name: str = Field(..., description="角色名称")
 
     # 项目归属

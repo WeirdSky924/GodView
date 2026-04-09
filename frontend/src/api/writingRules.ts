@@ -3,9 +3,9 @@
  * 写作规则管理接口
  */
 
-import axios from 'axios'
+import { api } from './client'
 
-const API_BASE = '/api'
+const API_BASE = ''
 
 // ==================== 类型定义 ====================
 
@@ -115,40 +115,35 @@ export async function getWritingRules(
   params.append('limit', String(limit))
   params.append('offset', String(offset))
 
-  const response = await axios.get(`${API_BASE}/writing-rules?${params.toString()}`)
-  return response.data
+  return await api.get(`${API_BASE}/writing-rules?${params.toString()}`)
 }
 
 /**
  * 创建写作规则
  */
 export async function createWritingRule(dto: CreateWritingRuleDTO): Promise<{ success: boolean; message: string; rule: WritingRule }> {
-  const response = await axios.post(`${API_BASE}/writing-rules`, dto)
-  return response.data
+  return await api.post(`${API_BASE}/writing-rules`, dto)
 }
 
 /**
  * 获取写作规则详情
  */
 export async function getWritingRule(ruleId: string): Promise<WritingRule> {
-  const response = await axios.get(`${API_BASE}/writing-rules/${ruleId}`)
-  return response.data
+  return await api.get(`${API_BASE}/writing-rules/${ruleId}`)
 }
 
 /**
  * 更新写作规则
  */
 export async function updateWritingRule(ruleId: string, dto: UpdateWritingRuleDTO): Promise<{ success: boolean; message: string }> {
-  const response = await axios.put(`${API_BASE}/writing-rules/${ruleId}`, dto)
-  return response.data
+  return await api.put(`${API_BASE}/writing-rules/${ruleId}`, dto)
 }
 
 /**
  * 删除写作规则
  */
 export async function deleteWritingRule(ruleId: string): Promise<{ success: boolean; message: string }> {
-  const response = await axios.delete(`${API_BASE}/writing-rules/${ruleId}`)
-  return response.data
+  return await api.delete(`${API_BASE}/writing-rules/${ruleId}`)
 }
 
 /**
@@ -170,24 +165,21 @@ export async function getWritingRuleSets(
   params.append('limit', String(limit))
   params.append('offset', String(offset))
 
-  const response = await axios.get(`${API_BASE}/writing-rule-sets?${params.toString()}`)
-  return response.data
+  return await api.get(`${API_BASE}/writing-rule-sets?${params.toString()}`)
 }
 
 /**
  * 创建写作规则集
  */
 export async function createWritingRuleSet(dto: CreateWritingRuleSetDTO): Promise<{ success: boolean; message: string; rule_set: WritingRuleSet }> {
-  const response = await axios.post(`${API_BASE}/writing-rule-sets`, dto)
-  return response.data
+  return await api.post(`${API_BASE}/writing-rule-sets`, dto)
 }
 
 /**
  * 获取项目写作配置
  */
 export async function getProjectWritingConfig(projectId: string): Promise<ProjectWritingConfig> {
-  const response = await axios.get(`${API_BASE}/projects/${projectId}/writing-config`)
-  return response.data
+  return await api.get(`${API_BASE}/projects/${projectId}/writing-config`)
 }
 
 /**
@@ -197,8 +189,7 @@ export async function updateProjectWritingConfig(
   projectId: string,
   dto: UpdateProjectWritingConfigDTO
 ): Promise<{ success: boolean; message: string }> {
-  const response = await axios.put(`${API_BASE}/projects/${projectId}/writing-config`, dto)
-  return response.data
+  return await api.put(`${API_BASE}/projects/${projectId}/writing-config`, dto)
 }
 
 /**
@@ -208,6 +199,5 @@ export async function previewWritingPrompt(
   projectId: string,
   context?: Record<string, any>
 ): Promise<PreviewResult> {
-  const response = await axios.post(`${API_BASE}/projects/${projectId}/writing-config/preview`, context)
-  return response.data
+  return await api.post(`${API_BASE}/projects/${projectId}/writing-config/preview`, context)
 }

@@ -160,6 +160,55 @@ class SentenceTransformersEmbeddingService(EmbeddingService):
     }
 
     @staticmethod
+    def is_model_cached(model_name: str, cache_folder: Optional[str] = None) -> bool:
+        """检查模型是否已在本地缓存
+
+        Args:
+            model_name: 模型名称
+            cache_folder: 模型缓存路径（可选）
+
+        Returns:
+            bool: 模型是否已缓存
+        """
+        import os
+
+        cache_paths = []
+        if cache_folder:
+            cache_paths.append(cache_folder)
+
+        default_cache = os.path.expanduser("~/.cache/huggingface/hub")
+        cache_paths.append(default_cache)
+
+        for cache_path in cache_paths:
+            model_dir_patterns = [
+                os.path.join(cache_path, f"models--sentence-transformers--{model_name}"),
+                os.path.join(cache_path, f"models--{model_name.replace('/', '--')}"),
+                os.path.join(cache_path, model_name),
+            ]
+
+            for model_dir in model_dir_patterns:
+                if os.path.exists(model_dir):
+                    # 检查是否有必要的模型文件
+                    # 至少要有 config.json 或者 pytorch_model.bin / model.safetensors
+                    config_path = os.path.join(model_dir, "config.json")
+                    has_model_file = any(
+                        os.path.exists(os.path.join(model_dir, f))
+                        for f in ["pytorch_model.bin", "model.safetensors", "pytorch_model.bin.index"]
+                    ) or os.path.exists(os.path.join(model_dir, "snapshots"))
+
+                    if os.path.exists(config_path) or has_model_file:
+                        return True
+
+                    # 检查 snapshots 目录（HuggingFace Hub 格式）
+                    snapshots_dir = os.path.join(model_dir, "snapshots")
+                    if os.path.exists(snapshots_dir):
+                        snapshots = os.listdir(snapshots_dir)
+                        if snapshots:
+                            return True
+
+        return False
+
+    @staticmethod
     def get_known_dimension(model_name: str, cache_folder: Optional[str] = None) -> Optional[int]:
         """静态方法：快速获取维度（无需实例化服务，无需加载模型）
 
@@ -229,6 +278,7 @@ class SentenceTransformersEmbeddingService(EmbeddingService):
         self.cache_folder = cache_folder  # 自定义模型存储路径
         self._model = None
         self._dimension = None
+        self._is_cached = None  # 缓存检查结果
 
     def _get_dimension_from_config(self) -> Optional[int]:
         """方法二：从配置文件读取维度（轻量级，无需加载模型）"""
@@ -299,46 +349,45 @@ class SentenceTransformersEmbeddingService(EmbeddingService):
         if self._model is None:
             try:
                 from sentence_transformers import SentenceTransformer
-                from huggingface_hub import snapshot_download
+                import os
 
-                set_download_progress("downloading", 0, "检查模型...", self.model_name)
-
-                # 检查模型是否已缓存
-                cache_path = None
+                # 设置 HuggingFace 缓存环境变量，避免网络请求
                 if self.cache_folder:
-                    import os
                     os.makedirs(self.cache_folder, exist_ok=True)
-                    cache_path = self.cache_folder
+                    os.environ['HF_HOME'] = self.cache_folder
+                    os.environ['TRANSFORMERS_CACHE'] = self.cache_folder
+                    os.environ['HF_HUB_CACHE'] = self.cache_folder
 
-                # 自定义下载回调
-                class ProgressCallback:
-                    def __init__(self, parent):
-                        self.parent = parent
-                        self.current_file = ""
+                # 先检查模型是否已在本地缓存
+                is_cached = self.is_model_cached(self.model_name, self.cache_folder)
 
-                    def on_download_start(self, file_name):
-                        self.current_file = file_name
-                        set_download_progress("downloading", 5, f"开始下载: {file_name}", self.parent.model_name)
-
-                    def on_download_progress(self, file_name, progress, total):
-                        percent = int(progress / total * 100) if total > 0 else 50
-                        set_download_progress("downloading", percent, f"下载: {file_name} ({percent}%)", self.parent.model_name)
-
-                    def on_download_end(self, file_name):
-                        set_download_progress("downloading", 90, f"完成: {file_name}", self.parent.model_name)
-
-                progress = ProgressCallback(self)
+                if is_cached:
+                    # 模型已缓存，直接加载，不触发下载进度
+                    logger.info(f"模型 '{self.model_name}' 已在本地缓存，直接加载")
+                    set_download_progress("completed", 100, f"模型已缓存，正在加载...", self.model_name)
+                else:
+                    # 模型未缓存，显示下载进度
+                    logger.info(f"模型 '{self.model_name}' 未缓存，开始下载")
+                    set_download_progress("downloading", 0, "检查模型...", self.model_name)
 
                 # 加载模型
-                set_download_progress("downloading", 10, "加载模型...", self.model_name)
+                if not is_cached:
+                    set_download_progress("downloading", 10, "加载模型...", self.model_name)
 
-                if cache_path:
+                # 构建模型名称（sentence-transformers 格式）
+                model_id = f"sentence-transformers/{self.model_name}" if "/" not in self.model_name else self.model_name
+
+                if self.cache_folder:
                     self._model = SentenceTransformer(
-                        self.model_name,
-                        cache_folder=cache_path
+                        model_id,
+                        cache_folder=self.cache_folder,
+                        local_files_only=is_cached  # 仅在已缓存时禁用网络请求
                     )
                 else:
-                    self._model = SentenceTransformer(self.model_name)
+                    self._model = SentenceTransformer(
+                        model_id,
+                        local_files_only=is_cached
+                    )
 
                 self._dimension = self._model.get_sentence_embedding_dimension()
                 set_download_progress("completed", 100, f"模型加载完成，维度：{self._dimension}", self.model_name)
@@ -379,11 +428,18 @@ class SentenceTransformersEmbeddingService(EmbeddingService):
 
     async def test_connection(self) -> tuple[bool, str]:
         try:
+            # 先检查模型是否已缓存
+            is_cached = self.is_model_cached(self.model_name, self.cache_folder)
+
             # 测试模型是否能正常加载和运行
             model = self._get_model()
             embedding = model.encode("test")
             dimension = len(embedding)
-            return True, f"模型 '{self.model_name}' 加载成功（维度：{dimension}）"
+
+            if is_cached:
+                return True, f"模型 '{self.model_name}' 已缓存，加载成功（维度：{dimension}）"
+            else:
+                return True, f"模型 '{self.model_name}' 下载完成，加载成功（维度：{dimension}）"
         except Exception as e:
             return False, f"模型加载失败：{str(e)}"
 
@@ -406,7 +462,8 @@ class OllamaEmbeddingService(EmbeddingService):
 
     async def embed_texts(self, texts: List[str]) -> List[List[float]]:
         embeddings = []
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        # trust_env=False 避免 httpx 使用系统代理导致本地连接失败
+        async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
             for text in texts:
                 response = await client.post(
                     f"{self.base_url}/api/embeddings",
@@ -430,7 +487,8 @@ class OllamaEmbeddingService(EmbeddingService):
 
     async def test_connection(self) -> tuple[bool, str]:
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            # trust_env=False 避免 httpx 使用系统代理导致本地连接失败
+            async with httpx.AsyncClient(timeout=10.0, trust_env=False) as client:
                 response = await client.post(
                     f"{self.base_url}/api/embeddings",
                     json={"model": self.model, "prompt": "test"},

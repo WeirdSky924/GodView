@@ -3,9 +3,9 @@
  * 设定管理 Agent 接口
  */
 
-import axios from 'axios'
+import { api } from './client'
 
-const API_BASE = '/api/setting-agent'
+const API_BASE = '/setting-agent'
 
 // ==================== 类型定义 ====================
 
@@ -101,12 +101,11 @@ export async function chatWithSettingAgent(
   message: string,
   context?: Record<string, unknown>
 ): Promise<ChatResponse> {
-  const response = await axios.post(`${API_BASE}/chat`, {
+  return await api.post(`${API_BASE}/chat`, {
     project_id: projectId,
     message,
     context,
   })
-  return response.data
 }
 
 /**
@@ -119,14 +118,13 @@ export async function requestSettingChange(
   targetLoreId?: string,
   userIntent?: string
 ): Promise<SettingChangeResult> {
-  const response = await axios.post(`${API_BASE}/change`, {
+  return await api.post(`${API_BASE}/change`, {
     project_id: projectId,
     change_type: changeType,
     lore_data: loreData,
     target_lore_id: targetLoreId,
     user_intent: userIntent,
   })
-  return response.data
 }
 
 /**
@@ -137,12 +135,11 @@ export async function negotiateConflict(
   conflictId: string,
   userResponse: string
 ): Promise<NegotiateResult> {
-  const response = await axios.post(`${API_BASE}/negotiate`, {
+  return await api.post(`${API_BASE}/negotiate`, {
     project_id: projectId,
     conflict_id: conflictId,
     user_response: userResponse,
   })
-  return response.data
 }
 
 /**
@@ -153,20 +150,18 @@ export async function executeSettingChange(
   requestId: string,
   overrideConflicts: boolean = false
 ): Promise<ExecuteResult> {
-  const response = await axios.post(`${API_BASE}/execute`, {
+  return await api.post(`${API_BASE}/execute`, {
     project_id: projectId,
     request_id: requestId,
     override_conflicts: overrideConflicts,
   })
-  return response.data
 }
 
 /**
  * 获取设定摘要
  */
 export async function getLoreSummary(projectId: string): Promise<LoreSummary> {
-  const response = await axios.get(`${API_BASE}/${projectId}/summary`)
-  return response.data
+  return await api.get(`${API_BASE}/${projectId}/summary`)
 }
 
 /**
@@ -176,18 +171,16 @@ export async function getChatHistory(
   projectId: string,
   limit: number = 50
 ): Promise<ConversationHistory> {
-  const response = await axios.get(`${API_BASE}/${projectId}/history`, {
+  return await api.get(`${API_BASE}/${projectId}/history`, {
     params: { limit },
   })
-  return response.data
 }
 
 /**
  * 获取待处理冲突
  */
 export async function getPendingConflicts(projectId: string): Promise<PendingConflicts> {
-  const response = await axios.get(`${API_BASE}/${projectId}/conflicts`)
-  return response.data
+  return await api.get(`${API_BASE}/${projectId}/conflicts`)
 }
 
 /**
@@ -197,8 +190,7 @@ export async function createOrGetSession(
   projectId: string,
   mode: 'bootstrap' | 'management' | 'conflict_resolution' = 'management'
 ): Promise<{ success: boolean; session: Record<string, unknown> }> {
-  const response = await axios.post(`${API_BASE}/${projectId}/session`, null, {
+  return await api.post(`${API_BASE}/${projectId}/session`, null, {
     params: { mode },
   })
-  return response.data
 }

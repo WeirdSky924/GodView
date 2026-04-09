@@ -21,6 +21,27 @@ from sqlalchemy import text
 logger = logging.getLogger(__name__)
 
 
+def _prepare_json_params(data: Dict[str, Any], json_fields: List[str]) -> Dict[str, Any]:
+    """
+    将 Python 列表/字典转换为 JSON 字符串，用于 SQLAlchemy text 查询
+
+    Args:
+        data: 原始数据字典
+        json_fields: 需要转换的 JSON 字段名列表
+
+    Returns:
+        Dict: 处理后的数据字典
+    """
+    result = data.copy()
+    for field in json_fields:
+        if field in result and result[field] is not None:
+            value = result[field]
+            # 如果是列表或字典，转换为 JSON 字符串
+            if isinstance(value, (list, dict)):
+                result[field] = json.dumps(value)
+    return result
+
+
 class PostgresDatabase:
     """PostgreSQL 数据库操作类"""
 
@@ -86,7 +107,7 @@ class PostgresDatabase:
         self, query: str, params: Optional[Dict[str, Any]] = None
     ) -> List[Dict[str, Any]]:
         """
-        执行 SQL 查询
+        执行 SQL 查询（SELECT）
 
         Args:
             query: SQL 查询语句
@@ -99,6 +120,23 @@ class PostgresDatabase:
             result = await session.execute(text(query), params or {})
             columns = result.keys()
             return [dict(zip(columns, row)) for row in result.fetchall()]
+
+    async def execute_write(
+        self, query: str, params: Optional[Dict[str, Any]] = None
+    ) -> int:
+        """
+        执行 SQL 写操作（INSERT/UPDATE/DELETE）
+
+        Args:
+            query: SQL 语句
+            params: 参数
+
+        Returns:
+            int: 影响的行数
+        """
+        async with self.get_session() as session:
+            result = await session.execute(text(query), params or {})
+            return result.rowcount
 
     async def execute_many(
         self, query: str, params_list: List[Dict[str, Any]]
@@ -129,15 +167,34 @@ class PostgresDatabase:
         Returns:
             str: 角色 ID
         """
+        from datetime import datetime
+
+        # 处理 JSON 字段
+        params = _prepare_json_params(character_data, [
+            'personality_traits', 'lexicon', 'voice_samples', 'attributes', 'goals', 'inventory'
+        ])
+
+        # 处理可选的 UUID 字段
+        if params.get('world_id') is None:
+            params['world_id'] = None
+
+        # 确保 datetime 字段是 datetime 对象
+        for field in ['created_at', 'updated_at']:
+            if field in params and isinstance(params[field], str):
+                try:
+                    params[field] = datetime.fromisoformat(params[field].replace('Z', '+00:00'))
+                except:
+                    params[field] = datetime.now()
+            elif field not in params or params[field] is None:
+                params[field] = datetime.now()
+
         query = """
         INSERT INTO characters (id, name, project_id, world_id, description, role, status, appearance, age, gender,
                                 personality_traits, background_story, speech_pattern, lexicon,
-                                forbidden_words, voice_samples, attributes, goals, inventory,
-                                current_location, created_at, updated_at)
-        VALUES (:id, :name, :project_id, :world_id, :description, :role, :status, :appearance, :age, :gender,
+                                forbidden_words, voice_samples, attributes, goals, inventory, current_location)
+        VALUES (CAST(:id AS UUID), :name, CAST(:project_id AS UUID), :world_id, :description, :role, :status, :appearance, :age, :gender,
                 :personality_traits, :background_story, :speech_pattern, :lexicon,
-                :forbidden_words, :voice_samples, :attributes, :goals, :inventory,
-                :current_location, :created_at, :updated_at)
+                :forbidden_words, :voice_samples, :attributes, :goals, :inventory, :current_location)
         ON CONFLICT (id) DO UPDATE SET
             name = EXCLUDED.name,
             project_id = EXCLUDED.project_id,
@@ -158,9 +215,9 @@ class PostgresDatabase:
             goals = EXCLUDED.goals,
             inventory = EXCLUDED.inventory,
             current_location = EXCLUDED.current_location,
-            updated_at = EXCLUDED.updated_at
+            updated_at = CURRENT_TIMESTAMP
         """
-        await self.execute_query(query, character_data)
+        await self.execute_write(query, params)
         return character_data.get("id", "")
 
     async def get_character(self, character_id: str) -> Optional[Dict[str, Any]]:
@@ -180,7 +237,6 @@ class PostgresDatabase:
     async def get_all_characters(
         self,
         project_id: Optional[str] = None,
-        status: Optional[str] = None,
         role: Optional[str] = None,
         limit: int = 100,
     ) -> List[Dict[str, Any]]:
@@ -189,7 +245,6 @@ class PostgresDatabase:
 
         Args:
             project_id: 项目 ID 过滤
-            status: 状态过滤
             role: 角色类型过滤
             limit: 返回数量限制
 
@@ -200,11 +255,8 @@ class PostgresDatabase:
         params: Dict[str, Any] = {"limit": limit}
 
         if project_id:
-            conditions.append("project_id = :project_id")
+            conditions.append("project_id = CAST(:project_id AS UUID)")
             params["project_id"] = project_id
-        if status:
-            conditions.append("status = :status")
-            params["status"] = status
         if role:
             conditions.append("role = :role")
             params["role"] = role
@@ -216,8 +268,8 @@ class PostgresDatabase:
 
     async def delete_character(self, character_id: str) -> bool:
         """删除角色"""
-        query = "DELETE FROM characters WHERE id = :id"
-        await self.execute_query(query, {"id": character_id})
+        query = "DELETE FROM characters WHERE id = CAST(:id AS UUID)"
+        await self.execute_write(query, {"id": character_id})
         return True
 
     # ==================== 世界相关操作 ====================
@@ -226,22 +278,40 @@ class PostgresDatabase:
 
     async def save_project(self, project_data: Dict[str, Any]) -> str:
         """保存项目数据"""
+        import json
+
+        # 如果有 id，将其转换为 UUID
+        project_id = project_data.get("id")
+
+        # 处理 metadata，确保是 JSON 字符串
+        metadata = project_data.get("metadata") or {}
+        if isinstance(metadata, dict):
+            metadata = json.dumps(metadata)
+
+        params = {
+            "id": project_data.get("id"),
+            "name": project_data.get("name"),
+            "description": project_data.get("description"),
+            "user_id": project_data.get("user_id"),
+            "status": project_data.get("status", "draft"),
+            "world_id": project_data.get("world_id"),
+            "metadata": metadata
+        }
+
         query = """
-        INSERT INTO projects (id, name, description, user_id, status, world_id,
-                             created_at, updated_at, metadata)
-        VALUES (:id, :name, :description, :user_id, :status, :world_id,
-                :created_at, :updated_at, :metadata)
+        INSERT INTO projects (id, name, description, user_id, status, world_id, metadata)
+        VALUES (CAST(:id AS UUID), :name, :description, :user_id, :status, :world_id, CAST(:metadata AS jsonb))
         ON CONFLICT (id) DO UPDATE SET
             name = EXCLUDED.name,
             description = EXCLUDED.description,
             user_id = EXCLUDED.user_id,
             status = EXCLUDED.status,
             world_id = EXCLUDED.world_id,
-            updated_at = EXCLUDED.updated_at,
+            updated_at = CURRENT_TIMESTAMP,
             metadata = EXCLUDED.metadata
         """
-        await self.execute_query(query, project_data)
-        return project_data.get("id", "")
+        await self.execute_write(query, params)
+        return project_id or ""
 
     async def get_project(self, project_id: str) -> Optional[Dict[str, Any]]:
         """获取项目数据"""
@@ -265,14 +335,14 @@ class PostgresDatabase:
         # 添加更新时间
         set_clauses.append("updated_at = CURRENT_TIMESTAMP")
 
-        query = f"UPDATE projects SET {', '.join(set_clauses)} WHERE id = :id"
-        await self.execute_query(query, params)
+        query = f"UPDATE projects SET {', '.join(set_clauses)} WHERE id = CAST(:id AS UUID)"
+        await self.execute_write(query, params)
         return True
 
     async def delete_project(self, project_id: str) -> bool:
         """删除项目"""
-        query = "DELETE FROM projects WHERE id = :id"
-        await self.execute_query(query, {"id": project_id})
+        query = "DELETE FROM projects WHERE id = CAST(:id AS UUID)"
+        await self.execute_write(query, {"id": project_id})
         return True
 
     async def get_all_projects(
@@ -298,8 +368,8 @@ class PostgresDatabase:
         if status:
             query = """
             SELECT p.*,
-                   (SELECT COUNT(*) FROM characters c WHERE c.created_by = p.id) as character_count,
-                   (SELECT COUNT(*) FROM chapters c WHERE c.world_id = p.world_id) as chapter_count
+                   (SELECT COUNT(*) FROM characters c WHERE c.project_id = p.id) as character_count,
+                   (SELECT COUNT(*) FROM chapters ch WHERE ch.project_id = p.id) as chapter_count
             FROM projects p
             WHERE p.status = :status
             ORDER BY p.created_at DESC
@@ -309,8 +379,8 @@ class PostgresDatabase:
         else:
             query = """
             SELECT p.*,
-                   (SELECT COUNT(*) FROM characters c WHERE c.created_by = p.id) as character_count,
-                   (SELECT COUNT(*) FROM chapters c WHERE c.world_id = p.world_id) as chapter_count
+                   (SELECT COUNT(*) FROM characters c WHERE c.project_id = p.id) as character_count,
+                   (SELECT COUNT(*) FROM chapters ch WHERE ch.project_id = p.id) as chapter_count
             FROM projects p
             ORDER BY p.created_at DESC
             LIMIT :limit
@@ -321,16 +391,31 @@ class PostgresDatabase:
         """获取项目摘要信息"""
         query = """
         SELECT p.*,
-               (SELECT COUNT(*) FROM characters c WHERE c.created_by = p.id) as character_count,
-               (SELECT COUNT(*) FROM chapters c WHERE c.world_id = p.world_id) as chapter_count
+               (SELECT COUNT(*) FROM characters c WHERE c.project_id = p.id) as character_count,
+               (SELECT COUNT(*) FROM chapters ch WHERE ch.project_id = p.id) as chapter_count
         FROM projects p
-        WHERE p.id = :id
+        WHERE p.id = CAST(:id AS UUID)
         """
         results = await self.execute_query(query, {"id": project_id})
         return results[0] if results else None
 
     async def save_world(self, world_data: Dict[str, Any]) -> str:
         """保存世界数据"""
+        from datetime import datetime
+
+        # 处理 JSON 字段
+        params = _prepare_json_params(world_data, ['rules', 'factions'])
+
+        # 确保 datetime 字段是 datetime 对象
+        for field in ['created_at', 'updated_at']:
+            if field in params and isinstance(params[field], str):
+                try:
+                    params[field] = datetime.fromisoformat(params[field].replace('Z', '+00:00'))
+                except:
+                    params[field] = datetime.now()
+            elif field not in params or params[field] is None:
+                params[field] = datetime.now()
+
         query = """
         INSERT INTO worlds (id, name, project_id, description, world_type, tone, rules, power_system,
                            technology_level, history, geography, factions, created_at, updated_at)
@@ -350,19 +435,19 @@ class PostgresDatabase:
             factions = EXCLUDED.factions,
             updated_at = EXCLUDED.updated_at
         """
-        await self.execute_query(query, world_data)
+        await self.execute_write(query, params)
         return world_data.get("id", "")
 
     async def get_world(self, world_id: str) -> Optional[Dict[str, Any]]:
         """获取世界数据"""
-        query = "SELECT * FROM worlds WHERE id = :id"
+        query = "SELECT * FROM worlds WHERE id = CAST(:id AS UUID)"
         results = await self.execute_query(query, {"id": world_id})
         return results[0] if results else None
 
     async def delete_world(self, world_id: str) -> bool:
         """删除世界"""
-        query = "DELETE FROM worlds WHERE id = :id"
-        await self.execute_query(query, {"id": world_id})
+        query = "DELETE FROM worlds WHERE id = CAST(:id AS UUID)"
+        await self.execute_write(query, {"id": world_id})
         return True
 
     async def get_all_worlds(
@@ -391,6 +476,34 @@ class PostgresDatabase:
 
     async def save_region(self, region_data: Dict[str, Any]) -> str:
         """保存区域数据"""
+        import json
+        from datetime import datetime
+
+        # 确保必要字段有默认值
+        logger = logging.getLogger(__name__)
+        logger.info(f"save_region input keys: {list(region_data.keys())}")
+        if region_data.get("area_size") is None:
+            region_data["area_size"] = 0.0
+        if region_data.get("atmosphere") is None:
+            region_data["atmosphere"] = ""
+        logger.info(f"save_region after fix: area_size={region_data.get('area_size')}")
+
+        # 确保 JSONB 字段被正确序列化
+        json_fields = ['coordinates', 'terrain_features', 'landmarks', 'encounters', 'connections', 'local_rules']
+        for field in json_fields:
+            if field in region_data and region_data[field] is not None:
+                if isinstance(region_data[field], (list, dict)):
+                    region_data[field] = json.dumps(region_data[field])
+
+        # 确保 datetime 字段是 datetime 对象
+        datetime_fields = ['created_at', 'updated_at']
+        for field in datetime_fields:
+            if field in region_data and isinstance(region_data[field], str):
+                try:
+                    region_data[field] = datetime.fromisoformat(region_data[field].replace('Z', '+00:00'))
+                except:
+                    region_data[field] = datetime.utcnow()
+
         query = """
         INSERT INTO regions (id, name, world_id, region_type, terrain_type, description,
                             atmosphere, coordinates, area_size, terrain_features, landmarks,
@@ -408,6 +521,7 @@ class PostgresDatabase:
             description = EXCLUDED.description,
             atmosphere = EXCLUDED.atmosphere,
             coordinates = EXCLUDED.coordinates,
+            area_size = EXCLUDED.area_size,
             terrain_features = EXCLUDED.terrain_features,
             landmarks = EXCLUDED.landmarks,
             encounters = EXCLUDED.encounters,
@@ -417,30 +531,46 @@ class PostgresDatabase:
             visit_count = EXCLUDED.visit_count,
             updated_at = EXCLUDED.updated_at
         """
-        await self.execute_query(query, region_data)
+        await self.execute_write(query, region_data)
         return region_data.get("id", "")
 
     async def get_region(self, region_id: str) -> Optional[Dict[str, Any]]:
         """获取区域数据"""
-        query = "SELECT * FROM regions WHERE id = :id"
+        query = "SELECT * FROM regions WHERE id = CAST(:id AS UUID)"
         results = await self.execute_query(query, {"id": region_id})
         return results[0] if results else None
 
     async def get_regions_by_world(self, world_id: str) -> List[Dict[str, Any]]:
         """获取世界的所有区域"""
-        query = "SELECT * FROM regions WHERE world_id = :world_id"
+        query = "SELECT * FROM regions WHERE world_id = CAST(:world_id AS UUID)"
         return await self.execute_query(query, {"world_id": world_id})
 
     # ==================== 伏笔相关操作 ====================
 
     async def save_hook(self, hook_data: Dict[str, Any]) -> str:
         """保存伏笔数据"""
+        # 处理可选字段，设置默认值
+        params = hook_data.copy()
+        for field in ['world_id', 'plant_chapter', 'resolution_chapter']:
+            if params.get(field) is None:
+                params[field] = None
+
+        # 确保 datetime 字段是 datetime 对象
+        for field in ['created_at', 'resolved_at']:
+            if field in params and isinstance(params[field], str):
+                try:
+                    params[field] = datetime.fromisoformat(params[field].replace('Z', '+00:00'))
+                except:
+                    params[field] = datetime.now()
+            elif field == 'created_at' and (field not in params or params[field] is None):
+                params[field] = datetime.now()
+
         query = """
         INSERT INTO hooks (id, title, project_id, world_id, description, hook_type, status, related_characters,
                           related_locations, related_objects, plant_context, plant_chapter,
                           resolution_hint, resolution_context, resolution_chapter, priority,
                           created_at, resolved_at)
-        VALUES (:id, :title, :project_id, :world_id, :description, :hook_type, :status, :related_characters,
+        VALUES (:id, :title, CAST(:project_id AS UUID), :world_id, :description, :hook_type, :status, :related_characters,
                 :related_locations, :related_objects, :plant_context, :plant_chapter,
                 :resolution_hint, :resolution_context, :resolution_chapter, :priority,
                 :created_at, :resolved_at)
@@ -462,12 +592,12 @@ class PostgresDatabase:
             priority = EXCLUDED.priority,
             resolved_at = EXCLUDED.resolved_at
         """
-        await self.execute_query(query, hook_data)
+        await self.execute_write(query, params)
         return hook_data.get("id", "")
 
     async def get_hook(self, hook_id: str) -> Optional[Dict[str, Any]]:
         """获取伏笔数据"""
-        query = "SELECT * FROM hooks WHERE id = :id"
+        query = "SELECT * FROM hooks WHERE id = CAST(:id AS UUID)"
         results = await self.execute_query(query, {"id": hook_id})
         return results[0] if results else None
 
@@ -487,7 +617,7 @@ class PostgresDatabase:
             List: 伏笔列表
         """
         if project_id:
-            query = "SELECT * FROM hooks WHERE status = :status AND project_id = :project_id ORDER BY priority DESC"
+            query = "SELECT * FROM hooks WHERE status = :status AND project_id = CAST(:project_id AS UUID) ORDER BY priority DESC"
             return await self.execute_query(query, {"status": status, "project_id": project_id})
         else:
             query = "SELECT * FROM hooks WHERE status = :status ORDER BY priority DESC"
@@ -495,14 +625,14 @@ class PostgresDatabase:
 
     async def update_hook_status(self, hook_id: str, status: str) -> bool:
         """更新伏笔状态"""
-        query = "UPDATE hooks SET status = :status WHERE id = :id"
-        await self.execute_query(query, {"id": hook_id, "status": status})
+        query = "UPDATE hooks SET status = :status WHERE id = CAST(:id AS UUID)"
+        await self.execute_write(query, {"id": hook_id, "status": status})
         return True
 
     async def delete_hook(self, hook_id: str) -> bool:
         """删除伏笔"""
-        query = "DELETE FROM hooks WHERE id = :id"
-        await self.execute_query(query, {"id": hook_id})
+        query = "DELETE FROM hooks WHERE id = CAST(:id AS UUID)"
+        await self.execute_write(query, {"id": hook_id})
         return True
 
     async def get_all_hooks(
@@ -516,7 +646,7 @@ class PostgresDatabase:
 
         Args:
             project_id: 项目 ID 过滤
-            status: 状态过滤
+            status: 状态过滤 (resolved: True/False)
             limit: 返回数量限制
 
         Returns:
@@ -526,14 +656,17 @@ class PostgresDatabase:
         params: Dict[str, Any] = {"limit": limit}
 
         if project_id:
-            conditions.append("project_id = :project_id")
+            conditions.append("project_id = CAST(:project_id AS UUID)")
             params["project_id"] = project_id
         if status:
-            conditions.append("status = :status")
-            params["status"] = status
+            # Map status to resolved column
+            if status == "resolved":
+                conditions.append("resolved = TRUE")
+            elif status in ["planted", "triggered"]:
+                conditions.append("resolved = FALSE")
 
         where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        query = f"SELECT * FROM hooks {where_clause} ORDER BY priority DESC, created_at DESC LIMIT :limit"
+        query = f"SELECT * FROM hooks {where_clause} ORDER BY importance DESC, created_at DESC LIMIT :limit"
 
         return await self.execute_query(query, params)
 
@@ -541,11 +674,30 @@ class PostgresDatabase:
 
     async def save_chapter(self, chapter_data: Dict[str, Any]) -> str:
         """保存章节数据"""
+        # 处理 JSON 字段
+        params = _prepare_json_params(chapter_data, [
+            'events', 'hooks_planted', 'hooks_resolved', 'main_plot_progress', 'reader_scores'
+        ])
+
+        # 处理可选字段
+        if params.get('world_id') is None:
+            params['world_id'] = None
+
+        # 确保 datetime 字段是 datetime 对象
+        for field in ['created_at', 'updated_at', 'completed_at']:
+            if field in params and isinstance(params[field], str):
+                try:
+                    params[field] = datetime.fromisoformat(params[field].replace('Z', '+00:00'))
+                except:
+                    params[field] = datetime.now()
+            elif field in ['created_at', 'updated_at'] and (field not in params or params[field] is None):
+                params[field] = datetime.now()
+
         query = """
         INSERT INTO chapters (id, title, project_id, world_id, content, word_count, status, events,
                              hooks_planted, hooks_resolved, main_plot_progress, reader_scores,
                              created_at, updated_at, completed_at)
-        VALUES (:id, :title, :project_id, :world_id, :content, :word_count, :status, :events,
+        VALUES (:id, :title, CAST(:project_id AS UUID), :world_id, :content, :word_count, :status, :events,
                 :hooks_planted, :hooks_resolved, :main_plot_progress, :reader_scores,
                 :created_at, :updated_at, :completed_at)
         ON CONFLICT (id) DO UPDATE SET
@@ -563,18 +715,18 @@ class PostgresDatabase:
             updated_at = EXCLUDED.updated_at,
             completed_at = EXCLUDED.completed_at
         """
-        await self.execute_query(query, chapter_data)
+        await self.execute_write(query, params)
         return chapter_data.get("id", "")
 
     async def get_chapter(self, chapter_id: str) -> Optional[Dict[str, Any]]:
         """获取章节数据"""
-        query = "SELECT * FROM chapters WHERE id = :id"
+        query = "SELECT * FROM chapters WHERE id = CAST(:id AS UUID)"
         results = await self.execute_query(query, {"id": chapter_id})
         return results[0] if results else None
 
     async def get_chapters_by_world(self, world_id: str) -> List[Dict[str, Any]]:
         """获取世界的所有章节"""
-        query = "SELECT * FROM chapters WHERE world_id = :world_id ORDER BY created_at ASC"
+        query = "SELECT * FROM chapters WHERE world_id = CAST(:world_id AS UUID) ORDER BY created_at ASC"
         return await self.execute_query(query, {"world_id": world_id})
 
     async def get_chapters_by_project(
@@ -610,6 +762,23 @@ class PostgresDatabase:
 
     async def save_snapshot(self, snapshot_data: Dict[str, Any]) -> str:
         """保存世界快照"""
+        import json
+        from datetime import datetime
+
+        # 确保 JSONB 字段被正确序列化
+        json_fields = ['characters', 'relationships', 'regions', 'hooks', 'completed_events', 'character_locations']
+        for field in json_fields:
+            if field in snapshot_data and snapshot_data[field] is not None:
+                if isinstance(snapshot_data[field], (list, dict)):
+                    snapshot_data[field] = json.dumps(snapshot_data[field])
+
+        # 确保 created_at 是 datetime 对象
+        if 'created_at' in snapshot_data and isinstance(snapshot_data['created_at'], str):
+            try:
+                snapshot_data['created_at'] = datetime.fromisoformat(snapshot_data['created_at'].replace('Z', '+00:00'))
+            except:
+                snapshot_data['created_at'] = datetime.utcnow()
+
         query = """
         INSERT INTO world_snapshots (id, world_id, chapter_id, snapshot_type, name, description,
                                      characters, relationships, regions, hooks, main_plot_progress,
@@ -620,18 +789,18 @@ class PostgresDatabase:
                 :completed_events, :character_locations, :created_at, :created_by,
                 :parent_snapshot_id, :is_branch, :branch_reason)
         """
-        await self.execute_query(query, snapshot_data)
+        await self.execute_write(query, snapshot_data)
         return snapshot_data.get("id", "")
 
     async def get_snapshot(self, snapshot_id: str) -> Optional[Dict[str, Any]]:
         """获取快照数据"""
-        query = "SELECT * FROM world_snapshots WHERE id = :id"
+        query = "SELECT * FROM world_snapshots WHERE id = CAST(:id AS UUID)"
         results = await self.execute_query(query, {"id": snapshot_id})
         return results[0] if results else None
 
     async def get_snapshots_by_world(self, world_id: str) -> List[Dict[str, Any]]:
         """获取世界的所有快照"""
-        query = "SELECT * FROM world_snapshots WHERE world_id = :world_id ORDER BY created_at DESC"
+        query = "SELECT * FROM world_snapshots WHERE world_id = CAST(:world_id AS UUID) ORDER BY created_at DESC"
         return await self.execute_query(query, {"world_id": world_id})
 
     async def rollback_to_snapshot(self, snapshot_id: str) -> Dict[str, Any]:
@@ -672,7 +841,7 @@ class PostgresDatabase:
                 :affected_hooks, :affected_relationships, :affected_characters,
                 :outcome_rating, :outcome_notes, :created_at)
         """
-        await self.execute_query(query, intervention_data)
+        await self.execute_write(query, intervention_data)
         return intervention_data.get("id", "")
 
     async def update_intervention_evaluation(
@@ -686,9 +855,9 @@ class PostgresDatabase:
         UPDATE intervention_logs
         SET outcome_rating = :outcome_rating,
             outcome_notes = :outcome_notes
-        WHERE id = :id
+        WHERE id = CAST(:id AS UUID)
         """
-        await self.execute_query(
+        await self.execute_write(
             query,
             {
                 "id": intervention_id,
@@ -696,6 +865,19 @@ class PostgresDatabase:
                 "outcome_notes": outcome_notes,
             },
         )
+
+    async def get_intervention_logs(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """获取干预日志列表"""
+        query = """
+        SELECT id, snapshot_id, intervention_type, description, details,
+               affected_hooks, affected_relationships, affected_characters,
+               outcome_rating, outcome_notes, created_at
+        FROM intervention_logs
+        ORDER BY created_at DESC
+        LIMIT :limit
+        """
+        rows = await self.execute_query(query, {"limit": limit})
+        return [dict(row) for row in rows]
 
     # ==================== 初始化表结构 ====================
 
@@ -865,7 +1047,7 @@ class PostgresDatabase:
             :chapter_id, :character_id, :estimated_cost, :metadata, :created_at
         )
         """
-        await self.execute_query(query, usage_data)
+        await self.execute_write(query, usage_data)
         return usage_data.get("id", "")
 
     async def _update_project_token_stats(
@@ -887,9 +1069,9 @@ class PostgresDatabase:
         SET total_tokens = COALESCE(total_tokens, 0) + :tokens,
             total_cost = COALESCE(total_cost, 0) + :cost,
             updated_at = NOW()
-        WHERE id = :project_id
+        WHERE id = CAST(:project_id AS UUID)
         """
-        await self.execute_query(query, {
+        await self.execute_write(query, {
             "project_id": project_id,
             "tokens": tokens,
             "cost": cost,
@@ -1031,7 +1213,7 @@ class PostgresDatabase:
         """
         query = """
         SELECT
-            p.id as project_id,
+            CAST(p.id AS VARCHAR) as project_id,
             p.name as project_name,
             COALESCE(p.total_tokens, 0) as total_tokens,
             COALESCE(p.total_cost, 0) as total_cost

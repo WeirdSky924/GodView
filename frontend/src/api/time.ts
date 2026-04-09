@@ -116,8 +116,7 @@ export async function createTimeSystem(worldId: string, config: Partial<TimeSyst
  * 获取时间系统状态
  */
 export async function getTimeSystemStatus(worldId: string): Promise<TimeSystemStatus> {
-  const response = await api.get('/time/systems/' + worldId)
-  return response.data
+  return await api.get('/time/systems/' + worldId)
 }
 
 /**
@@ -178,8 +177,7 @@ export async function createTimeBranch(
  * 获取时间分支列表
  */
 export async function getTimeBranches(worldId: string): Promise<{ success: boolean; world_id: string; branches: TimeBranchInfo[]; count: number }> {
-  const response = await api.get('/time/branches/' + worldId)
-  return response.data
+  return await api.get('/time/branches/' + worldId)
 }
 
 /**
@@ -205,10 +203,9 @@ export async function recordTimePoint(worldId: string, note: string) {
  * 获取时间历史
  */
 export async function getTimeHistory(worldId: string, limit: number = 100): Promise<TimeHistoryResponse> {
-  const response = await api.get('/time/history/' + worldId, {
+  return await api.get('/time/history/' + worldId, {
     params: { limit }
   })
-  return response.data
 }
 
 // WebSocket 相关类型

@@ -32,26 +32,21 @@ export interface UpdateWorldDTO {
 
 export async function getWorlds(projectId?: string) {
   const params = projectId ? { project_id: projectId } : {}
-  const response = await api.get<World[]>('/worlds', { params })
-  return response.data
+  return await api.get<World[]>('/worlds', { params })
 }
 
 export async function getWorld(id: string) {
-  const response = await api.get<World>(`/worlds/${id}`)
-  return response.data
+  return await api.get<World>(`/worlds/${id}`)
 }
 
 export async function createWorld(data: CreateWorldDTO) {
-  const response = await api.post<World>('/worlds', data)
-  return response.data
+  return await api.post<World>('/worlds', data)
 }
 
 export async function updateWorld(id: string, data: UpdateWorldDTO) {
-  const response = await api.put<World>(`/worlds/${id}`, data)
-  return response.data
+  return await api.put<World>(`/worlds/${id}`, data)
 }
 
 export async function deleteWorld(id: string) {
-  const response = await api.delete(`/worlds/${id}`)
-  return response.data
+  return await api.delete(`/worlds/${id}`)
 }

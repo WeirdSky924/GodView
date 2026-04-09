@@ -76,7 +76,7 @@ class WorldRule(BaseModel):
 class World(BaseModel):
     """世界模型"""
 
-    id: str = Field(..., description="世界唯一 ID")
+    id: Optional[str] = Field(None, description="世界唯一 ID（创建时自动生成）")
     name: str = Field(..., description="世界名称")
 
     # 项目归属
@@ -153,9 +153,9 @@ class Encounter(BaseModel):
 class Region(BaseModel):
     """区域模型"""
 
-    id: str = Field(..., description="区域唯一 ID")
+    id: Optional[str] = Field(None, description="区域唯一 ID")
     name: str = Field(..., description="区域名称")
-    world_id: str = Field(..., description="所属世界 ID")
+    world_id: Optional[str] = Field(None, description="所属世界 ID")
 
     # 区域类型
     region_type: RegionType = Field(default=RegionType.CUSTOM, description="区域类型")

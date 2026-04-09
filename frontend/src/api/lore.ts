@@ -93,28 +93,23 @@ export async function getLoreList(
   if (priority) params.priority = priority
   if (search) params.search = search
 
-  const response = await api.get<LoreEntry[]>('/lore', { params })
-  return response.data
+  return await api.get<LoreEntry[]>('/lore', { params })
 }
 
 export async function getLore(id: string) {
-  const response = await api.get<LoreEntry>(`/lore/${id}`)
-  return response.data
+  return await api.get<LoreEntry>(`/lore/${id}`)
 }
 
 export async function createLore(data: CreateLoreDTO) {
-  const response = await api.post<LoreEntry>('/lore', data)
-  return response.data
+  return await api.post<LoreEntry>('/lore', data)
 }
 
 export async function updateLore(id: string, data: UpdateLoreDTO) {
-  const response = await api.put<LoreEntry>(`/lore/${id}`, data)
-  return response.data
+  return await api.put<LoreEntry>(`/lore/${id}`, data)
 }
 
 export async function deleteLore(id: string) {
-  const response = await api.delete(`/lore/${id}`)
-  return response.data
+  return await api.delete(`/lore/${id}`)
 }
 
 export async function searchLore(
@@ -122,14 +117,13 @@ export async function searchLore(
   query: string,
   category?: LoreCategory,
 ) {
-  const response = await api.post<LoreSearchResult[]>('/lore/search', null, {
+  return await api.post<LoreSearchResult[]>('/lore/search', null, {
     params: {
       project_id: projectId,
       query,
       category,
     },
   })
-  return response.data
 }
 
 export async function validateContent(
@@ -137,22 +131,19 @@ export async function validateContent(
   content: string,
   checkConstitutional: boolean = true,
 ) {
-  const response = await api.post<LoreValidationResult>('/lore/validate', null, {
+  return await api.post<LoreValidationResult>('/lore/validate', null, {
     params: {
       project_id: projectId,
       content,
       check_constitutional: checkConstitutional,
     },
   })
-  return response.data
 }
 
 export async function getLoreCategories() {
-  const response = await api.get<Array<{ value: string; label: string }>>('/lore/categories')
-  return response.data
+  return await api.get<Array<{ value: string; label: string }>>('/lore/categories')
 }
 
 export async function getLorePriorities() {
-  const response = await api.get<Array<{ value: string; label: string }>>('/lore/priorities')
-  return response.data
+  return await api.get<Array<{ value: string; label: string }>>('/lore/priorities')
 }

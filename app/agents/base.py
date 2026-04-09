@@ -12,6 +12,9 @@ from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain_core.language_models import BaseLanguageModel
 
+from app.models.token_usage import UsageCategory
+from app.services.token_tracker import token_tracker
+
 logger = logging.getLogger(__name__)
 
 
@@ -88,6 +91,7 @@ class BaseAgent(ABC):
         messages: List,
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
+        category: UsageCategory = UsageCategory.OTHER,
     ) -> str:
         if not self.model:
             raise ValueError(f"Agent {self.name} 未配置模型")
@@ -95,8 +99,60 @@ class BaseAgent(ABC):
         if self.system_prompt:
             messages = [SystemMessage(content=self.system_prompt)] + messages
 
+        # 记录输入 token 数（估算）
+        input_tokens = sum(len(msg.content) // 4 for msg in messages)
+
         response = await self.model.ainvoke(messages)
-        return response.content
+        content = response.content
+
+        # 尝试获取实际 token 使用量
+        output_tokens = len(content) // 4  # 估算输出 token
+        self._record_token_usage(input_tokens, output_tokens, category)
+
+        return content
+
+    def _record_token_usage(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        category: UsageCategory,
+    ):
+        """记录 token 使用量"""
+        if not self.project_id:
+            return
+
+        try:
+            # 从模型中提取 provider 和 model 信息
+            provider = "anthropic"
+            model = "claude"
+
+            # 尝试从模型配置中获取更多信息
+            if hasattr(self.model, 'model'):
+                model = self.model.model
+            if hasattr(self.model, 'model_name'):
+                model = self.model.model_name
+
+            # 获取 provider 信息
+            model_str = str(self.model.__class__)
+            if "Anthropic" in model_str:
+                provider = "anthropic"
+            elif "OpenAI" in model_str or "ChatOpenAI" in model_str:
+                provider = "openai"
+
+            # 异步记录 token 使用
+            asyncio.create_task(
+                token_tracker.record_usage(
+                    project_id=self.project_id,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    provider=provider,
+                    model=model,
+                    category=category,
+                    agent_name=self.name,
+                )
+            )
+        except Exception as e:
+            logger.warning(f"记录 token 使用失败: {e}")
 
     def _parse_json_response(self, text: str) -> Dict[str, Any]:
         import re

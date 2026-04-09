@@ -37,7 +37,7 @@ class LorePriority(str, Enum):
 class LoreEntry(BaseModel):
     """设定条目模型"""
 
-    id: str = Field(..., description="设定唯一 ID")
+    id: Optional[str] = Field(None, description="设定唯一 ID（创建时自动生成）")
     project_id: str = Field(..., description="所属项目 ID")
 
     # 基本信息
