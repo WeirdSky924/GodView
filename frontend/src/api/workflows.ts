@@ -9,7 +9,7 @@ const API_BASE = '/api'
 
 // ==================== 类型定义 ====================
 
-export type NodeType = 'agent' | 'condition' | 'group_discussion' | 'parallel' | 'start' | 'end' | 'input'
+export type NodeType = 'agent' | 'condition' | 'group_discussion' | 'scene_performance' | 'parallel' | 'start' | 'end' | 'input'
 export type NodeStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped'
 export type WorkflowStatus = 'pending' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled'
 

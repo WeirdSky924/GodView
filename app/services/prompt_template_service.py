@@ -93,16 +93,21 @@ class PromptTemplateService:
 
     async def update_template(
         self, template_id: str, dto: PromptTemplateUpdate
-    ) -> Optional[PromptTemplate]:
-        """更新 Prompt 模板"""
+    ) -> tuple[Optional[PromptTemplate], Optional[str]]:
+        """
+        更新 Prompt 模板
+
+        Returns:
+            tuple: (模板, 错误类型) 错误类型为 'not_found' 或 'is_system' 或 None
+        """
         template = self._templates.get(template_id)
         if not template:
-            return None
+            return None, 'not_found'
 
         # 系统内置模板不可更新
         if template.is_system:
             logger.warning(f"尝试更新系统内置模板 {template_id}，操作被拒绝")
-            return None
+            return None, 'is_system'
 
         # 更新字段
         update_data = dto.dict(exclude_unset=True)
@@ -113,22 +118,27 @@ class PromptTemplateService:
         template.updated_at = datetime.now()
         logger.info(f"更新 PromptTemplate: {template_id}")
 
-        return template
+        return template, None
 
-    async def delete_template(self, template_id: str) -> bool:
-        """删除 Prompt 模板"""
+    async def delete_template(self, template_id: str) -> tuple[bool, Optional[str]]:
+        """
+        删除 Prompt 模板
+
+        Returns:
+            tuple: (是否成功, 错误类型) 错误类型为 'not_found' 或 'is_system' 或 None
+        """
         template = self._templates.get(template_id)
         if not template:
-            return False
+            return False, 'not_found'
 
         # 系统内置模板不可删除
         if template.is_system:
             logger.warning(f"尝试删除系统内置模板 {template_id}，操作被拒绝")
-            return False
+            return False, 'is_system'
 
         del self._templates[template_id]
         logger.info(f"删除 PromptTemplate: {template_id}")
-        return True
+        return True, None
 
     # ==================== 查询和搜索 ====================
 

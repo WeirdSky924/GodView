@@ -455,6 +455,9 @@ class SettingAgentService:
         # 检查是否需要提取并保存设定
         lore_saved = await self._check_and_save_lore_from_conversation(project_id, session)
 
+        # 同步对话到 AgentMemoryService（与工作流 Agent 共享记忆）
+        await self._sync_to_agent_memory(project_id, message, response)
+
         # 自动分析并更新项目元数据（每5次对话触发一次）
         if len(session.conversation_history) % 10 == 0:  # 每5次用户消息
             metadata_results = await self.analyze_and_update_project_metadata(
@@ -474,6 +477,66 @@ class SettingAgentService:
             result["lore_saved"] = True
 
         return result
+
+    async def _sync_to_agent_memory(
+        self,
+        project_id: str,
+        user_message: str,
+        assistant_response: str,
+    ):
+        """
+        同步对话到 AgentMemoryService
+
+        确保工作流中的 SettingAgent 和 /lore 界面共享记忆
+
+        Args:
+            project_id: 项目 ID
+            user_message: 用户消息
+            assistant_response: 助手响应
+        """
+        try:
+            from app.api.app import postgres_db
+            from app.services.agent_memory_service import get_memory_service
+            from app.models.agent_memory import MemoryEntry, MemoryType, MemoryImportance
+
+            if not postgres_db:
+                return
+
+            # 获取记忆服务（传入数据库连接）
+            memory_service = get_memory_service(postgres_db)
+
+            # 获取或创建 Agent 记忆
+            memory = await memory_service.get_memory(
+                project_id=project_id,
+                agent_type="setting",
+                agent_id="setting_agent",
+            )
+
+            # 用户消息
+            user_entry = MemoryEntry(
+                type=MemoryType.DIALOGUE,
+                content=f"用户: {user_message[:500]}",
+                importance=MemoryImportance.NORMAL,
+                metadata={"source": "lore_interface", "role": "user"},
+            )
+            memory.add_memory(user_entry)
+
+            # 助手响应
+            assistant_entry = MemoryEntry(
+                type=MemoryType.DIALOGUE,
+                content=f"设定助手: {assistant_response[:500]}",
+                importance=MemoryImportance.NORMAL,
+                metadata={"source": "lore_interface", "role": "assistant"},
+            )
+            memory.add_memory(assistant_entry)
+
+            # 保存到数据库
+            await memory_service.save_memory(memory)
+
+            logger.debug(f"同步 Setting Agent 对话到记忆系统: project_id={project_id}")
+
+        except Exception as e:
+            logger.warning(f"同步 Setting Agent 记忆失败: {e}")
 
     async def _check_and_save_lore_from_conversation(
         self,

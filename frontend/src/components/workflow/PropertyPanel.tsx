@@ -6,7 +6,8 @@
 import { useState, useEffect } from 'react'
 import { useTheme } from '@/contexts/ThemeContext'
 import type { WorkflowNode } from '@/api/workflows'
-import { X, Settings, Save, GitBranch, Plus, Trash2, ArrowDownCircle, ArrowUpCircle } from 'lucide-react'
+import { X, Settings, Save, GitBranch, Plus, Trash2, ArrowDownCircle, ArrowUpCircle, BookOpen, Layers, RefreshCw } from 'lucide-react'
+import { getAgentTypeSkills, type Skill } from '@/api/skills'
 
 // Agent 类型选项
 const AGENT_TYPE_OPTIONS = [
@@ -103,6 +104,28 @@ export default function PropertyPanel({ node, edge, onClose, onUpdateNode, onUpd
   // 输入输出配置状态
   const [inputs, setInputs] = useState<NodeInputConfig[]>([])
   const [outputs, setOutputs] = useState<NodeOutputConfig[]>([])
+  // Skills 状态
+  const [agentSkills, setAgentSkills] = useState<Skill[]>([])
+  const [loadingSkills, setLoadingSkills] = useState(false)
+
+  // 加载 Agent 类型的 Skills
+  const loadAgentSkills = async (agentType: string) => {
+    if (!agentType) {
+      setAgentSkills([])
+      return
+    }
+
+    setLoadingSkills(true)
+    try {
+      const skills = await getAgentTypeSkills(agentType)
+      setAgentSkills(skills)
+    } catch (error) {
+      console.error('Failed to load agent skills:', error)
+      setAgentSkills([])
+    } finally {
+      setLoadingSkills(false)
+    }
+  }
 
   useEffect(() => {
     if (node) {
@@ -112,11 +135,24 @@ export default function PropertyPanel({ node, edge, onClose, onUpdateNode, onUpd
       // 加载 inputs 和 outputs
       setInputs((node as any).inputs || [])
       setOutputs((node as any).outputs || [])
+      // 加载 Agent Skills
+      if (node.node_type === 'agent' && node.agent_type) {
+        loadAgentSkills(node.agent_type)
+      } else {
+        setAgentSkills([])
+      }
     }
     if (edge) {
       setEdgeCondition(edge.condition?.result || '')
     }
   }, [node, edge])
+
+  // 当 agentType 变化时重新加载 Skills
+  useEffect(() => {
+    if (node?.node_type === 'agent' && agentType) {
+      loadAgentSkills(agentType)
+    }
+  }, [agentType])
 
   // 添加输入配置
   const handleAddInput = () => {
@@ -720,8 +756,77 @@ export default function PropertyPanel({ node, edge, onClose, onUpdateNode, onUpd
           </div>
         )}
 
-        {/* 输入配置区域 (Agent 节点和讨论节点) */}
-        {(node!.node_type === 'agent' || node!.node_type === 'group_discussion') && (
+        {/* 场景演绎配置 (仅场景演绎节点) */}
+        {node!.node_type === 'scene_performance' && (
+          <div className="space-y-3">
+            <div>
+              <label
+                className={`block text-xs font-medium mb-1 ${
+                  isDark ? 'text-gray-400' : 'text-gray-500'
+                }`}
+              >
+                演绎模式
+              </label>
+              <select
+                value={config.scene_mode || 'interactive'}
+                onChange={(e) => setConfig({ ...config, scene_mode: e.target.value })}
+                className={`
+                  w-full px-3 py-2 rounded-lg border text-sm
+                  ${isDark
+                    ? 'bg-gray-800 border-gray-600 text-white'
+                    : 'bg-white border-gray-300'
+                  }
+                `}
+              >
+                <option value="interactive">互动模式 - 角色按顺序互动</option>
+                <option value="parallel">并行模式 - 角色独立表演</option>
+              </select>
+            </div>
+            <div>
+              <label
+                className={`block text-xs font-medium mb-1 ${
+                  isDark ? 'text-gray-400' : 'text-gray-500'
+                }`}
+              >
+                场景方向
+              </label>
+              <textarea
+                value={config.scene_direction || ''}
+                onChange={(e) => setConfig({ ...config, scene_direction: e.target.value })}
+                placeholder="描述场景的主要内容、氛围、冲突点..."
+                rows={3}
+                className={`
+                  w-full px-3 py-2 rounded-lg border text-sm
+                  ${isDark
+                    ? 'bg-gray-800 border-gray-600 text-white'
+                    : 'bg-white border-gray-300'
+                  }
+                `}
+              />
+            </div>
+            <div>
+              <label
+                className={`flex items-center gap-2 text-xs font-medium ${
+                  isDark ? 'text-gray-400' : 'text-gray-500'
+                }`}
+              >
+                <input
+                  type="checkbox"
+                  checked={config.need_background_characters !== false}
+                  onChange={(e) => setConfig({ ...config, need_background_characters: e.target.checked })}
+                  className="w-4 h-4 rounded"
+                />
+                需要背景角色
+              </label>
+              <p className={`text-xs mt-1 ml-6 ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+                自动生成背景角色的行为描述
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* 输入配置区域 (Agent 节点、讨论节点、场景演绎节点) */}
+        {(node!.node_type === 'agent' || node!.node_type === 'group_discussion' || node!.node_type === 'scene_performance') && (
           <div className="space-y-2">
             <div className="flex items-center justify-between">
               <label
@@ -751,8 +856,8 @@ export default function PropertyPanel({ node, edge, onClose, onUpdateNode, onUpd
           </div>
         )}
 
-        {/* 输出配置区域 (Agent 节点和讨论节点) */}
-        {(node!.node_type === 'agent' || node!.node_type === 'group_discussion') && (
+        {/* 输出配置区域 (Agent 节点、讨论节点、场景演绎节点) */}
+        {(node!.node_type === 'agent' || node!.node_type === 'group_discussion' || node!.node_type === 'scene_performance') && (
           <div className="space-y-2">
             <div className="flex items-center justify-between">
               <label
@@ -779,6 +884,93 @@ export default function PropertyPanel({ node, edge, onClose, onUpdateNode, onUpd
                 {outputs.map((output, index) => renderOutputConfig(output, index))}
               </div>
             )}
+          </div>
+        )}
+
+        {/* Skills 展示区域 (仅 Agent 节点) */}
+        {node!.node_type === 'agent' && agentType && (
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <label
+                className={`flex items-center gap-1 text-xs font-medium ${
+                  isDark ? 'text-gray-400' : 'text-gray-500'
+                }`}
+              >
+                <Layers size={14} />
+                Agent Skills
+              </label>
+              <button
+                onClick={() => loadAgentSkills(agentType)}
+                disabled={loadingSkills}
+                className={`flex items-center gap-1 px-2 py-1 text-xs text-purple-500 hover:bg-purple-50 dark:hover:bg-purple-900/30 rounded ${loadingSkills ? 'opacity-50' : ''}`}
+              >
+                <RefreshCw size={12} className={loadingSkills ? 'animate-spin' : ''} />
+                刷新
+              </button>
+            </div>
+            <p className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+              该 Agent 类型可用的技能（从 Skills 系统加载）
+            </p>
+
+            {loadingSkills ? (
+              <div className={`p-4 text-center text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+                加载 Skills...
+              </div>
+            ) : agentSkills.length > 0 ? (
+              <div className="space-y-1 max-h-48 overflow-y-auto">
+                {agentSkills.map((skill) => (
+                  <div
+                    key={skill.id}
+                    className={`
+                      p-2 rounded-lg border text-xs
+                      ${isDark ? 'bg-gray-800 border-gray-600' : 'bg-gray-50 border-gray-200'}
+                    `}
+                  >
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <BookOpen size={12} className={isDark ? 'text-gray-400' : 'text-gray-500'} />
+                        <span className={`font-medium ${isDark ? 'text-gray-200' : 'text-gray-700'}`}>
+                          {skill.name}
+                        </span>
+                      </div>
+                      <span className={`text-[10px] px-1.5 py-0.5 rounded ${
+                        skill.skill_type === 'knowledge'
+                          ? (isDark ? 'bg-blue-900 text-blue-300' : 'bg-blue-100 text-blue-700')
+                          : skill.skill_type === 'prompt'
+                          ? (isDark ? 'bg-purple-900 text-purple-300' : 'bg-purple-100 text-purple-700')
+                          : (isDark ? 'bg-gray-700 text-gray-300' : 'bg-gray-200 text-gray-600')
+                      }`}>
+                        {skill.skill_type === 'knowledge' ? '知识' : skill.skill_type === 'prompt' ? '提示词' : skill.skill_type}
+                      </span>
+                    </div>
+                    <p className={`mt-1 line-clamp-2 ${isDark ? 'text-gray-500' : 'text-gray-500'}`}>
+                      {skill.description}
+                    </p>
+                    <div className="flex items-center gap-2 mt-1">
+                      <span className={`text-[10px] ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+                        优先级: {skill.priority}
+                      </span>
+                      {skill.is_system && (
+                        <span className={`text-[10px] ${isDark ? 'text-yellow-500' : 'text-yellow-600'}`}>
+                          系统内置
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className={`p-4 text-center text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+                暂无可用 Skills
+              </div>
+            )}
+
+            <a
+              href="/skills"
+              className={`block text-xs text-center text-blue-500 hover:underline mt-2`}
+            >
+              前往 Skills 管理页面 →
+            </a>
           </div>
         )}
 

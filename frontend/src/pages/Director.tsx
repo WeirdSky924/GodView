@@ -5,6 +5,7 @@ import { useDynamicWebSocket } from '@/hooks/useWebSocket'
 import { getDirectorState, getSnapshotTree } from '@/api/director'
 import { getCharacters } from '@/api/characters'
 import { getWorkflows, type WorkflowDefinition } from '@/api/workflows'
+import { useWorkflowAgents, type AgentStatus } from '@/hooks/useWorkflowAgents'
 import {
   Play, Pause, RotateCcw, Target, BookOpen, MessageSquare, GitBranch, Settings,
   Sparkles, FileText, Network, FolderOpen, UserPlus, UserMinus, Users, ChevronDown,
@@ -13,13 +14,9 @@ import {
 import { useProject } from '@/contexts/ProjectContext'
 import { useTheme } from '@/contexts/ThemeContext'
 import { motion, AnimatePresence } from 'framer-motion'
+import WorkflowHelp from '@/components/workflow/WorkflowHelp'
 
 // ==================== Types ====================
-interface AgentStatus {
-  name: string
-  status: 'idle' | 'working' | 'completed' | 'error'
-  message: string
-}
 
 interface SnapshotNode {
   id: string
@@ -28,18 +25,6 @@ interface SnapshotNode {
   parent_snapshot_id?: string | null
   children?: SnapshotNode[]
 }
-
-const defaultAgents: AgentStatus[] = [
-  { name: 'Summarizer', status: 'idle', message: '剧情总结员' },
-  { name: 'Master Plotter', status: 'idle', message: '总编剧' },
-  { name: 'Hook Manager', status: 'idle', message: '伏笔管理员' },
-  { name: 'Writer', status: 'idle', message: '内容执行官' },
-  { name: 'Evaluator', status: 'idle', message: '剧情评估员' },
-  { name: 'Character Agent', status: 'idle', message: '角色演绎' },
-  { name: 'Setting', status: 'idle', message: '设定 Agent' },
-  { name: 'Event Generator', status: 'idle', message: '事件生成' },
-  { name: 'World Map', status: 'idle', message: '地图管理' },
-]
 
 // ==================== Sub Components ====================
 
@@ -221,7 +206,12 @@ function AgentStatusCard({
   onInterventionChange: (value: string) => void
   onSendIntervention: () => void
 }) {
-  const config = AGENT_CONFIG[agent.name] || { icon: '🤖', color: 'gray', description: agent.name }
+  // 优先使用 agent 自带的配置，否则 fallback 到 AGENT_CONFIG
+  const config = {
+    icon: agent.icon || AGENT_CONFIG[agent.name]?.icon || '🤖',
+    color: agent.color || AGENT_CONFIG[agent.name]?.color || 'gray',
+    description: agent.description || AGENT_CONFIG[agent.name]?.description || agent.name,
+  }
   const isWorking = agent.status === 'working'
   const hasOutput = streamingContent || lastOutput
 
@@ -651,19 +641,34 @@ export default function Director() {
   const [isConnected, setIsConnected] = useState(false) // 是否已主动连接
   const [isGenerating, setIsGenerating] = useState(false)
   const [logs, setLogs] = useState<string[]>([])
-  const [agents, setAgents] = useState<AgentStatus[]>(defaultAgents)
   const [runtimeState, setRuntimeState] = useState<Record<string, any> | null>(null)
   const [snapshotTree, setSnapshotTree] = useState<SnapshotNode[]>([])
-
-  // Agent 输出记录
-  const [agentOutputs, setAgentOutputs] = useState<Record<string, string>>({})
-
-  // Agent 实时流式输出（正在生成中）
-  const [agentStreaming, setAgentStreaming] = useState<Record<string, string>>({})
 
   // Workflow state
   const [savedWorkflows, setSavedWorkflows] = useState<WorkflowDefinition[]>([])
   const [selectedWorkflowId, setSelectedWorkflowId] = useState('')
+
+  // 检查当前选中的工作流是否包含 group_discussion 节点
+  const hasGroupDiscussionNode = useMemo(() => {
+    if (!selectedWorkflowId || savedWorkflows.length === 0) return false
+    const workflow = savedWorkflows.find(w => w.id === selectedWorkflowId)
+    if (!workflow) return false
+    return workflow.nodes.some(node => node.node_type === 'group_discussion')
+  }, [selectedWorkflowId, savedWorkflows])
+
+  // 使用 useWorkflowAgents hook 动态生成 Agent 列表
+  const {
+    agents,
+    agentOutputs,
+    agentStreaming,
+    updateAgentStatus,
+    setAgentOutput,
+    setAgentOutputs,
+    appendAgentStreaming,
+    clearAgentStreaming,
+    updateAgentStreaming,
+    resetAll: resetWorkflowAgents,
+  } = useWorkflowAgents(selectedWorkflowId, savedWorkflows)
 
   // Auto mode state
   const [autoModeRunning, setAutoModeRunning] = useState(false)
@@ -690,6 +695,7 @@ export default function Director() {
     name: '',
     description: '',
     importance_tier: 'npc' as string,
+    role: '',
   })
 
   // 生成单章 state
@@ -759,7 +765,10 @@ export default function Director() {
   }
 
   const updateAgent = (name: string, patch: Partial<AgentStatus>) => {
-    setAgents(prev => prev.map(a => a.name === name ? { ...a, ...patch } : a))
+    // 使用 hook 提供的 updateAgentStatus 或直接更新
+    if (patch.status) {
+      updateAgentStatus(name, patch.status, patch.message)
+    }
   }
 
   const getWorkingAgentName = () => agents.find(a => a.status === 'working')?.message || null
@@ -796,7 +805,7 @@ export default function Director() {
           }
           // 如果状态变为completed/idle/error，清除流式输出
           if (data.status !== 'working') {
-            setAgentStreaming(prev => {
+            updateAgentStreaming(prev => {
               const next = { ...prev }
               delete next[data.agent]
               return next
@@ -814,7 +823,7 @@ export default function Director() {
               // 调试日志
               console.log(`[流式输出] agent: ${streamData.agent}, label: ${streamData.label}, agentName: ${agentName}, streamKey: ${streamKey}`)
 
-              setAgentStreaming(prev => ({
+              updateAgentStreaming(prev => ({
                 ...prev,
                 [streamKey]: (prev[streamKey] || '') + streamData.chunk
               }))
@@ -840,7 +849,7 @@ export default function Director() {
                 [outputData.agent]: outputStr.slice(0, 1000)
               }))
               // 清除流式输出
-              setAgentStreaming(prev => {
+              updateAgentStreaming(prev => {
                 const next = { ...prev }
                 delete next[outputData.agent]
                 return next
@@ -892,7 +901,7 @@ export default function Director() {
 
             // 记录流式输出
             if (nodeData.node_id) {
-              setAgentStreaming(prev => ({
+              updateAgentStreaming(prev => ({
                 ...prev,
                 [nodeData.node_id]: ''
               }))
@@ -921,14 +930,14 @@ export default function Director() {
 
             // 清除流式输出
             if (nodeData.node_id) {
-              setAgentStreaming(prev => {
+              updateAgentStreaming(prev => {
                 const next = { ...prev }
                 delete next[nodeData.node_id]
                 return next
               })
             }
             if (agentName) {
-              setAgentStreaming(prev => {
+              updateAgentStreaming(prev => {
                 const next = { ...prev }
                 delete next[agentName]
                 return next
@@ -944,7 +953,7 @@ export default function Director() {
               const agentName = getAgentNameFromNode(nodeData)
               const streamKey = agentName || nodeData.node_id
 
-              setAgentStreaming(prev => ({
+              updateAgentStreaming(prev => ({
                 ...prev,
                 [streamKey]: (prev[streamKey] || '') + nodeData.chunk
               }))
@@ -1196,7 +1205,7 @@ export default function Director() {
   }
 
   const resetAll = () => {
-    setAgents(defaultAgents)
+    resetWorkflowAgents()
     setLogs([])
     setRuntimeState(null)
     setSnapshotTree([])
@@ -1247,7 +1256,7 @@ export default function Director() {
       type: 'add_character',
       character_data: { ...newCharacterForm, project_id: currentProject.id },
     })
-    setNewCharacterForm({ name: '', description: '', importance_tier: 'npc' })
+    setNewCharacterForm({ name: '', description: '', importance_tier: 'npc', role: '' })
     setShowAddCharacterModal(false)
   }
 
@@ -1275,6 +1284,7 @@ export default function Director() {
     <div className="flex items-center gap-4">
       <AgentStatusBar agents={agents} isDark={isDark} />
       <ConnectionBadge status={wsStatus} isDark={isDark} />
+      <WorkflowHelp />
     </div>
   )
 
@@ -1456,25 +1466,27 @@ export default function Director() {
         <div className="grid grid-cols-1 xl:grid-cols-4 gap-4">
           {/* 左侧：Agent状态面板（大） */}
           <div className="xl:col-span-3 space-y-4">
-            {/* 集体会话卡片 - 始终显示 */}
-            <GroupDiscussionCard
-              discussion={groupDiscussion || { topic: '', messages: [], characters: [], isActive: false }}
-              isDark={isDark}
-              input={discussionInput}
-              onInputChange={setDiscussionInput}
-              onSend={sendDiscussionMessage}
-              onEnd={endDiscussion}
-            />
+            {/* 集体会话卡片 - 仅当工作流包含 group_discussion 节点时显示 */}
+            {hasGroupDiscussionNode && (
+              <GroupDiscussionCard
+                discussion={groupDiscussion || { topic: '', messages: [], characters: [], isActive: false }}
+                isDark={isDark}
+                input={discussionInput}
+                onInputChange={setDiscussionInput}
+                onSend={sendDiscussionMessage}
+                onEnd={endDiscussion}
+              />
+            )}
 
             {/* Agent 卡片网格 */}
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-2 gap-4">
               {agents.map(agent => (
                 <AgentStatusCard
-                  key={agent.name}
+                  key={agent.id || agent.agent_type || agent.name}
                   agent={agent}
                   isDark={isDark}
-                  lastOutput={agentOutputs[agent.name]}
-                  streamingContent={agentStreaming[agent.name]}
+                  lastOutput={agentOutputs[agent.id || agent.agent_type || agent.name]}
+                  streamingContent={agentStreaming[agent.id || agent.agent_type || agent.name]}
                   interventionInput={agentInterventionInputs[agent.name] || ''}
                   onInterventionChange={(value) => setAgentInput(agent.name, value)}
                   onSendIntervention={() => sendAgentIntervention(agent.name)}

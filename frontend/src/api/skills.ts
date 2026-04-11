@@ -11,6 +11,16 @@ const API_BASE = '/skills'
 
 export type SkillType = 'prompt' | 'function' | 'workflow' | 'knowledge'
 export type SkillStatus = 'draft' | 'active' | 'deprecated'
+export type SkillCategory =
+  | 'writing' | 'editing' | 'style'
+  | 'plotting' | 'pacing' | 'conflict'
+  | 'character' | 'dialogue' | 'ooc_check'
+  | 'foreshadowing' | 'hook'
+  | 'evaluation' | 'reader_sim'
+  | 'world_building' | 'setting'
+  | 'analysis' | 'summary'
+  | 'discussion' | 'performance'
+  | 'general'
 
 export interface SkillParameter {
   name: string
@@ -19,24 +29,64 @@ export interface SkillParameter {
   default?: any
   required: boolean
   options?: any[]
+  validation?: Record<string, any>
+}
+
+export interface SkillOutputSpec {
+  name: string
+  type: string
+  description: string
+  required: boolean
 }
 
 export interface Skill {
   id: string
   name: string
   description: string
+
+  // 类型和分类
   skill_type: SkillType
+  category: SkillCategory
+  tags: string[]
+
+  // 适用范围
+  applicable_agent_types: string[]  // 空数组表示所有 Agent 都可用
+
+  // 内容定义
   prompt_template?: string
+  prompt_template_id?: string
   function_code?: string
   workflow_steps?: Array<Record<string, any>>
   knowledge_content?: string
+
+  // 参数和输出
   parameters: SkillParameter[]
-  tags: string[]
-  version: string
+  output_spec: SkillOutputSpec[]
+
+  // 执行配置
+  temperature: number
+  max_tokens?: number
+  timeout: number
+  retry_count: number
+
+  // 优先级和状态
+  priority: number
   status: SkillStatus
+  is_system: boolean
+  is_enabled: boolean
+  is_composable: boolean
+
+  // 创建来源
   creator_project_id?: string
   creator_agent_id?: string
   creator_user_id?: string
+
+  // 元数据
+  version: string
+  author: string
+  examples: Array<Record<string, any>>
+
+  // 使用统计
   usage_count: number
   last_used_at?: string
   created_at: string
@@ -46,10 +96,20 @@ export interface Skill {
 export interface SkillAssignment {
   id: string
   skill_id: string
-  project_id: string
-  agent_id: string
+  agent_type: string
+
+  // 分配配置
+  slot_name: string
   custom_parameters?: Record<string, any>
+  variable_overrides: Record<string, any>
   priority: number
+
+  // 执行条件
+  execution_condition?: string
+  is_enabled: boolean
+  is_required: boolean
+
+  // 分配信息
   assigned_by: string
   assigned_at: string
 }
@@ -64,6 +124,7 @@ export interface SkillExecutionLog {
   success: boolean
   error_message?: string
   execution_time_ms?: number
+  token_usage?: Record<string, number>
   created_at: string
 }
 
@@ -72,6 +133,7 @@ export interface SkillTestResult {
   output?: string
   error?: string
   execution_time_ms?: number
+  token_usage?: Record<string, number>
 }
 
 export interface SkillStats {
@@ -84,37 +146,71 @@ export interface SkillStats {
 
 export interface CreateSkillDTO {
   name: string
-  description: string
+  description?: string
   skill_type: SkillType
+  category?: SkillCategory
+  tags?: string[]
+  applicable_agent_types?: string[]
+
   prompt_template?: string
+  prompt_template_id?: string
   function_code?: string
   workflow_steps?: Array<Record<string, any>>
   knowledge_content?: string
+
   parameters?: SkillParameter[]
-  tags?: string[]
+  output_spec?: SkillOutputSpec[]
+
+  temperature?: number
+  max_tokens?: number
+  timeout?: number
+
+  priority?: number
+  is_composable?: boolean
+  examples?: Array<Record<string, any>>
+
   creator_project_id?: string
   creator_agent_id?: string
+  creator_user_id?: string
 }
 
 export interface UpdateSkillDTO {
   name?: string
   description?: string
+  category?: SkillCategory
+  tags?: string[]
+  applicable_agent_types?: string[]
+
   prompt_template?: string
+  prompt_template_id?: string
   function_code?: string
   workflow_steps?: Array<Record<string, any>>
   knowledge_content?: string
+
   parameters?: SkillParameter[]
-  tags?: string[]
-  version?: string
+  output_spec?: SkillOutputSpec[]
+
+  temperature?: number
+  max_tokens?: number
+  timeout?: number
+
+  priority?: number
   status?: SkillStatus
+  is_enabled?: boolean
+  is_composable?: boolean
+  examples?: Array<Record<string, any>>
 }
 
 export interface AssignSkillDTO {
   skill_id: string
-  project_id: string
-  agent_id: string
+  agent_type: string
+  slot_name?: string
   custom_parameters?: Record<string, any>
+  variable_overrides?: Record<string, any>
   priority?: number
+  execution_condition?: string
+  is_enabled?: boolean
+  is_required?: boolean
 }
 
 // ==================== API 函数 ====================
@@ -125,6 +221,8 @@ export interface AssignSkillDTO {
 export async function getSkills(
   skillType?: SkillType,
   status?: SkillStatus,
+  category?: SkillCategory,
+  agentType?: string,
   tags?: string[],
   search?: string,
   limit: number = 50,
@@ -133,6 +231,8 @@ export async function getSkills(
   const params = new URLSearchParams()
   if (skillType) params.append('skill_type', skillType)
   if (status) params.append('status', status)
+  if (category) params.append('category', category)
+  if (agentType) params.append('agent_type', agentType)
   if (tags) params.append('tags', tags.join(','))
   if (search) params.append('search', search)
   params.append('limit', String(limit))
@@ -207,7 +307,7 @@ export async function executeSkill(
 }
 
 /**
- * 分配 Skill 给 Agent
+ * 分配 Skill 给 Agent 模板
  */
 export async function assignSkill(dto: AssignSkillDTO): Promise<SkillAssignment> {
   return await api.post(`${API_BASE}/assign`, dto)
@@ -218,10 +318,9 @@ export async function assignSkill(dto: AssignSkillDTO): Promise<SkillAssignment>
  */
 export async function unassignSkill(
   skillId: string,
-  projectId: string,
-  agentId: string
+  agentType: string
 ): Promise<{ success: boolean; message: string }> {
-  return await api.delete(`${API_BASE}/assign?skill_id=${skillId}&project_id=${projectId}&agent_id=${agentId}`)
+  return await api.delete(`${API_BASE}/${skillId}/assign/${agentType}`)
 }
 
 /**
@@ -232,10 +331,10 @@ export async function getSkillAssignments(skillId: string): Promise<SkillAssignm
 }
 
 /**
- * 获取 Agent 已分配的 Skills
+ * 获取 Agent 模板的 Skills
  */
-export async function getAgentSkills(projectId: string, agentId: string): Promise<Skill[]> {
-  return await api.get(`${API_BASE}/agent/${projectId}/${agentId}`)
+export async function getAgentTypeSkills(agentType: string): Promise<Skill[]> {
+  return await api.get(`${API_BASE}/agents/${agentType}/skills`)
 }
 
 /**
@@ -276,4 +375,33 @@ export async function getAllLogs(
  */
 export async function getSkillsStats(): Promise<SkillStats> {
   return await api.get(`${API_BASE}/stats/overview`)
+}
+
+/**
+ * 初始化默认 Skills
+ */
+export async function initializeDefaultSkills(): Promise<{
+  success: boolean
+  message: string
+  result: {
+    skills_created: number
+    skills_skipped: number
+    assignments_created: number
+  }
+}> {
+  return await api.post(`${API_BASE}/initialize`)
+}
+
+/**
+ * 获取所有 Skill 类别
+ */
+export async function getSkillCategories(): Promise<string[]> {
+  return await api.get(`${API_BASE}/categories`)
+}
+
+/**
+ * 获取所有 Skill 类型
+ */
+export async function getSkillTypes(): Promise<string[]> {
+  return await api.get(`${API_BASE}/types`)
 }

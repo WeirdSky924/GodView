@@ -5,6 +5,7 @@ Agent 基类
 import asyncio
 import json
 import logging
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
@@ -13,7 +14,6 @@ from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain_core.language_models import BaseLanguageModel
 
 from app.models.token_usage import UsageCategory
-from app.services.token_tracker import token_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -43,21 +43,210 @@ class BaseAgent(ABC):
         system_prompt: Optional[str] = None,
         config: Optional[Dict[str, Any]] = None,
         project_id: Optional[str] = None,
+        agent_id: Optional[str] = None,  # 新增：用于区分同类型多实例
     ):
         self.name = name
         self.model = model
         self.config = config or {}
         self.project_id = project_id
+        self.agent_id = agent_id  # 实例 ID
         self.message_history: List = []
         self._lock = asyncio.Lock()
         # 流式输出回调（由 workflow_engine 设置）
         self._stream_callback: Optional[callable] = None
 
-        # 如果有 project_id 且没有手动指定 system_prompt，尝试从模板加载
+        # Skills 缓存（从模板加载）
+        self._skills: Dict[str, Any] = {}  # skill_id -> Skill 对象
+        self._skills_loaded: bool = False
+
+        # ========== 记忆系统 ==========
+        self._memory = None  # AgentMemory 对象（延迟加载）
+        self._memory_loaded: bool = False
+
+        # 延迟加载 system prompt 的标记
+        self._system_prompt_loaded: bool = False
+        self._pending_system_prompt_load: bool = False
+
+        # 如果有 project_id 且没有手动指定 system_prompt，标记为需要延迟加载
         if project_id and not system_prompt and self.AGENT_TYPE:
-            self.system_prompt = self._load_system_prompt()
+            self._pending_system_prompt_load = True
+            self.system_prompt = ""  # 先设置为空，稍后在异步上下文中加载
         else:
             self.system_prompt = system_prompt or ""
+            self._system_prompt_loaded = True
+
+    @property
+    def memory(self):
+        """获取 Agent 记忆"""
+        return self._memory
+
+    async def load_memory(self, db=None):
+        """
+        加载 Agent 记忆（从数据库）
+
+        Args:
+            db: 数据库连接（可选，如果不提供则尝试自动获取）
+        """
+        if self._memory_loaded:
+            return self._memory
+
+        if not self.project_id:
+            logger.debug(f"Agent {self.name} 没有 project_id，跳过记忆加载")
+            return None
+
+        try:
+            from app.services.agent_memory_service import get_memory_service
+
+            # 获取记忆服务
+            service = get_memory_service(db)
+
+            # 加载记忆
+            self._memory = await service.get_memory(
+                project_id=self.project_id,
+                agent_type=self.AGENT_TYPE or self.name,
+                agent_id=self.agent_id,
+            )
+
+            self._memory_loaded = True
+            logger.info(
+                f"Agent {self.name} 加载记忆成功: "
+                f"{self._memory.total_memories} 条记忆, "
+                f"{self._memory.execution_count} 次执行"
+            )
+
+            return self._memory
+
+        except Exception as e:
+            logger.warning(f"Agent {self.name} 加载记忆失败: {e}")
+            return None
+
+    async def save_memory(self, db=None):
+        """
+        保存 Agent 记忆到数据库
+
+        Args:
+            db: 数据库连接
+        """
+        if not self._memory:
+            return False
+
+        try:
+            from app.services.agent_memory_service import get_memory_service
+
+            service = get_memory_service(db)
+            return await service.save_memory(self._memory)
+
+        except Exception as e:
+            logger.error(f"Agent {self.name} 保存记忆失败: {e}")
+            return False
+
+    def add_memory(
+        self,
+        content: str,
+        memory_type: str = "observation",
+        importance: str = "medium",
+        tags: List[str] = None,
+        context: Dict[str, Any] = None,
+    ):
+        """
+        添加记忆条目
+
+        Args:
+            content: 记忆内容
+            memory_type: 记忆类型 (observation/decision/action/learning/reflection)
+            importance: 重要性 (critical/high/medium/low/ephemeral)
+            tags: 标签列表
+            context: 上下文信息
+        """
+        if not self._memory:
+            return None
+
+        from app.models.agent_memory import MemoryType, MemoryImportance
+
+        try:
+            mem_type = MemoryType(memory_type)
+        except ValueError:
+            mem_type = MemoryType.OBSERVATION
+
+        try:
+            mem_importance = MemoryImportance(importance)
+        except ValueError:
+            mem_importance = MemoryImportance.MEDIUM
+
+        entry = self._memory.add_memory(
+            content=content,
+            memory_type=mem_type,
+            importance=mem_importance,
+            tags=tags or [],
+            context=context or {},
+        )
+
+        logger.debug(f"Agent {self.name} 添加记忆: {content[:50]}...")
+        return entry
+
+    def get_memory_context(self) -> str:
+        """
+        获取记忆上下文（用于注入到 prompt 中）
+
+        Returns:
+            str: 格式化的记忆上下文
+        """
+        if not self._memory:
+            return ""
+
+        # 获取最近的记忆
+        recent = self._memory.get_recent_memories(5)
+
+        if not recent:
+            return ""
+
+        context_parts = ["【Agent 历史记忆】"]
+
+        for entry in recent:
+            context_parts.append(
+                f"- [{entry.type.value}] {entry.content[:100]}"
+            )
+
+        # 获取重要记忆
+        important = self._memory.get_important_memories()[:3]
+        if important:
+            context_parts.append("\n【关键记忆】")
+            for entry in important:
+                context_parts.append(
+                    f"- [{entry.importance.value}] {entry.content[:100]}"
+                )
+
+        return "\n".join(context_parts)
+
+    async def _ensure_system_prompt_loaded(self):
+        """
+        确保系统提示词已加载（在异步上下文中调用）
+        """
+        if self._system_prompt_loaded or not self._pending_system_prompt_load:
+            return
+
+        if not self.project_id or not self.AGENT_TYPE:
+            self._system_prompt_loaded = True
+            return
+
+        try:
+            from app.services.agent_prompt_service import get_agent_prompt_service
+
+            service = get_agent_prompt_service()
+            prompt = await service.build_agent_prompt(
+                agent_type=self.AGENT_TYPE,
+                project_id=self.project_id,
+            )
+
+            if prompt:
+                self.system_prompt = prompt
+                logger.debug(f"Agent {self.name} 从模板加载 prompt 成功 (project={self.project_id}, type={self.AGENT_TYPE})")
+
+        except Exception as e:
+            logger.warning(f"Agent {self.name} 加载 prompt 失败: {e}")
+
+        self._system_prompt_loaded = True
+        self._pending_system_prompt_load = False
 
     @abstractmethod
     async def execute(self, input_data: Dict[str, Any]) -> AgentResponse:
@@ -73,56 +262,6 @@ class BaseAgent(ABC):
         """
         pass
 
-    def _load_system_prompt(self) -> str:
-        """
-        从模板系统加载 system prompt
-
-        Returns:
-            str: 加载的 system prompt，如果无法加载则返回空字符串
-        """
-        if not self.project_id or not self.AGENT_TYPE:
-            return ""
-
-        # 尝试从 AgentPromptService 加载
-        try:
-            import asyncio
-            from app.services.agent_prompt_service import get_agent_prompt_service
-
-            service = get_agent_prompt_service()
-
-            # 尝试在已有事件循环中运行
-            try:
-                loop = asyncio.get_running_loop()
-                # 如果已有事件循环，创建一个任务
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(
-                        asyncio.run,
-                        service.build_agent_prompt(
-                            agent_type=self.AGENT_TYPE,
-                            project_id=self.project_id,
-                        )
-                    )
-                    prompt = future.result(timeout=5)
-            except RuntimeError:
-                # 没有运行中的事件循环
-                prompt = asyncio.run(
-                    service.build_agent_prompt(
-                        agent_type=self.AGENT_TYPE,
-                        project_id=self.project_id,
-                    )
-                )
-
-            if prompt:
-                logger.debug(f"Agent {self.name} 从模板加载 prompt 成功 (project={self.project_id}, type={self.AGENT_TYPE})")
-                return prompt
-
-        except Exception as e:
-            logger.warning(f"Agent {self.name} 加载 prompt 失败: {e}")
-
-        logger.debug(f"Agent {self.name} 尝试从模板加载 prompt (project={self.project_id}, type={self.AGENT_TYPE})")
-        return ""
-
     async def _call_llm(
         self,
         messages: List,
@@ -133,6 +272,9 @@ class BaseAgent(ABC):
         if not self.model:
             raise ValueError(f"Agent {self.name} 未配置模型")
 
+        # 确保系统提示词已加载（延迟加载）
+        await self._ensure_system_prompt_loaded()
+
         # 如果设置了流式回调，使用流式输出
         if self._stream_callback:
             return await self._stream_llm(
@@ -140,8 +282,15 @@ class BaseAgent(ABC):
                 on_chunk=self._stream_callback
             )
 
-        if self.system_prompt:
-            messages = [SystemMessage(content=self.system_prompt)] + messages
+        # 构建完整的 system prompt（包含记忆上下文）
+        full_system_prompt = self.system_prompt
+        if self._memory:
+            memory_context = self.get_memory_context()
+            if memory_context:
+                full_system_prompt = f"{self.system_prompt}\n\n{memory_context}"
+
+        if full_system_prompt:
+            messages = [SystemMessage(content=full_system_prompt)] + messages
 
         response = await self.model.ainvoke(messages)
         content = response.content
@@ -195,8 +344,18 @@ class BaseAgent(ABC):
         if not self.model:
             raise ValueError(f"Agent {self.name} 未配置模型")
 
-        if self.system_prompt:
-            messages = [SystemMessage(content=self.system_prompt)] + messages
+        # 确保系统提示词已加载（延迟加载）
+        await self._ensure_system_prompt_loaded()
+
+        # 构建完整的 system prompt（包含记忆上下文）
+        full_system_prompt = self.system_prompt
+        if self._memory:
+            memory_context = self.get_memory_context()
+            if memory_context:
+                full_system_prompt = f"{self.system_prompt}\n\n{memory_context}"
+
+        if full_system_prompt:
+            messages = [SystemMessage(content=full_system_prompt)] + messages
 
         full_content = ""
         last_chunk = None
@@ -204,22 +363,34 @@ class BaseAgent(ABC):
 
         try:
             logger.info(f"Agent {self.name} 开始流式调用 LLM...")
-            # 使用 astream 进行流式输出
-            async for chunk in self.model.astream(messages):
-                chunk_text = chunk.content if hasattr(chunk, 'content') else str(chunk)
-                full_content += chunk_text
-                last_chunk = chunk
-                chunk_count += 1
+            # 使用 astream 进行流式输出（添加超时保护）
+            async def stream_with_timeout():
+                nonlocal full_content, last_chunk, chunk_count
+                async for chunk in self.model.astream(messages):
+                    chunk_text = chunk.content if hasattr(chunk, 'content') else str(chunk)
+                    full_content += chunk_text
+                    last_chunk = chunk
+                    chunk_count += 1
 
-                # 调用回调函数
-                if on_chunk:
-                    try:
-                        await on_chunk(chunk_text) if asyncio.iscoroutinefunction(on_chunk) else on_chunk(chunk_text)
-                    except Exception as e:
-                        logger.warning(f"流式输出回调失败: {e}")
+                    # 调用回调函数
+                    if on_chunk:
+                        try:
+                            await on_chunk(chunk_text) if asyncio.iscoroutinefunction(on_chunk) else on_chunk(chunk_text)
+                        except Exception as e:
+                            logger.warning(f"流式输出回调失败: {e}")
+
+            # 设置 5 分钟超时
+            await asyncio.wait_for(stream_with_timeout(), timeout=300.0)
 
             logger.info(f"Agent {self.name} 流式调用完成，共 {chunk_count} 个 chunk，总长度 {len(full_content)} 字符")
 
+        except asyncio.TimeoutError:
+            logger.error(f"Agent {self.name} 流式调用超时（超过 300 秒）")
+            # 返回已有内容
+            if full_content:
+                logger.info(f"Agent {self.name} 返回已获取的 {len(full_content)} 字符内容")
+                return full_content
+            raise
         except Exception as e:
             logger.error(f"流式调用 LLM 失败: {e}")
             # 如果流式失败，回退到普通调用
@@ -272,7 +443,8 @@ class BaseAgent(ABC):
             elif "OpenAI" in model_str or "ChatOpenAI" in model_str:
                 provider = "openai"
 
-            # 异步记录 token 使用
+            # 异步记录 token 使用（lazy import 避免循环依赖）
+            from app.services.token_tracker import token_tracker
             asyncio.create_task(
                 token_tracker.record_usage(
                     project_id=self.project_id,
@@ -290,14 +462,27 @@ class BaseAgent(ABC):
     def _parse_json_response(self, text: str) -> Dict[str, Any]:
         import re
 
-        json_pattern = r"```json\s*(.*?)\s*```"
-        match = re.search(json_pattern, text, re.DOTALL)
-        json_str = match.group(1) if match else text.strip()
+        # 尝试多种 JSON 提取模式
+        patterns = [
+            r"```json\s*(.*?)\s*```",  # 标准 markdown JSON 代码块
+            r"```\s*(\{[\s\S]*?\})\s*```",  # 普通代码块中的 JSON 对象
+            r"(\{[\s\S]*\})",  # 直接的 JSON 对象
+        ]
 
+        for pattern in patterns:
+            match = re.search(pattern, text, re.DOTALL)
+            if match:
+                json_str = match.group(1).strip()
+                try:
+                    return json.loads(json_str)
+                except json.JSONDecodeError:
+                    continue
+
+        # 最后尝试直接解析整个文本
         try:
-            return json.loads(json_str)
+            return json.loads(text.strip())
         except json.JSONDecodeError as e:
-            logger.error(f"JSON 解析失败：{e}, 原始文本：{text}")
+            logger.error(f"JSON 解析失败：{e}, 原始文本：{text[:500]}...")
             raise ValueError(f"Agent {self.name} 返回了无效的 JSON 格式")
 
     def add_to_history(self, role: str, content: str):
@@ -313,6 +498,142 @@ class BaseAgent(ABC):
 
     def get_history(self) -> List:
         return self.message_history.copy()
+
+    # ==================== Skill 集成 ====================
+
+    async def load_skills(self) -> None:
+        """
+        加载绑定到当前 Agent 类型的 Skills
+
+        从 Agent 模板的 skill_slots 中获取 Skill ID，然后从 SkillService 加载
+        """
+        if self._skills_loaded:
+            return
+
+        if not self.AGENT_TYPE:
+            return
+
+        try:
+            from app.services.skill_service import get_skill_service
+            service = get_skill_service()
+
+            # 获取适用于此 Agent 类型的所有 Skills
+            skills = await service.get_skills_for_agent_type(self.AGENT_TYPE)
+
+            for skill in skills:
+                if skill.is_enabled and skill.status.value == 'active':
+                    self._skills[skill.id] = skill
+
+            self._skills_loaded = True
+            logger.info(f"Agent {self.name} 加载了 {len(self._skills)} 个 Skills")
+
+        except Exception as e:
+            logger.warning(f"Agent {self.name} 加载 Skills 失败: {e}")
+
+    async def execute_skill(
+        self,
+        skill_id: str,
+        parameters: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        执行指定的 Skill
+
+        Args:
+            skill_id: Skill ID
+            parameters: 执行参数
+
+        Returns:
+            Dict: 执行结果
+        """
+        # 确保 Skills 已加载
+        if not self._skills_loaded:
+            await self.load_skills()
+
+        # 检查 Skill 是否已加载
+        if skill_id not in self._skills:
+            # 尝试从服务获取
+            try:
+                from app.services.skill_service import get_skill_service
+                service = get_skill_service()
+                skill = await service.get_skill(skill_id)
+                if skill:
+                    self._skills[skill_id] = skill
+                else:
+                    return {"success": False, "error": f"Skill {skill_id} 不存在"}
+            except Exception as e:
+                return {"success": False, "error": f"加载 Skill 失败: {e}"}
+
+        skill = self._skills[skill_id]
+
+        try:
+            from app.services.skill_service import get_skill_service, ExecuteSkillDTO
+            service = get_skill_service()
+
+            dto = ExecuteSkillDTO(
+                skill_id=skill_id,
+                project_id=self.project_id,
+                agent_id=self.name,
+                parameters=parameters or {},
+            )
+
+            result = await service.execute_skill(dto)
+            return result.model_dump()
+
+        except Exception as e:
+            logger.error(f"执行 Skill {skill_id} 失败: {e}")
+            return {"success": False, "error": str(e)}
+
+    def get_knowledge_context(self) -> str:
+        """
+        获取所有 knowledge 类型 Skill 的内容
+
+        用于在 Agent 的 system prompt 或 user message 中注入知识上下文
+
+        Returns:
+            str: 合并后的知识内容
+        """
+        knowledge_parts = []
+
+        for skill_id, skill in self._skills.items():
+            if skill.skill_type.value == 'knowledge' and skill.knowledge_content:
+                knowledge_parts.append(f"【{skill.name}】\n{skill.knowledge_content}")
+
+        return "\n\n".join(knowledge_parts) if knowledge_parts else ""
+
+    def get_skill(self, skill_id: str) -> Optional[Any]:
+        """获取已加载的 Skill"""
+        return self._skills.get(skill_id)
+
+    def get_all_skills(self) -> Dict[str, Any]:
+        """获取所有已加载的 Skills"""
+        return self._skills.copy()
+
+    # ==================== 内置工具函数（可作为 Skill 调用）====================
+
+    async def count_words(self, text: str) -> int:
+        """
+        统计文本字数（支持中英文混合）
+
+        可以作为工具 Skill 调用，也可直接调用
+
+        Args:
+            text: 输入文本
+
+        Returns:
+            int: 字数
+        """
+        if not text:
+            return 0
+
+        try:
+            from app.utils.text_utils import count_mixed_text
+            return count_mixed_text(text)
+        except ImportError:
+            # 回退到简单统计
+            import re
+            chinese = len(re.findall(r'[\u4e00-\u9fff]', text))
+            english = len(re.findall(r'\b[a-zA-Z]+\b', text))
+            return chinese + english
 
     async def __aenter__(self):
         await self._lock.acquire()

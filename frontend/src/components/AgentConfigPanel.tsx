@@ -18,24 +18,17 @@ import {
 } from '@/api/agentConfigs'
 import { getAgentTemplates, AgentTemplate } from '@/api/agentTemplates'
 import { getPrompts, PromptTemplate } from '@/api/prompts'
+import { useAgentTypes } from '@/hooks/useAgentTypes'
 import { Eye, RefreshCw, Settings, ChevronDown, ChevronUp, Check } from 'lucide-react'
-
-const AGENT_TYPE_LABELS: Record<string, string> = {
-  character: '角色 Agent',
-  setting: '设定 Agent',
-  summarizer: '摘要 Agent',
-  master_plotter: '总编剧 Agent',
-  hook_manager: '伏笔管理 Agent',
-  writer: '作家 Agent',
-  evaluator: '评估 Agent',
-  proc_gen: '过程生成 Agent',
-}
 
 interface AgentConfigPanelProps {
   projectId: string
 }
 
 export default function AgentConfigPanel({ projectId }: AgentConfigPanelProps) {
+  // 动态加载 Agent 类型元数据
+  const { labels: AGENT_TYPE_LABELS } = useAgentTypes()
+
   const [configs, setConfigs] = useState<AgentConfig[]>([])
   const [templates, setTemplates] = useState<AgentTemplate[]>([])
   const [prompts, setPrompts] = useState<PromptTemplate[]>([])

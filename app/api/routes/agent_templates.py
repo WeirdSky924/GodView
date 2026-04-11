@@ -174,12 +174,11 @@ async def update_agent_template(template_id: str, request: AgentTemplateUpdate):
     """
     service = get_agent_template_service()
 
-    template = await service.update_template(template_id, request)
-    if not template:
-        raise HTTPException(
-            status_code=404,
-            detail="Agent 模板不存在或系统内置模板不可修改"
-        )
+    template, error = await service.update_template(template_id, request)
+    if error == 'not_found':
+        raise HTTPException(status_code=404, detail="Agent 模板不存在")
+    if error == 'is_system':
+        raise HTTPException(status_code=403, detail="系统内置模板不可修改")
 
     return {
         "success": True,
@@ -201,12 +200,11 @@ async def delete_agent_template(template_id: str):
     """
     service = get_agent_template_service()
 
-    success = await service.delete_template(template_id)
-    if not success:
-        raise HTTPException(
-            status_code=404,
-            detail="Agent 模板不存在或系统内置模板不可删除"
-        )
+    success, error = await service.delete_template(template_id)
+    if error == 'not_found':
+        raise HTTPException(status_code=404, detail="Agent 模板不存在")
+    if error == 'is_system':
+        raise HTTPException(status_code=403, detail="系统内置模板不可删除")
 
     return {
         "success": True,
@@ -428,3 +426,160 @@ async def get_optional_agent_types():
         List: 可选 Agent 类型列表
     """
     return [t.value for t in AgentType.optional_agents()]
+
+
+@router.get("/agent-templates/types/metadata", response_model=List[Dict[str, Any]])
+async def get_agent_types_metadata():
+    """
+    获取所有 Agent 类型的元数据（用于动态生成 UI）
+
+    Returns:
+        List: Agent 类型元数据列表，包含类型、标签、是否核心等信息
+    """
+    core_types = [t.value for t in AgentType.core_agents()]
+    optional_types = [t.value for t in AgentType.optional_agents()]
+
+    # Agent 类型的中文标签
+    type_labels = {
+        AgentType.CHARACTER: "角色 Agent",
+        AgentType.SETTING: "设定 Agent",
+        AgentType.SUMMARIZER: "摘要 Agent",
+        AgentType.MASTER_PLOTTER: "总编剧 Agent",
+        AgentType.HOOK_MANAGER: "伏笔管理 Agent",
+        AgentType.WRITER: "作家 Agent",
+        AgentType.EVALUATOR: "评估 Agent",
+        AgentType.PROC_GEN: "过程生成 Agent",
+        AgentType.SCENE_COORDINATOR: "场景协调 Agent",
+        AgentType.EVENT_GENERATOR: "事件生成 Agent",
+        AgentType.DUNGEON_GENERATOR: "副本生成 Agent",
+        AgentType.WORLD_MAP_MANAGER: "世界地图 Agent",
+    }
+
+    # Agent 类型的描述
+    type_descriptions = {
+        AgentType.CHARACTER: "扮演小说中的角色，进行对话和互动",
+        AgentType.SETTING: "管理和维护世界观设定",
+        AgentType.SUMMARIZER: "生成内容摘要和关键信息提取",
+        AgentType.MASTER_PLOTTER: "规划剧情大纲和章节结构",
+        AgentType.HOOK_MANAGER: "管理伏笔的埋设和回收",
+        AgentType.WRITER: "执行章节内容写作",
+        AgentType.EVALUATOR: "评估内容质量和一致性",
+        AgentType.PROC_GEN: "过程化内容生成（随机事件等）",
+        AgentType.SCENE_COORDINATOR: "统筹多角色演绎场景，协调信息分配",
+        AgentType.EVENT_GENERATOR: "生成故事事件、转折和随机变数",
+        AgentType.DUNGEON_GENERATOR: "生成故事副本、挑战和任务",
+        AgentType.WORLD_MAP_MANAGER: "管理世界地图、地点和空间关系",
+    }
+
+    # Agent 类型的图标建议
+    type_icons = {
+        AgentType.CHARACTER: "User",
+        AgentType.SETTING: "Settings",
+        AgentType.SUMMARIZER: "FileText",
+        AgentType.MASTER_PLOTTER: "GitBranch",
+        AgentType.HOOK_MANAGER: "Link",
+        AgentType.WRITER: "PenTool",
+        AgentType.EVALUATOR: "CheckCircle",
+        AgentType.PROC_GEN: "Shuffle",
+        AgentType.SCENE_COORDINATOR: "Users",
+        AgentType.EVENT_GENERATOR: "Zap",
+        AgentType.DUNGEON_GENERATOR: "Map",
+        AgentType.WORLD_MAP_MANAGER: "Globe",
+    }
+
+    result = []
+    for agent_type in AgentType:
+        type_value = agent_type.value
+        result.append({
+            "type": type_value,
+            "label": type_labels.get(agent_type, type_value),
+            "description": type_descriptions.get(agent_type, ""),
+            "icon": type_icons.get(agent_type, "Bot"),
+            "is_core": type_value in core_types,
+            "is_optional": type_value in optional_types,
+        })
+
+    return result
+
+
+@router.get("/workflow/node-types", response_model=Dict[str, Any])
+async def get_workflow_node_types(project_id: Optional[str] = Query(default=None, description="项目ID，用于获取项目角色")):
+    """
+    获取工作流节点类型（用于可视化工作台）
+
+    返回三类节点：
+    1. Agent 节点 - 系统 Agent
+    2. 交互节点 - 场景演绎、集体讨论
+    3. 控制节点 - 开始、结束、条件、并行等
+
+    Args:
+        project_id: 项目 ID，如果提供则返回该项目的角色 Agent
+
+    Returns:
+        Dict: 按类别分组的节点类型
+    """
+    from app.models.node_types import (
+        NodeCategory,
+        SYSTEM_AGENT_NODES,
+        INTERACTION_NODES,
+        CONTROL_NODES,
+        NodeTypeInfo,
+    )
+
+    def serialize_node(node: NodeTypeInfo) -> Dict[str, Any]:
+        """序列化节点，确保枚举转换为字符串"""
+        data = node.dict()
+        data["category"] = node.category.value  # 枚举转字符串
+        return data
+
+    result = {
+        "agent_nodes": [],
+        "interaction_nodes": [],
+        "control_nodes": [],
+        "character_nodes": [],  # 项目角色 Agent
+    }
+
+    # 系统 Agent 节点
+    for node in SYSTEM_AGENT_NODES:
+        result["agent_nodes"].append(serialize_node(node))
+
+    # 交互节点
+    for node in INTERACTION_NODES:
+        result["interaction_nodes"].append(serialize_node(node))
+
+    # 控制节点
+    for node in CONTROL_NODES:
+        result["control_nodes"].append(serialize_node(node))
+
+    # 如果有项目 ID，获取项目角色
+    if project_id:
+        try:
+            from app.database.postgres import PostgresDatabase
+            db = PostgresDatabase()
+            characters = await db.fetchall(
+                """
+                SELECT id, name, role, importance_tier, has_agent, agent_enabled
+                FROM characters
+                WHERE project_id = $1 AND has_agent = true
+                ORDER BY importance_tier, name
+                """,
+                project_id
+            )
+            for char in characters or []:
+                result["character_nodes"].append({
+                    "type": "agent",
+                    "agent_type": f"character:{char['id']}",
+                    "label": f"{char['name']} (角色)",
+                    "description": f"角色 Agent - {char['role']}",
+                    "category": "agent",
+                    "icon": "User",
+                    "color": "orange",
+                    "is_system": False,
+                    "character_id": char["id"],
+                    "character_name": char["name"],
+                    "importance_tier": char["importance_tier"],
+                })
+        except Exception as e:
+            logger.warning(f"Failed to load characters for project {project_id}: {e}")
+
+    return result

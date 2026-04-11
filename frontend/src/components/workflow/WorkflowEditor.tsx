@@ -3,7 +3,7 @@
  * v8 Agent协作可视化工作台
  */
 
-import { useState, useCallback, useMemo, useRef } from 'react'
+import { useState, useCallback, useMemo, useRef, useEffect } from 'react'
 import ReactFlow, {
   Background,
   Controls,
@@ -55,7 +55,8 @@ const nodeTypes: NodeTypes = useMemo(() => ({
   agent: AgentNode,
   condition: ConditionNode,
   parallel: ParallelNode,
-  group_discussion: AgentNode,  // 使用 AgentNode 渲染
+  group_discussion: AgentNode,  // 集体讨论节点
+  scene_performance: AgentNode, // 场景演绎节点
   start: AgentNode,
   end: AgentNode,
   input: AgentNode,

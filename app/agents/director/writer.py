@@ -1,10 +1,11 @@
 """
 内容执行官 Agent - 将剧情意图润色成小说文本
-支持自动字数检查和续写
+支持自动字数检查和续写，以及分段生成策略
 """
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+import asyncio
 
 from langchain_core.language_models import BaseLanguageModel
 from langchain_core.messages import HumanMessage
@@ -15,12 +16,17 @@ from app.models.token_usage import UsageCategory
 
 logger = logging.getLogger(__name__)
 
+# 分段生成的阈值配置
+SEGMENT_THRESHOLD = 1500  # 超过此字数时采用分段生成
+SEGMENT_SIZE = 800  # 每段目标字数
+MAX_SEGMENTS = 5  # 最大分段数
+WORDS_PER_RETRY = 250  # 每次续写预期增加的字数，用于计算最大续写次数
+
 
 class WriterAgent(BaseAgent):
     """内容执行官 Agent"""
 
     AGENT_TYPE = AgentType.WRITER
-    MAX_RETRY_COUNT = 3  # 最大续写次数
 
     def __init__(
         self,
@@ -97,7 +103,7 @@ class WriterAgent(BaseAgent):
     async def execute(self, input_data: Dict[str, Any]) -> AgentResponse:
         """
         执行小说文本生成
-        支持自动字数检查和续写
+        支持自动字数检查、续写和分段生成
 
         Args:
             input_data: 包含以下字段
@@ -119,6 +125,9 @@ class WriterAgent(BaseAgent):
         Returns:
             AgentResponse: 生成的小说文本
         """
+        # 加载绑定的 Skills（包括字数统计工具）
+        await self.load_skills()
+
         try:
             intents = input_data.get("intents", [])
             environment = input_data.get("environment", "")
@@ -141,98 +150,32 @@ class WriterAgent(BaseAgent):
             # 计算最低字数要求
             min_word_count = int(word_count * 0.8)
 
-            # 构建用户消息
-            if auto_write_mode and writing_prompt:
-                # 自动写作模式：使用完整提示
-                user_message = writing_prompt
-            else:
-                # 普通模式：构建用户消息
-                user_message = self._build_user_message(
-                    intents=intents,
-                    environment=environment,
-                    character_moods=character_moods,
-                    hooks=hooks,
-                    previous_style=previous_style,
+            # ========== 决定生成策略 ==========
+            use_segmented = word_count >= SEGMENT_THRESHOLD
+
+            if use_segmented:
+                logger.info(f"目标字数 {word_count} 超过阈值 {SEGMENT_THRESHOLD}，采用分段生成策略")
+                result = await self._execute_segmented(
+                    input_data=input_data,
                     word_count=word_count,
                     min_word_count=min_word_count,
-                    discussion_summary=discussion_summary,
-                    chapter_num=chapter_num,
-                    total_chapters=total_chapters,
-                    world_info=world_info,
+                )
+            else:
+                # 普通生成流程
+                result = await self._execute_single(
+                    input_data=input_data,
+                    word_count=word_count,
+                    min_word_count=min_word_count,
                 )
 
-            # 如果是重试，添加重试提示
-            if is_retry and retry_message:
-                user_message = f"{retry_message}\n\n---\n\n{user_message}"
-                logger.info(f"Writer Agent 第 {retry_count} 次重试，已添加评估反馈")
+            # 如果是重试，添加重试标记
+            if is_retry:
+                result["is_retry"] = True
+                result["retry_count"] = retry_count
 
-            # 调用 LLM（自动写作模式使用更高的 temperature 增加创造性）
-            temperature = 0.8 if auto_write_mode else 0.7
-            response_text = await self._call_llm(
-                messages=[HumanMessage(content=user_message)], temperature=temperature,
-                category=UsageCategory.CHAPTER
-            )
-
-            # 解析响应
-            result = self._parse_json_response(response_text)
-
-            # 如果解析失败，尝试直接返回文本
-            if not result or not result.get("content"):
-                result = {
-                    "content": response_text,
-                    "word_count": len(response_text),
-                }
-
-            # 进行字数统计验证
+            # 最终字数验证
             content = result.get("content", "")
-            actual_word_count = self._count_words(content)
-
-            # 如果LLM报告的字数与实际统计差距较大，使用实际统计
-            if abs(result.get("word_count", 0) - actual_word_count) > 100:
-                logger.warning(f"字数统计差异较大: LLM报告 {result.get('word_count')} vs 实际 {actual_word_count}")
-                result["word_count"] = actual_word_count
-
-            # ========== 自动续写逻辑 ==========
-            # 如果字数不足且未达到最大重试次数，自动续写
-            continue_count = 0
-            while actual_word_count < min_word_count and continue_count < self.MAX_RETRY_COUNT:
-                continue_count += 1
-                shortage = min_word_count - actual_word_count
-
-                logger.info(f"字数不足 ({actual_word_count}/{min_word_count})，开始第 {continue_count} 次续写...")
-
-                # 构建续写提示
-                continue_prompt = self._build_continue_prompt(
-                    existing_content=content,
-                    shortage=shortage,
-                    intents=intents,
-                    character_moods=character_moods,
-                    chapter_num=chapter_num,
-                    total_chapters=total_chapters,
-                )
-
-                # 调用 LLM 续写
-                continue_response = await self._call_llm(
-                    messages=[HumanMessage(content=continue_prompt)], temperature=0.75,
-                    category=UsageCategory.CHAPTER
-                )
-
-                # 解析续写内容
-                continue_result = self._parse_json_response(continue_response)
-                if continue_result and continue_result.get("content"):
-                    new_content = continue_result.get("content", "")
-                    content = content + "\n\n" + new_content
-                    actual_word_count = self._count_words(content)
-                    logger.info(f"续写完成，新增 {self._count_words(new_content)} 字，当前总字数: {actual_word_count}")
-                else:
-                    # 如果解析失败，直接追加
-                    content = content + "\n\n" + continue_response
-                    actual_word_count = self._count_words(content)
-
-            # 更新结果
-            result["content"] = content
-            result["word_count"] = actual_word_count
-            result["continue_count"] = continue_count
+            actual_word_count = await self._count_words_async(content)
 
             # 字数检查
             word_count_passed = actual_word_count >= min_word_count
@@ -244,10 +187,10 @@ class WriterAgent(BaseAgent):
             }
 
             if not word_count_passed:
-                logger.warning(f"经过 {continue_count} 次续写后字数仍不达标: 实际 {actual_word_count} < 最低要求 {min_word_count}")
+                logger.warning(f"字数不达标: 实际 {actual_word_count} < 最低要求 {min_word_count}")
                 result["word_count_warning"] = f"字数不足 {min_word_count - actual_word_count} 字"
-            elif continue_count > 0:
-                logger.info(f"经过 {continue_count} 次续写后字数达标: {actual_word_count} 字")
+            else:
+                logger.info(f"字数达标: {actual_word_count} 字 (目标: {word_count})")
 
             # 验证风格一致性（如果有前文样本）
             if previous_style and self.config.get("style_check_enabled", True):
@@ -268,13 +211,425 @@ class WriterAgent(BaseAgent):
                     "auto_write_mode": auto_write_mode,
                     "is_retry": is_retry,
                     "retry_count": retry_count,
-                    "continue_count": continue_count,
+                    "use_segmented": use_segmented,
                 },
             )
 
         except Exception as e:
-            logger.error(f"WriterAgent 执行失败：{e}")
+            logger.error(f"WriterAgent 执行失败：{e}", exc_info=True)
             return AgentResponse(success=False, error=str(e))
+
+    async def _execute_single(
+        self,
+        input_data: Dict[str, Any],
+        word_count: int,
+        min_word_count: int,
+    ) -> Dict[str, Any]:
+        """
+        单次生成流程（适用于较小字数需求）
+        """
+        intents = input_data.get("intents", [])
+        environment = input_data.get("environment", "")
+        character_moods = input_data.get("character_moods", {})
+        hooks = input_data.get("hooks", [])
+        previous_style = input_data.get("previous_style", "")
+        auto_write_mode = input_data.get("auto_write_mode", False)
+        writing_prompt = input_data.get("writing_prompt", "")
+        discussion_summary = input_data.get("last_discussion_summary", "")
+        chapter_num = input_data.get("chapter_num", 1)
+        total_chapters = input_data.get("total_chapters", 10)
+        world_info = input_data.get("world_info")
+
+        # 构建用户消息
+        if auto_write_mode and writing_prompt:
+            user_message = writing_prompt
+        else:
+            user_message = self._build_user_message(
+                intents=intents,
+                environment=environment,
+                character_moods=character_moods,
+                hooks=hooks,
+                previous_style=previous_style,
+                word_count=word_count,
+                min_word_count=min_word_count,
+                discussion_summary=discussion_summary,
+                chapter_num=chapter_num,
+                total_chapters=total_chapters,
+                world_info=world_info,
+            )
+
+        # 调用 LLM
+        temperature = 0.8 if auto_write_mode else 0.7
+        response_text = await self._call_llm(
+            messages=[HumanMessage(content=user_message)], temperature=temperature,
+            category=UsageCategory.CHAPTER
+        )
+
+        # 解析响应
+        result = self._parse_json_response(response_text)
+
+        # 如果解析失败，尝试直接返回文本
+        if not result or not result.get("content"):
+            result = {
+                "content": response_text,
+                "word_count": len(response_text),
+            }
+
+        # 进行字数统计验证
+        content = result.get("content", "")
+        actual_word_count = await self._count_words_async(content)
+
+        # 如果LLM报告的字数与实际统计差距较大，使用实际统计
+        if abs(result.get("word_count", 0) - actual_word_count) > 100:
+            logger.warning(f"字数统计差异: LLM报告 {result.get('word_count')} vs 实际 {actual_word_count}")
+            result["word_count"] = actual_word_count
+
+        # ========== 自动续写逻辑（必须达到字数要求）==========
+        # 计算最大续写次数：需求字数 / 250，至少 3 次
+        max_retry_count = max(3, word_count // WORDS_PER_RETRY)
+        logger.info(f"最大续写次数: {max_retry_count} (目标字数: {word_count})")
+
+        continue_count = 0
+        while actual_word_count < min_word_count and continue_count < max_retry_count:
+            continue_count += 1
+            shortage = min_word_count - actual_word_count
+
+            logger.info(f"字数不足 ({actual_word_count}/{min_word_count})，开始第 {continue_count}/{max_retry_count} 次续写...")
+
+            # 构建续写提示
+            continue_prompt = self._build_continue_prompt(
+                existing_content=content,
+                shortage=shortage,
+                intents=intents,
+                character_moods=character_moods,
+                chapter_num=chapter_num,
+                total_chapters=total_chapters,
+            )
+
+            # 调用 LLM 续写
+            continue_response = await self._call_llm(
+                messages=[HumanMessage(content=continue_prompt)], temperature=0.75,
+                category=UsageCategory.CHAPTER
+            )
+
+            # 解析续写内容
+            continue_result = self._parse_json_response(continue_response)
+            if continue_result and continue_result.get("content"):
+                new_content = continue_result.get("content", "")
+                content = content + "\n\n" + new_content
+                actual_word_count = await self._count_words_async(content)
+                logger.info(f"续写完成，新增 {await self._count_words_async(new_content)} 字，当前总字数: {actual_word_count}")
+            else:
+                # 如果解析失败，直接追加
+                content = content + "\n\n" + continue_response
+                actual_word_count = await self._count_words_async(content)
+
+        # 更新结果
+        result["content"] = content
+        result["word_count"] = actual_word_count
+        result["continue_count"] = continue_count
+        result["max_retry_count"] = max_retry_count
+        result["generation_strategy"] = "single"
+
+        return result
+
+    async def _execute_segmented(
+        self,
+        input_data: Dict[str, Any],
+        word_count: int,
+        min_word_count: int,
+    ) -> Dict[str, Any]:
+        """
+        分段生成流程（适用于大字数需求）
+
+        策略：
+        1. 先规划分段结构
+        2. 每段独立生成
+        3. 汇总并检查字数
+        4. 必要时补充内容
+        """
+        intents = input_data.get("intents", [])
+        environment = input_data.get("environment", "")
+        character_moods = input_data.get("character_moods", {})
+        hooks = input_data.get("hooks", [])
+        previous_style = input_data.get("previous_style", "")
+        discussion_summary = input_data.get("last_discussion_summary", "")
+        chapter_num = input_data.get("chapter_num", 1)
+        total_chapters = input_data.get("total_chapters", 10)
+        world_info = input_data.get("world_info")
+
+        # 计算分段数
+        segment_count = min(MAX_SEGMENTS, (word_count + SEGMENT_SIZE - 1) // SEGMENT_SIZE)
+        segment_target = word_count // segment_count
+
+        logger.info(f"分段生成: {segment_count} 段，每段目标 {segment_target} 字")
+
+        # ========== 第一阶段：规划分段结构 ==========
+        segment_plan = await self._plan_segments(
+            intents=intents,
+            environment=environment,
+            character_moods=character_moods,
+            word_count=word_count,
+            segment_count=segment_count,
+            chapter_num=chapter_num,
+            total_chapters=total_chapters,
+            world_info=world_info,
+        )
+
+        # ========== 第二阶段：逐段生成 ==========
+        all_content = []
+        total_words = 0
+        segment_results = []
+
+        for i, segment_info in enumerate(segment_plan.get("segments", [])):
+            segment_num = i + 1
+            logger.info(f"生成第 {segment_num}/{segment_count} 段...")
+
+            # 构建分段提示
+            segment_prompt = self._build_segment_prompt(
+                segment_info=segment_info,
+                previous_content=all_content[-1] if all_content else None,
+                segment_num=segment_num,
+                total_segments=segment_count,
+                target_words=segment_target,
+                world_info=world_info,
+                previous_style=previous_style if i == 0 else None,
+            )
+
+            # 生成该段
+            segment_response = await self._call_llm(
+                messages=[HumanMessage(content=segment_prompt)], temperature=0.75,
+                category=UsageCategory.CHAPTER
+            )
+
+            # 解析
+            segment_result = self._parse_json_response(segment_response)
+            if segment_result and segment_result.get("content"):
+                segment_content = segment_result.get("content", "")
+            else:
+                segment_content = segment_response
+
+            segment_words = await self._count_words_async(segment_content)
+            all_content.append(segment_content)
+            total_words += segment_words
+
+            segment_results.append({
+                "segment_num": segment_num,
+                "focus": segment_info.get("focus", ""),
+                "word_count": segment_words,
+                "target": segment_target,
+            })
+
+            logger.info(f"第 {segment_num} 段完成: {segment_words} 字")
+
+        # ========== 第三阶段：合并内容 ==========
+        full_content = "\n\n".join(all_content)
+        actual_word_count = await self._count_words_async(full_content)
+
+        logger.info(f"分段生成完成: 总计 {actual_word_count} 字")
+
+        # ========== 第四阶段：补充内容（必须达到字数要求）==========
+        # 计算最大续写次数：需求字数 / 250，至少 3 次
+        max_retry_count = max(3, word_count // WORDS_PER_RETRY)
+        logger.info(f"最大补充次数: {max_retry_count} (目标字数: {word_count})")
+
+        continue_count = 0
+        while actual_word_count < min_word_count and continue_count < max_retry_count:
+            continue_count += 1
+            shortage = min_word_count - actual_word_count
+
+            logger.info(f"分段生成后字数不足 ({actual_word_count}/{min_word_count})，开始第 {continue_count}/{max_retry_count} 次补充...")
+
+            # 构建补充提示
+            supplement_prompt = self._build_supplement_prompt(
+                existing_content=full_content,
+                shortage=shortage,
+                chapter_num=chapter_num,
+                total_chapters=total_chapters,
+            )
+
+            supplement_response = await self._call_llm(
+                messages=[HumanMessage(content=supplement_prompt)], temperature=0.7,
+                category=UsageCategory.CHAPTER
+            )
+
+            supplement_result = self._parse_json_response(supplement_response)
+            if supplement_result and supplement_result.get("content"):
+                new_content = supplement_result.get("content", "")
+                full_content = full_content + "\n\n" + new_content
+                actual_word_count = await self._count_words_async(full_content)
+                logger.info(f"补充完成，新增 {await self._count_words_async(new_content)} 字，当前总字数: {actual_word_count}")
+            else:
+                # 如果解析失败，直接追加
+                full_content = full_content + "\n\n" + supplement_response
+                actual_word_count = await self._count_words_async(full_content)
+
+        return {
+            "content": full_content,
+            "word_count": actual_word_count,
+            "continue_count": continue_count,
+            "max_retry_count": max_retry_count,
+            "generation_strategy": "segmented",
+            "segment_count": segment_count,
+            "segment_results": segment_results,
+            "segment_plan": segment_plan,
+        }
+
+    async def _plan_segments(
+        self,
+        intents: List[str],
+        environment: str,
+        character_moods: Dict[str, str],
+        word_count: int,
+        segment_count: int,
+        chapter_num: int,
+        total_chapters: int,
+        world_info: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        规划分段结构
+
+        Returns:
+            Dict: 包含 segments 列表，每段有 focus 和 key_elements
+        """
+        prompt = f"""你是小说结构规划师，请为以下章节内容规划分段结构。
+
+【章节信息】
+- 第 {chapter_num} 章，全书共 {total_chapters} 章
+- 目标字数: {word_count} 字
+- 分段数: {segment_count} 段
+
+【环境设定】
+{environment[:300] if environment else "无特定环境"}
+
+【需要表达的意图】
+{chr(10).join(intents[:5]) if intents else "自由发挥"}
+
+【角色状态】
+{chr(10).join([f"- {k}: {v}" for k, v in list(character_moods.items())[:5]]) if character_moods else "无特定状态"}
+
+【规划要求】
+1. 每段应该有明确的叙事焦点
+2. 段落之间要自然过渡
+3. 保持剧情连贯性
+4. 合理分配信息密度
+
+请输出 JSON 格式：
+{{
+    "segments": [
+        {{
+            "focus": "该段的叙事焦点（如：开篇铺垫、冲突展开、对话互动、情节推进、高潮渲染、结尾收束等）",
+            "key_elements": ["该段需要包含的关键元素"],
+            "tone": "该段的情感基调",
+            "suggested_word_count": 建议字数
+        }}
+    ],
+    "overall_structure": "整体结构说明",
+    "pacing_note": "节奏把控建议"
+}}"""
+
+        try:
+            response = await self._call_llm(
+                messages=[HumanMessage(content=prompt)], temperature=0.5,
+                category=UsageCategory.PLANNING
+            )
+            result = self._parse_json_response(response)
+            return result if result else {"segments": self._get_default_segments(segment_count)}
+        except Exception as e:
+            logger.warning(f"分段规划失败，使用默认结构: {e}")
+            return {"segments": self._get_default_segments(segment_count)}
+
+    def _get_default_segments(self, segment_count: int) -> List[Dict[str, Any]]:
+        """获取默认分段结构"""
+        default_focuses = [
+            {"focus": "开篇铺垫", "key_elements": ["场景描写", "氛围渲染"], "tone": "平稳"},
+            {"focus": "情节展开", "key_elements": ["角色互动", "对话推进"], "tone": "渐强"},
+            {"focus": "冲突深化", "key_elements": ["矛盾激化", "悬念设置"], "tone": "紧张"},
+            {"focus": "高潮渲染", "key_elements": ["情感爆发", "关键转折"], "tone": "激烈"},
+            {"focus": "结尾收束", "key_elements": ["悬念钩子", "情感余韵"], "tone": "回味"},
+        ]
+        return default_focuses[:segment_count]
+
+    def _build_segment_prompt(
+        self,
+        segment_info: Dict[str, Any],
+        previous_content: Optional[str],
+        segment_num: int,
+        total_segments: int,
+        target_words: int,
+        world_info: Optional[Dict[str, Any]] = None,
+        previous_style: Optional[str] = None,
+    ) -> str:
+        """构建分段生成提示"""
+        parts = []
+
+        parts.append(f"""【分段写作任务】
+- 当前是第 {segment_num}/{total_segments} 段
+- 本段焦点: {segment_info.get('focus', '自由发挥')}
+- 目标字数: 约 {target_words} 字（最低 {int(target_words * 0.8)} 字）
+- 情感基调: {segment_info.get('tone', '平稳')}""")
+
+        key_elements = segment_info.get('key_elements', [])
+        if key_elements:
+            parts.append(f"\n【本段关键元素】\n{chr(10).join(['- ' + e for e in key_elements])}")
+
+        if world_info:
+            parts.append(f"\n【世界观参考】\n名称：{world_info.get('name', '未知')}\n类型：{world_info.get('world_type', '奇幻')}")
+
+        if previous_content:
+            parts.append(f"\n【前一段落结尾】\n...{previous_content[-300:]}")
+
+        if previous_style and segment_num == 1:
+            parts.append(f"\n【前文风格样本】\n{previous_style[:300]}\n请保持与上述风格一致。")
+
+        parts.append(f"""
+【写作要求】
+1. 必须达到最低字数要求
+2. 与前文自然衔接
+3. 突出本段的叙事焦点
+4. 保持网文的节奏感和可读性
+
+输出 JSON 格式：
+{{
+    "content": "本段正文内容",
+    "word_count": 字数,
+    "key_points_covered": ["已覆盖的关键元素"],
+    "transition_to_next": "与下一段的衔接思路"
+}}""")
+
+        return "\n".join(parts)
+
+    def _build_supplement_prompt(
+        self,
+        existing_content: str,
+        shortage: int,
+        chapter_num: int,
+        total_chapters: int,
+    ) -> str:
+        """构建补充内容提示"""
+        return f"""请为以下章节内容进行补充，增加约 {shortage} 字。
+
+【已有内容（最后 400 字）】
+...{existing_content[-400:]}
+
+【长篇创作意识】
+- 当前是第 {chapter_num} 章，全书共 {total_chapters} 章
+- 保持剧情可持续发展，不要急于推进到高潮
+
+【补充方向】
+请选择以下方向之一进行补充：
+1. 深化场景细节描写
+2. 增加角色内心活动
+3. 丰富对话和互动
+4. 添加环境氛围渲染
+5. 埋下伏笔或悬念
+
+输出 JSON 格式：
+{{
+    "content": "补充的内容",
+    "word_count": 字数,
+    "supplement_direction": "选择的补充方向"
+}}"""
 
     def _build_continue_prompt(
         self,
@@ -314,7 +669,7 @@ class WriterAgent(BaseAgent):
 
     def _count_words(self, text: str) -> int:
         """
-        统计字数（中文按字计，英文按词计）
+        同步字数统计方法（向后兼容）
 
         Args:
             text: 输入文本
@@ -329,13 +684,67 @@ class WriterAgent(BaseAgent):
             from app.utils.text_utils import count_mixed_text
             return count_mixed_text(text)
         except ImportError:
-            # 回退到简单统计
             import re
-            # 中文字符
             chinese = len(re.findall(r'[\u4e00-\u9fff]', text))
-            # 英文单词
             english = len(re.findall(r'\b[a-zA-Z]+\b', text))
             return chinese + english
+
+    async def _count_words_async(self, text: str) -> int:
+        """
+        异步字数统计（优先使用 Skill）
+
+        Args:
+            text: 输入文本
+
+        Returns:
+            int: 字数
+        """
+        if not text:
+            return 0
+
+        # 尝试使用 Skill 进行精确统计
+        try:
+            result = await self.execute_skill("skill_word_count", {"text": text})
+            if result.get("success") and result.get("output"):
+                import json
+                data = result["output"] if isinstance(result["output"], dict) else json.loads(result["output"])
+                total = data.get("total_count", 0)
+                if total > 0:
+                    logger.debug(f"Skill 字数统计: {total} 字")
+                    return total
+        except Exception as e:
+            logger.debug(f"Skill 字数统计失败，使用内置方法: {e}")
+
+        # 回退到内置统计
+        return self._count_words(text)
+
+    async def count_words_with_skill(self, text: str) -> Dict[str, int]:
+        """
+        使用 Skill 统计字数（异步版本，返回详细统计）
+
+        Args:
+            text: 输入文本
+
+        Returns:
+            Dict: 包含 chinese_count, english_count, total_count 等字段
+        """
+        if not text:
+            return {"chinese_count": 0, "english_count": 0, "total_count": 0}
+
+        # 尝试使用 Skill
+        result = await self.execute_skill("skill_word_count", {"text": text})
+        if result.get("success") and result.get("output"):
+            # 解析 Skill 返回的 JSON
+            try:
+                import json
+                data = json.loads(result["output"]) if isinstance(result["output"], str) else result["output"]
+                return data
+            except:
+                pass
+
+        # 回退到内置方法
+        count = self._count_words(text)
+        return {"total_count": count, "chinese_count": count, "english_count": 0}
 
     def _build_user_message(
         self,

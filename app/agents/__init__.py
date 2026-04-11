@@ -6,6 +6,7 @@ from app.agents.base import BaseAgent, AgentResponse
 from app.agents.character_agent import CharacterAgent
 from app.agents.procgen import ProcGenAgent
 from app.agents.evaluator import EvaluatorAgent
+from app.agents.scene_coordinator import SceneCoordinatorAgent
 
 __all__ = [
     "BaseAgent",
@@ -13,4 +14,5 @@ __all__ = [
     "CharacterAgent",
     "ProcGenAgent",
     "EvaluatorAgent",
+    "SceneCoordinatorAgent",
 ]

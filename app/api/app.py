@@ -135,7 +135,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         from app.api.routes.agent_templates import set_agent_template_service, set_prompt_service as set_agent_prompt_service
         from app.services.agent_template_service import AgentTemplateService
         from app.data.system_agent_templates import SYSTEM_AGENT_TEMPLATES
-        agent_template_service = AgentTemplateService()
+        agent_template_service = AgentTemplateService(db=postgres_db)
         await agent_template_service.initialize_system_templates(SYSTEM_AGENT_TEMPLATES)
         set_agent_template_service(agent_template_service)
         # 共享 prompt_service 给 agent_templates

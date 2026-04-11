@@ -15,11 +15,14 @@ import {
   type WorkflowNode as WfNode,
   type WorkflowEdge as WfEdge,
 } from '@/api/workflows'
-import { Network, Users, GitBranch, Play, Pause, Save, Trash2, Plus } from 'lucide-react'
+import { getWorkflowNodeTypes, type NodeTypeInfo, type WorkflowNodeTypes } from '@/api/nodeTypes'
+import { Network, Users, GitBranch, Play, Pause, Save, Trash2, Plus, Loader2 } from 'lucide-react'
 import { useTheme } from '@/contexts/ThemeContext'
 import { useProject } from '@/contexts/ProjectContext'
+import WorkflowHelp from '@/components/workflow/WorkflowHelp'
 
-// 自定义节点组件 - 带连接点
+// ==================== 自定义节点组件 ====================
+
 function AgentNode({ data }: { data: any }) {
   const { theme } = useTheme()
   const isDark = theme === 'dark'
@@ -42,11 +45,9 @@ function AgentNode({ data }: { data: any }) {
   )
 }
 
-// 条件分支节点组件 - 带连接点
 function ConditionNode({ data }: { data: any }) {
   return (
     <div className="px-4 py-3 rounded-lg border-2 border-orange-400 bg-orange-50 min-w-[150px]">
-      {/* 顶部：输入连接点 */}
       <Handle type="target" position={Position.Top} className="!bg-orange-400 !w-3 !h-3" />
       <div className="font-medium text-sm">🔀 条件判断</div>
       <div className="text-xs opacity-70">{data.label || '评估结果'}</div>
@@ -54,41 +55,56 @@ function ConditionNode({ data }: { data: any }) {
         <span className="text-green-600">✓ 通过</span>
         <span className="text-red-600">✗ 重试</span>
       </div>
-      {/* 左侧：通过连接点 */}
       <Handle type="source" position={Position.Left} id="pass" className="!bg-green-500 !w-3 !h-3" />
-      {/* 右侧：重试连接点 */}
       <Handle type="source" position={Position.Right} id="retry" className="!bg-red-500 !w-3 !h-3" />
     </div>
   )
 }
 
-// 集体讨论节点组件
-function GroupDiscussionNode({ data }: { data: any }) {
+function ParallelNode({ data }: { data: any }) {
   return (
-    <div className="px-4 py-3 rounded-lg border-2 border-purple-400 bg-purple-50 min-w-[150px]">
+    <div className="px-4 py-3 rounded-lg border-2 border-purple-400 bg-purple-50 min-w-[120px]">
       <Handle type="target" position={Position.Top} className="!bg-purple-400 !w-3 !h-3" />
-      <div className="font-medium text-sm">🌟 集体讨论</div>
-      <div className="text-xs opacity-70">{data.label || '所有角色剧情讨论'}</div>
-      <div className="text-xs text-purple-600 mt-1">评估通过后触发</div>
+      <div className="font-medium text-sm">⚡ 并行执行</div>
+      <div className="text-xs opacity-70">{data.label || '同时执行多个分支'}</div>
       <Handle type="source" position={Position.Bottom} className="!bg-purple-400 !w-3 !h-3" />
     </div>
   )
 }
 
-// 开始节点组件 - 支持循环回到开始
+function ScenePerformanceNode({ data }: { data: any }) {
+  return (
+    <div className="px-4 py-3 rounded-lg border-2 border-rose-400 bg-rose-50 min-w-[150px]">
+      <Handle type="target" position={Position.Top} className="!bg-rose-400 !w-3 !h-3" />
+      <div className="font-medium text-sm">🎭 场景演绎</div>
+      <div className="text-xs opacity-70">{data.label || '多角色同台表演'}</div>
+      <div className="text-xs text-rose-600 mt-1">自动协调角色Agent</div>
+      <Handle type="source" position={Position.Bottom} className="!bg-rose-400 !w-3 !h-3" />
+    </div>
+  )
+}
+
+function GroupDiscussionNode({ data }: { data: any }) {
+  return (
+    <div className="px-4 py-3 rounded-lg border-2 border-indigo-400 bg-indigo-50 min-w-[150px]">
+      <Handle type="target" position={Position.Top} className="!bg-indigo-400 !w-3 !h-3" />
+      <div className="font-medium text-sm">💬 集体讨论</div>
+      <div className="text-xs opacity-70">{data.label || '多Agent讨论'}</div>
+      <Handle type="source" position={Position.Bottom} className="!bg-indigo-400 !w-3 !h-3" />
+    </div>
+  )
+}
+
 function StartNode({ data }: { data: any }) {
   return (
     <div className="px-4 py-3 rounded-lg border-2 border-green-500 bg-green-50 min-w-[100px]">
-      {/* 顶部：循环输入连接点（retry 可以连回来） */}
       <Handle type="target" position={Position.Top} id="loop" className="!bg-green-400 !w-3 !h-3" />
       <div className="font-medium text-sm text-center">▶️ {data.label || '开始'}</div>
-      {/* 底部：输出连接点 */}
       <Handle type="source" position={Position.Bottom} className="!bg-green-500 !w-3 !h-3" />
     </div>
   )
 }
 
-// 结束节点组件
 function EndNode({ data }: { data: any }) {
   return (
     <div className="px-4 py-3 rounded-lg border-2 border-red-500 bg-red-50 min-w-[100px]">
@@ -98,35 +114,29 @@ function EndNode({ data }: { data: any }) {
   )
 }
 
+function InputNode({ data }: { data: any }) {
+  return (
+    <div className="px-4 py-3 rounded-lg border-2 border-blue-400 bg-blue-50 min-w-[120px]">
+      <Handle type="target" position={Position.Top} className="!bg-blue-400 !w-3 !h-3" />
+      <div className="font-medium text-sm">📝 用户输入</div>
+      <div className="text-xs opacity-70">{data.label || '等待用户输入'}</div>
+      <Handle type="source" position={Position.Bottom} className="!bg-blue-400 !w-3 !h-3" />
+    </div>
+  )
+}
+
 const nodeTypes: NodeTypes = {
   agent: AgentNode,
   condition: ConditionNode,
+  parallel: ParallelNode,
+  scene_performance: ScenePerformanceNode,
   group_discussion: GroupDiscussionNode,
   start: StartNode,
   end: EndNode,
+  input: InputNode,
 }
 
 type TabType = 'workflow' | 'plots' | 'snapshots'
-
-// Agent 类型选项
-const AGENT_TYPES = [
-  { type: 'setting', label: '设定 Agent' },
-  { type: 'writer', label: '作家 Agent' },
-  { type: 'plotter', label: '编剧 Agent' },
-  { type: 'character', label: '角色 Agent' },
-  { type: 'summarizer', label: '摘要 Agent' },
-  { type: 'evaluator', label: '评估 Agent' },
-  { type: 'hook_manager', label: '伏笔 Agent' },
-  { type: 'event_generator', label: '事件 Agent' },
-  { type: 'world_map_manager', label: '地图 Agent' },
-]
-
-// 节点类型选项
-const NODE_TYPES = [
-  { type: 'agent', label: 'Agent 节点' },
-  { type: 'condition', label: '条件分支' },
-  { type: 'group_discussion', label: '集体讨论' },
-]
 
 const generateId = () => `node_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`
 
@@ -140,6 +150,15 @@ export default function Visualizer() {
   const [worlds, setWorlds] = useState<World[]>([])
   const [selectedWorldId, setSelectedWorldId] = useState('')
 
+  // 动态节点类型
+  const [nodeTypesData, setNodeTypesData] = useState<WorkflowNodeTypes>({
+    agent_nodes: [],
+    interaction_nodes: [],
+    control_nodes: [],
+    character_nodes: [],
+  })
+  const [loadingNodeTypes, setLoadingNodeTypes] = useState(true)
+
   // 工作流相关状态
   const [workflows, setWorkflows] = useState<WorkflowDefinition[]>([])
   const [selectedWorkflow, setSelectedWorkflow] = useState<WorkflowDefinition | null>(null)
@@ -148,6 +167,23 @@ export default function Visualizer() {
   const [workflowName, setWorkflowName] = useState('新工作流')
   const [saving, setSaving] = useState(false)
   const [executing, setExecuting] = useState(false)
+
+  // 加载节点类型
+  useEffect(() => {
+    loadNodeTypes()
+  }, [currentProject])
+
+  const loadNodeTypes = async () => {
+    setLoadingNodeTypes(true)
+    try {
+      const result = await getWorkflowNodeTypes(currentProject?.id)
+      setNodeTypesData(result)
+    } catch (error) {
+      console.error('Failed to load node types:', error)
+    } finally {
+      setLoadingNodeTypes(false)
+    }
+  }
 
   useEffect(() => {
     loadWorlds()
@@ -168,11 +204,8 @@ export default function Visualizer() {
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Delete' || e.key === 'Backspace') {
-        // 检查是否在输入框中
         const target = e.target as HTMLElement
         if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') return
-
-        // 删除选中的节点和边
         setNodes((nds) => nds.filter((node) => !node.selected))
         setEdges((eds) => eds.filter((edge) => !edge.selected))
       }
@@ -210,7 +243,6 @@ export default function Visualizer() {
     }
   }
 
-  // 工作流节点变化处理
   const onNodesChange: OnNodesChange = useCallback((changes) => {
     setNodes((nds) => applyNodeChanges(changes, nds))
   }, [])
@@ -228,17 +260,9 @@ export default function Visualizer() {
     setSelectedWorkflow(workflow)
     setWorkflowName(workflow.name)
     const flowNodes = workflow.nodes.map((node) => {
-      // 确定节点类型
-      let nodeType = 'agent'
-      if (node.node_type === 'agent') nodeType = 'agent'
-      else if (node.node_type === 'condition') nodeType = 'condition'
-      else if (node.node_type === 'group_discussion') nodeType = 'group_discussion'
-      else if (node.node_type === 'start') nodeType = 'start'
-      else if (node.node_type === 'end') nodeType = 'end'
-
       return {
         id: node.id,
-        type: nodeType,
+        type: node.node_type,
         position: node.position,
         data: {
           label: node.label,
@@ -247,23 +271,19 @@ export default function Visualizer() {
         },
       }
     })
-    // 恢复边，包括 sourceHandle（从 condition 恢复）
     const flowEdges = workflow.edges.map((edge) => {
-      // 从 condition 恢复 sourceHandle
       let sourceHandle: string | undefined
       if (edge.condition?.result === 'pass') {
         sourceHandle = 'pass'
       } else if (edge.condition?.result === 'retry') {
         sourceHandle = 'retry'
       }
-
       return {
         id: edge.id,
         source: edge.source,
         target: edge.target,
         sourceHandle,
         animated: true,
-        // 保存样式以区分 pass 和 retry 边
         style: sourceHandle === 'pass'
           ? { stroke: '#22c55e', strokeWidth: 2 }
           : sourceHandle === 'retry'
@@ -280,162 +300,45 @@ export default function Visualizer() {
     setSelectedWorkflow(null)
     setWorkflowName('新工作流')
     setNodes([
-      {
-        id: 'start',
-        type: 'start',
-        position: { x: 250, y: 50 },
-        data: { label: '开始' },
-      },
-      {
-        id: 'end',
-        type: 'end',
-        position: { x: 250, y: 400 },
-        data: { label: '结束' },
-      },
+      { id: 'start', type: 'start', position: { x: 250, y: 50 }, data: { label: '开始' } },
+      { id: 'end', type: 'end', position: { x: 250, y: 400 }, data: { label: '结束' } },
     ])
     setEdges([])
   }
 
-  // 添加 Agent 节点
-  const handleAddAgentNode = (agentType: string, label: string) => {
+  // 添加节点
+  const handleAddNode = (nodeInfo: NodeTypeInfo) => {
+    const nodeType = nodeInfo.type
     const newNode: Node = {
       id: generateId(),
-      type: 'agent',
+      type: nodeType,
       position: { x: 100 + Math.random() * 300, y: 150 + nodes.length * 80 },
-      data: { label, agent_type: agentType },
+      data: {
+        label: nodeInfo.label,
+        agent_type: nodeInfo.agent_type,
+      },
     }
     setNodes((nds) => [...nds, newNode])
   }
 
-  // 添加条件节点
-  const handleAddConditionNode = (label: string) => {
-    const newNode: Node = {
-      id: generateId(),
-      type: 'condition',
-      position: { x: 100 + Math.random() * 300, y: 150 + nodes.length * 80 },
-      data: { label },
-    }
-    setNodes((nds) => [...nds, newNode])
-  }
-
-  // 添加集体讨论节点
-  const handleAddGroupDiscussionNode = (label: string) => {
-    const newNode: Node = {
-      id: generateId(),
-      type: 'group_discussion',
-      position: { x: 100 + Math.random() * 300, y: 150 + nodes.length * 80 },
-      data: { label },
-    }
-    setNodes((nds) => [...nds, newNode])
-  }
-
-  // 保存工作流 - 更新或新建
+  // 保存工作流
   const handleSaveWorkflow = async () => {
     if (!currentProject) return
     setSaving(true)
     try {
-      // 类型映射函数
-      const mapNodeType = (type: string | undefined): string => {
-        const typeMap: Record<string, string> = {
-          'agent': 'agent',
-          'condition': 'condition',
-          'group_discussion': 'group_discussion',
-          'parallel': 'parallel',
-          'input': 'start',      // ReactFlow input 映射为 start
-          'output': 'end',       // ReactFlow output 映射为 end
-          'start': 'start',      // 直接是 start
-          'end': 'end',          // 直接是 end
-        }
-        return typeMap[type || ''] || 'agent'
-      }
-
-      // 检测循环依赖
-      const detectCycle = (): string | null => {
-        const graph = new Map<string, string[]>()
-        edges.forEach((edge) => {
-          if (!graph.has(edge.source)) graph.set(edge.source, [])
-          graph.get(edge.source)!.push(edge.target)
-        })
-
-        const visited = new Set<string>()
-        const recStack = new Set<string>()
-        const path: string[] = []
-
-        const dfs = (nodeId: string): boolean => {
-          visited.add(nodeId)
-          recStack.add(nodeId)
-          path.push(nodeId)
-
-          const neighbors = graph.get(nodeId) || []
-          for (const neighbor of neighbors) {
-            if (!visited.has(neighbor)) {
-              if (dfs(neighbor)) return true
-            } else if (recStack.has(neighbor)) {
-              path.push(neighbor)
-              return true
-            }
-          }
-
-          path.pop()
-          recStack.delete(nodeId)
-          return false
-        }
-
-        for (const node of nodes) {
-          if (!visited.has(node.id)) {
-            if (dfs(node.id)) {
-              const cycleStart = path.indexOf(path[path.length - 1])
-              const cyclePath = path.slice(cycleStart).map((id) => {
-                const node = nodes.find((n) => n.id === id)
-                return node?.data?.label || id
-              })
-              return cyclePath.join(' → ')
-            }
-          }
-        }
-        return null
-      }
-
-      // 检查是否是合法的 retry 循环（边连接回 start 节点）
-      const isValidRetryLoop = (): boolean => {
-        // 检查是否有边回到 start 节点
-        const hasEdgeToStart = edges.some((edge) => edge.target === 'start')
-        if (hasEdgeToStart) return true
-
-        // 检查是否有带 retry 条件的边
-        const hasRetryEdge = edges.some((edge) => edge.condition?.result === 'retry')
-        if (hasRetryEdge) return true
-
-        return false
-      }
-
-      // 检查循环依赖
-      const cycleInfo = detectCycle()
-      if (cycleInfo && !isValidRetryLoop()) {
-        alert(`工作流存在意外的循环依赖：${cycleInfo}\n\n请删除形成环路的连接线。\n\n提示：如果需要创建重试循环，请将条件节点的连接线指向"开始"节点。`)
-        setSaving(false)
-        return
-      }
-
       const workflowNodes: WfNode[] = nodes.map((node) => ({
         id: node.id,
-        node_type: mapNodeType(node.type) as any,
+        node_type: node.type as any,
         label: node.data.label || '节点',
         agent_type: node.data.agent_type,
         config: node.data.config || {},
         position: node.position,
       }))
       const workflowEdges: WfEdge[] = edges.map((edge, index) => {
-        // 确定边的条件 - 基于连接点ID
         let condition: { result: string } | undefined
-        if (edge.sourceHandle === 'pass') {
-          condition = { result: 'pass' }
-        } else if (edge.sourceHandle === 'retry') {
-          condition = { result: 'retry' }
-        } else if (edge.sourceHandle === 'loop') {
-          condition = { result: 'retry' }
-        }
-
+        if (edge.sourceHandle === 'pass') condition = { result: 'pass' }
+        else if (edge.sourceHandle === 'retry') condition = { result: 'retry' }
+        else if (edge.sourceHandle === 'loop') condition = { result: 'retry' }
         return {
           id: edge.id || `edge_${index}`,
           source: edge.source,
@@ -445,7 +348,6 @@ export default function Visualizer() {
       })
 
       if (selectedWorkflow) {
-        // 更新现有工作流
         await updateWorkflow(selectedWorkflow.id, {
           name: workflowName,
           nodes: workflowNodes,
@@ -453,8 +355,7 @@ export default function Visualizer() {
         })
         alert('工作流更新成功！')
       } else {
-        // 创建新工作流
-        const result = await createWorkflow({
+        await createWorkflow({
           project_id: currentProject.id,
           name: workflowName,
           nodes: workflowNodes,
@@ -462,7 +363,6 @@ export default function Visualizer() {
         })
         alert('工作流创建成功！')
       }
-
       await loadWorkflows()
     } catch (error) {
       console.error('Failed to save workflow:', error)
@@ -577,6 +477,7 @@ export default function Visualizer() {
                 <Save size={14} />
                 {saving ? '保存中...' : '保存'}
               </button>
+              <WorkflowHelp />
             </>
           )}
           <div className="w-48">
@@ -617,9 +518,9 @@ export default function Visualizer() {
 
       {activeTab === 'workflow' ? (
         <div className="flex gap-4" style={{ height: 'calc(100vh - 280px)', minHeight: '500px' }}>
-          {/* 左侧：工作流列表和节点面板 - 改为更宽敞的两列布局 */}
+          {/* 左侧面板 */}
           <div className="w-80 flex flex-col gap-3">
-            {/* 已保存的工作流 - 放在顶部可折叠 */}
+            {/* 工作流列表 */}
             <Card className="p-3">
               <div className="flex items-center justify-between mb-2">
                 <h3 className={`text-sm font-semibold ${isDark ? 'text-gray-200' : 'text-gray-700'}`}>
@@ -662,65 +563,123 @@ export default function Visualizer() {
               </div>
             </Card>
 
-            {/* Agent 节点面板 + 流程控制合并为一个更宽敞的面板 */}
+            {/* 动态节点面板 */}
             <Card className="p-3 flex-1 overflow-y-auto">
-              <h3 className={`text-sm font-semibold mb-2 ${isDark ? 'text-gray-200' : 'text-gray-700'}`}>
-                可用节点
-              </h3>
-
-              {/* Agent 节点 */}
-              <div className="mb-3">
-                <p className={`text-xs font-medium mb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>Agent 节点</p>
-                <div className="grid grid-cols-2 gap-1">
-                  {AGENT_TYPES.map((agent) => (
-                    <button
-                      key={agent.type}
-                      onClick={() => handleAddAgentNode(agent.type, agent.label)}
-                      className={`text-left px-2 py-1.5 rounded text-xs transition-colors truncate ${
-                        isDark
-                          ? 'bg-gray-700 hover:bg-gray-600 text-gray-300'
-                          : 'bg-gray-50 hover:bg-gray-100 text-gray-700'
-                      }`}
-                      title={agent.label}
-                    >
-                      {agent.label.replace(' Agent', '')}
-                    </button>
-                  ))}
+              {loadingNodeTypes ? (
+                <div className="flex items-center justify-center h-32">
+                  <Loader2 size={24} className="animate-spin text-blue-500" />
                 </div>
-              </div>
+              ) : (
+                <>
+                  <h3 className={`text-sm font-semibold mb-2 ${isDark ? 'text-gray-200' : 'text-gray-700'}`}>
+                    可用节点
+                  </h3>
 
-              {/* 流程控制 */}
-              <div>
-                <p className={`text-xs font-medium mb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>流程控制</p>
-                <div className="grid grid-cols-2 gap-1">
-                  {NODE_TYPES.filter(n => n.type === 'condition').map((node) => (
-                    <button
-                      key={node.type}
-                      onClick={() => handleAddConditionNode('条件判断')}
-                      className={`text-left px-2 py-1.5 rounded text-xs transition-colors ${
-                        isDark
-                          ? 'bg-orange-900/50 hover:bg-orange-800/50 text-orange-300'
-                          : 'bg-orange-50 hover:bg-orange-100 text-orange-700'
-                      }`}
-                    >
-                      {node.label}
-                    </button>
-                  ))}
-                  {NODE_TYPES.filter(n => n.type === 'group_discussion').map((node) => (
-                    <button
-                      key={node.type}
-                      onClick={() => handleAddGroupDiscussionNode('集体讨论')}
-                      className={`text-left px-2 py-1.5 rounded text-xs transition-colors ${
-                        isDark
-                          ? 'bg-purple-900/50 hover:bg-purple-800/50 text-purple-300'
-                          : 'bg-purple-50 hover:bg-purple-100 text-purple-700'
-                      }`}
-                    >
-                      {node.label}
-                    </button>
-                  ))}
-                </div>
-              </div>
+                  {/* Agent 节点 */}
+                  <div className="mb-3">
+                    <p className={`text-xs font-medium mb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+                      🤖 系统 Agent
+                    </p>
+                    <div className="grid grid-cols-2 gap-1">
+                      {nodeTypesData.agent_nodes.map((node) => (
+                        <button
+                          key={node.agent_type || node.type}
+                          onClick={() => handleAddNode(node)}
+                          className={`text-left px-2 py-1.5 rounded text-xs transition-colors truncate ${
+                            isDark
+                              ? 'bg-gray-700 hover:bg-gray-600 text-gray-300'
+                              : 'bg-gray-50 hover:bg-gray-100 text-gray-700'
+                          }`}
+                          title={node.label}
+                        >
+                          {node.label.replace(' Agent', '').replace('管理员', '')}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* 角色 Agent */}
+                  {nodeTypesData.character_nodes.length > 0 && (
+                    <div className="mb-3">
+                      <p className={`text-xs font-medium mb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+                        👤 角色 Agent
+                      </p>
+                      <div className="grid grid-cols-2 gap-1">
+                        {nodeTypesData.character_nodes.map((node) => (
+                          <button
+                            key={node.character_id}
+                            onClick={() => handleAddNode(node)}
+                            className={`text-left px-2 py-1.5 rounded text-xs transition-colors truncate ${
+                              isDark
+                                ? 'bg-orange-900/50 hover:bg-orange-800/50 text-orange-300'
+                                : 'bg-orange-50 hover:bg-orange-100 text-orange-700'
+                            }`}
+                            title={node.label}
+                          >
+                            {node.character_name}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* 交互节点 */}
+                  <div className="mb-3">
+                    <p className={`text-xs font-medium mb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+                      💬 交互节点
+                    </p>
+                    <div className="grid grid-cols-2 gap-1">
+                      {nodeTypesData.interaction_nodes.map((node) => (
+                        <button
+                          key={node.type}
+                          onClick={() => handleAddNode(node)}
+                          className={`text-left px-2 py-1.5 rounded text-xs transition-colors truncate ${
+                            isDark
+                              ? 'bg-rose-900/50 hover:bg-rose-800/50 text-rose-300'
+                              : 'bg-rose-50 hover:bg-rose-100 text-rose-700'
+                          }`}
+                          title={node.label}
+                        >
+                          {node.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* 控制节点 */}
+                  <div>
+                    <p className={`text-xs font-medium mb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+                      ⚙️ 控制节点
+                    </p>
+                    <div className="grid grid-cols-2 gap-1">
+                      {nodeTypesData.control_nodes
+                        .filter((n) => n.type !== 'start' && n.type !== 'end')
+                        .map((node) => (
+                          <button
+                            key={node.type}
+                            onClick={() => handleAddNode(node)}
+                            className={`text-left px-2 py-1.5 rounded text-xs transition-colors truncate ${
+                              node.type === 'condition'
+                                ? isDark
+                                  ? 'bg-orange-900/50 hover:bg-orange-800/50 text-orange-300'
+                                  : 'bg-orange-50 hover:bg-orange-100 text-orange-700'
+                                : node.type === 'parallel'
+                                  ? isDark
+                                    ? 'bg-purple-900/50 hover:bg-purple-800/50 text-purple-300'
+                                    : 'bg-purple-50 hover:bg-purple-100 text-purple-700'
+                                  : isDark
+                                    ? 'bg-gray-700 hover:bg-gray-600 text-gray-300'
+                                    : 'bg-gray-50 hover:bg-gray-100 text-gray-700'
+                            }`}
+                            title={node.label}
+                          >
+                            {node.label}
+                          </button>
+                        ))}
+                    </div>
+                  </div>
+                </>
+              )}
             </Card>
 
             {/* 执行控制 */}
@@ -747,49 +706,48 @@ export default function Visualizer() {
                 <p className="text-sm">或从左侧选择一个已保存的工作流</p>
               </div>
             ) : (
-            <ReactFlow
-              nodes={nodes}
-              edges={edges}
-              onNodesChange={onNodesChange}
-              onEdgesChange={onEdgesChange}
-              onConnect={onConnect}
-              nodeTypes={nodeTypes}
-              fitView
-              selectNodesOnDrag={false}
-              panOnScroll
-              selectionOnDrag
-              proOptions={{ hideAttribution: true }}
-            >
-              <MiniMap />
-              <Controls />
-              <Background color={isDark ? '#374151' : '#e5e7eb'} gap={16} />
-              <Panel position="top-right">
-                <div className="flex gap-2">
-                  <button
-                    onClick={handleDeleteSelectedNodes}
-                    className={`px-3 py-1.5 rounded text-sm ${
-                      isDark ? 'bg-red-900 text-red-200 hover:bg-red-800' : 'bg-red-100 text-red-700 hover:bg-red-200'
-                    }`}
-                    title="删除选中节点 (Delete)"
-                  >
-                    <Trash2 size={14} className="inline mr-1" /> 删除选中
-                  </button>
-                  <button
-                    onClick={() => {
-                      // 只保留开始和结束节点，删除其他节点和所有边
-                      setNodes((nds) => nds.filter((node) => node.id === 'start' || node.id === 'end'))
-                      setEdges([])
-                    }}
-                    className={`px-3 py-1.5 rounded text-sm ${
-                      isDark ? 'bg-gray-800 text-gray-300 hover:bg-gray-700' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-                    }`}
-                    title="清空所有节点（保留开始和结束）"
-                  >
-                    清空
-                  </button>
-                </div>
-              </Panel>
-            </ReactFlow>
+              <ReactFlow
+                nodes={nodes}
+                edges={edges}
+                onNodesChange={onNodesChange}
+                onEdgesChange={onEdgesChange}
+                onConnect={onConnect}
+                nodeTypes={nodeTypes}
+                fitView
+                selectNodesOnDrag={false}
+                panOnScroll
+                selectionOnDrag
+                proOptions={{ hideAttribution: true }}
+              >
+                <MiniMap />
+                <Controls />
+                <Background color={isDark ? '#374151' : '#e5e7eb'} gap={16} />
+                <Panel position="top-right">
+                  <div className="flex gap-2">
+                    <button
+                      onClick={handleDeleteSelectedNodes}
+                      className={`px-3 py-1.5 rounded text-sm ${
+                        isDark ? 'bg-red-900 text-red-200 hover:bg-red-800' : 'bg-red-100 text-red-700 hover:bg-red-200'
+                      }`}
+                      title="删除选中节点 (Delete)"
+                    >
+                      <Trash2 size={14} className="inline mr-1" /> 删除选中
+                    </button>
+                    <button
+                      onClick={() => {
+                        setNodes((nds) => nds.filter((node) => node.id === 'start' || node.id === 'end'))
+                        setEdges([])
+                      }}
+                      className={`px-3 py-1.5 rounded text-sm ${
+                        isDark ? 'bg-gray-800 text-gray-300 hover:bg-gray-700' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                      }`}
+                      title="清空所有节点（保留开始和结束）"
+                    >
+                      清空
+                    </button>
+                  </div>
+                </Panel>
+              </ReactFlow>
             )}
           </div>
         </div>

@@ -84,9 +84,12 @@ async def create_agent_provider(director: DirectorSystem):
     Returns:
         Callable: Agent provider 函数
     """
+    # 获取数据库连接（用于记忆加载）
+    from app.api.app import postgres_db
+
     async def agent_provider(agent_type: str, project_id: str):
         """
-        获取 Agent 实例
+        获取 Agent 实例（并加载记忆）
 
         Args:
             agent_type: Agent 类型
@@ -98,25 +101,127 @@ async def create_agent_provider(director: DirectorSystem):
         from app.models.character import CharacterPresence
 
         # 系统内置 Agent（支持多种命名方式）
-        system_agents = {
+        # 注意：对于可能并行执行的 agent，需要创建新实例以避免状态冲突
+        system_agents_shared = {
             "summarizer": director.summarizer,
             "master_plotter": director.master_plotter,
             "plotter": director.master_plotter,  # 别名
             "hook_manager": director.hook_manager,
             "writer": director.writer,
             "evaluator": director.evaluator,
-            "procgen": director.procgen,
-            "world_map_manager": director.procgen,  # 地图管理复用 ProcGen
-            "event_generator": director.procgen,    # 事件生成复用 ProcGen
-            "setting": director.summarizer,         # 设定复用 Summarizer
+            # setting agent 使用独立的 SettingAgent，与 /lore 界面共享
         }
 
-        # 检查是否是系统 Agent
+        # 检查是否是系统 Agent（共享实例）
         agent_type_lower = agent_type.lower().replace(" ", "_").replace("-", "_")
-        if agent_type_lower in system_agents:
-            return system_agents[agent_type_lower]
-        if agent_type in system_agents:
-            return system_agents[agent_type]
+        if agent_type_lower in system_agents_shared:
+            agent = system_agents_shared[agent_type_lower]
+            # 确保记忆已加载
+            if agent and hasattr(agent, 'load_memory') and not agent._memory_loaded:
+                await agent.load_memory(postgres_db)
+            return agent
+        if agent_type in system_agents_shared:
+            agent = system_agents_shared[agent_type]
+            # 确保记忆已加载
+            if agent and hasattr(agent, 'load_memory') and not agent._memory_loaded:
+                await agent.load_memory(postgres_db)
+            return agent
+
+        # ========== 需要独立实例的 Agent（避免并行执行时状态冲突）==========
+        # Setting Agent：使用独立的 SettingAgent，与 /lore 界面共享
+        if agent_type_lower == "setting":
+            from app.agents.setting_agent import get_setting_agent
+            model = director._model_factory() if director._model_factory else None
+            agent = await get_setting_agent(project_id, model=model, db=postgres_db)
+            logger.info(f"Setting Agent 实例获取成功: project_id={project_id}")
+            return agent
+
+        # Event Generator Agent：独立的事件生成 Agent
+        if agent_type_lower == "event_generator":
+            from app.agents.event_generator import EventGeneratorAgent
+            model = director._model_factory() if director._model_factory else None
+            agent_instance = EventGeneratorAgent(
+                model=model,
+                project_id=project_id,
+                agent_id="event_generator",
+            )
+            logger.info(f"EventGeneratorAgent 实例已创建: project_id={project_id}")
+            await agent_instance.load_memory(postgres_db)
+            return agent_instance
+
+        # World Map Manager Agent：独立的地图管理 Agent
+        if agent_type_lower == "world_map_manager":
+            from app.agents.world_map_manager import WorldMapManagerAgent
+            model = director._model_factory() if director._model_factory else None
+            agent_instance = WorldMapManagerAgent(
+                model=model,
+                project_id=project_id,
+                agent_id="world_map_manager",
+            )
+            logger.info(f"WorldMapManagerAgent 实例已创建: project_id={project_id}")
+            await agent_instance.load_memory(postgres_db)
+            return agent_instance
+
+        # ProcGen Agent：世界生成 Agent（保留用于底层生成能力）
+        if agent_type_lower == "procgen":
+            from app.agents.procgen import ProcGenAgent
+            from app.models.world import World
+            model = director._model_factory() if director._model_factory else None
+
+            logger.info(f"创建新的 ProcGenAgent 实例，类型: {agent_type}, 模型: {type(model) if model else None}")
+
+            # 获取或创建 world 对象
+            world = None
+
+            # 方法1: 从 director.world_data 创建 World 对象
+            if hasattr(director, 'world_data') and director.world_data:
+                try:
+                    world = World(**director.world_data)
+                    logger.info(f"从 director.world_data 创建 World: {world.name}")
+                except Exception as e:
+                    logger.warning(f"从 world_data 创建 World 失败: {e}")
+
+            # 方法2: 尝试从数据库获取
+            if not world:
+                if postgres_db and director.project_id:
+                    try:
+                        project = await postgres_db.get_project(director.project_id)
+                        if project and project.get("world_id"):
+                            world_data = await postgres_db.get_world(project["world_id"])
+                            if world_data:
+                                world = World(**world_data)
+                                logger.info(f"从数据库获取 World: {world.name}")
+                    except Exception as e:
+                        logger.warning(f"获取世界数据失败: {e}")
+
+            # 方法3: 创建默认世界
+            if not world:
+                world = World(
+                    id="default_world",
+                    name="默认世界",
+                    world_type="奇幻",
+                )
+                logger.info("创建默认 World 对象")
+
+            # 创建新的 ProcGenAgent 实例
+            agent_instance = ProcGenAgent(
+                world=world,
+                model=model,
+                project_id=project_id,
+                agent_id=agent_type_lower,
+            )
+            logger.info(f"ProcGenAgent 实例已创建: 类型={agent_type}, 实例ID={id(agent_instance)}, 世界={world.name}, 模型={type(model).__name__ if model else 'None'}")
+
+            # 加载记忆
+            await agent_instance.load_memory(postgres_db)
+
+            return agent_instance
+
+        # 检查是否是场景协调 Agent（按需创建实例）
+        if agent_type_lower == "scene_coordinator" or agent_type == "scene_coordinator":
+            from app.agents.scene_coordinator import SceneCoordinatorAgent
+            model = director._model_factory() if director._model_factory else None
+            return SceneCoordinatorAgent(model=model, project_id=project_id)
 
         # 检查是否是批量角色获取（格式：characters:presence_type）
         if agent_type.startswith("characters:"):
@@ -410,6 +515,8 @@ async def websocket_connect(websocket: WebSocket, client_id: str):
                     await handle_discussion_message(websocket, message, client_id)
                 elif message_type == "end_discussion":
                     await handle_end_discussion(websocket, message, client_id)
+                elif message_type == "discussion_confirm":
+                    await handle_discussion_confirm(websocket, message, client_id)
                 else:
                     await send_error(websocket, f"未知消息类型：{message_type}")
             except json.JSONDecodeError:
@@ -1627,8 +1734,7 @@ async def handle_discussion_message(websocket: WebSocket, message: dict, client_
     })
 
     # 获取 Director 实例，让 Agent 们回应用户
-    from app.services.director import get_director
-    director = get_director(client_id)
+    director = get_or_create_director(client_id)
 
     if director:
         # 让角色 Agent 们回应用户的讨论
@@ -1681,6 +1787,58 @@ async def handle_end_discussion(websocket: WebSocket, message: dict, client_id: 
             "timestamp": datetime.now().isoformat(),
         },
     })
+
+
+async def handle_discussion_confirm(websocket: WebSocket, message: dict, client_id: str):
+    """
+    处理用户确认/拒绝讨论结果
+
+    消息格式:
+    {
+        "type": "discussion_confirm",
+        "approved": true/false,
+        "feedback": "反馈意见（拒绝时必填）"
+    }
+
+    流程：
+    1. 领头人广播结束消息
+    2. 同意 -> 工作流继续
+    3. 拒绝 -> 带反馈重启工作流
+    """
+    from app.services.workflow_engine import get_workflow_engine
+    from app.api.app import postgres_db
+
+    approved = message.get("approved", True)
+    feedback = message.get("feedback", "")
+
+    logger.info(f"用户确认讨论: approved={approved}, feedback={feedback[:50] if feedback else 'None'}...")
+
+    engine = get_workflow_engine()
+    execution_id = manager.get_execution(client_id)
+
+    if not execution_id:
+        await send_error(websocket, "没有活跃的工作流执行")
+        return
+
+    # 调用引擎的确认方法
+    result = await engine.confirm_discussion(
+        execution_id=execution_id,
+        approved=approved,
+        feedback=feedback if not approved else None,
+        db=postgres_db,
+    )
+
+    if result.get("success"):
+        await websocket.send_json({
+            "type": "discussion_confirmed",
+            "data": {
+                "approved": approved,
+                "message": result.get("message", "确认成功"),
+                "retry_count": result.get("retry_count", 0),
+            },
+        })
+    else:
+        await send_error(websocket, result.get("error", "确认失败"))
 
 
 async def _broadcast_workflow_status(websocket: WebSocket, execution_id: str, client_id: str):

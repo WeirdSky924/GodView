@@ -78,7 +78,7 @@ export default function CharacterVoice() {
         project_id: data.project_id,
         personality: data.personality,
         appearance: data.appearance,
-        background: data.background,
+        background_story: data.background_story,
         speech_pattern: data.speech_pattern,
         lexicon: data.lexicon || [],
         forbidden_words: data.forbidden_words || [],

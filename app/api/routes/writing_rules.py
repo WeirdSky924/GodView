@@ -174,7 +174,7 @@ async def update_writing_rule(rule_id: str, request: WritingRuleUpdate):
     # 检查是否为系统规则
     rule = get_system_rule_by_id(rule_id)
     if rule:
-        raise HTTPException(status_code=400, detail="系统规则不可修改")
+        raise HTTPException(status_code=403, detail="系统内置规则不可修改")
 
     # TODO: 实现自定义规则的更新
     return {
@@ -198,7 +198,7 @@ async def delete_writing_rule(rule_id: str):
     # 检查是否为系统规则
     rule = get_system_rule_by_id(rule_id)
     if rule:
-        raise HTTPException(status_code=400, detail="系统规则不可删除")
+        raise HTTPException(status_code=403, detail="系统内置规则不可删除")
 
     # TODO: 实现自定义规则的删除
     return {
@@ -358,7 +358,7 @@ async def update_writing_rule_set(rule_set_id: str, request: WritingRuleSetUpdat
     # 检查是否为系统规则集
     rule_set = get_system_rule_set_by_id(rule_set_id)
     if rule_set:
-        raise HTTPException(status_code=400, detail="系统规则集不可修改")
+        raise HTTPException(status_code=403, detail="系统内置规则集不可修改")
 
     # TODO: 实现自定义规则集的更新
     return {
@@ -382,7 +382,7 @@ async def delete_writing_rule_set(rule_set_id: str):
     # 检查是否为系统规则集
     rule_set = get_system_rule_set_by_id(rule_set_id)
     if rule_set:
-        raise HTTPException(status_code=400, detail="系统规则集不可删除")
+        raise HTTPException(status_code=403, detail="系统内置规则集不可删除")
 
     # TODO: 实现自定义规则集的删除
     return {

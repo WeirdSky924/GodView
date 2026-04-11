@@ -198,6 +198,7 @@ export interface Character {
 
 export interface CreateCharacterDTO {
   name: string
+  role?: string
   status: Character['status']
   description: string
   project_id?: string
@@ -217,6 +218,7 @@ export interface CreateCharacterDTO {
   personality?: string
   appearance?: string
   background_story?: string
+  background?: string  // 别名
   age?: number
   gender?: string
 

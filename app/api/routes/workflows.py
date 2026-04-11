@@ -378,6 +378,42 @@ async def resume_execution(execution_id: str):
     }
 
 
+@router.post("/executions/{execution_id}/confirm-discussion", response_model=Dict[str, Any])
+async def confirm_discussion(execution_id: str, approved: bool = Query(...), feedback: Optional[str] = Query(None)):
+    """
+    确认集体讨论结果
+
+    用户可以选择：
+    - 同意（approved=true）：工作流继续执行
+    - 不同意（approved=false）：提供反馈意见，工作流重新开始
+
+    Args:
+        execution_id: 执行ID
+        approved: 是否同意讨论结果
+        feedback: 用户反馈意见（不同意时必填）
+
+    Returns:
+        Dict: 操作结果
+    """
+    engine = get_workflow_engine()
+    db = get_db()
+
+    if not approved and not feedback:
+        raise HTTPException(status_code=400, detail="不同意讨论结果时必须提供反馈意见（feedback 参数）")
+
+    result = await engine.confirm_discussion(
+        execution_id=execution_id,
+        approved=approved,
+        feedback=feedback,
+        db=db,
+    )
+
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error", "确认失败"))
+
+    return result
+
+
 @router.post("/executions/{execution_id}/cancel", response_model=Dict[str, Any])
 async def cancel_execution(execution_id: str):
     """

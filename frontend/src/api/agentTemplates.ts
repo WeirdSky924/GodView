@@ -18,6 +18,7 @@ export type AgentType =
   | 'writer'
   | 'evaluator'
   | 'proc_gen'
+  | 'scene_coordinator'
   | 'event_generator'
   | 'dungeon_generator'
   | 'world_map_manager'
@@ -32,13 +33,26 @@ export interface PromptSlot {
   variable_overrides: Record<string, any>
 }
 
+export interface SkillSlot {
+  slot_name: string
+  description: string
+  skill_id?: string
+  is_enabled: boolean
+  is_required: boolean
+  priority: number
+  variable_overrides: Record<string, any>
+  execution_condition?: string
+}
+
 export interface AgentTemplate {
   id: string
   name: string
   description: string
   agent_type: AgentType
   prompt_slots: PromptSlot[]
+  skill_slots: SkillSlot[]
   default_prompt_order: string[]
+  default_skill_order: string[]
   tags: string[]
   is_system: boolean
   is_optional: boolean
@@ -53,7 +67,9 @@ export interface CreateAgentTemplateDTO {
   description: string
   agent_type: AgentType
   prompt_slots?: PromptSlot[]
+  skill_slots?: SkillSlot[]
   default_prompt_order?: string[]
+  default_skill_order?: string[]
   tags?: string[]
 }
 
@@ -61,7 +77,9 @@ export interface UpdateAgentTemplateDTO {
   name?: string
   description?: string
   prompt_slots?: PromptSlot[]
+  skill_slots?: SkillSlot[]
   default_prompt_order?: string[]
+  default_skill_order?: string[]
   tags?: string[]
   version?: string
 }
@@ -173,4 +191,23 @@ export async function getCoreAgentTypes(): Promise<string[]> {
  */
 export async function getOptionalAgentTypes(): Promise<string[]> {
   return await api.get(`${API_BASE}/optional/list`)
+}
+
+/**
+ * Agent 类型元数据
+ */
+export interface AgentTypeMetadata {
+  type: AgentType
+  label: string
+  description: string
+  icon: string
+  is_core: boolean
+  is_optional: boolean
+}
+
+/**
+ * 获取所有 Agent 类型的元数据（用于动态生成 UI）
+ */
+export async function getAgentTypesMetadata(): Promise<AgentTypeMetadata[]> {
+  return await api.get(`${API_BASE}/types/metadata`)
 }

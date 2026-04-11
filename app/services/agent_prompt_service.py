@@ -2,6 +2,7 @@
 """
 Agent Prompt 服务
 负责动态加载和组装 Agent 的完整 system prompt
+集成 Skills 系统，支持从数据库加载 Agent 技能
 """
 
 import logging
@@ -9,8 +10,9 @@ from typing import Any, Dict, List, Optional
 
 from app.data.system_prompts import SYSTEM_PROMPTS, PROMPTS_FOR_AGENT_TYPE
 from app.data.system_agent_templates import TEMPLATES_BY_TYPE, SYSTEM_AGENT_TEMPLATES
-from app.models.agent_template import AgentTemplate, AgentType
+from app.models.agent_template import AgentTemplate, AgentType, SkillSlot
 from app.models.prompt_template import PromptTemplate
+from app.models.skill import Skill, SkillType
 from app.services.writing_rules_init import build_writing_prompt
 
 logger = logging.getLogger(__name__)
@@ -31,6 +33,10 @@ class AgentPromptService:
         # 项目写作规则缓存
         self._project_writing_rules: Dict[str, Dict[str, Any]] = {}
 
+        # Skill 缓存（按 agent_type 索引）
+        self._skills_cache: Dict[str, List[Skill]] = {}
+        self._skills_cache_valid: bool = False
+
     def _build_cache(self):
         """构建 Prompt 模板缓存"""
         for prompt in SYSTEM_PROMPTS:
@@ -42,6 +48,88 @@ class AgentPromptService:
             self._template_cache[template.id] = template
             # 同时按 agent_type 索引
             self._template_cache[template.agent_type] = template
+
+    async def _load_skills_for_agent(self, agent_type: str) -> List[Skill]:
+        """
+        加载 Agent 的 Skills
+
+        优先从数据库加载，如果数据库不可用则使用默认 Skills
+
+        Args:
+            agent_type: Agent 类型
+
+        Returns:
+            List[Skill]: Skill 列表（按优先级降序）
+        """
+        # 检查缓存
+        if self._skills_cache_valid and agent_type in self._skills_cache:
+            return self._skills_cache[agent_type]
+
+        skills = []
+
+        try:
+            # 尝试从 SkillService 加载
+            from app.services.skill_service import get_skill_service
+            service = get_skill_service()
+            skills = await service.get_skills_for_agent_type(agent_type)
+
+            # 更新缓存
+            self._skills_cache[agent_type] = skills
+            self._skills_cache_valid = True
+
+            logger.info(f"从 SkillService 加载 {agent_type} 的 Skills: {len(skills)} 个")
+
+        except Exception as e:
+            logger.warning(f"从 SkillService 加载 Skills 失败: {e}，使用默认 Skills")
+            # 使用默认 Skills
+            skills = self._get_default_skills_for_agent(agent_type)
+            self._skills_cache[agent_type] = skills
+
+        return skills
+
+    def _get_default_skills_for_agent(self, agent_type: str) -> List[Skill]:
+        """
+        获取 Agent 的默认 Skills（当数据库不可用时使用）
+
+        Args:
+            agent_type: Agent 类型
+
+        Returns:
+            List[Skill]: Skill 列表
+        """
+        try:
+            from app.data.default_skills import get_default_skills
+
+            all_skills = get_default_skills()
+            result = []
+
+            for skill in all_skills:
+                # 空列表表示所有 Agent 都可用
+                if not skill.applicable_agent_types:
+                    result.append(skill)
+                elif agent_type in skill.applicable_agent_types:
+                    result.append(skill)
+
+            # 按优先级降序排序
+            result.sort(key=lambda x: -x.priority)
+            return result
+
+        except Exception as e:
+            logger.error(f"获取默认 Skills 失败: {e}")
+            return []
+
+    def invalidate_skills_cache(self):
+        """使 Skills 缓存失效"""
+        self._skills_cache_valid = False
+        self._skills_cache.clear()
+
+    def get_skill_cache_status(self) -> Dict[str, Any]:
+        """获取 Skills 缓存状态"""
+        return {
+            "valid": self._skills_cache_valid,
+            "cached_agents": list(self._skills_cache.keys()),
+            "total_cached_skills": sum(len(s) for s in self._skills_cache.values()),
+        }
 
     def get_prompt_template(self, template_id: str) -> Optional[PromptTemplate]:
         """获取 Prompt 模板"""
@@ -84,6 +172,7 @@ class AgentPromptService:
         project_id: Optional[str] = None,
         variables: Optional[Dict[str, Any]] = None,
         characters: Optional[List[Any]] = None,
+        include_skills: bool = True,
     ) -> str:
         """
         构建 Agent 的完整 system prompt
@@ -93,6 +182,7 @@ class AgentPromptService:
             project_id: 项目ID（用于加载写作规则等）
             variables: 模板变量
             characters: 角色列表（用于构建角色层级信息）
+            include_skills: 是否包含 Skills
 
         Returns:
             str: 完整的 system prompt
@@ -112,6 +202,13 @@ class AgentPromptService:
         # 组装 prompt 片段
         prompt_pieces = []
 
+        # 1. 首先加载并渲染 Skills（最高优先级）
+        if include_skills:
+            skills_content = await self._build_skills_prompt(agent_type, variables)
+            if skills_content:
+                prompt_pieces.append(skills_content)
+
+        # 2. 处理模板插槽
         for slot in sorted_slots:
             if not slot.is_enabled:
                 continue
@@ -153,6 +250,143 @@ class AgentPromptService:
                 prompt_pieces.append(rendered)
 
         return "\n\n".join(prompt_pieces)
+
+    async def _build_skills_prompt(
+        self,
+        agent_type: str,
+        variables: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        构建 Agent 的 Skills prompt
+
+        按优先级加载和渲染 Skills：
+        1. KNOWLEDGE 类型：直接提供知识内容
+        2. PROMPT 类型：渲染模板内容
+
+        Args:
+            agent_type: Agent 类型
+            variables: 模板变量
+
+        Returns:
+            str: Skills 组合后的 prompt
+        """
+        # 加载 Skills
+        skills = await self._load_skills_for_agent(agent_type)
+
+        if not skills:
+            return ""
+
+        # 按类型分组
+        knowledge_pieces = []
+        prompt_pieces = []
+
+        for skill in skills:
+            if not skill.is_enabled:
+                continue
+
+            try:
+                if skill.skill_type == SkillType.KNOWLEDGE:
+                    # 知识类型：直接使用内容
+                    content = skill.knowledge_content or ""
+                    if content:
+                        # 渲染变量
+                        rendered = self._render_skill_content(skill, content, variables)
+                        knowledge_pieces.append(rendered)
+
+                elif skill.skill_type == SkillType.PROMPT:
+                    # Prompt 类型：渲染模板
+                    content = skill.prompt_template or ""
+                    if content:
+                        rendered = self._render_skill_content(skill, content, variables)
+                        prompt_pieces.append(rendered)
+
+            except Exception as e:
+                logger.warning(f"渲染 Skill {skill.id} 失败: {e}")
+
+        # 组合：知识在前，prompt 在后
+        pieces = []
+        if knowledge_pieces:
+            pieces.append("【核心知识与原则】\n" + "\n\n".join(knowledge_pieces))
+        if prompt_pieces:
+            pieces.append("【技能指导】\n" + "\n\n".join(prompt_pieces))
+
+        return "\n\n".join(pieces)
+
+    def _render_skill_content(
+        self,
+        skill: Skill,
+        content: str,
+        variables: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        渲染 Skill 内容，替换变量占位符
+
+        Args:
+            skill: Skill 对象
+            content: 原始内容
+            variables: 变量字典
+
+        Returns:
+            str: 渲染后的内容
+        """
+        if not variables:
+            variables = {}
+
+        # 合并默认参数值
+        for param in skill.parameters:
+            if param.name not in variables and param.default is not None:
+                variables[param.name] = param.default
+
+        # 替换变量占位符 {var_name}
+        rendered = content
+        for var_name, var_value in variables.items():
+            placeholder = f"{{{var_name}}}"
+            if placeholder in rendered:
+                # 处理不同类型的值
+                if isinstance(var_value, (list, dict)):
+                    import json
+                    rendered = rendered.replace(placeholder, json.dumps(var_value, ensure_ascii=False, indent=2))
+                else:
+                    rendered = rendered.replace(placeholder, str(var_value))
+
+        return rendered
+
+    async def build_skill_prompt(
+        self,
+        skill_id: str,
+        variables: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        构建单个 Skill 的完整 prompt
+
+        Args:
+            skill_id: Skill ID
+            variables: 模板变量
+
+        Returns:
+            str: 渲染后的 prompt
+        """
+        try:
+            from app.services.skill_service import get_skill_service
+            service = get_skill_service()
+            skill = await service.get_skill(skill_id)
+
+            if not skill:
+                logger.warning(f"Skill 不存在: {skill_id}")
+                return ""
+
+            if skill.skill_type == SkillType.KNOWLEDGE:
+                content = skill.knowledge_content or ""
+            elif skill.skill_type == SkillType.PROMPT:
+                content = skill.prompt_template or ""
+            else:
+                return ""
+
+            return self._render_skill_content(skill, content, variables)
+
+        except Exception as e:
+            logger.error(f"构建 Skill prompt 失败: {e}")
+            return ""
 
     def _build_character_hierarchy_prompt(self, characters: Optional[List[Any]]) -> str:
         """
@@ -242,10 +476,38 @@ class AgentPromptService:
                 "id": template.id,
                 "name": template.name,
                 "slots": [slot.slot_name for slot in template.prompt_slots],
+                "skill_slots": [slot.slot_name for slot in template.skill_slots],
                 "model": template.default_model,
                 "temperature": template.default_temperature,
             }
         return summary
+
+    async def get_agent_skills_info(self, agent_type: str) -> List[Dict[str, Any]]:
+        """
+        获取 Agent 的 Skills 详细信息
+
+        Args:
+            agent_type: Agent 类型
+
+        Returns:
+            List[Dict]: Skill 信息列表
+        """
+        skills = await self._load_skills_for_agent(agent_type)
+
+        result = []
+        for skill in skills:
+            result.append({
+                "id": skill.id,
+                "name": skill.name,
+                "description": skill.description,
+                "skill_type": skill.skill_type.value,
+                "category": skill.category.value,
+                "priority": skill.priority,
+                "is_enabled": skill.is_enabled,
+                "is_system": skill.is_system,
+            })
+
+        return result
 
 
 # 全局单例

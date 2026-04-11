@@ -121,16 +121,21 @@ class WritingRuleService:
 
     async def update_rule(
         self, rule_id: str, dto: WritingRuleUpdate
-    ) -> Optional[WritingRule]:
-        """更新写作规则"""
+    ) -> tuple[Optional[WritingRule], Optional[str]]:
+        """
+        更新写作规则
+
+        Returns:
+            tuple: (规则, 错误类型) 错误类型为 'not_found' 或 'is_system' 或 None
+        """
         rule = self._rules.get(rule_id)
         if not rule:
-            return None
+            return None, 'not_found'
 
         # 系统内置规则不可更新
         if rule.is_system:
             logger.warning(f"尝试更新系统内置规则 {rule_id}，操作被拒绝")
-            return None
+            return None, 'is_system'
 
         # 更新字段
         update_data = dto.dict(exclude_unset=True)
@@ -141,28 +146,33 @@ class WritingRuleService:
         rule.updated_at = datetime.now()
         logger.info(f"更新 WritingRule: {rule_id}")
 
-        return rule
+        return rule, None
 
-    async def delete_rule(self, rule_id: str) -> bool:
-        """删除写作规则"""
+    async def delete_rule(self, rule_id: str) -> tuple[bool, Optional[str]]:
+        """
+        删除写作规则
+
+        Returns:
+            tuple: (是否成功, 错误类型) 错误类型为 'not_found' 或 'is_system' 或 'in_use' 或 None
+        """
         rule = self._rules.get(rule_id)
         if not rule:
-            return False
+            return False, 'not_found'
 
         # 系统内置规则不可删除
         if rule.is_system:
             logger.warning(f"尝试删除系统内置规则 {rule_id}，操作被拒绝")
-            return False
+            return False, 'is_system'
 
         # 检查是否有规则集引用此规则
         for rule_set in self._rule_sets.values():
             if rule_id in rule_set.rule_ids:
                 logger.warning(f"规则 {rule_id} 被规则集 {rule_set.id} 引用，无法删除")
-                return False
+                return False, 'in_use'
 
         del self._rules[rule_id]
         logger.info(f"删除 WritingRule: {rule_id}")
-        return True
+        return True, None
 
     # ==================== WritingRuleSet CRUD ====================
 

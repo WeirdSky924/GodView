@@ -11,35 +11,9 @@ import { AnimatedCard, AnimatedList, AnimatedListItem, AnimatedNumber, GradientB
 import { useTheme } from '@/contexts/ThemeContext'
 import { useProject } from '@/contexts/ProjectContext'
 import { getGlobalStats, type GlobalStats } from '@/api/config'
-import { getAgentTemplates, type AgentTemplate, type AgentType } from '@/api/agentTemplates'
+import { getAgentTemplates, type AgentTemplate } from '@/api/agentTemplates'
 import { getCharacters, type Character } from '@/api/characters'
-
-// Agent 类型中文标签
-const AGENT_TYPE_LABELS: Record<string, string> = {
-  character: '角色 Agent',
-  setting: '设定 Agent',
-  summarizer: '摘要 Agent',
-  master_plotter: '总编剧 Agent',
-  hook_manager: '伏笔管理 Agent',
-  writer: '作家 Agent',
-  evaluator: '评估 Agent',
-  proc_gen: '过程生成 Agent',
-  event_generator: '事件生成 Agent',
-  dungeon_generator: '副本生成 Agent',
-  world_map_manager: '世界地图 Agent',
-}
-
-// 核心 Agent 类型
-const CORE_AGENT_TYPES: AgentType[] = [
-  'setting',
-  'writer',
-  'master_plotter',
-  'summarizer',
-  'evaluator',
-  'hook_manager',
-  'event_generator',
-  'world_map_manager',
-]
+import { useAgentTypes } from '@/hooks/useAgentTypes'
 
 interface AgentStatus {
   id: string
@@ -49,6 +23,7 @@ interface AgentStatus {
   status: 'ready' | 'disabled' | 'inactive'
   isOptional: boolean
   isEnabled: boolean
+  isCore: boolean
   isCharacter?: boolean
   characterName?: string
 }
@@ -61,6 +36,9 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true)
   const [agents, setAgents] = useState<AgentStatus[]>([])
   const [characterAgents, setCharacterAgents] = useState<AgentStatus[]>([])
+
+  // 动态加载 Agent 类型元数据
+  const { getLabel, isCoreType, loading: loadingTypes } = useAgentTypes()
 
   useEffect(() => {
     loadStats()
@@ -89,10 +67,11 @@ export default function Dashboard() {
         id: t.id,
         name: t.name,
         type: t.agent_type,
-        desc: AGENT_TYPE_LABELS[t.agent_type] || t.agent_type,
+        desc: getLabel(t.agent_type),
         status: t.is_optional ? (t.is_enabled ? 'ready' : 'disabled') : 'ready',
         isOptional: t.is_optional,
         isEnabled: t.is_enabled,
+        isCore: isCoreType(t.agent_type),
       }))
 
       setAgents(systemAgents)
@@ -110,6 +89,7 @@ export default function Dashboard() {
             status: c.agent_enabled ? 'ready' : 'inactive',
             isOptional: false,
             isEnabled: c.agent_enabled || false,
+            isCore: false,
             isCharacter: true,
             characterName: c.name,
           }))
@@ -134,9 +114,9 @@ export default function Dashboard() {
     { icon: <BookOpen size={24} />, label: '已生成章节', value: stats?.chapter_count || 0, color: 'from-purple-500 to-violet-600', glow: 'glow-secondary' },
   ]
 
-  // 分离核心和可选 Agent
-  const coreAgents = agents.filter(a => !a.isOptional || CORE_AGENT_TYPES.includes(a.type as AgentType))
-  const optionalAgents = agents.filter(a => a.isOptional && !CORE_AGENT_TYPES.includes(a.type as AgentType))
+  // 分离核心和可选 Agent（使用动态数据）
+  const coreAgents = agents.filter(a => a.isCore || (!a.isOptional))
+  const optionalAgents = agents.filter(a => a.isOptional && !a.isCore)
 
   return (
     <div className="min-h-screen">
@@ -332,7 +312,7 @@ function AgentStatusItem({ agent, isDark, index }: { agent: AgentStatus; isDark:
           <div>
             <div className="flex items-center gap-2">
               <p className={`font-medium text-sm ${isDark ? 'text-white' : 'text-gray-800'}`}>{agent.name}</p>
-              {!agent.isOptional && !agent.isCharacter && (
+              {agent.isCore && !agent.isCharacter && (
                 <span title="核心Agent">
                   <Lock className={`w-3 h-3 ${isDark ? 'text-gray-500' : 'text-gray-400'}`} />
                 </span>

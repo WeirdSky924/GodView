@@ -76,11 +76,17 @@ class SummarizerAgent(BaseAgent):
                 - participants: 参与角色列表（可以是字符串或字典）
                 - context: 当前情境
                 - active_hooks: 当前活跃的伏笔列表
+                - setting_check_mode: 如果为 True，执行世界观一致性检查
 
         Returns:
             AgentResponse: 总结结果
         """
         try:
+            # 检查是否为设定检查模式
+            setting_check_mode = input_data.get("setting_check_mode", False)
+            if setting_check_mode:
+                return await self._execute_setting_check(input_data)
+
             dialogue_history = input_data.get("dialogue_history", [])
             participants = input_data.get("participants", [])
             context = input_data.get("context", "")
@@ -121,6 +127,115 @@ class SummarizerAgent(BaseAgent):
 
         except Exception as e:
             logger.error(f"SummarizerAgent 执行失败：{e}")
+            return AgentResponse(success=False, error=str(e))
+
+    async def _execute_setting_check(self, input_data: Dict[str, Any]) -> AgentResponse:
+        """
+        执行世界观一致性检查（Setting Agent 模式）
+
+        Args:
+            input_data: 包含以下字段
+                - world_info: 世界观设定
+                - lore_entries: 设定条目列表
+                - chapter_content: 章节内容
+
+        Returns:
+            AgentResponse: 检查结果
+        """
+        world_info = input_data.get("world_info", {})
+        lore_entries = input_data.get("lore_entries", [])
+        chapter_content = input_data.get("chapter_content", "") or input_data.get("dialogue_history", [{}])[0].get("content", "")
+
+        # 构建设定信息
+        setting_info = ""
+        if world_info:
+            setting_info = f"""【世界观基础】
+世界名称：{world_info.get('name', '未知')}
+世界类型：{world_info.get('world_type', '奇幻')}
+叙事基调：{world_info.get('tone', '正剧')}
+背景设定：{world_info.get('background', '无')[:500]}
+核心规则：{world_info.get('rules', {})}"""
+
+        if lore_entries:
+            lore_text = "\n".join([
+                f"- {l.get('title', '无标题')}（{l.get('category', 'general')}）：{l.get('content', '')[:200]}"
+                for l in lore_entries[:10]
+            ])
+            setting_info += f"\n\n【设定条目】\n{lore_text}"
+
+        # 如果没有章节内容，返回世界观确认
+        if not chapter_content or len(chapter_content) < 50:
+            prompt = f"""你是世界观设定管理员。请确认以下世界观设定，并提供设定管理建议。
+
+{setting_info}
+
+请输出 JSON 格式：
+{{
+    "status": "confirmed",
+    "world_name": "世界名称",
+    "key_settings": ["核心设定点1", "核心设定点2"],
+    "suggestions": ["设定管理建议"],
+    "consistency_check": "世界观设定已确认，等待内容生成后进行一致性检查"
+}}"""
+
+            try:
+                response_text = await self._call_llm(
+                    messages=[HumanMessage(content=prompt)], temperature=0.3,
+                    category=UsageCategory.PLOT
+                )
+                result = self._parse_json_response(response_text)
+                return AgentResponse(success=True, data=result)
+            except Exception as e:
+                logger.error(f"设定确认失败：{e}")
+                return AgentResponse(
+                    success=True,
+                    data={
+                        "status": "confirmed",
+                        "consistency_check": "世界观设定已加载，等待内容生成后进行一致性检查",
+                        "error": str(e)
+                    }
+                )
+
+        # 有章节内容，进行一致性检查
+        prompt = f"""你是世界观设定管理员。请检查以下章节内容与世界观设定的一致性。
+
+{setting_info}
+
+【章节内容】
+{chapter_content[:3000]}
+
+请检查：
+1. 角色能力使用是否符合设定
+2. 世界规则是否被遵守
+3. 是否有设定冲突或矛盾
+4. 是否有需要补充的设定
+
+请输出 JSON 格式：
+{{
+    "consistency_status": "consistent/inconsistent/partial",
+    "world_name": "世界名称",
+    "checked_items": ["检查项目1", "检查项目2"],
+    "issues": [
+        {{
+            "type": "设定冲突类型",
+            "description": "问题描述",
+            "location": "问题位置",
+            "suggestion": "修改建议"
+        }}
+    ],
+    "suggestions": ["改进建议"],
+    "lore_expansion_suggestions": ["可以扩展的设定点"]
+}}"""
+
+        try:
+            response_text = await self._call_llm(
+                messages=[HumanMessage(content=prompt)], temperature=0.3,
+                category=UsageCategory.PLOT
+            )
+            result = self._parse_json_response(response_text)
+            return AgentResponse(success=True, data=result)
+        except Exception as e:
+            logger.error(f"设定检查失败：{e}")
             return AgentResponse(success=False, error=str(e))
 
     def _build_user_message(

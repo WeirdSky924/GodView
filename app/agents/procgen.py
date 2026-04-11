@@ -28,6 +28,7 @@ class ProcGenAgent(BaseAgent):
         config: Optional[Dict[str, Any]] = None,
         project_id: Optional[str] = None,
         system_prompt: Optional[str] = None,
+        agent_id: Optional[str] = None,  # 新增：支持多实例
     ):
         self.world = world
 
@@ -41,6 +42,7 @@ class ProcGenAgent(BaseAgent):
             system_prompt=system_prompt,
             config=config,
             project_id=project_id,
+            agent_id=agent_id,
         )
 
     def _get_default_variables(self) -> Dict[str, Any]:
@@ -99,6 +101,8 @@ class ProcGenAgent(BaseAgent):
             existing_regions = input_data.get("existing_regions", [])
             generation_type = input_data.get("generation_type", "first_time")
 
+            logger.info(f"ProcGenAgent 开始执行: exploration_direction={exploration_direction[:100] if exploration_direction else 'N/A'}, generation_type={generation_type}")
+
             # 构建用户消息
             user_message = self._build_user_message(
                 exploration_direction=exploration_direction,
@@ -113,21 +117,33 @@ class ProcGenAgent(BaseAgent):
                 category=UsageCategory.WORLD
             )
 
+            logger.info(f"ProcGenAgent LLM 调用完成，响应长度: {len(response_text)}")
+
             # 解析响应
             try:
                 region_data = self._parse_json_response(response_text)
             except ValueError as e:
-                return AgentResponse(
-                    success=False, error=f"生成内容格式错误：{str(e)}"
-                )
+                logger.error(f"ProcGenAgent JSON 解析失败: {e}")
+                # 尝试宽松解析
+                region_data = self._try_extract_any_json(response_text)
+                if not region_data:
+                    return AgentResponse(
+                        success=False, error=f"生成内容格式错误：{str(e)}"
+                    )
 
-            # 验证必要字段
-            required_fields = ["region_name", "region_type", "description"]
-            missing_fields = [f for f in required_fields if f not in region_data]
-            if missing_fields:
-                return AgentResponse(
-                    success=False, error=f"缺少必要字段：{', '.join(missing_fields)}"
-                )
+            # 放宽验证：只要求有 description，其他字段可选
+            # 这样可以支持多种输出格式（事件、区域、地图等）
+            if "description" not in region_data and "content" not in region_data:
+                # 如果完全没有描述性字段，尝试从响应文本中提取
+                region_data["description"] = response_text[:500]
+                region_data["raw_response"] = True
+
+            # 为缺少的字段提供默认值
+            region_data.setdefault("region_name", region_data.get("name", "未命名区域"))
+            region_data.setdefault("region_type", region_data.get("type", "custom"))
+            region_data.setdefault("name", region_data.get("region_name", "未命名"))
+
+            logger.info(f"ProcGenAgent 执行成功: name={region_data.get('name', region_data.get('region_name', 'N/A'))}")
 
             return AgentResponse(
                 success=True,
@@ -139,8 +155,27 @@ class ProcGenAgent(BaseAgent):
             )
 
         except Exception as e:
+            import traceback
             logger.error(f"ProcGenAgent 执行失败：{e}")
+            logger.error(traceback.format_exc())
             return AgentResponse(success=False, error=str(e))
+
+    def _try_extract_any_json(self, text: str) -> Optional[Dict[str, Any]]:
+        """尝试从文本中提取任何 JSON 对象"""
+        import re
+        import json
+
+        # 尝试找 JSON 对象
+        json_pattern = r'\{[\s\S]*\}'
+        matches = re.findall(json_pattern, text)
+
+        for match in matches:
+            try:
+                return json.loads(match)
+            except json.JSONDecodeError:
+                continue
+
+        return None
 
     def _build_user_message(
         self,

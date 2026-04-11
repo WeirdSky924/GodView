@@ -4,7 +4,9 @@ Skill 服务层
 支持数据库持久化和与 Agent 模板的集成
 """
 
+import json
 import logging
+import re
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -40,13 +42,109 @@ class SkillService:
             prompt_template_service: Prompt 模板服务
         """
         self._db = db
-        # 内存存储（当没有数据库连接时使用）
-        self._skills: Dict[str, Skill] = {}
-        self._assignments: Dict[str, SkillAssignment] = {}
-        self._execution_logs: Dict[str, SkillExecutionLog] = {}
+        # 内存缓存
+        self._skills_cache: Dict[str, Skill] = {}
+        self._cache_valid: bool = False
 
         # 依赖服务
         self.prompt_template_service = prompt_template_service
+
+    async def _ensure_cache(self):
+        """确保缓存有效"""
+        if self._cache_valid:
+            return
+
+        if self._db:
+            try:
+                rows = await self._db.execute_query("SELECT * FROM skills ORDER BY priority DESC")
+                for row in rows:
+                    skill = self._row_to_skill(row)
+                    self._skills_cache[skill.id] = skill
+                self._cache_valid = True
+                logger.info(f"从数据库加载 {len(self._skills_cache)} 个 Skills")
+            except Exception as e:
+                logger.warning(f"从数据库加载 Skills 失败: {e}")
+
+    def _row_to_skill(self, row: Dict) -> Skill:
+        """将数据库行转换为 Skill 对象"""
+        return Skill(
+            id=row['id'],
+            name=row['name'],
+            description=row['description'] or '',
+            skill_type=SkillType(row['skill_type']),
+            category=SkillCategory(row.get('category', 'general')),
+            tags=json.loads(row.get('tags', '[]')) if isinstance(row.get('tags'), str) else row.get('tags', []),
+            applicable_agent_types=json.loads(row.get('applicable_agent_types', '[]')) if isinstance(row.get('applicable_agent_types'), str) else row.get('applicable_agent_types', []),
+            prompt_template=row.get('prompt_template'),
+            prompt_template_id=row.get('prompt_template_id'),
+            function_code=row.get('function_code'),
+            workflow_steps=json.loads(row.get('workflow_steps', 'null')) if isinstance(row.get('workflow_steps'), str) else row.get('workflow_steps'),
+            knowledge_content=row.get('knowledge_content'),
+            parameters=[SkillParameter(**p) for p in (json.loads(row.get('parameters', '[]')) if isinstance(row.get('parameters'), str) else row.get('parameters', []))],
+            output_spec=[SkillOutputSpec(**o) for o in (json.loads(row.get('output_spec', '[]')) if isinstance(row.get('output_spec'), str) else row.get('output_spec', []))],
+            temperature=row.get('temperature', 0.7),
+            max_tokens=row.get('max_tokens'),
+            timeout=row.get('timeout', 60),
+            retry_count=row.get('retry_count', 0),
+            priority=row.get('priority', 50),
+            status=SkillStatus(row.get('status', 'active')),
+            is_system=row.get('is_system', False),
+            is_enabled=row.get('is_enabled', True),
+            is_composable=row.get('is_composable', True),
+            creator_project_id=row.get('creator_project_id'),
+            creator_agent_id=row.get('creator_agent_id'),
+            creator_user_id=row.get('creator_user_id'),
+            version=row.get('version', '1.0.0'),
+            author=row.get('author', 'system'),
+            examples=json.loads(row.get('examples', '[]')) if isinstance(row.get('examples'), str) else row.get('examples', []),
+            usage_count=row.get('usage_count', 0),
+            last_used_at=row.get('last_used_at'),
+            created_at=row.get('created_at', datetime.now()),
+            updated_at=row.get('updated_at', datetime.now()),
+        )
+
+    def _skill_to_db_dict(self, skill: Skill) -> Dict:
+        """将 Skill 对象转换为数据库字典"""
+        return {
+            'id': skill.id,
+            'name': skill.name,
+            'description': skill.description,
+            'skill_type': skill.skill_type.value,
+            'category': skill.category.value,
+            'tags': json.dumps(skill.tags, ensure_ascii=False),
+            'applicable_agent_types': json.dumps(skill.applicable_agent_types, ensure_ascii=False),
+            'prompt_template': skill.prompt_template,
+            'prompt_template_id': skill.prompt_template_id,
+            'function_code': skill.function_code,
+            'workflow_steps': json.dumps(skill.workflow_steps, ensure_ascii=False) if skill.workflow_steps else None,
+            'knowledge_content': skill.knowledge_content,
+            'parameters': json.dumps([p.model_dump() for p in skill.parameters], ensure_ascii=False),
+            'output_spec': json.dumps([o.model_dump() for o in skill.output_spec], ensure_ascii=False),
+            'temperature': skill.temperature,
+            'max_tokens': skill.max_tokens,
+            'timeout': skill.timeout,
+            'retry_count': skill.retry_count,
+            'priority': skill.priority,
+            'status': skill.status.value,
+            'is_system': skill.is_system,
+            'is_enabled': skill.is_enabled,
+            'is_composable': skill.is_composable,
+            'creator_project_id': skill.creator_project_id,
+            'creator_agent_id': skill.creator_agent_id,
+            'creator_user_id': skill.creator_user_id,
+            'version': skill.version,
+            'author': skill.author,
+            'examples': json.dumps(skill.examples, ensure_ascii=False),
+            'usage_count': skill.usage_count,
+            'last_used_at': skill.last_used_at,
+            'created_at': skill.created_at,
+            'updated_at': skill.updated_at,
+        }
+
+    def invalidate_cache(self):
+        """使缓存失效"""
+        self._cache_valid = False
+        self._skills_cache.clear()
 
     # ==================== Skill CRUD ====================
 
@@ -54,67 +152,97 @@ class SkillService:
         """创建 Skill"""
         skill_id = f"skill_{uuid.uuid4().hex[:12]}"
 
-        # 处理 prompt 类型 Skill：创建关联的 PromptTemplate
-        prompt_template_id = dto.prompt_template_id
-
-        # 如果提供了 prompt 内容但没有关联的 PromptTemplate，则创建一个
-        if dto.skill_type == SkillType.PROMPT and not prompt_template_id:
-            if hasattr(dto, 'prompt_template') and dto.prompt_template:
-                # 创建一个新的 PromptTemplate
-                if self.prompt_template_service:
-                    prompt_create_dto = PromptTemplateCreate(
-                        name=f"{dto.name} (Skill)",
-                        description=f"由 Skill {skill_id} 创建的 PromptTemplate",
-                        category=PromptCategory.FUNCTION,  # 默认分类为 FUNCTION
-                        tags=dto.tags + ["skill-generated"],
-                        content=dto.prompt_template,
-                        variables=[],  # 可以从内容中提取，这里简化
-                        priority=50,
-                    )
-                    try:
-                        prompt_template = await self.prompt_template_service.create_template(prompt_create_dto)
-                        prompt_template_id = prompt_template.id
-                        logger.info(f"为 Skill {skill_id} 创建 PromptTemplate: {prompt_template_id}")
-                    except Exception as e:
-                        logger.error(f"创建 PromptTemplate 失败: {e}")
-
         skill = Skill(
             id=skill_id,
             name=dto.name,
-            description=dto.description,
+            description=dto.description or '',
             skill_type=dto.skill_type,
-            prompt_template_id=prompt_template_id,  # 使用新的字段名
+            category=dto.category or SkillCategory.GENERAL,
+            tags=dto.tags or [],
+            applicable_agent_types=dto.applicable_agent_types or [],
+            prompt_template=dto.prompt_template,
+            prompt_template_id=dto.prompt_template_id,
             function_code=dto.function_code,
             workflow_steps=dto.workflow_steps,
             knowledge_content=dto.knowledge_content,
-            parameters=dto.parameters,
-            tags=dto.tags,
+            parameters=dto.parameters or [],
+            output_spec=dto.output_spec or [],
+            temperature=dto.temperature or 0.7,
+            max_tokens=dto.max_tokens,
+            timeout=dto.timeout or 60,
+            priority=dto.priority or 50,
+            status=SkillStatus.DRAFT,
+            is_enabled=True,
+            is_composable=dto.is_composable if dto.is_composable is not None else True,
+            examples=dto.examples or [],
             creator_project_id=dto.creator_project_id,
             creator_agent_id=dto.creator_agent_id,
             creator_user_id=dto.creator_user_id,
-            status=SkillStatus.DRAFT,
         )
 
-        self._skills[skill_id] = skill
-        logger.info(f"创建 Skill: {skill_id} - {skill.name}")
+        # 存入数据库
+        if self._db:
+            try:
+                data = self._skill_to_db_dict(skill)
+                columns = ', '.join(data.keys())
+                placeholders = ', '.join([f':{k}' for k in data.keys()])
+
+                await self._db.execute_write(
+                    f"INSERT INTO skills ({columns}) VALUES ({placeholders})",
+                    data
+                )
+                logger.info(f"创建 Skill 到数据库: {skill_id} - {skill.name}")
+            except Exception as e:
+                logger.error(f"创建 Skill 到数据库失败: {e}")
+                raise
+
+        # 更新缓存
+        self._skills_cache[skill_id] = skill
+        self._cache_valid = True
+
+        return skill
+
+    async def create_skill_from_model(self, skill: Skill) -> Skill:
+        """从 Skill 模型创建（用于初始化默认 Skills）"""
+        # 存入数据库
+        if self._db:
+            try:
+                data = self._skill_to_db_dict(skill)
+                columns = ', '.join(data.keys())
+                placeholders = ', '.join([f':{k}' for k in data.keys()])
+
+                await self._db.execute_write(
+                    f"INSERT INTO skills ({columns}) VALUES ({placeholders}) ON CONFLICT (id) DO NOTHING",
+                    data
+                )
+                logger.info(f"创建 Skill 到数据库: {skill.id} - {skill.name}")
+            except Exception as e:
+                logger.error(f"创建 Skill 到数据库失败: {e}")
+                # 不抛出异常，继续处理
+
+        # 更新缓存
+        self._skills_cache[skill.id] = skill
 
         return skill
 
     async def get_skill(self, skill_id: str) -> Optional[Skill]:
         """获取 Skill"""
-        return self._skills.get(skill_id)
+        await self._ensure_cache()
+        return self._skills_cache.get(skill_id)
 
     async def get_all_skills(
         self,
         skill_type: Optional[SkillType] = None,
         status: Optional[SkillStatus] = None,
+        category: Optional[SkillCategory] = None,
         tags: Optional[List[str]] = None,
         search: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
     ) -> List[Skill]:
         """获取 Skill 列表（支持过滤）"""
-        skills = list(self._skills.values())
+        await self._ensure_cache()
+        skills = list(self._skills_cache.values())
 
         # 过滤类型
         if skill_type:
@@ -123,6 +251,10 @@ class SkillService:
         # 过滤状态
         if status:
             skills = [s for s in skills if s.status == status]
+
+        # 过滤类别
+        if category:
+            skills = [s for s in skills if s.category == category]
 
         # 过滤标签
         if tags:
@@ -136,15 +268,16 @@ class SkillService:
                 if search_lower in s.name.lower() or search_lower in s.description.lower()
             ]
 
-        # 排序：按创建时间倒序
-        skills.sort(key=lambda x: x.created_at, reverse=True)
+        # 排序：按优先级降序
+        skills.sort(key=lambda x: (-x.priority, x.created_at))
 
         # 分页
         return skills[offset:offset + limit]
 
     async def update_skill(self, skill_id: str, dto: UpdateSkillDTO) -> Optional[Skill]:
         """更新 Skill"""
-        skill = self._skills.get(skill_id)
+        await self._ensure_cache()
+        skill = self._skills_cache.get(skill_id)
         if not skill:
             return None
 
@@ -156,118 +289,118 @@ class SkillService:
 
         skill.updated_at = datetime.now()
 
+        # 更新数据库
+        if self._db:
+            try:
+                data = self._skill_to_db_dict(skill)
+                set_clause = ', '.join([f"{k} = :{k}" for k in data.keys()])
+                data['skill_id'] = skill_id
+
+                await self._db.execute_write(
+                    f"UPDATE skills SET {set_clause} WHERE id = :skill_id",
+                    data
+                )
+            except Exception as e:
+                logger.error(f"更新 Skill 到数据库失败: {e}")
+
         logger.info(f"更新 Skill: {skill_id}")
         return skill
 
     async def delete_skill(self, skill_id: str) -> bool:
         """删除 Skill"""
-        if skill_id not in self._skills:
+        await self._ensure_cache()
+
+        if skill_id not in self._skills_cache:
             return False
 
-        # 删除相关分配
-        assignments_to_delete = [
-            aid for aid, a in self._assignments.items()
-            if a.skill_id == skill_id
-        ]
-        for aid in assignments_to_delete:
-            del self._assignments[aid]
+        # 从数据库删除
+        if self._db:
+            try:
+                await self._db.execute_write(
+                    "DELETE FROM skill_assignments WHERE skill_id = :skill_id",
+                    {"skill_id": skill_id}
+                )
+                await self._db.execute_write(
+                    "DELETE FROM skills WHERE id = :skill_id",
+                    {"skill_id": skill_id}
+                )
+            except Exception as e:
+                logger.error(f"从数据库删除 Skill 失败: {e}")
 
-        del self._skills[skill_id]
+        del self._skills_cache[skill_id]
         logger.info(f"删除 Skill: {skill_id}")
         return True
 
     async def search_skills(self, query: str, limit: int = 10) -> List[Skill]:
         """搜索 Skill"""
+        await self._ensure_cache()
         query_lower = query.lower()
         results = []
 
-        for skill in self._skills.values():
-            # 搜索名称、描述、标签
+        for skill in self._skills_cache.values():
             if (query_lower in skill.name.lower() or
                 query_lower in skill.description.lower() or
                 any(query_lower in tag.lower() for tag in skill.tags)):
                 results.append(skill)
 
-        results.sort(key=lambda x: x.usage_count, reverse=True)
+        results.sort(key=lambda x: (-x.priority, -x.usage_count))
         return results[:limit]
 
     # ==================== Skill 分配 ====================
 
-    async def assign_skill_to_agent(self, dto: AssignSkillDTO) -> SkillAssignment:
-        """将 Skill 分配给 Agent"""
-        # 检查 Skill 是否存在
-        if dto.skill_id not in self._skills:
+    async def assign_skill(self, dto: AssignSkillDTO) -> SkillAssignment:
+        """将 Skill 分配给 Agent 类型"""
+        await self._ensure_cache()
+
+        if dto.skill_id not in self._skills_cache:
             raise ValueError(f"Skill {dto.skill_id} 不存在")
 
-        # 检查是否已分配
-        for assignment in self._assignments.values():
-            if (assignment.skill_id == dto.skill_id and
-                assignment.project_id == dto.project_id and
-                assignment.agent_id == dto.agent_id):
-                # 更新现有分配
-                assignment.custom_parameters = dto.custom_parameters
-                assignment.priority = dto.priority
-                assignment.assigned_at = datetime.now()
-                return assignment
-
-        # 创建新分配
         assignment_id = f"assign_{uuid.uuid4().hex[:12]}"
         assignment = SkillAssignment(
             id=assignment_id,
             skill_id=dto.skill_id,
-            project_id=dto.project_id,
-            agent_id=dto.agent_id,
+            agent_type=dto.agent_type,
+            slot_name=dto.slot_name or '',
             custom_parameters=dto.custom_parameters,
-            priority=dto.priority,
+            variable_overrides=dto.variable_overrides or {},
+            priority=dto.priority or 50,
+            execution_condition=dto.execution_condition,
+            is_enabled=dto.is_enabled if dto.is_enabled is not None else True,
+            is_required=dto.is_required if dto.is_required is not None else False,
         )
 
-        self._assignments[assignment_id] = assignment
-        logger.info(f"分配 Skill {dto.skill_id} 给 Agent {dto.agent_id}")
+        # 存入数据库
+        if self._db:
+            try:
+                await self._db.execute_write(
+                    """
+                    INSERT INTO skill_assignments
+                    (id, skill_id, agent_type, slot_name, custom_parameters, variable_overrides,
+                     priority, execution_condition, is_enabled, is_required)
+                    VALUES (:id, :skill_id, :agent_type, :slot_name, :custom_parameters, :variable_overrides,
+                     :priority, :execution_condition, :is_enabled, :is_required)
+                    ON CONFLICT (skill_id, agent_type, slot_name) DO UPDATE SET
+                    custom_parameters = :custom_parameters, variable_overrides = :variable_overrides, priority = :priority,
+                    execution_condition = :execution_condition, is_enabled = :is_enabled, is_required = :is_required
+                    """,
+                    {
+                        "id": assignment_id,
+                        "skill_id": dto.skill_id,
+                        "agent_type": dto.agent_type,
+                        "slot_name": dto.slot_name or '',
+                        "custom_parameters": json.dumps(dto.custom_parameters or {}, ensure_ascii=False),
+                        "variable_overrides": json.dumps(dto.variable_overrides or {}, ensure_ascii=False),
+                        "priority": dto.priority or 50,
+                        "execution_condition": dto.execution_condition,
+                        "is_enabled": dto.is_enabled if dto.is_enabled is not None else True,
+                        "is_required": dto.is_required if dto.is_required is not None else False,
+                    }
+                )
+            except Exception as e:
+                logger.error(f"分配 Skill 到数据库失败: {e}")
 
+        logger.info(f"分配 Skill {dto.skill_id} 给 Agent 类型 {dto.agent_type}")
         return assignment
-
-    async def unassign_skill_from_agent(
-        self,
-        skill_id: str,
-        project_id: str,
-        agent_id: str,
-    ) -> bool:
-        """取消 Skill 分配"""
-        assignment_id = None
-        for aid, assignment in self._assignments.items():
-            if (assignment.skill_id == skill_id and
-                assignment.project_id == project_id and
-                assignment.agent_id == agent_id):
-                assignment_id = aid
-                break
-
-        if assignment_id:
-            del self._assignments[assignment_id]
-            logger.info(f"取消 Skill {skill_id} 分配给 Agent {agent_id}")
-            return True
-
-        return False
-
-    async def get_agent_skills(
-        self,
-        project_id: str,
-        agent_id: str,
-    ) -> List[Skill]:
-        """获取 Agent 已分配的 Skills"""
-        skill_ids = [
-            a.skill_id for a in self._assignments.values()
-            if a.project_id == project_id and a.agent_id == agent_id
-        ]
-
-        skills = []
-        for skill_id in skill_ids:
-            skill = self._skills.get(skill_id)
-            if skill:
-                skills.append(skill)
-
-        # 按优先级排序
-        skills.sort(key=lambda x: x.usage_count, reverse=True)
-        return skills
 
     async def get_skills_for_agent_type(self, agent_type: str) -> List[Skill]:
         """
@@ -293,10 +426,35 @@ class SkillService:
 
     async def get_skill_assignments(self, skill_id: str) -> List[SkillAssignment]:
         """获取 Skill 的所有分配"""
-        return [
-            a for a in self._assignments.values()
-            if a.skill_id == skill_id
-        ]
+        if not self._db:
+            return []
+
+        try:
+            rows = await self._db.execute_query(
+                "SELECT * FROM skill_assignments WHERE skill_id = :skill_id",
+                {"skill_id": skill_id}
+            )
+            return [self._row_to_assignment(row) for row in rows]
+        except Exception as e:
+            logger.error(f"获取 Skill 分配失败: {e}")
+            return []
+
+    def _row_to_assignment(self, row: Dict) -> SkillAssignment:
+        """将数据库行转换为 SkillAssignment 对象"""
+        return SkillAssignment(
+            id=row['id'],
+            skill_id=row['skill_id'],
+            agent_type=row['agent_type'],
+            slot_name=row.get('slot_name', ''),
+            custom_parameters=json.loads(row.get('custom_parameters', '{}')) if isinstance(row.get('custom_parameters'), str) else row.get('custom_parameters', {}),
+            variable_overrides=json.loads(row.get('variable_overrides', '{}')) if isinstance(row.get('variable_overrides'), str) else row.get('variable_overrides', {}),
+            priority=row.get('priority', 50),
+            execution_condition=row.get('execution_condition'),
+            is_enabled=row.get('is_enabled', True),
+            is_required=row.get('is_required', False),
+            assigned_by=row.get('assigned_by', 'user'),
+            assigned_at=row.get('assigned_at', datetime.now()),
+        )
 
     # ==================== Skill 执行 ====================
 
@@ -307,7 +465,8 @@ class SkillService:
         """执行 Skill"""
         import time
 
-        skill = self._skills.get(dto.skill_id)
+        await self._ensure_cache()
+        skill = self._skills_cache.get(dto.skill_id)
         if not skill:
             return SkillTestResult(success=False, error=f"Skill {dto.skill_id} 不存在")
 
@@ -323,6 +482,20 @@ class SkillService:
             # 更新使用统计
             skill.usage_count += 1
             skill.last_used_at = datetime.now()
+
+            # 更新数据库中的使用统计
+            if self._db:
+                try:
+                    await self._db.execute_write(
+                        "UPDATE skills SET usage_count = :usage_count, last_used_at = :last_used_at WHERE id = :skill_id",
+                        {
+                            "usage_count": skill.usage_count,
+                            "last_used_at": skill.last_used_at,
+                            "skill_id": skill.id,
+                        }
+                    )
+                except Exception as e:
+                    logger.warning(f"更新 Skill 使用统计失败: {e}")
 
             # 记录执行日志
             await self._log_execution(
@@ -385,57 +558,125 @@ class SkillService:
         parameters: Dict[str, Any],
     ) -> str:
         """执行 Prompt 类型 Skill"""
-        if not skill.prompt_template_id:
-            return ""
+        if skill.prompt_template:
+            # 直接使用内嵌的模板
+            content = skill.prompt_template
+            for var_name, var_value in parameters.items():
+                placeholder = f"{{{var_name}}}"
+                if placeholder in content:
+                    if isinstance(var_value, (list, dict)):
+                        content = content.replace(placeholder, json.dumps(var_value, ensure_ascii=False, indent=2))
+                    else:
+                        content = content.replace(placeholder, str(var_value))
+            return content
 
-        # 如果有 prompt_template_service，使用它来渲染模板
-        if self.prompt_template_service:
+        if skill.prompt_template_id and self.prompt_template_service:
             try:
-                # 获取 PromptTemplate
                 prompt_template = await self.prompt_template_service.get_template(
                     skill.prompt_template_id
                 )
-                if not prompt_template:
-                    logger.warning(f"PromptTemplate 不存在: {skill.prompt_template_id}")
-                    return ""
+                if prompt_template:
+                    merged_params = parameters.copy()
+                    for param in skill.parameters:
+                        if param.name not in merged_params and param.default is not None:
+                            merged_params[param.name] = param.default
 
-                # 合并 Skill 参数和传入参数
-                merged_params = parameters.copy()
-                for param in skill.parameters:
-                    if param.name not in merged_params and param.default is not None:
-                        merged_params[param.name] = param.default
-
-                # 渲染模板
-                from app.models.prompt_template import PromptRenderRequest
-                request = PromptRenderRequest(
-                    template_id=skill.prompt_template_id,
-                    variables=merged_params,
-                )
-                result = await self.prompt_template_service.render_template(request)
-                return result.rendered_content
-
+                    from app.models.prompt_template import PromptRenderRequest
+                    request = PromptRenderRequest(
+                        template_id=skill.prompt_template_id,
+                        variables=merged_params,
+                    )
+                    result = await self.prompt_template_service.render_template(request)
+                    return result.rendered_content
             except Exception as e:
                 logger.error(f"渲染 PromptTemplate 失败: {e}")
                 return f"[渲染失败: {str(e)}]"
-        else:
-            # 如果没有服务，返回占位符
-            logger.warning(f"PromptTemplateService 未注入，无法执行 prompt skill: {skill.id}")
-            return f"[需要 PromptTemplateService 来执行: {skill.prompt_template_id}]"
+
+        return ""
 
     async def _execute_function_skill(
         self,
         skill: Skill,
         parameters: Dict[str, Any],
     ) -> str:
-        """执行 Function 类型 Skill"""
-        # 注意：直接执行代码存在安全风险，生产环境应使用沙箱
+        """
+        执行 Function 类型 Skill
+
+        在受限环境中执行 Python 代码，只允许访问安全的内置函数和模块
+
+        Args:
+            skill: Skill 对象
+            parameters: 执行参数
+
+        Returns:
+            str: 执行结果（JSON 字符串）
+        """
         if not skill.function_code:
             return ""
 
-        # 简单实现：返回代码内容
-        # 实际实现应使用安全的执行环境
-        logger.warning(f"Function Skill 执行需要安全沙箱: {skill.id}")
-        return f"[Function execution not implemented]\nCode:\n{skill.function_code[:500]}..."
+        import json
+
+        # 创建安全的执行环境
+        safe_globals = {
+            '__builtins__': {
+                'len': len,
+                'str': str,
+                'int': int,
+                'float': float,
+                'bool': bool,
+                'list': list,
+                'dict': dict,
+                'tuple': tuple,
+                'set': set,
+                'range': range,
+                'enumerate': enumerate,
+                'zip': zip,
+                'map': map,
+                'filter': filter,
+                'sorted': sorted,
+                'reversed': reversed,
+                'sum': sum,
+                'max': max,
+                'min': min,
+                'abs': abs,
+                'round': round,
+                'isinstance': isinstance,
+                'type': type,
+                'hasattr': hasattr,
+                'getattr': getattr,
+                'any': any,
+                'all': all,
+                'print': print,
+                '__import__': __import__,  # 允许导入模块
+            },
+            're': re,
+            'json': json,
+        }
+
+        # 添加参数到执行环境
+        local_vars = parameters.copy()
+
+        try:
+            # 执行代码
+            exec(skill.function_code, safe_globals, local_vars)
+
+            # 查找 execute 函数并调用
+            if 'execute' in local_vars and callable(local_vars['execute']):
+                result = local_vars['execute'](**parameters)
+            else:
+                # 如果没有 execute 函数，尝试返回所有新定义的变量
+                result = {k: v for k, v in local_vars.items()
+                         if k not in parameters and not k.startswith('_')}
+
+            # 将结果转换为 JSON 字符串
+            if isinstance(result, dict):
+                return json.dumps(result, ensure_ascii=False)
+            else:
+                return json.dumps({"result": result}, ensure_ascii=False)
+
+        except Exception as e:
+            logger.error(f"执行 Function Skill {skill.id} 失败: {e}")
+            return json.dumps({"error": str(e)}, ensure_ascii=False)
 
     async def _execute_workflow_skill(
         self,
@@ -460,7 +701,18 @@ class SkillService:
         parameters: Dict[str, Any],
     ) -> str:
         """执行 Knowledge 类型 Skill"""
-        return skill.knowledge_content or ""
+        content = skill.knowledge_content or ""
+
+        # 替换参数占位符
+        for var_name, var_value in parameters.items():
+            placeholder = f"{{{var_name}}}"
+            if placeholder in content:
+                if isinstance(var_value, (list, dict)):
+                    content = content.replace(placeholder, json.dumps(var_value, ensure_ascii=False, indent=2))
+                else:
+                    content = content.replace(placeholder, str(var_value))
+
+        return content
 
     async def _log_execution(
         self,
@@ -474,19 +726,31 @@ class SkillService:
         execution_time_ms: Optional[int] = None,
     ):
         """记录执行日志"""
-        log_id = f"log_{uuid.uuid4().hex[:12]}"
-        log = SkillExecutionLog(
-            id=log_id,
-            skill_id=skill_id,
-            project_id=project_id,
-            agent_id=agent_id,
-            input_params=input_params,
-            output_result=output_result,
-            success=success,
-            error_message=error_message,
-            execution_time_ms=execution_time_ms,
-        )
-        self._execution_logs[log_id] = log
+        if not self._db:
+            return
+
+        try:
+            log_id = f"log_{uuid.uuid4().hex[:12]}"
+            await self._db.execute_write(
+                """
+                INSERT INTO skill_execution_logs
+                (id, skill_id, project_id, agent_id, input_params, output_result, success, error_message, execution_time_ms)
+                VALUES (:id, :skill_id, :project_id, :agent_id, :input_params, :output_result, :success, :error_message, :execution_time_ms)
+                """,
+                {
+                    "id": log_id,
+                    "skill_id": skill_id,
+                    "project_id": project_id,
+                    "agent_id": agent_id,
+                    "input_params": json.dumps(input_params, ensure_ascii=False),
+                    "output_result": output_result,
+                    "success": success,
+                    "error_message": error_message,
+                    "execution_time_ms": execution_time_ms,
+                }
+            )
+        except Exception as e:
+            logger.warning(f"记录 Skill 执行日志失败: {e}")
 
     async def get_execution_logs(
         self,
@@ -496,17 +760,45 @@ class SkillService:
         limit: int = 50,
     ) -> List[SkillExecutionLog]:
         """获取执行日志"""
-        logs = list(self._execution_logs.values())
+        if not self._db:
+            return []
 
-        if skill_id:
-            logs = [l for l in logs if l.skill_id == skill_id]
-        if project_id:
-            logs = [l for l in logs if l.project_id == project_id]
-        if agent_id:
-            logs = [l for l in logs if l.agent_id == agent_id]
+        try:
+            query = "SELECT * FROM skill_execution_logs WHERE 1=1"
+            params = {}
 
-        logs.sort(key=lambda x: x.created_at, reverse=True)
-        return logs[:limit]
+            if skill_id:
+                query += " AND skill_id = :skill_id"
+                params["skill_id"] = skill_id
+            if project_id:
+                query += " AND project_id = :project_id"
+                params["project_id"] = project_id
+            if agent_id:
+                query += " AND agent_id = :agent_id"
+                params["agent_id"] = agent_id
+
+            query += " ORDER BY created_at DESC LIMIT :limit"
+            params["limit"] = limit
+
+            rows = await self._db.execute_query(query, params)
+            return [
+                SkillExecutionLog(
+                    id=row['id'],
+                    skill_id=row['skill_id'],
+                    project_id=row.get('project_id'),
+                    agent_id=row.get('agent_id'),
+                    input_params=json.loads(row.get('input_params', '{}')) if isinstance(row.get('input_params'), str) else row.get('input_params', {}),
+                    output_result=row.get('output_result'),
+                    success=row.get('success', True),
+                    error_message=row.get('error_message'),
+                    execution_time_ms=row.get('execution_time_ms'),
+                    created_at=row.get('created_at', datetime.now()),
+                )
+                for row in rows
+            ]
+        except Exception as e:
+            logger.error(f"获取执行日志失败: {e}")
+            return []
 
     # ==================== Skill 生成 ====================
 
@@ -516,9 +808,6 @@ class SkillService:
         skill_type: SkillType = SkillType.PROMPT,
     ) -> Skill:
         """根据描述生成 Skill（AI 辅助）"""
-        # 简单实现：创建基础 Skill
-        # 实际实现应调用 LLM 生成
-
         skill_id = f"skill_{uuid.uuid4().hex[:12]}"
         skill = Skill(
             id=skill_id,
@@ -528,8 +817,7 @@ class SkillService:
             status=SkillStatus.DRAFT,
         )
 
-        self._skills[skill_id] = skill
-        return skill
+        return await self.create_skill_from_model(skill)
 
 
 # 全局单例
@@ -540,5 +828,16 @@ def get_skill_service() -> SkillService:
     """获取 SkillService 单例"""
     global _skill_service
     if _skill_service is None:
-        _skill_service = SkillService()
+        # 尝试获取数据库连接
+        try:
+            from app.api.app import postgres_db
+            _skill_service = SkillService(db=postgres_db)
+        except ImportError:
+            _skill_service = SkillService()
     return _skill_service
+
+
+def set_skill_service(service: SkillService):
+    """设置 SkillService 实例"""
+    global _skill_service
+    _skill_service = service

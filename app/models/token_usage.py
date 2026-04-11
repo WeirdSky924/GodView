@@ -29,6 +29,7 @@ class UsageCategory(str, Enum):
     SETTING_AGENT = "setting_agent"  # 设定代理
     SKILL = "skill"                  # Skill 执行
     RAG = "rag"                      # RAG 检索
+    PLANNING = "planning"            # 分段规划
     OTHER = "other"                  # 其他
 
 

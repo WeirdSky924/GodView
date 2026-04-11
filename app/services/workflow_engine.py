@@ -5,6 +5,7 @@ v8 Agent协作可视化工作台
 
 import asyncio
 import logging
+import random
 from collections import defaultdict, deque
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Set
@@ -374,12 +375,25 @@ class WorkflowEngine:
         if len(end_nodes) == 0:
             errors.append("工作流缺少结束节点")
 
-        # 检查边的源和目标节点是否存在（这应该已经被自动过滤，但保留检查作为警告）
+        # 检查边的源和目标节点是否存在
+        # 无效边会导致工作流死锁，必须作为错误处理
+        invalid_edges = []
         for edge in workflow.edges:
             if edge.source not in node_ids:
-                warnings.append(f"边的源节点 '{edge.source}' 不存在（应该已被过滤）")
+                invalid_edges.append(f"边 '{edge.id}': 源节点 '{edge.source}' 不存在")
             if edge.target not in node_ids:
-                warnings.append(f"边的目标节点 '{edge.target}' 不存在（应该已被过滤）")
+                invalid_edges.append(f"边 '{edge.id}': 目标节点 '{edge.target}' 不存在")
+
+        if invalid_edges:
+            # 自动修复：过滤掉无效边
+            valid_edges = [
+                edge for edge in workflow.edges
+                if edge.source in node_ids and edge.target in node_ids
+            ]
+            if len(valid_edges) < len(workflow.edges):
+                warnings.append(f"自动过滤了 {len(workflow.edges) - len(valid_edges)} 条无效边: {invalid_edges}")
+                # 更新 workflow 的 edges
+                workflow.edges = valid_edges
 
         # 检查是否有意外的环（retry 循环是允许的）
         has_cycle, cycle_info = self._detect_cycle(fixed_nodes, workflow.edges)
@@ -538,17 +552,22 @@ class WorkflowEngine:
 
         # 记录边的连接情况
         logger.info(f"工作流包含 {len(workflow.edges)} 条边:")
+        valid_edge_count = 0
         for edge in workflow.edges:
-            logger.info(f"  边: {edge.source} -> {edge.target}")
-
-            # 检查边的源和目标是否都在节点列表中
+            # 只处理源和目标都存在的边
             if edge.source not in all_node_ids:
-                logger.warning(f"  警告: 边的源节点 {edge.source} 不在节点列表中!")
+                logger.warning(f"  警告: 边的源节点 {edge.source} 不在节点列表中，跳过此边")
+                continue
             if edge.target not in all_node_ids:
-                logger.warning(f"  警告: 边的目标节点 {edge.target} 不在节点列表中!")
+                logger.warning(f"  警告: 边的目标节点 {edge.target} 不在节点列表中，跳过此边")
+                continue
 
+            logger.info(f"  边: {edge.source} -> {edge.target}")
             if edge.target in predecessors:
                 predecessors[edge.target].append(edge.source)
+                valid_edge_count += 1
+
+        logger.info(f"有效边数量: {valid_edge_count}")
 
         # 详细日志：输出每个节点的前驱
         logger.info("前驱图构建结果:")
@@ -570,11 +589,14 @@ class WorkflowEngine:
         Returns:
             Dict[str, List[str]]: 节点ID -> 后继节点ID列表
         """
+        all_node_ids = {node.id for node in workflow.nodes}
         successors = {node.id: [] for node in workflow.nodes}
 
         for edge in workflow.edges:
-            if edge.source in successors:
-                successors[edge.source].append(edge.target)
+            # 只处理源和目标都存在的边
+            if edge.source in all_node_ids and edge.target in all_node_ids:
+                if edge.source in successors:
+                    successors[edge.source].append(edge.target)
 
         return successors
 
@@ -773,13 +795,23 @@ class WorkflowEngine:
             start_node_id = list(start_node_ids)[0]
             logger.info(f"使用起始节点: {start_node_id}")
 
-            # 已完成的节点集合
+            # 已完成的节点集合（从执行状态恢复）
             completed_nodes: Set[str] = set()
+            for node_id, node_state in execution.node_states.items():
+                if node_state.status == NodeStatus.COMPLETED:
+                    completed_nodes.add(node_id)
+                    logger.debug(f"节点 {node_id} 已完成，跳过重复执行")
+
             # 正在执行的节点集合
             running_nodes: Set[str] = set()
 
-            # 初始就绪节点
-            ready_nodes = [start_node_id]
+            # 初始就绪节点（如果已完成节点为空，从起始节点开始；否则查找下一批就绪节点）
+            if not completed_nodes:
+                ready_nodes = [start_node_id]
+            else:
+                # 从已完成节点之后继续
+                ready_nodes = self._get_ready_nodes(workflow, execution, predecessors, completed_nodes)
+                logger.info(f"从已完成节点继续，就绪节点: {ready_nodes}")
 
             max_iterations = 100
             iteration = 0
@@ -822,22 +854,31 @@ class WorkflowEngine:
                     # 并行执行
                     async def execute_with_id(node_id: str, node: WorkflowNode):
                         try:
+                            logger.info(f"开始执行并行节点: {node_id} ({node.label})")
                             await self._execute_node_with_merge(
                                 execution, node, predecessors, workflow, db
                             )
+                            logger.info(f"并行节点执行完成: {node_id} ({node.label})")
                             return (node_id, True, None)
                         except Exception as e:
+                            import traceback
                             logger.error(f"节点 {node_id} 执行异常: {e}")
+                            logger.error(traceback.format_exc())
                             return (node_id, False, str(e))
 
                     tasks = [execute_with_id(nid, n) for nid, n in tasks_with_ids]
 
                     # 等待所有任务完成
+                    logger.info(f"等待 {len(tasks)} 个并行任务完成...")
                     results = await asyncio.gather(*tasks, return_exceptions=True)
+                    logger.info(f"所有 {len(tasks)} 个并行任务已返回结果")
 
                     # 处理结果
+                    goto_target = None
+                    goto_source_node = None  # 记录 goto 来源节点
                     for i, result in enumerate(results):
                         node_id = tasks_with_ids[i][0]
+                        node = tasks_with_ids[i][1]
                         running_nodes.discard(node_id)
 
                         if isinstance(result, Exception):
@@ -850,8 +891,68 @@ class WorkflowEngine:
                             else:
                                 logger.error(f"节点 {nid} 执行失败: {error}")
                             completed_nodes.add(nid)
+
+                            # 检查条件分支的 goto
+                            if success and node.node_type == NodeType.CONDITION:
+                                next_node_id = self._get_next_node(nid, execution, workflow)
+                                if next_node_id and next_node_id in completed_nodes:
+                                    goto_target = next_node_id
+                                    goto_source_node = nid
+                                    logger.info(f"并行执行中检测到条件分支 goto: {nid} -> {next_node_id}")
                         else:
                             completed_nodes.add(node_id)
+
+                    # 处理 goto（只处理第一个检测到的，最多重试 3 次）
+                    if goto_target:
+                        # 初始化 goto 重试计数
+                        if "goto_retry_counts" not in execution.context:
+                            execution.context["goto_retry_counts"] = {}
+
+                        goto_key = f"{goto_source_node}->{goto_target}"
+                        current_retry = execution.context["goto_retry_counts"].get(goto_key, 0)
+
+                        # 检查是否达到最大重试次数（3 次）
+                        if current_retry >= 3:
+                            logger.warning(
+                                f"并行执行中 goto 已达最大重试次数 (3次): {goto_source_node} -> {goto_target}，跳过重试"
+                            )
+                            goto_target = None  # 清除 goto 目标
+                        else:
+                            # 增加重试计数
+                            execution.context["goto_retry_counts"][goto_key] = current_retry + 1
+                            logger.info(
+                                f"并行执行后处理 goto: 重置节点 {goto_target} "
+                                f"(重试 {current_retry + 1}/3 次)"
+                            )
+
+                            # 检查目标节点是否是 start 节点
+                            target_node = next((n for n in workflow.nodes if n.id == goto_target), None)
+                            is_goto_to_start = target_node and (
+                                target_node.node_type == NodeType.START or
+                                target_node.label in ["开始", "Start", "start"]
+                            )
+
+                            if is_goto_to_start:
+                                # goto 到 start 节点：重置所有中间节点的状态
+                                logger.info(f"并行执行后 goto 到开始节点，重置所有节点状态")
+                                for nid in list(completed_nodes):
+                                    completed_nodes.discard(nid)
+                                    state = execution.node_states.get(nid)
+                                    if state:
+                                        state.status = NodeStatus.PENDING
+                                        state.started_at = None
+                                        state.completed_at = None
+                                        state.output_data = {}
+                                        state.error = None
+                            else:
+                                # 普通 goto：只重置目标节点状态
+                                completed_nodes.discard(goto_target)
+                                target_state = execution.node_states.get(goto_target)
+                                if target_state:
+                                    target_state.status = NodeStatus.PENDING
+                                    target_state.started_at = None
+                                    target_state.completed_at = None
+                                    target_state.output_data = {}
 
                     logger.info(f"并行执行完成，已完成节点: {completed_nodes}")
 
@@ -873,6 +974,67 @@ class WorkflowEngine:
                         )
                         completed_nodes.add(node_id)
                         logger.info(f"节点 {node_id} 执行完成")
+
+                        # ========== 条件分支 goto 处理（最多重试 3 次）==========
+                        if node.node_type == NodeType.CONDITION:
+                            next_node_id = self._get_next_node(node_id, execution, workflow)
+                            if next_node_id:
+                                # 检查是否是 goto（retry 到已完成的节点）
+                                if next_node_id in completed_nodes:
+                                    # 初始化 goto 重试计数
+                                    if "goto_retry_counts" not in execution.context:
+                                        execution.context["goto_retry_counts"] = {}
+
+                                    goto_key = f"{node_id}->{next_node_id}"
+                                    current_retry = execution.context["goto_retry_counts"].get(goto_key, 0)
+
+                                    # 检查是否达到最大重试次数（3 次）
+                                    if current_retry >= 3:
+                                        logger.warning(
+                                            f"条件分支 goto 已达最大重试次数 (3次): {node_id} -> {next_node_id}，跳过重试"
+                                        )
+                                        # 不再执行 goto，继续正常流程
+                                    else:
+                                        # 增加重试计数
+                                        execution.context["goto_retry_counts"][goto_key] = current_retry + 1
+                                        logger.info(
+                                            f"条件分支 goto: {node_id} -> {next_node_id} "
+                                            f"(重试 {current_retry + 1}/3 次)"
+                                        )
+
+                                        # 检查目标节点是否是 start 节点
+                                        target_node = next((n for n in workflow.nodes if n.id == next_node_id), None)
+                                        is_goto_to_start = target_node and (
+                                            target_node.node_type == NodeType.START or
+                                            target_node.label in ["开始", "Start", "start"]
+                                        )
+
+                                        if is_goto_to_start:
+                                            # goto 到 start 节点：重置所有中间节点的状态
+                                            logger.info(f"goto 到开始节点，重置所有节点状态")
+                                            for nid in list(completed_nodes):
+                                                completed_nodes.discard(nid)
+                                                state = execution.node_states.get(nid)
+                                                if state:
+                                                    state.status = NodeStatus.PENDING
+                                                    state.started_at = None
+                                                    state.completed_at = None
+                                                    state.output_data = {}
+                                                    state.error = None
+                                        else:
+                                            # 普通 goto：只重置目标节点状态
+                                            completed_nodes.discard(next_node_id)
+                                            target_state = execution.node_states.get(next_node_id)
+                                            if target_state:
+                                                target_state.status = NodeStatus.PENDING
+                                                target_state.started_at = None
+                                                target_state.completed_at = None
+                                                target_state.output_data = {}
+
+                                        # 将目标节点添加到就绪列表
+                                        ready_nodes = [next_node_id]
+                                        continue
+
                     except Exception as e:
                         logger.error(f"节点 {node_id} 执行失败: {e}")
                         node_state = execution.node_states.get(node_id)
@@ -1289,9 +1451,9 @@ class WorkflowEngine:
                 logger.info(f"节点 '{node.label}' 根据 inputs 配置准备了 {len(node.inputs)} 个输入")
 
             if actual_node_type == NodeType.START:
-                # 开始节点：直接通过
+                # 开始节点：加载基础上下文并传递给后续节点
                 logger.info(f"执行开始节点: {node.id}")
-                output = {"status": "started"}
+                output = await self._execute_start_node(execution, db)
 
             elif actual_node_type == NodeType.END:
                 # 结束节点：直接通过
@@ -1307,8 +1469,12 @@ class WorkflowEngine:
                 output = await self._execute_condition_node(node, execution, db)
 
             elif node.node_type == NodeType.GROUP_DISCUSSION:
-                # 集体讨论节点：所有角色参与讨论
+                # 集体讨论节点：创作会议模式
                 output = await self._execute_group_discussion_node(node, execution, db)
+
+            elif node.node_type == NodeType.SCENE_PERFORMANCE:
+                # 场景演绎节点：多角色同台飙戏
+                output = await self._execute_scene_performance_node(node, execution, db)
 
             elif node.node_type == NodeType.PARALLEL:
                 # 并行节点：标记并行执行点
@@ -1358,6 +1524,167 @@ class WorkflowEngine:
             completed_data["agent_type"] = node.agent_type
         await self._broadcast_status(execution.id, "node_completed", completed_data)
 
+    async def _execute_start_node(
+        self,
+        execution: "WorkflowExecution",
+        db=None,
+    ) -> Dict[str, Any]:
+        """
+        执行开始节点：加载基础上下文
+
+        加载项目的基础信息并传递给后续节点：
+        - 世界观设定（world_info）
+        - 项目信息（project_info）
+        - 前文章节（previous_chapters）
+        - 角色列表（characters）
+        - 设定条目（lore_entries）
+        - 伏笔列表（hooks）
+
+        Args:
+            execution: 工作流执行实例
+            db: 数据库连接
+
+        Returns:
+            Dict: 包含所有基础上下文的输出
+        """
+        output = {"status": "started"}
+        project_id = execution.project_id
+
+        if not db:
+            logger.warning("开始节点：数据库连接不存在，无法加载基础上下文")
+            return output
+
+        logger.info(f"开始节点加载基础上下文，项目ID: {project_id}")
+
+        try:
+            # ========== 1. 加载项目信息 ==========
+            project = await db.get_project(project_id) if hasattr(db, 'get_project') else None
+            if project:
+                output["project_info"] = {
+                    "id": project.get("id", project_id),
+                    "title": project.get("title", ""),
+                    "description": project.get("description", ""),
+                    "initial_plot": project.get("initial_plot", ""),
+                    "world_type": project.get("world_type", "奇幻"),
+                    "tone": project.get("tone", "正剧"),
+                }
+                # 同时保存到执行上下文
+                execution.context["project_info"] = output["project_info"]
+                logger.info(f"加载项目信息: {project.get('title', '未知')}")
+
+            # ========== 2. 加载世界观设定 ==========
+            world_id = project.get("world_id") if project else None
+            if not world_id:
+                # 尝试从项目的世界列表获取
+                worlds = await db.get_worlds_by_project(project_id) if hasattr(db, 'get_worlds_by_project') else []
+                if worlds:
+                    world_id = worlds[0].get("id")
+
+            if world_id:
+                world = await db.get_world(world_id) if hasattr(db, 'get_world') else None
+                if world:
+                    output["world_info"] = {
+                        "id": world.get("id", ""),
+                        "name": world.get("name", "未知世界"),
+                        "world_type": world.get("world_type", "奇幻"),
+                        "description": world.get("description", ""),
+                        "background": world.get("background", ""),
+                        "rules": world.get("rules", {}),
+                        "themes": world.get("themes", []),
+                        "tone": world.get("tone", "正剧"),
+                        "target_audience": world.get("target_audience", "大众"),
+                    }
+                    execution.context["world_info"] = output["world_info"]
+                    logger.info(f"加载世界观设定: {world.get('name', '未知')} ({world.get('world_type', '奇幻')})")
+
+            # ========== 3. 加载角色列表 ==========
+            characters = await db.get_all_characters(project_id) if hasattr(db, 'get_all_characters') else []
+            if characters:
+                output["characters"] = characters
+                execution.context["characters"] = characters
+                logger.info(f"加载 {len(characters)} 个角色")
+
+            # ========== 4. 加载前文章节 ==========
+            chapters = await db.get_chapters_by_project(project_id) if hasattr(db, 'get_chapters_by_project') else []
+            if chapters:
+                # 提取最近的章节作为参考
+                recent_chapters = chapters[-5:] if len(chapters) > 5 else chapters
+                output["previous_chapters"] = recent_chapters
+                output["all_chapters"] = chapters
+                execution.context["previous_chapters"] = recent_chapters
+                execution.context["all_chapters"] = chapters
+
+                # 提取章节概要
+                chapter_summaries = [
+                    {"chapter_num": i+1, "title": c.get("title", ""), "summary": c.get("summary", "")}
+                    for i, c in enumerate(chapters)
+                ]
+                output["chapter_summaries"] = chapter_summaries
+                execution.context["chapter_summaries"] = chapter_summaries
+
+                # 最近章节的风格参考
+                if recent_chapters:
+                    last_chapter = recent_chapters[-1]
+                    output["previous_style"] = last_chapter.get("content", "")[:1000]
+                    execution.context["previous_style"] = output["previous_style"]
+
+                logger.info(f"加载 {len(chapters)} 个章节（最近 {len(recent_chapters)} 章）")
+
+            # ========== 5. 加载设定条目 ==========
+            try:
+                lores = await db.execute_query(
+                    "SELECT * FROM lore_entries WHERE project_id = CAST(:project_id AS UUID) ORDER BY priority, created_at DESC LIMIT 30",
+                    {"project_id": project_id}
+                ) if hasattr(db, 'execute_query') else []
+                if lores:
+                    output["lore_entries"] = lores
+                    execution.context["lore_entries"] = lores
+                    logger.info(f"加载 {len(lores)} 个设定条目")
+            except Exception as e:
+                logger.warning(f"加载设定条目失败: {e}")
+
+            # ========== 6. 加载伏笔列表 ==========
+            hooks = await db.get_hooks(project_id) if hasattr(db, 'get_hooks') else []
+            if hooks:
+                output["hooks"] = hooks
+                output["existing_hooks"] = hooks
+                execution.context["existing_hooks"] = hooks
+                logger.info(f"加载 {len(hooks)} 个伏笔")
+
+            # ========== 7. 加载事件列表 ==========
+            events = await db.get_events(project_id) if hasattr(db, 'get_events') else []
+            if events:
+                output["events"] = events
+                execution.context["events"] = events
+                logger.info(f"加载 {len(events)} 个事件")
+
+            # ========== 8. 加载地点列表 ==========
+            locations = await db.get_locations(project_id) if hasattr(db, 'get_locations') else []
+            if locations:
+                output["locations"] = locations
+                execution.context["locations"] = locations
+                logger.info(f"加载 {len(locations)} 个地点")
+
+            # ========== 9. 处理用户反馈（重试场景）==========
+            user_feedback = execution.context.get("user_feedback")
+            if user_feedback:
+                output["user_feedback"] = user_feedback
+                output["is_retry"] = execution.context.get("is_retry", False)
+                output["retry_count"] = execution.context.get("retry_count", 0)
+                output["user_feedback_timestamp"] = execution.context.get("user_feedback_timestamp")
+                logger.info(f"检测到用户反馈（重试 {output.get('retry_count', 0)} 次）: {user_feedback[:100]}...")
+
+            # 记录加载完成
+            loaded_items = [k for k in output.keys() if k != "status"]
+            logger.info(f"开始节点完成，加载了 {len(loaded_items)} 项基础上下文: {loaded_items}")
+
+        except Exception as e:
+            logger.error(f"开始节点加载基础上下文失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+        return output
+
     async def _execute_agent_node(
         self,
         node: WorkflowNode,
@@ -1369,13 +1696,15 @@ class WorkflowEngine:
         if not self._agent_provider:
             raise ValueError("Agent provider 未设置")
 
-        logger.info(f"请求 Agent: type={node.agent_type}, label={node.label}, project_id={project_id}")
+        logger.info(f"请求 Agent: type={node.agent_type}, label={node.label}, node_id={node.id}, project_id={project_id}")
 
         # 获取 Agent 实例
         agent = await self._agent_provider(node.agent_type, project_id)
         if not agent:
             logger.error(f"无法获取 Agent: {node.agent_type}，可用类型请检查 agent_provider 配置")
             raise ValueError(f"无法获取 Agent: {node.agent_type}")
+
+        logger.info(f"Agent 实例获取成功: type={node.agent_type}, instance_id={id(agent)}")
 
         # ========== 从数据库加载相关数据 ==========
         # 如果节点有 inputs 配置，使用 execution.context（已被 _prepare_node_inputs 准备好）
@@ -1426,6 +1755,11 @@ class WorkflowEngine:
         """
         根据 Agent 类型从数据库加载相关数据到上下文
 
+        注意：基础上下文（world_info, characters, previous_chapters 等）
+        应该已经在 start 节点加载。此方法主要用于：
+        1. 向后兼容（没有 start 节点的工作流）
+        2. 为特定 Agent 类型准备特殊格式的输入
+
         Args:
             agent_type: Agent 类型
             execution: 工作流执行实例
@@ -1437,6 +1771,14 @@ class WorkflowEngine:
         # 从执行上下文复制基础数据
         context = execution.context.copy()
 
+        # 记录已有上下文状态
+        existing_keys = [k for k in ["world_info", "characters", "previous_chapters", "lore_entries", "hooks"]
+                         if k in context]
+        if existing_keys:
+            logger.info(f"Agent '{agent_type}' 上下文已有: {existing_keys}")
+        else:
+            logger.info(f"Agent '{agent_type}' 上下文为空，将从数据库加载")
+
         if not db:
             logger.warning("数据库连接不存在，无法加载Agent上下文数据")
             return context
@@ -1446,6 +1788,7 @@ class WorkflowEngine:
             data_loaded = False  # 跟踪是否有新数据加载
 
             # ========== 核心信息：世界观设定（所有 Agent 都需要）==========
+            # 如果 start 节点已经加载，这里会跳过
             if "world_info" not in context:
                 # 从项目获取 world_id
                 project = await db.get_project(project_id) if hasattr(db, 'get_project') else None
@@ -1617,6 +1960,12 @@ class WorkflowEngine:
                 if last_summary and "last_discussion_summary" not in context:
                     context["last_discussion_summary"] = last_summary
 
+                # ========== 关键：设置字数要求 ==========
+                # 从 execution.context 获取 target_word_count，映射到 word_count
+                target_word_count = execution.context.get("target_word_count", 2000)
+                context["word_count"] = target_word_count
+                logger.info(f"为 Writer 设置目标字数: {target_word_count}")
+
                 # 记录 Writer Agent 获得的上下文摘要
                 logger.info(f"Writer Agent 上下文: intents={len(intents)}, moods={len(character_moods)}, hooks={len(context.get('hooks', []))}")
 
@@ -1628,6 +1977,46 @@ class WorkflowEngine:
                         context["all_chapters"] = chapters
                         execution.context["all_chapters"] = chapters
                         logger.info(f"加载 {len(chapters)} 个章节到摘要上下文（summarizer）")
+
+            # ===== Setting Agent：使用独立的 SettingAgent（与 /lore 界面共享）=====
+            # SettingAgent 内部使用 SettingAgentService，自动处理对话历史和记忆
+            if agent_type == "setting":
+                # 获取世界观设定
+                if "world_info" not in context:
+                    project = await db.get_project(project_id) if hasattr(db, 'get_project') else None
+                    if project and project.get("world_id"):
+                        world = await db.get_world(project["world_id"]) if hasattr(db, 'get_world') else None
+                        if world:
+                            context["world_info"] = {
+                                "id": world.get("id", ""),
+                                "name": world.get("name", "未知世界"),
+                                "world_type": world.get("world_type", "奇幻"),
+                                "description": world.get("description", ""),
+                                "background": world.get("background", ""),
+                                "rules": world.get("rules", {}),
+                                "themes": world.get("themes", []),
+                                "tone": world.get("tone", "正剧"),
+                            }
+                            execution.context["world_info"] = context["world_info"]
+
+                # 获取章节内容用于一致性检查
+                if "chapter_content" not in context:
+                    chapter_content = execution.context.get("written_content", "") or execution.context.get("chapter_content", "")
+                    if not chapter_content:
+                        chapters = await db.get_chapters_by_project(project_id) if hasattr(db, 'get_chapters_by_project') else []
+                        if chapters:
+                            chapter_content = chapters[-1].get("content", "") if chapters else ""
+                    if chapter_content:
+                        context["chapter_content"] = chapter_content
+                        logger.info(f"Setting Agent 加载章节内容: {len(chapter_content)} 字符")
+
+                # SettingAgent 会通过 SettingAgentService 自动处理
+                # 传入 task 参数指定任务类型
+                task = context.get("task", "manage_settings")
+                if context.get("chapter_content"):
+                    task = "consistency_check"
+                context["task"] = task
+                logger.info(f"Setting Agent 任务类型: {task}")
 
             # ===== Evaluator Agent：需要章节历史、设定 =====
             if agent_type == "evaluator":
@@ -1684,6 +2073,7 @@ class WorkflowEngine:
 
             # ===== ProcGen/World Agent：需要已有区域 =====
             if agent_type in ["procgen", "world_map_manager", "event_generator"]:
+                # 加载已有区域
                 if "existing_regions" not in context:
                     # 尝试获取项目的世界
                     worlds = await db.get_worlds_by_project(project_id) if hasattr(db, 'get_worlds_by_project') else []
@@ -1696,6 +2086,47 @@ class WorkflowEngine:
                             execution.context["existing_regions"] = regions
                             execution.context["world_id"] = world_id
                             logger.info(f"加载 {len(regions)} 个区域到世界生成上下文（{agent_type}）")
+
+                # 准备 ProcGenAgent 需要的输入参数
+                # exploration_direction: 从章节目标或剧情规划中提取
+                if "exploration_direction" not in context:
+                    chapter_goal = execution.context.get("chapter_goal", "")
+                    plot_outline = execution.context.get("plot_outline", [])
+                    world_info = context.get("world_info", {})
+
+                    # 构建探索方向
+                    if chapter_goal:
+                        context["exploration_direction"] = chapter_goal
+                    elif plot_outline:
+                        # 从剧情大纲提取最近的探索方向
+                        latest_plot = plot_outline[-1] if plot_outline else {}
+                        context["exploration_direction"] = latest_plot.get("event", "扩展世界内容")
+                    elif world_info:
+                        context["exploration_direction"] = f"探索 {world_info.get('name', '未知世界')} 的新区域"
+                    else:
+                        context["exploration_direction"] = "随机探索"
+
+                    logger.info(f"为 ProcGen Agent 设置探索方向: {context['exploration_direction'][:100]}")
+
+                # generation_type: 根据上下文确定生成类型
+                if "generation_type" not in context:
+                    existing_regions = context.get("existing_regions", [])
+                    if not existing_regions:
+                        context["generation_type"] = "first_time"
+                    else:
+                        context["generation_type"] = "expansion"
+
+                # current_location: 从上下文获取当前位置
+                if "current_location" not in context:
+                    context["current_location"] = execution.context.get("current_location")
+
+                # 根据 agent 类型添加特定的任务提示
+                if agent_type == "world_map_manager":
+                    context["exploration_direction"] = f"[地图管理任务] {context.get('exploration_direction', '生成新地图区域')}"
+                    logger.info(f"World Map Manager 上下文准备完成: exploration_direction={context.get('exploration_direction', 'N/A')[:100]}, generation_type={context.get('generation_type', 'N/A')}")
+                elif agent_type == "event_generator":
+                    context["exploration_direction"] = f"[事件生成任务] {context.get('exploration_direction', '生成世界事件')}"
+                    logger.info(f"Event Generator 上下文准备完成: exploration_direction={context.get('exploration_direction', 'N/A')[:100]}, generation_type={context.get('generation_type', 'N/A')}")
 
         except Exception as e:
             logger.error(f"加载Agent上下文数据失败: {e}")
@@ -1712,6 +2143,10 @@ class WorkflowEngine:
     ) -> Dict[str, Any]:
         """执行Agent并处理结果"""
         chunk_count = 0  # 统计发送的 chunk 数量
+        agent_id = id(agent)  # 获取 agent 实例 ID 用于调试
+
+        # 记录 agent 实例信息
+        logger.info(f"Agent 实例信息: type={node.agent_type}, id={agent_id}, name={getattr(agent, 'name', 'unknown')}")
 
         # 定义流式输出回调
         async def on_stream_chunk(chunk: str):
@@ -1729,13 +2164,30 @@ class WorkflowEngine:
         # 这样 Agent 在调用 _call_llm 时会自动使用流式输出
         if hasattr(agent, '_stream_callback'):
             agent._stream_callback = on_stream_chunk
-            logger.info(f"已为 Agent {node.agent_type} 设置流式回调")
+            logger.info(f"已为 Agent {node.agent_type} (实例ID: {agent_id}) 设置流式回调")
         else:
             logger.warning(f"Agent {node.agent_type} 不支持流式回调（缺少 _stream_callback 属性）")
 
+        # ========== 注入 Agent 记忆上下文 ==========
+        if hasattr(agent, 'get_memory_context') and agent._memory:
+            memory_context = agent.get_memory_context()
+            if memory_context:
+                context["agent_memory_context"] = memory_context
+                logger.info(f"Agent {node.agent_type} 注入了记忆上下文 ({agent._memory.total_memories} 条记忆)")
+
         try:
-            # 执行 Agent
+            # 执行 Agent（添加超时保护）
+            logger.info(f"开始执行 Agent {node.agent_type} (实例ID: {agent_id})")
             result = await agent.execute(context)
+            logger.info(f"Agent {node.agent_type} (实例ID: {agent_id}) 执行完成, success={result.success}")
+        except asyncio.TimeoutError:
+            logger.error(f"Agent {node.agent_type} (实例ID: {agent_id}) 执行超时")
+            result = AgentResponse(success=False, error="Agent 执行超时")
+        except Exception as e:
+            import traceback
+            logger.error(f"Agent {node.agent_type} (实例ID: {agent_id}) 执行异常: {e}")
+            logger.error(traceback.format_exc())
+            result = AgentResponse(success=False, error=str(e))
         finally:
             # 清理回调
             if hasattr(agent, '_stream_callback'):
@@ -1743,9 +2195,14 @@ class WorkflowEngine:
 
         # 日志记录流式输出统计
         if chunk_count > 0:
-            logger.info(f"Agent {node.agent_type} 发送了 {chunk_count} 个流式 chunk")
+            logger.info(f"Agent {node.agent_type} (实例ID: {agent_id}) 发送了 {chunk_count} 个流式 chunk")
         else:
-            logger.warning(f"Agent {node.agent_type} 没有发送任何流式 chunk（可能 Agent 内部没有调用 _call_llm）")
+            logger.warning(f"Agent {node.agent_type} (实例ID: {agent_id}) 没有发送任何流式 chunk（可能 Agent 内部没有调用 _call_llm 或模型为空）")
+            # 额外诊断信息
+            if hasattr(agent, 'model') and agent.model is None:
+                logger.error(f"Agent {node.agent_type} 的模型为 None！无法调用 LLM")
+            elif hasattr(agent, 'model'):
+                logger.info(f"Agent {node.agent_type} 的模型类型: {type(agent.model)}")
 
         # 广播 Agent 完成输出
         if result.success:
@@ -1856,9 +2313,26 @@ class WorkflowEngine:
         if node.agent_type == "writer" and result.success and result.data:
             await self._save_chapter_from_writer(execution, result.data, db)
 
+            # ========== 角色检测与晋升 ==========
+            # 在章节内容生成后，检测可能的新角色
+            chapter_content = result.data.get("content", "")
+            if chapter_content and len(chapter_content) > 500:
+                # 获取 Writer Agent 的 LLM 模型用于智能角色检测
+                writer_model = getattr(agent, 'model', None) if agent else None
+                await self._detect_and_promote_characters(
+                    execution=execution,
+                    content=chapter_content,
+                    db=db,
+                    llm_model=writer_model,
+                )
+
         # 如果是伏笔管理 Agent，保存伏笔到数据库
         if node.agent_type == "hook_manager" and result.success and result.data:
             await self._save_hooks_from_manager(execution, result.data, db)
+
+        # 如果是设定 Agent，保存设定到 lore_entries 表
+        if node.agent_type == "setting" and result.success and result.data:
+            await self._save_lore_from_setting(execution, result.data, db)
 
         # 如果是世界生成 Agent，保存区域到数据库
         if node.agent_type in ["procgen", "world_map_manager", "event_generator"] and result.success and result.data:
@@ -1871,6 +2345,42 @@ class WorkflowEngine:
         # 如果是编剧 Agent，保存剧情规划
         if node.agent_type in ["master_plotter", "plotter"] and result.success and result.data:
             await self._save_plot_from_plotter(execution, result.data, db)
+
+        # ========== 保存 Agent 记忆 ==========
+        if hasattr(agent, 'save_memory') and agent._memory:
+            try:
+                # 添加执行记录到记忆
+                if result.success:
+                    agent.add_memory(
+                        content=f"执行任务: {node.label} - 成功",
+                        memory_type="action",
+                        importance="medium",
+                        tags=[node.agent_type, "workflow", node.node_type.value],
+                        context={
+                            "node_id": node.id,
+                            "execution_id": execution.id,
+                            "output_keys": list(result.data.keys()) if result.data else [],
+                        },
+                    )
+                else:
+                    agent.add_memory(
+                        content=f"执行任务: {node.label} - 失败: {result.error}",
+                        memory_type="action",
+                        importance="high",  # 失败记录更重要
+                        tags=[node.agent_type, "workflow", "error"],
+                        context={
+                            "node_id": node.id,
+                            "execution_id": execution.id,
+                            "error": result.error,
+                        },
+                    )
+
+                # 保存记忆到数据库
+                await agent.save_memory(db)
+                logger.info(f"Agent {node.agent_type} 记忆已保存")
+
+            except Exception as e:
+                logger.warning(f"保存 Agent {node.agent_type} 记忆失败: {e}")
 
         return result.data if result.success else {"error": result.error}
 
@@ -1952,6 +2462,70 @@ class WorkflowEngine:
         except Exception as e:
             logger.error(f"保存章节失败: {e}")
             execution.context["chapter_save_error"] = str(e)
+
+    async def _detect_and_promote_characters(
+        self,
+        execution: "WorkflowExecution",
+        content: str,
+        db=None,
+        llm_model=None,
+    ):
+        """
+        从章节内容中检测新角色并执行晋升
+
+        Args:
+            execution: 工作流执行实例
+            content: 章节内容
+            db: 数据库连接
+            llm_model: LLM 模型实例（用于智能角色检测）
+        """
+        try:
+            from app.services.character_detection import get_character_detection_manager
+
+            # 获取已有角色
+            existing_characters = []
+            if db:
+                existing_characters = await db.get_all_characters(execution.project_id) or []
+
+            # 获取检测管理器
+            detection_manager = get_character_detection_manager()
+
+            # 处理内容，检测新角色（传入 LLM 模型进行智能检测）
+            result = await detection_manager.process_content(
+                content=content,
+                project_id=execution.project_id,
+                existing_characters=existing_characters,
+                context={
+                    "chapter_num": execution.context.get("chapter_num", 1),
+                    "scene_directions": execution.context.get("scene_directions", {}),
+                },
+                db=db,
+                llm_model=llm_model,
+            )
+
+            # 如果检测到新角色或晋升了角色，广播通知
+            if result.get("detected"):
+                logger.info(f"检测到新角色: {[c.get('name', 'Unknown') for c in result['detected']]}")
+                await self._broadcast_status(execution.id, "characters_detected", {
+                    "detected": self._make_json_safe(result["detected"]),
+                    "candidates": self._make_json_safe(result.get("candidates", [])),
+                })
+
+            if result.get("promoted"):
+                promoted_names = [p.get("character", {}).get("name", "Unknown") for p in result["promoted"]]
+                logger.info(f"角色晋升成功: {promoted_names}")
+                await self._broadcast_status(execution.id, "characters_promoted", {
+                    "promoted": self._make_json_safe(result["promoted"]),
+                    "message": f"新角色晋升: {', '.join(promoted_names)}",
+                })
+
+                # 更新上下文中的角色列表
+                for promoted in result["promoted"]:
+                    char_data = promoted.get("character", {})
+                    execution.context.setdefault("new_characters", []).append(char_data)
+
+        except Exception as e:
+            logger.warning(f"角色检测失败: {e}")
 
     async def _save_hooks_from_manager(
         self,
@@ -2035,6 +2609,138 @@ class WorkflowEngine:
         except Exception as e:
             logger.error(f"保存伏笔失败: {e}")
             execution.context["hook_save_error"] = str(e)
+
+    async def _save_lore_from_setting(
+        self,
+        execution: "WorkflowExecution",
+        setting_output: Dict[str, Any],
+        db=None,
+    ):
+        """
+        保存设定 Agent 输出的设定到 lore_entries 表
+
+        Args:
+            execution: 工作流执行实例
+            setting_output: Setting Agent 的输出数据
+            db: 数据库连接
+        """
+        if not db:
+            logger.warning("数据库连接不存在，无法保存设定")
+            return
+
+        import uuid
+        from datetime import datetime
+
+        try:
+            # 获取新创建的设定
+            new_lores = setting_output.get("new_lores", [])
+            updated_lores = setting_output.get("updated_lores", [])
+            validated_lores = setting_output.get("validated_lores", [])
+
+            # 保存新设定
+            created_ids = []
+            for lore_data in new_lores:
+                lore_id = str(uuid.uuid4())
+
+                # 确定类别和优先级
+                category = lore_data.get("category", "custom")
+                priority = lore_data.get("priority", "standard")
+
+                # 映射字符串到枚举值（如果需要）
+                from app.models.lore import LoreCategory, LorePriority
+                if isinstance(category, str):
+                    try:
+                        category = LoreCategory(category.lower())
+                    except ValueError:
+                        category = LoreCategory.CUSTOM
+                if isinstance(priority, str):
+                    try:
+                        priority = LorePriority(priority.lower())
+                    except ValueError:
+                        priority = LorePriority.STANDARD
+
+                params = {
+                    "id": lore_id,
+                    "project_id": execution.project_id,
+                    "title": lore_data.get("title", "未命名设定"),
+                    "category": category.value if hasattr(category, 'value') else str(category),
+                    "priority": priority.value if hasattr(priority, 'value') else str(priority),
+                    "content": lore_data.get("content", ""),
+                    "summary": lore_data.get("summary", "")[:500] if lore_data.get("summary") else "",
+                    "keywords": json.dumps(lore_data.get("keywords", [])),
+                    "tags": json.dumps(lore_data.get("tags", [])),
+                    "constraints": json.dumps(lore_data.get("constraints", [])),
+                    "related_characters": json.dumps(lore_data.get("related_characters", [])),
+                    "related_locations": json.dumps(lore_data.get("related_locations", [])),
+                    "related_items": json.dumps(lore_data.get("related_items", [])),
+                    "created_at": datetime.now(),
+                    "updated_at": datetime.now(),
+                }
+
+                await db.execute_write("""
+                    INSERT INTO lore_entries (
+                        id, project_id, title, category, priority, content, summary,
+                        keywords, tags, constraints, related_characters, related_locations, related_items,
+                        created_at, updated_at
+                    ) VALUES (
+                        CAST(:id AS UUID), CAST(:project_id AS UUID), :title, :category, :priority, :content, :summary,
+                        :keywords, :tags, :constraints, :related_characters, :related_locations, :related_items,
+                        :created_at, :updated_at
+                    )
+                """, params)
+
+                created_ids.append(lore_id)
+                logger.info(f"保存新设定: {lore_data.get('title', '未命名')} (ID: {lore_id})")
+
+            # 更新现有设定
+            for lore_data in updated_lores:
+                lore_id = lore_data.get("id")
+                if not lore_id:
+                    continue
+
+                update_fields = []
+                params = {"id": lore_id}
+
+                for field in ["title", "content", "summary"]:
+                    if field in lore_data:
+                        update_fields.append(f"{field} = :{field}")
+                        params[field] = lore_data[field]
+
+                if update_fields:
+                    update_fields.append("updated_at = NOW()")
+                    params["id"] = lore_id
+                    query = f"UPDATE lore_entries SET {', '.join(update_fields)} WHERE id = CAST(:id AS UUID)"
+                    await db.execute_write(query, params)
+                    logger.info(f"更新设定: {lore_id}")
+
+            # 更新执行上下文
+            if created_ids:
+                execution.context.setdefault("lores_created_this_run", []).extend(created_ids)
+
+            # 广播设定保存事件
+            await self._broadcast_status(execution.id, "lores_saved", {
+                "created_count": len(created_ids),
+                "updated_count": len(updated_lores),
+                "validated_count": len(validated_lores),
+            })
+
+            # 同时更新 execution.context 中的 lore_entries
+            if created_ids or updated_lores:
+                # 重新加载设定列表
+                try:
+                    results = await db.execute_query(
+                        "SELECT * FROM lore_entries WHERE project_id = CAST(:project_id AS UUID) ORDER BY priority, created_at DESC LIMIT 30",
+                        {"project_id": execution.project_id}
+                    )
+                    if results:
+                        execution.context["lore_entries"] = results
+                        logger.info(f"重新加载了 {len(results)} 条设定到上下文")
+                except Exception as e:
+                    logger.warning(f"重新加载设定列表失败: {e}")
+
+        except Exception as e:
+            logger.error(f"保存设定失败: {e}")
+            execution.context["lore_save_error"] = str(e)
 
     async def _save_world_data_from_procgen(
         self,
@@ -2243,6 +2949,275 @@ class WorkflowEngine:
         # 这里返回上下文中的条件字段
         return {"condition_evaluated": True}
 
+    async def _execute_scene_performance_node(
+        self,
+        node: WorkflowNode,
+        execution: "WorkflowExecution",
+        db=None,
+    ) -> Dict[str, Any]:
+        """
+        执行场景演绎节点 - 多个角色Agent同台飙戏
+
+        这是专门用于多角色演绎的节点类型，与 GROUP_DISCUSSION 节点区分。
+
+        节点配置 (node.config):
+        - scene_mode: "interactive"（同场景互动）或 "parallel"（并行独立）
+        - required_characters: 需要参与的角色名列表
+        - need_background_characters: 是否需要背景角色
+        - background_character_count: 背景角色数量
+        - background_character_type: 背景角色类型（路人/侍从/村民等）
+
+        输入（通过 node.inputs 配置）:
+        - scene_directions: 场景方向（编剧设定）
+        - characters: 参与角色列表
+
+        输出:
+        - performance_result: 完整的表演结果
+        - dialogues: 对话列表
+        - full_content: 完整文本内容
+        """
+        logger.info(f"执行场景演绎节点: {node.label}")
+
+        # 获取节点配置
+        node_config = node.config or {}
+
+        # 获取场景方向（从上下文或生成）
+        scene_directions = execution.context.get("scene_directions", {})
+
+        # 如果没有场景方向，让编剧生成
+        if not scene_directions:
+            plotter_agent = await self._get_agent_for_discussion("plotter", execution.project_id)
+            if plotter_agent:
+                scene_directions = await self._generate_scene_directions(
+                    plotter_agent, execution.context
+                )
+                if scene_directions:
+                    execution.context["scene_directions"] = scene_directions
+
+        # 默认场景方向
+        if not scene_directions:
+            scene_directions = {
+                "scene_type": node_config.get("scene_mode", "interactive"),
+                "main_scene": node.label,
+                "atmosphere": "正剧",
+                "character_roles": {},
+                "plot_focus": "推进剧情",
+            }
+
+        # 合并节点配置到场景方向
+        if node_config.get("required_characters"):
+            scene_directions["required_characters"] = node_config["required_characters"]
+        if node_config.get("need_background_characters"):
+            scene_directions["need_background_characters"] = True
+            scene_directions["background_character_count"] = node_config.get("background_character_count", 2)
+            scene_directions["background_character_type"] = node_config.get("background_character_type", "路人")
+
+        # ========== 角色选择逻辑 ==========
+        # 优先级：
+        # 1. 编剧在 scene_directions 中指定的角色（selected_characters）
+        # 2. 节点配置中的 required_characters
+        # 3. CharacterSelector 智能选择（后备方案）
+
+        # 获取所有可用角色
+        all_characters = []
+        if db:
+            all_characters = await db.get_all_characters(execution.project_id) or []
+
+        # 获取上一个节点的输出（供智能角色选择和后续协调使用）
+        previous_node_output = {}
+        if execution.node_states:
+            completed_nodes = [
+                (node_id, state) for node_id, state in execution.node_states.items()
+                if state.status == "completed"
+            ]
+            if completed_nodes:
+                last_node = max(completed_nodes, key=lambda x: x[1].completed_at or datetime.min)
+                previous_node_output = last_node[1].output_data or {}
+
+        characters_data = []
+
+        # 优先级 1: 编剧在 scene_directions 中指定的角色
+        selected_by_plotter = scene_directions.get("selected_characters", [])
+        if selected_by_plotter and all_characters:
+            logger.info(f"使用编剧指定的角色: {selected_by_plotter}")
+            for char_name in selected_by_plotter:
+                char_info = next((c for c in all_characters if c.get("name") == char_name), None)
+                if char_info:
+                    characters_data.append(char_info)
+
+        # 优先级 2: 节点配置中的 required_characters
+        if not characters_data:
+            required_characters = node_config.get("required_characters", [])
+            if required_characters and all_characters:
+                logger.info(f"使用节点配置的角色: {required_characters}")
+                for char_name in required_characters:
+                    char_info = next((c for c in all_characters if c.get("name") == char_name), None)
+                    if char_info:
+                        characters_data.append(char_info)
+
+        # 优先级 3: CharacterSelector 智能选择（后备方案）
+        if not characters_data and all_characters:
+            logger.info("编剧未指定角色，使用智能选择器")
+            from app.services.character_selector import (
+                get_character_selector,
+                extract_scene_context,
+            )
+
+            # 获取上一场出现的角色
+            previous_characters = []
+            performance_history = execution.context.get("performance_history", [])
+            if performance_history:
+                previous_characters = performance_history[-1].get("characters", [])
+
+            # 提取场景上下文
+            scene_ctx = extract_scene_context(
+                scene_directions=scene_directions,
+                previous_output=previous_node_output,
+                plot_focus=scene_directions.get("plot_focus", ""),
+            )
+
+            # 智能选择角色
+            selector = get_character_selector()
+            selected_chars = await selector.select_characters(
+                all_characters=all_characters,
+                scene_context=scene_ctx,
+                previous_characters=previous_characters,
+                director_guidance=scene_directions.get("character_guidance"),
+                max_characters=node_config.get("max_characters", 5),
+            )
+            characters_data = selected_chars
+
+            logger.info(f"智能选择角色: {[c.get('name') for c in characters_data]}")
+
+        # 回退：从上下文获取
+        if not characters_data:
+            characters_data = execution.context.get("characters", [])
+
+        # 添加背景角色
+        if node_config.get("need_background_characters"):
+            bg_count = node_config.get("background_character_count", 2)
+            bg_type = node_config.get("background_character_type", "路人")
+            for i in range(bg_count):
+                characters_data.append({
+                    "name": f"{bg_type}{i+1}",
+                    "importance_tier": 5,
+                    "character_type": "background",
+                    "is_protagonist": False,
+                    "is_antagonist": False,
+                    "personality": "普通人",
+                    "background": "普通路人",
+                    "traits": [],
+                    "speech_pattern": "自然随意",
+                })
+
+        logger.info(f"场景演绎参与角色: {len(characters_data)} 个")
+
+        # 广播表演开始
+        await self._broadcast_status(execution.id, "performance_started", {
+            "node_id": node.id,
+            "scene_type": scene_directions.get("scene_type", "interactive"),
+            "main_scene": scene_directions.get("main_scene", node.label),
+            "characters": [c.get("name", "未知") for c in characters_data],
+            "performance_topic": f"《{scene_directions.get('main_scene', node.label)}》",
+        })
+
+        # 使用 SceneCoordinatorAgent 统筹多角色表演
+        from app.agents.scene_coordinator import SceneCoordinatorAgent
+
+        # 获取模型
+        existing_agent = await self._get_agent_for_discussion("character", execution.project_id)
+        model = existing_agent.model if existing_agent else None
+
+        # 创建场景协调者
+        scene_coordinator = SceneCoordinatorAgent(
+            model=model,
+            project_id=execution.project_id,
+            db=db,  # 传递数据库连接以使用字数统计 skill
+        )
+
+        # 获取节点配置中的迭代参数
+        iteration_count = node_config.get("iteration_count", 3)  # 默认3轮迭代
+        plot_intents = execution.context.get("intents", [])  # 从上下文获取剧情意图
+
+        # 目标字数：场景演绎目标字数 = 章节要求字数 × 2
+        chapter_word_count = execution.context.get("target_word_count", 2000)
+        target_word_count = chapter_word_count * 2  # 场景演绎内容需要更丰富
+
+        # 如果节点有自定义配置，使用配置值（但不低于章节字数×2）
+        node_target = node_config.get("target_word_count")
+        if node_target and node_target > target_word_count:
+            target_word_count = node_target
+
+        # 执行场景协调（支持多轮迭代）
+        coordinator_input = {
+            "scene_directions": scene_directions,
+            "characters": characters_data,
+            "world_info": execution.context.get("world_info", {}),
+            "previous_output": previous_node_output,
+            "mode": scene_directions.get("scene_type", "interactive"),
+            "iteration_count": iteration_count,
+            "target_word_count": target_word_count,
+            "plot_intents": plot_intents,
+            "chapter_word_count": chapter_word_count,  # 传递章节字数供参考
+        }
+
+        logger.info(f"场景演绎参数: {iteration_count} 轮迭代, 目标 {target_word_count} 字 (章节 {chapter_word_count} 字 × 2), {len(characters_data)} 个角色")
+
+        result = await scene_coordinator.execute(coordinator_input)
+
+        if not result.success:
+            logger.error(f"场景协调执行失败: {result.error}")
+            return {"error": result.error, "status": "failed"}
+
+        performance_result = result.data
+        performance_messages = performance_result.get("performances", [])
+
+        # 广播每条表演消息
+        for msg in performance_messages:
+            await self._broadcast_discussion_message(execution.id, msg)
+            await asyncio.sleep(0.2)
+
+        # 生成表演总结
+        summarizer_agent = await self._get_agent_for_discussion("summarizer", execution.project_id)
+        if summarizer_agent and performance_messages:
+            summary = await self._generate_performance_summary(
+                summarizer_agent, scene_directions, performance_messages
+            )
+            if summary:
+                performance_messages.append(summary)
+                await self._broadcast_discussion_message(execution.id, summary)
+
+        # 存入上下文
+        performance_result["status"] = "completed"
+        execution.context["performance_result"] = performance_result
+        execution.context["dialogues"] = performance_messages
+        execution.context["last_performance_content"] = performance_result.get("full_content", "")
+
+        # 添加到表演历史
+        performance_history = execution.context.get("performance_history", [])
+        performance_history.append(performance_result)
+        execution.context["performance_history"] = performance_history
+
+        # 记录统计信息
+        actual_word_count = performance_result.get("actual_word_count", 0)
+        actual_iterations = performance_result.get("iteration_count", iteration_count)
+
+        logger.info(f"场景演绎完成: {len(performance_messages)} 条表演, {actual_iterations} 轮迭代, {actual_word_count} 字")
+
+        return {
+            "status": "completed",
+            "scene": scene_directions.get("main_scene", node.label),
+            "characters": [c.get("name") for c in characters_data],
+            "messages": performance_messages,
+            "full_content": performance_result.get("full_content", ""),
+            "iteration_count": actual_iterations,
+            "word_count": actual_word_count,
+            "target_word_count": target_word_count,
+        }
+
+    # 等待用户确认的超时时间（秒）
+    USER_CONFIRMATION_TIMEOUT = 60
+
     async def _execute_group_discussion_node(
         self,
         node: WorkflowNode,
@@ -2261,17 +3236,138 @@ class WorkflowEngine:
            - 编剧开场说明创作意图
            - 各Agent发表专业意见
            - 总结Agent汇总讨论结果
+
+        完成后暂停等待用户确认（超时自动接受）：
+        - 用户同意：继续工作流
+        - 用户不同意：提供反馈，工作流重新开始
+        - 超时（60秒）：自动接受并继续
         """
         # 检查节点配置，确定讨论模式
         node_config = node.config or {}
         discussion_mode = node_config.get("discussion_mode", "meeting")  # "meeting" 或 "performance"
+        require_user_confirmation = node_config.get("require_user_confirmation", True)  # 默认需要用户确认
+        confirmation_timeout = node_config.get("confirmation_timeout", self.USER_CONFIRMATION_TIMEOUT)  # 超时时间
 
         logger.info(f"开始执行集体讨论节点（模式: {discussion_mode}）: {node.id}")
 
         if discussion_mode == "performance":
-            return await self._execute_character_performance(node, execution, db)
+            result = await self._execute_character_performance(node, execution, db)
         else:
-            return await self._execute_meeting_discussion(node, execution, db)
+            result = await self._execute_meeting_discussion(node, execution, db)
+
+        # 如果需要用户确认，暂停工作流
+        if require_user_confirmation and result.get("status") == "completed":
+            logger.info(f"集体讨论节点完成，暂停等待用户确认（超时 {confirmation_timeout} 秒）...")
+
+            # 广播等待用户确认事件
+            await self._broadcast_status(execution.id, "waiting_user_confirmation", {
+                "node_id": node.id,
+                "node_type": "group_discussion",
+                "discussion_mode": discussion_mode,
+                "discussion_result": result,
+                "timeout_seconds": confirmation_timeout,
+                "message": f"讨论已完成，请在 {confirmation_timeout} 秒内确认，否则自动接受",
+            })
+
+            # 设置等待确认状态
+            execution.context["waiting_confirmation"] = {
+                "node_id": node.id,
+                "discussion_result": result,
+                "timestamp": datetime.now().isoformat(),
+                "timeout_seconds": confirmation_timeout,
+            }
+
+            # 暂停工作流
+            execution.status = WorkflowStatus.PAUSED
+
+            # 启动超时自动确认的后台任务
+            asyncio.create_task(
+                self._auto_confirm_on_timeout(
+                    execution_id=execution.id,
+                    timeout_seconds=confirmation_timeout,
+                    db=db,
+                )
+            )
+
+            # 更新结果状态
+            result["waiting_confirmation"] = True
+            result["timeout_seconds"] = confirmation_timeout
+            result["message"] = f"等待用户确认（{confirmation_timeout}秒后自动接受）"
+
+        return result
+
+    async def _auto_confirm_on_timeout(
+        self,
+        execution_id: str,
+        timeout_seconds: int,
+        db=None,
+    ):
+        """
+        超时自动确认讨论结果
+
+        Args:
+            execution_id: 执行ID
+            timeout_seconds: 超时秒数
+            db: 数据库连接
+        """
+        try:
+            # 等待超时时间
+            await asyncio.sleep(timeout_seconds)
+
+            # 检查是否仍然在等待确认
+            execution = self._executions.get(execution_id)
+            if not execution:
+                # 尝试从数据库加载
+                if db:
+                    execution = await self._load_execution_from_db(execution_id, db)
+                    if execution:
+                        self._executions[execution_id] = execution
+
+            if not execution:
+                logger.debug(f"执行 {execution_id} 不存在，跳过自动确认")
+                return
+
+            if execution.status != WorkflowStatus.PAUSED:
+                logger.debug(f"执行 {execution_id} 不在暂停状态，跳过自动确认")
+                return
+
+            waiting_confirmation = execution.context.get("waiting_confirmation")
+            if not waiting_confirmation:
+                logger.debug(f"执行 {execution_id} 没有等待确认状态，跳过自动确认")
+                return
+
+            # 检查是否已经有用户确认（双重检查）
+            if waiting_confirmation.get("confirmed"):
+                logger.debug(f"执行 {execution_id} 已被用户确认，跳过自动确认")
+                return
+
+            # 超时自动接受
+            logger.info(f"用户确认超时（{timeout_seconds}秒），自动接受讨论结果: {execution_id}")
+
+            # 标记已确认，防止重复确认
+            waiting_confirmation["confirmed"] = True
+            waiting_confirmation["auto_confirmed"] = True
+
+            # 广播超时事件
+            await self._broadcast_status(execution_id, "confirmation_timeout", {
+                "message": f"用户未在 {timeout_seconds} 秒内确认，自动接受讨论结果",
+                "auto_approved": True,
+            })
+
+            # 调用确认方法（自动接受）
+            result = await self.confirm_discussion(
+                execution_id=execution_id,
+                approved=True,
+                feedback=None,
+                db=db,
+            )
+
+            logger.info(f"自动确认结果: {result}")
+
+        except asyncio.CancelledError:
+            logger.debug(f"自动确认任务被取消: {execution_id}")
+        except Exception as e:
+            logger.error(f"自动确认任务失败: {e}")
 
     async def _execute_character_performance(
         self,
@@ -2318,30 +3414,117 @@ class WorkflowEngine:
                     "world_context": execution.context.get("world_info", {}).get("description", ""),
                 }
 
-            # ========== 第二步：获取参与角色 ==========
-            # 从节点配置或上下文获取参与角色
-            participant_characters = node_config.get("characters", [])
-            if not participant_characters:
-                # 从数据库获取所有角色
-                if db:
-                    chars = await db.get_all_characters(execution.project_id)
-                    if chars:
-                        participant_characters = [c.get("name") for c in chars if c.get("is_main_character") or c.get("importance_tier", 3) <= 2]
+            # ========== 第二步：角色选择 ==========
+            # 优先级：
+            # 1. 编剧在 scene_directions.selected_characters 中指定的角色
+            # 2. 节点配置中的 characters 或 required_characters
+            # 3. CharacterSelector 智能选择（后备方案）
 
-            # 获取角色详细信息
+            # 获取节点配置
+            node_config = node.config or {}
+
+            # 获取所有可用角色
+            all_characters = []
+            if db:
+                all_characters = await db.get_all_characters(execution.project_id) or []
+
+            # 获取上一个节点的输出
+            previous_node_output = {}
+            if execution.node_states:
+                completed_nodes = [
+                    (node_id, state) for node_id, state in execution.node_states.items()
+                    if state.status == "completed"
+                ]
+                if completed_nodes:
+                    last_node = max(completed_nodes, key=lambda x: x[1].completed_at or datetime.min)
+                    previous_node_output = last_node[1].output_data or {}
+
             characters_data = []
-            if db and participant_characters:
-                all_chars = await db.get_all_characters(execution.project_id) or []
-                for char_name in participant_characters:
-                    char_info = next((c for c in all_chars if c.get("name") == char_name), None)
+
+            # 优先级 1: 编剧在 scene_directions.selected_characters 中指定的角色
+            selected_by_plotter = scene_directions.get("selected_characters", [])
+            if selected_by_plotter and all_characters:
+                logger.info(f"使用编剧指定的角色: {selected_by_plotter}")
+                for char_name in selected_by_plotter:
+                    char_info = next((c for c in all_characters if c.get("name") == char_name), None)
                     if char_info:
                         characters_data.append(char_info)
 
+            # 优先级 2: 节点配置中的角色
             if not characters_data:
-                # 回退：使用上下文中的角色
+                participant_characters = node_config.get("characters", [])
+                if not participant_characters:
+                    participant_characters = scene_directions.get("required_characters", [])
+                if participant_characters and all_characters:
+                    logger.info(f"使用节点配置的角色: {participant_characters}")
+                    for char_name in participant_characters:
+                        char_info = next((c for c in all_characters if c.get("name") == char_name), None)
+                        if char_info:
+                            characters_data.append(char_info)
+
+            # 优先级 3: CharacterSelector 智能选择（后备方案）
+            if not characters_data and all_characters:
+                logger.info("编剧未指定角色，使用智能选择器")
+                from app.services.character_selector import (
+                    get_character_selector,
+                    extract_scene_context,
+                )
+
+                # 获取上一场出现的角色
+                previous_characters = []
+                performance_history = execution.context.get("performance_history", [])
+                if performance_history:
+                    previous_characters = performance_history[-1].get("characters", [])
+
+                # 提取场景上下文
+                scene_ctx = extract_scene_context(
+                    scene_directions=scene_directions,
+                    previous_output=previous_node_output,
+                    plot_focus=scene_directions.get("plot_focus", ""),
+                )
+
+                # 智能选择角色
+                selector = get_character_selector()
+                selected_chars = await selector.select_characters(
+                    all_characters=all_characters,
+                    scene_context=scene_ctx,
+                    previous_characters=previous_characters,
+                    director_guidance=scene_directions.get("character_guidance"),
+                    max_characters=node_config.get("max_characters", 5),
+                )
+                characters_data = selected_chars
+
+                logger.info(f"智能选择角色: {[c.get('name') for c in characters_data]}")
+
+            # 回退：使用上下文中的角色
+            if not characters_data:
                 characters_data = execution.context.get("characters", [])
 
-            logger.info(f"参与角色演绎: {len(characters_data)} 个角色")
+            # 如果场景需要背景角色/路人
+            background_characters = []
+            if scene_directions.get("need_background_characters"):
+                background_count = scene_directions.get("background_character_count", 2)
+                background_type = scene_directions.get("background_character_type", "路人")
+                # 生成临时背景角色数据
+                for i in range(background_count):
+                    background_characters.append({
+                        "name": f"{background_type}{i+1}",
+                        "importance_tier": 5,
+                        "character_type": "background",
+                        "is_protagonist": False,
+                        "is_antagonist": False,
+                        "personality": "普通人",
+                        "background": "普通路人",
+                        "speech_pattern": "自然随意",
+                        "traits": [],
+                        "role_in_scene": scene_directions.get("background_role", "背景群众"),
+                    })
+
+            # 添加背景角色
+            if background_characters:
+                characters_data.extend(background_characters)
+
+            logger.info(f"参与角色演绎: {len(characters_data)} 个角色 (其中 {len(background_characters)} 个背景角色)")
 
             # 广播表演开始
             await self._broadcast_status(execution.id, "performance_started", {
@@ -2352,61 +3535,52 @@ class WorkflowEngine:
                 "performance_topic": f"《{scene_directions.get('main_scene', '角色演绎')}》",
             })
 
-            performance_messages = []
-            world_info = execution.context.get("world_info", {})
+            # ========== 第三步：使用 SceneCoordinatorAgent 统筹多角色表演 ==========
+            # 创建场景协调者 Agent（每个角色会有独立的 Agent 实例）
+            from app.agents.scene_coordinator import SceneCoordinatorAgent
+            from app.api.app import postgres_db
 
-            # ========== 第三步：角色表演 ==========
-            scene_type = scene_directions.get("scene_type", "interactive")
+            # 获取一个已有的 Agent 来复用其 model
+            existing_agent = await self._get_agent_for_discussion("character", execution.project_id)
+            model = existing_agent.model if existing_agent else None
 
-            if scene_type == "interactive":
-                # 同场景互动模式：角色按顺序发言，可以互相响应
-                conversation_history = []
-                for i, char_data in enumerate(characters_data):
-                    char_name = char_data.get("name", "未知角色")
+            # 创建场景协调者
+            scene_coordinator = SceneCoordinatorAgent(
+                model=model,
+                project_id=execution.project_id,
+            )
 
-                    # 获取该角色的Agent
-                    char_agent = await self._get_agent_for_discussion("character", execution.project_id)
+            # 设置流式回调
+            if self._broadcast_discussion_message:
+                async def stream_callback(content: str):
+                    await self._broadcast_status(execution.id, "stream", {
+                        "content": content,
+                        "type": "character_dialogue",
+                    })
+                scene_coordinator._stream_callback = stream_callback
 
-                    if char_agent:
-                        message = await self._generate_character_performance(
-                            agent=char_agent,
-                            char_data=char_data,
-                            scene_directions=scene_directions,
-                            world_info=world_info,
-                            conversation_history=conversation_history,
-                            is_interactive=True,
-                            turn_number=i + 1,
-                            total_characters=len(characters_data),
-                        )
-                        if message:
-                            performance_messages.append(message)
-                            conversation_history.append(message)
-                            await self._broadcast_discussion_message(execution.id, message)
-                            await asyncio.sleep(0.3)  # 让消息有序广播
-            else:
-                # 并行独立模式：每个角色独立表演自己的场景
-                tasks = []
-                for i, char_data in enumerate(characters_data):
-                    char_agent = await self._get_agent_for_discussion("character", execution.project_id)
-                    if char_agent:
-                        tasks.append(self._generate_character_performance(
-                            agent=char_agent,
-                            char_data=char_data,
-                            scene_directions=scene_directions,
-                            world_info=world_info,
-                            conversation_history=[],
-                            is_interactive=False,
-                            turn_number=i + 1,
-                            total_characters=len(characters_data),
-                        ))
+            # 执行场景协调
+            coordinator_input = {
+                "scene_directions": scene_directions,
+                "characters": characters_data,
+                "world_info": execution.context.get("world_info", {}),
+                "previous_output": previous_node_output,
+                "mode": scene_directions.get("scene_type", "interactive"),
+            }
 
-                # 并行执行所有角色表演
-                if tasks:
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-                    for result in results:
-                        if isinstance(result, dict):
-                            performance_messages.append(result)
-                            await self._broadcast_discussion_message(execution.id, result)
+            result = await scene_coordinator.execute(coordinator_input)
+
+            if not result.success:
+                logger.error(f"场景协调执行失败: {result.error}")
+                return {"error": result.error, "status": "failed"}
+
+            performance_result = result.data
+            performance_messages = performance_result.get("performances", [])
+
+            # 广播每条表演消息
+            for msg in performance_messages:
+                await self._broadcast_discussion_message(execution.id, msg)
+                await asyncio.sleep(0.2)
 
             # ========== 第四步：生成表演总结 ==========
             summarizer_agent = await self._get_agent_for_discussion("summarizer", execution.project_id)
@@ -2463,15 +3637,21 @@ class WorkflowEngine:
         db=None,
     ) -> Dict[str, Any]:
         """
-        执行创作讨论模式 - 传统讨论，评价已写内容
+        执行创作讨论模式 - 领头人机制
 
-        讨论流程：
-        1. 编剧 Agent 开场：说明当前章节内容和创作意图
-        2. 各 Agent 发表意见：评价当前剧情，提出未来建议
-        3. 总结 Agent 总结讨论结果
-        4. 讨论结果存入上下文供后续章节参考
+        流程：
+        1. 领头人开启会话，广播开始
+        2. 各 Agent 发表意见，消息广播给所有参与者和前端
+        3. 领头人汇总并请求用户确认
+        4. 用户同意/拒绝后，领头人结束会话
+        5. 同意 -> 工作流继续；拒绝 -> 带反馈重启
+
+        领头人选择优先级：
+        1. 节点配置中指定的 leader_agent
+        2. 参与讨论的 Agent 中按优先级选择：
+           master_plotter > plotter > evaluator > writer > setting > hook_manager
         """
-        logger.info("开始创作讨论模式...")
+        logger.info("开始创作讨论模式（领头人机制）...")
 
         try:
             # 收集工作流中所有已执行的 Agent 类型
@@ -2497,18 +3677,71 @@ class WorkflowEngine:
                 "summarizer": "总结员",
             }
 
+            # 不参与讨论的 Agent 类型
+            excluded_from_discussion = {
+                "world_map_manager", "event_generator", "procgen",
+                "scene_coordinator", "summarizer"
+            }
+
+            # 过滤出有效参与讨论的 Agent
+            discussion_agents = [a for a in executed_agents if a not in excluded_from_discussion]
+
+            # 领头人选择：优先级列表
+            LEADER_PRIORITY = [
+                "master_plotter",  # 总编剧 - 最优先
+                "plotter",         # 编剧
+                "evaluator",       # 评估员
+                "writer",          # 作家
+                "setting",         # 设定管理员
+                "hook_manager",    # 伏笔管理员
+            ]
+
+            # 从节点配置中获取指定的领头人
+            node_config = node.config or {}
+            specified_leader = node_config.get("leader_agent")
+
+            # 选择领头人
+            LEADER_AGENT = None
+            if specified_leader and specified_leader in discussion_agents:
+                # 使用指定的领头人
+                LEADER_AGENT = specified_leader
+                logger.info(f"使用节点配置的领头人: {LEADER_AGENT}")
+            else:
+                # 按优先级从参与讨论的 Agent 中选择
+                for candidate in LEADER_PRIORITY:
+                    if candidate in discussion_agents:
+                        LEADER_AGENT = candidate
+                        logger.info(f"按优先级选择领头人: {LEADER_AGENT}")
+                        break
+
+            # 如果还是没有找到，使用第一个参与讨论的 Agent
+            if not LEADER_AGENT and discussion_agents:
+                LEADER_AGENT = list(discussion_agents)[0]
+                logger.info(f"使用默认领头人: {LEADER_AGENT}")
+
+            # 如果没有任何参与者，创建一个默认领头人
+            if not LEADER_AGENT:
+                LEADER_AGENT = "plotter"
+                logger.warning(f"没有参与讨论的 Agent，使用默认领头人: {LEADER_AGENT}")
+
+            leader_name = AGENT_NAME_MAP.get(LEADER_AGENT, LEADER_AGENT)
+
             # 构建参与讨论的 Agent 列表
             participants = []
-            for agent_type in executed_agents:
+            for agent_type in discussion_agents:
                 agent_name = AGENT_NAME_MAP.get(agent_type, agent_type)
                 participants.append({
                     "type": agent_type,
                     "name": agent_name,
                     "role": self._get_agent_role_description(agent_type),
+                    "is_leader": agent_type == LEADER_AGENT,
                 })
 
             # 获取角色列表
             characters = execution.context.get("characters", [])
+            if characters and isinstance(characters[0], dict):
+                characters = [c.get("name", "未知角色") for c in characters]
+
             if not characters and db:
                 try:
                     chars = await db.get_all_characters(execution.project_id)
@@ -2523,37 +3756,65 @@ class WorkflowEngine:
             evaluation_result = execution.context.get("evaluation_result", {})
             plot_outline = execution.context.get("plot_outline", [])
 
+            discussion_messages = []
+
+            # ========== 第一步：领头人开启会话 ==========
+            leader_agent = await self._get_agent_for_discussion(LEADER_AGENT, execution.project_id)
+
+            # 如果选定的领头人无法获取实例，尝试其他候选人
+            if not leader_agent:
+                for candidate in LEADER_PRIORITY:
+                    if candidate in discussion_agents:
+                        leader_agent = await self._get_agent_for_discussion(candidate, execution.project_id)
+                        if leader_agent:
+                            LEADER_AGENT = candidate
+                            leader_name = AGENT_NAME_MAP.get(LEADER_AGENT, candidate)
+                            logger.info(f"领头人实例获取回退: {LEADER_AGENT}")
+                            break
+
+            # 最后回退到 plotter
+            if not leader_agent:
+                leader_agent = await self._get_agent_for_discussion("plotter", execution.project_id)
+                if leader_agent:
+                    LEADER_AGENT = "plotter"
+                    leader_name = "编剧"
+                    logger.info("领头人最终回退到: plotter")
+
+            if leader_agent:
+                opening_message = await self._generate_leader_opening(
+                    leader_agent, chapter_title, current_plot_summary,
+                    written_content, plot_outline, evaluation_result, participants
+                )
+                if opening_message:
+                    discussion_messages.append(opening_message)
+                    await self._broadcast_discussion_message(execution.id, opening_message, is_leader_action=True)
+
             # 广播讨论开始
             await self._broadcast_status(execution.id, "group_discussion_started", {
                 "node_id": node.id,
+                "leader": leader_name,
                 "participants": [p["name"] for p in participants],
                 "characters": characters,
                 "discussion_topic": f"《{chapter_title}》创作讨论会",
+                "message": f"【{leader_name}】已开启集体讨论会",
             })
 
-            discussion_messages = []
-
-            # ========== 第一步：编剧开场 ==========
-            plotter_agent = await self._get_agent_for_discussion("plotter", execution.project_id)
-            if plotter_agent:
-                plotter_message = await self._generate_plotter_opening(
-                    plotter_agent, chapter_title, current_plot_summary,
-                    written_content, plot_outline, evaluation_result
-                )
-                if plotter_message:
-                    discussion_messages.append(plotter_message)
-                    await self._broadcast_discussion_message(execution.id, plotter_message)
-
             # ========== 第二步：各 Agent 发表意见 ==========
-            # 定义发言顺序（按重要性）
+            excluded_from_discussion = {
+                "world_map_manager", "event_generator", "procgen",
+                "scene_coordinator", "summarizer", "master_plotter", "plotter"
+            }
+
             agent_speaking_order = [
-                "evaluator", "hook_manager", "setting", "world_map_manager",
-                "event_generator", "writer", "character"
+                "evaluator", "hook_manager", "setting",
+                "writer", "character"
             ]
 
             for agent_type in agent_speaking_order:
+                if agent_type in excluded_from_discussion:
+                    continue
+
                 if agent_type in executed_agents:
-                    # 添加小延迟，让消息有序广播
                     await asyncio.sleep(0.3)
 
                     agent = await self._get_agent_for_discussion(agent_type, execution.project_id)
@@ -2565,42 +3826,42 @@ class WorkflowEngine:
                         )
                         if message:
                             discussion_messages.append(message)
-                            await self._broadcast_discussion_message(execution.id, message)
+                            await self._broadcast_discussion_message(execution.id, message, broadcast_to_all=True)
 
-            # ========== 第三步：总结 Agent 总结讨论 ==========
-            summarizer_agent = await self._get_agent_for_discussion("summarizer", execution.project_id)
-            if summarizer_agent and discussion_messages:
-                summary_message = await self._generate_discussion_summary(
-                    summarizer_agent, chapter_title, discussion_messages
+            # ========== 第三步：领头人汇总，请求用户确认 ==========
+            if leader_agent and discussion_messages:
+                summary_request = await self._generate_leader_summary_request(
+                    leader_agent, chapter_title, discussion_messages
                 )
-                if summary_message:
-                    discussion_messages.append(summary_message)
-                    await self._broadcast_discussion_message(execution.id, summary_message)
+                if summary_request:
+                    discussion_messages.append(summary_request)
+                    await self._broadcast_discussion_message(execution.id, summary_request, is_leader_action=True)
 
             # ========== 第四步：存储讨论结果 ==========
             discussion_result = {
                 "topic": f"《{chapter_title}》创作讨论会",
+                "leader": leader_name,
+                "leader_type": LEADER_AGENT,  # 保存领头人类型，用于后续确认
                 "participants": participants,
                 "messages": discussion_messages,
                 "characters": characters,
                 "timestamp": datetime.now().isoformat(),
-                "status": "completed",
+                "status": "waiting_confirmation",
             }
 
-            # 存入上下文供后续章节参考
             execution.context["group_discussion"] = discussion_result
             execution.context["last_discussion_summary"] = discussion_messages[-1].get("content", "") if discussion_messages else ""
 
-            # 添加到历史讨论记录
             discussion_history = execution.context.get("discussion_history", [])
             discussion_history.append(discussion_result)
             execution.context["discussion_history"] = discussion_history
 
-            logger.info(f"集体讨论节点完成，共 {len(discussion_messages)} 条发言")
+            logger.info(f"集体讨论节点完成，共 {len(discussion_messages)} 条发言，等待用户确认")
 
             return {
                 "status": "completed",
                 "discussion_topic": f"《{chapter_title}》创作讨论会",
+                "leader": leader_name,
                 "participants": participants,
                 "messages": discussion_messages,
                 "characters": characters,
@@ -2637,6 +3898,17 @@ class WorkflowEngine:
     ) -> Optional[Dict[str, Any]]:
         """编剧 Agent 开场发言（要有实质内容，引导讨论方向）"""
         try:
+            # 安全地格式化 issues（可能是 dict 列表或 str 列表）
+            issues_raw = evaluation_result.get('issues', [])
+            if issues_raw:
+                issues_formatted = '\n'.join([
+                    '- ' + (str(i) if isinstance(i, str) else i.get('issue', i.get('description', str(i))))
+                    for i in issues_raw[:5]
+                ])
+                issues_section = f"\n问题点：\n{issues_formatted}"
+            else:
+                issues_section = ''
+
             # 构建开场提示
             prompt = f"""你是总编剧，现在召开《{chapter_title}》创作讨论会。
 
@@ -2656,8 +3928,7 @@ class WorkflowEngine:
 
 【评估反馈】
 评分: {evaluation_result.get('score', 'N/A')}/10
-{'✅ 通过' if evaluation_result.get('quality_passed', True) else '⚠️ 需要改进'}
-{f"问题点：{chr(10).join(['- ' + i for i in evaluation_result.get('issues', [])[:5]])}" if evaluation_result.get('issues') else ''}
+{'✅ 通过' if evaluation_result.get('quality_passed', True) else '⚠️ 需要改进'}{issues_section}
 
 请输出你的开场发言，必须包含：
 
@@ -2704,6 +3975,168 @@ class WorkflowEngine:
             "content": f"【开场】{chapter_title}的创作已完成，请各位从各自专业角度进行分析讨论。",
             "is_llm_generated": False,
         }
+
+    async def _generate_leader_opening(
+        self,
+        agent,
+        chapter_title: str,
+        plot_summary: str,
+        written_content: str,
+        plot_outline: List,
+        evaluation_result: Dict,
+        participants: List[Dict],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        领头人开启会话
+
+        领头人（总编剧）负责：
+        1. 宣布讨论开始
+        2. 介绍讨论议题
+        3. 引导讨论方向
+        """
+        try:
+            participant_names = [p["name"] for p in participants if not p.get("is_leader")]
+
+            prompt = f"""你是总编剧（讨论领头人），现在正式开启《{chapter_title}》创作讨论会。
+
+【参会人员】
+{', '.join(participant_names)}
+
+【讨论内容】
+章节：{chapter_title}
+已写内容：{written_content[:1000] if written_content else "暂无"}...
+
+【评估结果】
+评分: {evaluation_result.get('score', 'N/A')}/10
+
+请输出你的开场发言，宣布讨论开始，说明本次讨论的目标和重点。
+格式要求：
+1. 宣布讨论会开始
+2. 简要介绍本章创作情况
+3. 说明本次讨论需要解决的问题
+4. 邀请各位发言
+
+直接输出内容，不要有格式标记。"""
+
+            if hasattr(agent, 'model') and agent.model:
+                from langchain_core.messages import HumanMessage
+                response = await agent.model.ainvoke([HumanMessage(content=prompt)])
+                content = response.content.strip()
+
+                return {
+                    "agent": "总编剧",
+                    "type": "master_plotter",
+                    "content": content,
+                    "is_llm_generated": True,
+                    "is_leader_action": True,
+                    "action": "open_session",
+                }
+        except Exception as e:
+            logger.error(f"领头人开场生成失败: {e}")
+
+        return {
+            "agent": "总编剧",
+            "type": "master_plotter",
+            "content": f"【宣布讨论开始】各位，《{chapter_title}》创作讨论会现在开始。请各位从专业角度发表意见。",
+            "is_llm_generated": False,
+            "is_leader_action": True,
+            "action": "open_session",
+        }
+
+    async def _generate_leader_summary_request(
+        self,
+        agent,
+        chapter_title: str,
+        discussion_messages: List[Dict],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        领头人汇总讨论并请求用户确认
+
+        领头人负责：
+        1. 汇总各位发言的要点
+        2. 提出建议方案
+        3. 请求用户确认
+        """
+        try:
+            # 提取各 Agent 的发言要点
+            messages_summary = []
+            for msg in discussion_messages:
+                agent_name = msg.get("agent", "Unknown")
+                content = msg.get("content", "")[:200]
+                messages_summary.append(f"【{agent_name}】{content}...")
+
+            prompt = f"""你是总编剧（讨论领头人），现在需要汇总讨论结果并请求用户确认。
+
+【讨论记录】
+{chr(10).join(messages_summary)}
+
+请输出你的汇总发言，格式要求：
+1. 总结本次讨论的主要观点
+2. 归纳达成的共识和分歧
+3. 提出后续创作建议
+4. 最后明确询问用户是否同意
+
+直接输出内容。"""
+
+            if hasattr(agent, 'model') and agent.model:
+                from langchain_core.messages import HumanMessage
+                response = await agent.model.ainvoke([HumanMessage(content=prompt)])
+                content = response.content.strip()
+
+                return {
+                    "agent": "总编剧",
+                    "type": "master_plotter",
+                    "content": content,
+                    "is_llm_generated": True,
+                    "is_leader_action": True,
+                    "action": "request_confirmation",
+                }
+        except Exception as e:
+            logger.error(f"领头人汇总生成失败: {e}")
+
+        return {
+            "agent": "总编剧",
+            "type": "master_plotter",
+            "content": f"【汇总】本次讨论共{len(discussion_messages)}位Agent发言。请确认是否同意讨论结果？",
+            "is_llm_generated": False,
+            "is_leader_action": True,
+            "action": "request_confirmation",
+        }
+
+    async def _generate_leader_closing(
+        self,
+        agent,
+        chapter_title: str,
+        approved: bool,
+        feedback: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        领头人结束会话
+
+        Args:
+            agent: 领头人 Agent
+            chapter_title: 章节标题
+            approved: 用户是否同意
+            feedback: 用户反馈（不同意时）
+        """
+        try:
+            if approved:
+                content = f"【宣布讨论结束】感谢各位的参与。《{chapter_title}》讨论结果已确认，我们将按照讨论意见继续创作。"
+            else:
+                content = f"【宣布讨论结束】用户对讨论结果有不同意见。反馈：{feedback or '需要重新讨论'}。我们将根据反馈调整后重新开始。"
+
+            return {
+                "agent": "总编剧",
+                "type": "master_plotter",
+                "content": content,
+                "is_llm_generated": False,
+                "is_leader_action": True,
+                "action": "close_session",
+                "approved": approved,
+            }
+        except Exception as e:
+            logger.error(f"领头人结束生成失败: {e}")
+            return None
 
     async def _generate_agent_opinion(
         self,
@@ -2962,14 +4395,34 @@ class WorkflowEngine:
             if not prompt_template:
                 return None
 
+            # 安全地格式化 issues（可能是 dict 列表或 str 列表）
+            issues_raw = evaluation_result.get('issues', [])
+            if issues_raw:
+                issues_formatted = ', '.join([
+                    str(i) if isinstance(i, str) else i.get('issue', i.get('description', str(i)))
+                    for i in issues_raw[:5]
+                ])
+            else:
+                issues_formatted = '无明显问题'
+
+            # 安全地格式化 characters（可能是 dict 列表或 str 列表）
+            if characters:
+                char_names = [
+                    str(c) if isinstance(c, str) else c.get('name', '未知角色')
+                    for c in characters[:5]
+                ]
+                characters_formatted = ', '.join(char_names)
+            else:
+                characters_formatted = '暂无角色'
+
             # 格式化提示
             prompt = prompt_template.format(
                 score=evaluation_result.get('score', 'N/A'),
-                issues=', '.join(evaluation_result.get('issues', ['无'])) if evaluation_result.get('issues') else '无明显问题',
-                suggestions=evaluation_result.get('summary', '继续保持')[:200],
+                issues=issues_formatted,
+                suggestions=evaluation_result.get('summary', '继续保持')[:200] if evaluation_result.get('summary') else '继续保持',
                 hooks_count=len(context.get('existing_hooks', [])),
                 word_count_info=context.get('word_count_check', {}).get('actual', '已统计') if context.get('word_count_check') else '字数已达标',
-                characters=', '.join(characters[:5]) if characters else '暂无角色',
+                characters=characters_formatted,
             )
 
             # 添加章节内容（重要：让Agent有具体的分析对象）
@@ -3105,13 +4558,25 @@ class WorkflowEngine:
         self,
         execution_id: str,
         message: Dict[str, Any],
+        is_leader_action: bool = False,
+        broadcast_to_all: bool = False,
     ):
-        """广播讨论消息"""
+        """
+        广播讨论消息
+
+        Args:
+            execution_id: 执行 ID
+            message: 消息内容
+            is_leader_action: 是否是领头人的操作（开启/结束会话）
+            broadcast_to_all: 是否广播给所有参与者
+        """
         await self._broadcast_status(execution_id, "discussion_message", {
             "agent": message.get("agent", "Unknown"),
             "type": message.get("type", "unknown"),
             "content": message.get("content", ""),
             "is_llm_generated": message.get("is_llm_generated", False),
+            "is_leader_action": is_leader_action,
+            "broadcast_to_all": broadcast_to_all,
             "timestamp": datetime.now().isoformat(),
         })
 
@@ -3211,12 +4676,25 @@ class WorkflowEngine:
             "relationships_in_scene": "与场景中其他角色的关系"
         }}
     }},
+    "required_characters": ["本场景必须出现的角色名列表"],
+    "need_background_characters": true/false,
+    "background_character_count": 2,
+    "background_character_type": "路人/侍从/村民/商贩等",
+    "background_role": "背景角色的作用描述",
+    "background_interaction": true/false,
     "plot_focus": "本段表演要推进的核心剧情（详细描述）",
     "key_dialogue_topics": ["主要对话话题"],
     "conflict_points": ["场景中的冲突点"],
     "world_elements_to_use": ["要展示的世界观元素"],
     "foreshadowing_hints": ["可以埋下的伏笔暗示"],
-    "pacing_note": "节奏控制建议"
+    "pacing_note": "节奏控制建议",
+    "visible_events": ["普通角色能看到的事件"],
+    "character_filter": {{
+        "min_tier": 1,
+        "max_tier": 5,
+        "locations": ["场景相关位置"],
+        "tags": ["需要包含的角色标签"]
+    }}
 }}"""
 
             from langchain_core.messages import HumanMessage
@@ -3247,6 +4725,7 @@ class WorkflowEngine:
         is_interactive: bool,
         turn_number: int,
         total_characters: int,
+        distributed_info: Dict[str, Any] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         生成单个角色的表演内容
@@ -3265,6 +4744,7 @@ class WorkflowEngine:
             is_interactive: 是否同场景互动模式
             turn_number: 当前轮次
             total_characters: 总角色数
+            distributed_info: 智能分发的信息（可选）
 
         Returns:
             Dict: 包含角色名、表演内容等
@@ -3403,6 +4883,205 @@ class WorkflowEngine:
                 "content": f"（角色表演生成失败，跳过）",
                 "is_llm_generated": False,
             }
+
+    def _match_character_filter(self, character: Dict[str, Any], filter_config: Dict[str, Any]) -> bool:
+        """
+        检查角色是否匹配场景筛选条件
+
+        Args:
+            character: 角色数据
+            filter_config: 筛选条件，如:
+                {
+                    "min_tier": 3,           # 最低重要性层级
+                    "max_tier": 5,           # 最高重要性层级
+                    "character_types": ["supporting", "background"],  # 角色类型
+                    "locations": ["客栈", "街道"],  # 当前位置
+                    "tags": ["商人", "武者"],  # 标签匹配
+                    "must_include": ["李明"], # 必须包含的角色
+                }
+
+        Returns:
+            bool: 是否匹配
+        """
+        # 必须包含的角色
+        if filter_config.get("must_include"):
+            if character.get("name") in filter_config["must_include"]:
+                return True
+
+        # 重要性层级范围
+        min_tier = filter_config.get("min_tier", 1)
+        max_tier = filter_config.get("max_tier", 5)
+        char_tier = character.get("importance_tier", 3)
+        if not (min_tier <= char_tier <= max_tier):
+            return False
+
+        # 角色类型
+        if filter_config.get("character_types"):
+            char_type = character.get("character_type", "supporting")
+            if char_type not in filter_config["character_types"]:
+                return False
+
+        # 位置匹配
+        if filter_config.get("locations"):
+            char_location = character.get("current_location", "")
+            if char_location and char_location not in filter_config["locations"]:
+                return False
+
+        # 标签匹配
+        if filter_config.get("tags"):
+            char_tags = character.get("tags", []) or character.get("traits", [])
+            if not any(tag in char_tags for tag in filter_config["tags"]):
+                return False
+
+        return True
+
+    def _distribute_scene_info_to_character(
+        self,
+        char_data: Dict[str, Any],
+        scene_directions: Dict[str, Any],
+        world_info: Dict[str, Any],
+        previous_node_output: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        将场景信息智能分发给角色
+
+        根据角色的重要性和在场景中的定位，分配合适的信息
+
+        Args:
+            char_data: 角色数据
+            scene_directions: 场景方向
+            world_info: 世界观信息
+            previous_node_output: 上一个节点的输出
+
+        Returns:
+            Dict: 该角色应该知道的信息
+        """
+        char_name = char_data.get("name", "未知角色")
+        importance_tier = char_data.get("importance_tier", 3)
+        char_role = scene_directions.get("character_roles", {}).get(char_name, {})
+
+        distributed_info = {
+            "scene_info": {},
+            "plot_context": {},
+            "character_specific": {},
+        }
+
+        # 1. 场景基础信息（所有在场角色都知道）
+        distributed_info["scene_info"] = {
+            "location": scene_directions.get("main_scene", "未知地点"),
+            "atmosphere": scene_directions.get("atmosphere", "正剧"),
+            "time": scene_directions.get("time_of_day", "白天"),
+        }
+
+        # 2. 剧情上下文（根据重要性分发不同程度）
+        if importance_tier <= 2:
+            # 重要角色知道更多
+            distributed_info["plot_context"] = {
+                "plot_focus": scene_directions.get("plot_focus", ""),
+                "conflict_points": scene_directions.get("conflict_points", []),
+                "key_events": previous_node_output.get("key_events", [])[:3],
+            }
+        else:
+            # 普通角色只知道表面
+            distributed_info["plot_context"] = {
+                "visible_events": scene_directions.get("visible_events", []),
+            }
+
+        # 3. 角色专属信息
+        if char_role:
+            distributed_info["character_specific"] = {
+                "role_in_scene": char_role.get("role_in_scene", "参与者"),
+                "emotional_state": char_role.get("emotional_state", "平静"),
+                "known_info": char_role.get("known_info", ""),
+                "hidden_motivation": char_role.get("hidden_motivation", ""),
+            }
+
+        # 4. 处理上一个节点传递的信息
+        if previous_node_output:
+            # 提取与该角色相关的信息
+            related_dialogues = []
+            for dialogue in previous_node_output.get("dialogues", []):
+                # 如果对话涉及该角色或发生在同一地点
+                if char_name in dialogue.get("content", "") or dialogue.get("is_public", True):
+                    related_dialogues.append(dialogue)
+
+            distributed_info["previous_context"] = {
+                "related_dialogues": related_dialogues[-3:],  # 最近3条相关对话
+                "recent_events": previous_node_output.get("events", [])[-2:],
+            }
+
+        return distributed_info
+
+    def _generate_background_character_behavior(
+        self,
+        background_char: Dict[str, Any],
+        scene_directions: Dict[str, Any],
+        main_characters: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        生成背景角色的行为
+
+        背景角色行为应该简短、自然、不干扰主线
+
+        Args:
+            background_char: 背景角色数据
+            scene_directions: 场景方向
+            main_characters: 场景中的主要角色列表
+
+        Returns:
+            Dict: 背景角色的行为描述
+        """
+        char_name = background_char.get("name", "路人")
+        scene_type = scene_directions.get("scene_type", "interactive")
+        atmosphere = scene_directions.get("atmosphere", "正剧")
+
+        # 根据场景氛围生成适合的背景行为
+        behavior_templates = {
+            "正剧": [
+                f"({char_name}在一旁静静观看)",
+                f"({char_name}走过，没有停留)",
+                f"({char_name}低声交谈了几句)",
+            ],
+            "紧张": [
+                f"({char_name}神色紧张地望向这边)",
+                f"({char_name}快步走过)",
+                f"({char_name}低着头匆匆离开)",
+            ],
+            "欢快": [
+                f"({char_name}笑着走过)",
+                f"({char_name}在远处闲聊)",
+                f"({char_name}心情不错的样子)",
+            ],
+            "悲伤": [
+                f"({char_name}默默走过)",
+                f"({char_name}低着头，似乎在沉思)",
+            ],
+        }
+
+        behaviors = behavior_templates.get(atmosphere, behavior_templates["正剧"])
+
+        # 选择一个合适的行为
+        import random
+        selected_behavior = random.choice(behaviors)
+
+        # 如果场景需要互动，可能让背景角色有简单反应
+        if scene_directions.get("background_interaction") and random.random() < 0.3:
+            main_char = random.choice(main_characters) if main_characters else {"name": "某人"}
+            return {
+                "agent": char_name,
+                "type": "background_action",
+                "content": selected_behavior + f"，看了{main_char.get('name', '某人')}一眼",
+                "is_llm_generated": False,
+                "importance": "background",
+            }
+
+        return {
+            "agent": char_name,
+            "type": "background_action",
+            "content": selected_behavior,
+            "is_llm_generated": False,
+            "importance": "background",
+        }
 
     def _get_character_tier_description(
         self,
@@ -4142,6 +5821,182 @@ class WorkflowEngine:
         logger.info(f"取消工作流: {execution_id}")
         return True
 
+    async def confirm_discussion(
+        self,
+        execution_id: str,
+        approved: bool,
+        feedback: Optional[str] = None,
+        db=None,
+    ) -> Dict[str, Any]:
+        """
+        确认集体讨论结果
+
+        流程：
+        1. 领头人广播结束消息
+        2. 同意 -> 工作流继续
+        3. 拒绝 -> 带反馈重启工作流
+
+        Args:
+            execution_id: 执行ID
+            approved: 用户是否同意讨论结果
+            feedback: 用户反馈意见（不同意时必填）
+            db: 数据库连接
+
+        Returns:
+            Dict: 处理结果
+        """
+        execution = self._executions.get(execution_id)
+        if not execution:
+            if db:
+                execution = await self._load_execution_from_db(execution_id, db)
+                if execution:
+                    self._executions[execution_id] = execution
+
+        if not execution:
+            return {"success": False, "error": "执行不存在"}
+
+        if execution.status != WorkflowStatus.PAUSED:
+            return {"success": False, "error": "工作流未处于暂停状态"}
+
+        waiting_confirmation = execution.context.get("waiting_confirmation")
+        if not waiting_confirmation:
+            return {"success": False, "error": "没有等待确认的讨论结果"}
+
+        if waiting_confirmation.get("confirmed"):
+            return {"success": False, "error": "讨论结果已被确认"}
+
+        # 标记已确认
+        waiting_confirmation["confirmed"] = True
+        waiting_confirmation["user_approved"] = approved
+
+        # ========== 领头人广播结束消息 ==========
+        # 从上下文中获取领头人类型（在讨论时保存的）
+        discussion_info = execution.context.get("group_discussion", {})
+        leader_type = discussion_info.get("leader_type", "master_plotter")
+
+        # 领头人优先级
+        LEADER_PRIORITY = ["master_plotter", "plotter", "evaluator", "writer", "setting"]
+
+        leader_agent = await self._get_agent_for_discussion(leader_type, execution.project_id)
+        if not leader_agent:
+            # 尝试其他候选人
+            for candidate in LEADER_PRIORITY:
+                leader_agent = await self._get_agent_for_discussion(candidate, execution.project_id)
+                if leader_agent:
+                    leader_type = candidate
+                    break
+
+        chapter_title = execution.context.get("chapter_title", "当前章节")
+        if leader_agent:
+            closing_message = await self._generate_leader_closing(
+                leader_agent, chapter_title, approved, feedback
+            )
+            if closing_message:
+                await self._broadcast_discussion_message(execution_id, closing_message, is_leader_action=True)
+
+        # 广播讨论结束
+        await self._broadcast_status(execution_id, "group_discussion_ended", {
+            "approved": approved,
+            "feedback": feedback,
+            "message": f"讨论会结束，{'用户同意' if approved else '用户不同意'}讨论结果",
+        })
+
+        if approved:
+            # 用户同意，恢复工作流继续执行
+            logger.info(f"用户同意讨论结果，继续执行工作流: {execution_id}")
+
+            execution.context.pop("waiting_confirmation", None)
+            execution.status = WorkflowStatus.RUNNING
+            if db:
+                await self._save_execution_to_db(execution, db)
+
+            await self._broadcast_status(execution_id, "discussion_confirmed", {
+                "approved": True,
+                "message": "用户同意讨论结果，工作流继续执行",
+            })
+
+            workflow = await self.get_workflow(execution.workflow_id, db)
+            if workflow:
+                asyncio.create_task(self._run_workflow(execution_id, workflow, db))
+
+            return {
+                "success": True,
+                "approved": True,
+                "message": "工作流继续执行",
+            }
+
+        else:
+            # 用户不同意，重置工作流并注入反馈
+            if not feedback:
+                return {"success": False, "error": "不同意讨论结果时必须提供反馈意见"}
+
+            logger.info(f"用户不同意讨论结果，将重新执行工作流: {execution_id}")
+            logger.info(f"用户反馈: {feedback[:200]}...")
+
+            workflow = await self.get_workflow(execution.workflow_id, db)
+            if not workflow:
+                return {"success": False, "error": "工作流定义不存在"}
+
+            # 构建用户反馈上下文
+            user_feedback_context = {
+                "user_feedback": feedback,
+                "user_feedback_timestamp": datetime.now().isoformat(),
+                "retry_reason": "用户对讨论结果不满意",
+                "is_retry": True,
+                "retry_count": execution.context.get("retry_count", 0) + 1,
+            }
+
+            # 保留部分上下文（世界观、角色等基础信息）
+            preserved_context = {
+                "world_info": execution.context.get("world_info"),
+                "characters": execution.context.get("characters", []),
+                "project_info": execution.context.get("project_info"),
+                "previous_chapters": execution.context.get("previous_chapters", []),
+                "lore_entries": execution.context.get("lore_entries", []),
+                "hooks": execution.context.get("hooks", []),
+                "user_feedback": feedback,
+                "user_feedback_context": user_feedback_context,
+                "discussion_history": execution.context.get("discussion_history", []),
+                "performance_history": execution.context.get("performance_history", []),
+                "is_retry": True,
+                "retry_count": user_feedback_context["retry_count"],
+            }
+
+            execution.context = preserved_context
+
+            # 重置所有节点状态
+            for node_id, node_state in execution.node_states.items():
+                node_state.status = NodeStatus.PENDING
+                node_state.started_at = None
+                node_state.completed_at = None
+                node_state.output_data = {}
+                node_state.error = None
+
+            execution.context["goto_retry_counts"] = {}
+            execution.status = WorkflowStatus.RUNNING
+            execution.current_node = None
+            execution.error = None
+
+            if db:
+                await self._save_execution_to_db(execution, db)
+
+            await self._broadcast_status(execution_id, "discussion_retry", {
+                "approved": False,
+                "feedback": feedback,
+                "retry_count": user_feedback_context["retry_count"],
+                "message": "用户不同意讨论结果，工作流将重新执行",
+            })
+
+            asyncio.create_task(self._run_workflow(execution_id, workflow, db))
+
+            return {
+                "success": True,
+                "approved": False,
+                "feedback": feedback,
+                "retry_count": user_feedback_context["retry_count"],
+                "message": f"工作流将重新执行（第 {user_feedback_context['retry_count']} 次重试）",
+            }
+
     async def step_workflow(self, execution_id: str, db=None) -> Optional[Dict[str, Any]]:
         """
         单步执行工作流
@@ -4282,20 +6137,31 @@ class WorkflowEngine:
         """递归序列化对象，处理 UUID 等非 JSON 类型"""
         import uuid
         from datetime import datetime
+        from types import MappingProxyType
 
         if isinstance(obj, uuid.UUID):
             return str(obj)
         elif isinstance(obj, datetime):
             return obj.isoformat()
+        elif isinstance(obj, MappingProxyType):
+            # 处理 mappingproxy 类型
+            return dict(obj)
         elif isinstance(obj, dict):
             return {k: self._serialize_for_json(v) for k, v in obj.items()}
         elif isinstance(obj, (list, tuple)):
             return [self._serialize_for_json(item) for item in obj]
+        elif hasattr(obj, 'model_dump'):
+            # 处理 Pydantic 模型
+            return self._serialize_for_json(obj.model_dump(mode="json"))
         elif hasattr(obj, '__dict__'):
-            # 处理 Pydantic 模型等
+            # 处理其他对象
             return self._serialize_for_json(obj.__dict__)
         else:
             return obj
+
+    def _make_json_safe(self, obj: Any) -> Any:
+        """使对象 JSON 安全（别名方法）"""
+        return self._serialize_for_json(obj)
 
     # ==================== 数据库操作 ====================
 

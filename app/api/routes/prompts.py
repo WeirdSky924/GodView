@@ -171,12 +171,11 @@ async def update_prompt(prompt_id: str, request: PromptTemplateUpdate):
     """
     service = get_prompt_service()
 
-    template = await service.update_template(prompt_id, request)
-    if not template:
-        raise HTTPException(
-            status_code=404,
-            detail="Prompt 模板不存在或系统内置模板不可修改"
-        )
+    template, error = await service.update_template(prompt_id, request)
+    if error == 'not_found':
+        raise HTTPException(status_code=404, detail="Prompt 模板不存在")
+    if error == 'is_system':
+        raise HTTPException(status_code=403, detail="系统内置模板不可修改")
 
     return {
         "success": True,
@@ -198,12 +197,11 @@ async def delete_prompt(prompt_id: str):
     """
     service = get_prompt_service()
 
-    success = await service.delete_template(prompt_id)
-    if not success:
-        raise HTTPException(
-            status_code=404,
-            detail="Prompt 模板不存在或系统内置模板不可删除"
-        )
+    success, error = await service.delete_template(prompt_id)
+    if error == 'not_found':
+        raise HTTPException(status_code=404, detail="Prompt 模板不存在")
+    if error == 'is_system':
+        raise HTTPException(status_code=403, detail="系统内置模板不可删除")
 
     return {
         "success": True,

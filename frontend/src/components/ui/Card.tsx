@@ -1,4 +1,4 @@
-import { ReactNode } from 'react'
+import { ReactNode, MouseEventHandler } from 'react'
 import { motion } from 'framer-motion'
 import { useTheme } from '@/contexts/ThemeContext'
 
@@ -10,9 +10,10 @@ interface CardProps {
   action?: ReactNode
   hover?: boolean
   noPadding?: boolean
+  onClick?: MouseEventHandler<HTMLDivElement>
 }
 
-export function Card({ children, className = '', title, description, action, hover = false, noPadding = false }: CardProps) {
+export function Card({ children, className = '', title, description, action, hover = false, noPadding = false, onClick }: CardProps) {
   const { theme } = useTheme()
   const isDark = theme === 'dark'
 
@@ -27,6 +28,7 @@ export function Card({ children, className = '', title, description, action, hov
       animate={{ opacity: 1, y: 0 }}
       whileHover={hover ? { y: -2 } : undefined}
       transition={{ duration: 0.2 }}
+      onClick={onClick}
     >
       {(title || description || action) && (
         <div className={`px-6 py-4 border-b flex items-start justify-between ${
