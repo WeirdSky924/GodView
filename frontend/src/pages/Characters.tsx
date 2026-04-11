@@ -13,6 +13,9 @@ import {
   getCharacterAgentPrompt,
   batchEnableCharacterAgents,
   generateCharacterPersonality,
+  CharacterImportanceTier,
+  TIER_DISPLAY_NAMES,
+  TIER_GROUPS,
 } from '@/api/characters'
 import type {
   Character,
@@ -21,15 +24,54 @@ import type {
   CharacterVoiceSampleSearchResult,
   CharacterAgentPrompt,
 } from '@/api/characters'
-import { Plus, Edit, Trash2, User, Mic, Search, RefreshCw, FolderOpen, Bot, Target, Brain, Eye, Sparkles } from 'lucide-react'
+import { Plus, Edit, Trash2, User, Mic, Search, RefreshCw, FolderOpen, Bot, Target, Brain, Eye, Sparkles, Crown, Star, Users, Zap, MessageSquare, Heart, Shield, Sword, Ghost, Settings, FileText, ChevronRight } from 'lucide-react'
 import { useProject } from '@/contexts/ProjectContext'
 import { useTheme } from '@/contexts/ThemeContext'
+import { motion, AnimatePresence } from 'framer-motion'
 
 function splitCsvInput(value: string) {
   return value
     .split(/[，,\n]/)
     .map((item) => item.trim())
     .filter(Boolean)
+}
+
+// 角色层级对应的图标和颜色
+const TIER_ICONS: Record<string, { icon: React.ElementType; bgClass: string }> = {
+  [CharacterImportanceTier.PROTAGONIST]: { icon: Crown, bgClass: 'from-yellow-400 to-amber-500' },
+  [CharacterImportanceTier.CO_PROTAGONIST]: { icon: Star, bgClass: 'from-orange-400 to-yellow-500' },
+  [CharacterImportanceTier.DEUTERAGONIST]: { icon: Star, bgClass: 'from-purple-400 to-purple-600' },
+  [CharacterImportanceTier.MENTOR]: { icon: Shield, bgClass: 'from-blue-400 to-indigo-500' },
+  [CharacterImportanceTier.LOVE_INTEREST]: { icon: Heart, bgClass: 'from-pink-400 to-rose-500' },
+  [CharacterImportanceTier.BEST_FRIEND]: { icon: Users, bgClass: 'from-cyan-400 to-blue-500' },
+  [CharacterImportanceTier.ARCHENEMY]: { icon: Sword, bgClass: 'from-red-500 to-red-700' },
+  [CharacterImportanceTier.MAJOR_ALLY]: { icon: Shield, bgClass: 'from-green-400 to-emerald-500' },
+  [CharacterImportanceTier.MAJOR_ANTAGONIST]: { icon: Sword, bgClass: 'from-red-400 to-orange-500' },
+  [CharacterImportanceTier.RIVAL]: { icon: Zap, bgClass: 'from-yellow-500 to-orange-500' },
+  [CharacterImportanceTier.FAMILY_MEMBER]: { icon: Heart, bgClass: 'from-pink-300 to-pink-500' },
+  [CharacterImportanceTier.GUARDIAN]: { icon: Shield, bgClass: 'from-blue-400 to-cyan-500' },
+  [CharacterImportanceTier.ARC_ANTAGONIST]: { icon: Sword, bgClass: 'from-red-400 to-red-600' },
+  [CharacterImportanceTier.ARC_ALLY]: { icon: Users, bgClass: 'from-teal-400 to-green-500' },
+  [CharacterImportanceTier.RECURRING]: { icon: Users, bgClass: 'from-gray-400 to-gray-600' },
+  [CharacterImportanceTier.CATALYST]: { icon: Zap, bgClass: 'from-violet-400 to-purple-500' },
+  [CharacterImportanceTier.MYSTERY_FIGURE]: { icon: Ghost, bgClass: 'from-indigo-400 to-violet-500' },
+  [CharacterImportanceTier.MINION]: { icon: User, bgClass: 'from-gray-400 to-gray-500' },
+  [CharacterImportanceTier.INFORMANT]: { icon: MessageSquare, bgClass: 'from-slate-400 to-slate-600' },
+  [CharacterImportanceTier.COMIC_RELIEF]: { icon: MessageSquare, bgClass: 'from-amber-400 to-yellow-500' },
+  [CharacterImportanceTier.VICTIM]: { icon: User, bgClass: 'from-gray-400 to-gray-500' },
+  [CharacterImportanceTier.NPC]: { icon: User, bgClass: 'from-gray-400 to-gray-500' },
+  [CharacterImportanceTier.BACKGROUND]: { icon: User, bgClass: 'from-gray-300 to-gray-400' },
+  [CharacterImportanceTier.CAMEO]: { icon: User, bgClass: 'from-gray-300 to-gray-400' },
+}
+
+// 状态配置
+const STATUS_CONFIG: Record<string, { label: string; bgClass: string; textClass: string }> = {
+  active: { label: '活跃', bgClass: 'bg-green-500/20', textClass: 'text-green-400' },
+  inactive: { label: '不活跃', bgClass: 'bg-gray-500/20', textClass: 'text-gray-400' },
+  dead: { label: '已故', bgClass: 'bg-red-500/20', textClass: 'text-red-400' },
+  ghost: { label: '幽灵', bgClass: 'bg-purple-500/20', textClass: 'text-purple-400' },
+  resurrected: { label: '复活', bgClass: 'bg-yellow-500/20', textClass: 'text-yellow-400' },
+  paused: { label: '暂停', bgClass: 'bg-orange-500/20', textClass: 'text-orange-400' },
 }
 
 export default function Characters() {
@@ -54,11 +96,20 @@ export default function Characters() {
   const [batchEnabling, setBatchEnabling] = useState(false)
   const [generatingPersonality, setGeneratingPersonality] = useState(false)
 
+  // 编辑窗口的标签页
+  const [activeTab, setActiveTab] = useState<'basic' | 'appearance' | 'voice' | 'agent'>('basic')
+
   const [formData, setFormData] = useState<CreateCharacterDTO>({
     name: '',
-    role: '',
     status: 'active',
     description: '',
+    importance_tier: CharacterImportanceTier.NPC,
+    narrative_weight: undefined,
+    story_arc_role: undefined,
+    personality: '',
+    appearance: '',
+    background_story: '',
+    gender: '',
     speech_pattern: '',
     lexicon: [],
     forbidden_words: [],
@@ -120,12 +171,13 @@ export default function Characters() {
     setEditingChar(null)
     setFormData({
       name: '',
-      role: '',
       status: 'active',
       description: '',
+      importance_tier: CharacterImportanceTier.NPC,
       personality: '',
       appearance: '',
-      background: '',
+      background_story: '',
+      gender: '',
       speech_pattern: '',
       lexicon: [],
       forbidden_words: [],
@@ -140,6 +192,7 @@ export default function Characters() {
     setVoiceSamplesInput('')
     setAgentGoalsInput('')
     setAgentMemoryInput('')
+    setActiveTab('basic')
     setShowModal(true)
   }
 
@@ -147,12 +200,15 @@ export default function Characters() {
     setEditingChar(character)
     setFormData({
       name: character.name,
-      role: character.role,
       status: character.status,
       description: character.description,
+      importance_tier: character.importance_tier || CharacterImportanceTier.NPC,
+      narrative_weight: character.narrative_weight,
+      story_arc_role: character.story_arc_role,
       personality: character.personality,
       appearance: character.appearance,
-      background: character.background,
+      background_story: character.background_story,
+      gender: character.gender,
       speech_pattern: character.speech_pattern,
       lexicon: character.lexicon || [],
       forbidden_words: character.forbidden_words || [],
@@ -167,6 +223,7 @@ export default function Characters() {
     setVoiceSamplesInput((character.voice_samples || []).join('\n'))
     setAgentGoalsInput((character.agent_goals || []).join('\n'))
     setAgentMemoryInput((character.agent_memory || []).join('\n'))
+    setActiveTab('basic')
     setShowModal(true)
   }
 
@@ -304,28 +361,71 @@ export default function Characters() {
     }
   }
 
-  const handleGeneratePersonality = async () => {
+  // 在编辑窗口中生成外貌和性格
+  const handleGenerateAppearanceAndPersonality = async () => {
+    if (!formData.name) {
+      alert('请先填写角色名称')
+      return
+    }
+
+    setGeneratingPersonality(true)
+    try {
+      // 如果是编辑现有角色，直接调用 API
+      if (editingChar?.id) {
+        const result = await generateCharacterPersonality(editingChar.id)
+        if (result.success) {
+          // 更新表单数据
+          if (result.appearance) setFormData(prev => ({ ...prev, appearance: result.appearance }))
+          if (result.personality) setFormData(prev => ({ ...prev, personality: result.personality }))
+          if (result.speech_pattern) setFormData(prev => ({ ...prev, speech_pattern: result.speech_pattern }))
+          if (result.agent_goals) setAgentGoalsInput(result.agent_goals.join('\n'))
+          if (result.agent_memory) setAgentMemoryInput(result.agent_memory.join('\n'))
+          // 自动启用 Agent
+          setFormData(prev => ({ ...prev, has_agent: true, agent_enabled: true }))
+        } else {
+          alert('生成失败：' + (result.message || '未知错误'))
+        }
+      } else {
+        // 新建角色时，需要先保存再生成
+        alert('请先保存角色后再生成外貌和性格')
+      }
+    } catch (error) {
+      console.error('Failed to generate personality:', error)
+      alert('生成失败')
+    } finally {
+      setGeneratingPersonality(false)
+    }
+  }
+
+  // 在声音样本面板中生成性格（针对已选中的角色）
+  const handleGeneratePersonalityForSelected = async () => {
     if (!selectedCharacterId) return
-    if (!confirm('确定要调用 Setting Agent 为该角色生成性格设定吗？')) return
+    if (!confirm('确定要调用 Setting Agent 为该角色生成外貌和性格设定吗？')) return
 
     setGeneratingPersonality(true)
     try {
       const result = await generateCharacterPersonality(selectedCharacterId)
       if (result.success) {
-        alert(`性格生成成功！\n\n性格：${result.personality}\n说话风格：${result.speech_pattern}`)
+        alert(`生成成功！\n\n外貌：${result.appearance || '无'}\n性格：${result.personality}\n说话风格：${result.speech_pattern}`)
         await loadCharacters()
       } else {
         alert('生成失败：' + (result.message || '未知错误'))
       }
     } catch (error) {
       console.error('Failed to generate personality:', error)
-      alert('生成性格失败')
+      alert('生成失败')
     } finally {
       setGeneratingPersonality(false)
     }
   }
 
   const selectedCharacter = characters.find((char) => char.id === selectedCharacterId)
+
+  // 获取角色的图标和颜色配置
+  const getTierConfig = (tier?: string) => {
+    if (!tier) return { icon: User, bgClass: 'from-gray-400 to-gray-500' }
+    return TIER_ICONS[tier] || { icon: User, bgClass: 'from-gray-400 to-gray-500' }
+  }
 
   return (
     <PageLayout
@@ -353,81 +453,197 @@ export default function Characters() {
         <p className={`text-center py-12 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>加载中...</p>
       ) : (
         <div className="grid grid-cols-1 xl:grid-cols-[2fr,1fr] gap-6">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          {/* 角色卡片网格 */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             {characters.length === 0 ? (
               <div className={`col-span-full text-center py-12 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
                 暂无角色，点击"新增角色"开始创建
               </div>
             ) : (
-              characters.map((char) => (
-                <Card
-                  key={char.id}
-                  className={`transition-shadow ${selectedCharacterId === char.id ? 'ring-2 ring-blue-500' : ''}`}
-                >
-                  <div className="flex items-start gap-4">
-                    <div className="w-16 h-16 bg-gradient-to-br from-blue-400 to-purple-500 rounded-lg flex items-center justify-center text-white text-2xl">
-                      <User size={24} />
-                    </div>
-                    <div className="flex-1 min-w-0 cursor-pointer" onClick={() => setSelectedCharacterId(char.id || '')}>
-                      <h3 className={`font-semibold text-lg truncate ${isDark ? 'text-white' : 'text-gray-800'}`}>{char.name}</h3>
-                      <p className={`text-sm mt-1 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>{char.role}</p>
-                      <p className={`text-sm mt-2 line-clamp-2 ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>{char.description}</p>
-                      <div className="mt-3 flex flex-wrap gap-2">
-                        <span className={`inline-block px-2 py-1 text-xs rounded ${
-                          char.status === 'active' ? (isDark ? 'bg-green-900 text-green-300' : 'bg-green-100 text-green-700') :
-                          char.status === 'inactive' ? (isDark ? 'bg-gray-700 text-gray-300' : 'bg-gray-200 text-gray-700') :
-                          char.status === 'dead' ? (isDark ? 'bg-red-900 text-red-300' : 'bg-red-100 text-red-700') :
-                          (isDark ? 'bg-yellow-900 text-yellow-300' : 'bg-yellow-100 text-yellow-700')
-                        }`}>
-                          {char.status === 'active' ? '活跃' : char.status === 'inactive' ? '不活跃' : char.status === 'dead' ? '已故' : '暂停'}
-                        </span>
-                        {char.has_agent && (
-                          <span className={`inline-flex items-center px-2 py-1 text-xs rounded ${isDark ? 'bg-purple-900 text-purple-300' : 'bg-purple-100 text-purple-700'}`}>
-                            <Bot size={12} className="mr-1" />Agent
-                          </span>
-                        )}
-                        <span className={`inline-block px-2 py-1 text-xs rounded ${isDark ? 'bg-blue-900 text-blue-300' : 'bg-blue-100 text-blue-700'}`}>
-                          声音样本 {char.voice_samples?.length || 0}
-                        </span>
+              characters.map((char) => {
+                const tierConfig = getTierConfig(char.importance_tier)
+                const statusConfig = STATUS_CONFIG[char.status] || STATUS_CONFIG.inactive
+                const IconComponent = tierConfig.icon
+
+                return (
+                  <motion.div
+                    key={char.id}
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    whileHover={{ scale: 1.02 }}
+                    className={`relative overflow-hidden rounded-xl cursor-pointer transition-all ${
+                      selectedCharacterId === char.id
+                        ? 'ring-2 ring-blue-500 ring-offset-2 ring-offset-transparent'
+                        : ''
+                    }`}
+                    onClick={() => setSelectedCharacterId(char.id || '')}
+                  >
+                    {/* 卡片背景渐变 */}
+                    <div className={`absolute inset-0 bg-gradient-to-br ${tierConfig.bgClass} opacity-5`} />
+
+                    <Card className={`relative h-full ${
+                      isDark ? 'bg-gray-800/80 hover:bg-gray-800' : 'bg-white hover:bg-gray-50'
+                    }`}>
+                      <div className="p-4 flex flex-col h-full">
+                        {/* 头部：头像 + 名称 + 状态 */}
+                        <div className="flex items-center gap-3 mb-3">
+                          <div className={`w-14 h-14 rounded-xl bg-gradient-to-br ${tierConfig.bgClass} flex items-center justify-center text-white shadow-lg flex-shrink-0`}>
+                            <IconComponent size={26} />
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <h3 className={`text-lg font-semibold truncate ${isDark ? 'text-white' : 'text-gray-900'}`}>
+                              {char.name}
+                            </h3>
+                            <div className="flex items-center gap-2 mt-1 flex-wrap">
+                              <span className={`px-2 py-0.5 text-xs font-medium rounded ${
+                                char.importance_tier === CharacterImportanceTier.PROTAGONIST ? 'bg-yellow-500 text-white' :
+                                char.importance_tier === CharacterImportanceTier.CO_PROTAGONIST ? 'bg-orange-500 text-white' :
+                                [CharacterImportanceTier.DEUTERAGONIST, CharacterImportanceTier.MENTOR, CharacterImportanceTier.LOVE_INTEREST, CharacterImportanceTier.BEST_FRIEND, CharacterImportanceTier.ARCHENEMY].includes(char.importance_tier as any) ?
+                                  (isDark ? 'bg-purple-900/80 text-purple-300' : 'bg-purple-100 text-purple-700') :
+                                (isDark ? 'bg-gray-700 text-gray-300' : 'bg-gray-200 text-gray-600')
+                              }`}>
+                                {TIER_DISPLAY_NAMES[char.importance_tier as CharacterImportanceTier] || 'NPC'}
+                              </span>
+                              <span className={`px-2 py-0.5 text-xs font-medium rounded-full ${statusConfig.bgClass} ${statusConfig.textClass}`}>
+                                {statusConfig.label}
+                              </span>
+                              {char.has_agent && (
+                                <span className={`flex items-center gap-1 px-2 py-0.5 text-xs font-medium rounded ${isDark ? 'bg-purple-900/60 text-purple-300' : 'bg-purple-100 text-purple-700'}`}>
+                                  <Bot size={12} />
+                                  Agent
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* 详细信息区域 */}
+                        <div className="flex-1 space-y-2 mb-3">
+                          {/* 简介 */}
+                          {char.description && (
+                            <div>
+                              <span className={`text-xs font-medium ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>简介：</span>
+                              <p className={`text-sm line-clamp-2 ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
+                                {char.description}
+                              </p>
+                            </div>
+                          )}
+
+                          {/* 外貌 */}
+                          {char.appearance && (
+                            <div>
+                              <span className={`text-xs font-medium ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>外貌：</span>
+                              <p className={`text-sm line-clamp-2 ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
+                                {char.appearance}
+                              </p>
+                            </div>
+                          )}
+
+                          {/* 性格 */}
+                          {char.personality && (
+                            <div>
+                              <span className={`text-xs font-medium ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>性格：</span>
+                              <p className={`text-sm line-clamp-2 ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
+                                {char.personality}
+                              </p>
+                            </div>
+                          )}
+
+                          {/* 如果没有详细信息 */}
+                          {!char.description && !char.appearance && !char.personality && (
+                            <p className={`text-sm italic ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+                              暂无详细设定
+                            </p>
+                          )}
+                        </div>
+
+                        {/* 底部操作按钮 */}
+                        <div className={`flex items-center justify-between pt-3 border-t ${isDark ? 'border-gray-700' : 'border-gray-100'}`}>
+                          <div className="flex items-center gap-2 text-xs">
+                            {char.gender && (
+                              <span className={`px-2 py-1 rounded ${isDark ? 'bg-gray-700 text-gray-400' : 'bg-gray-100 text-gray-500'}`}>
+                                {char.gender === 'male' ? '♂ 男' : char.gender === 'female' ? '♀ 女' : '⚧ 其他'}
+                              </span>
+                            )}
+                            {char.speech_pattern && (
+                              <span className={`px-2 py-1 rounded ${isDark ? 'bg-gray-700 text-gray-400' : 'bg-gray-100 text-gray-500'}`}>
+                                已设风格
+                              </span>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <button
+                              onClick={(e) => { e.stopPropagation(); openEditModal(char); }}
+                              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+                                isDark
+                                  ? 'bg-gray-700 hover:bg-blue-600 text-gray-300 hover:text-white'
+                                  : 'bg-gray-100 hover:bg-blue-500 text-gray-600 hover:text-white'
+                              }`}
+                            >
+                              <Edit size={16} />
+                              编辑
+                            </button>
+                            <button
+                              onClick={(e) => { e.stopPropagation(); handleDelete(char.id); }}
+                              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+                                isDark
+                                  ? 'bg-gray-700 hover:bg-red-600 text-gray-300 hover:text-white'
+                                  : 'bg-gray-100 hover:bg-red-500 text-gray-600 hover:text-white'
+                              }`}
+                            >
+                              <Trash2 size={16} />
+                              删除
+                            </button>
+                          </div>
+                        </div>
                       </div>
-                    </div>
-                  </div>
-                  <div className={`flex gap-2 mt-4 pt-4 ${isDark ? 'border-gray-700' : 'border-gray-200'} border-t`}>
-                    <Button variant="secondary" size="sm" onClick={() => openEditModal(char)}>
-                      <Edit size={14} className="mr-1" /> 编辑
-                    </Button>
-                    <Button variant="danger" size="sm" onClick={() => handleDelete(char.id)}>
-                      <Trash2 size={14} className="mr-1" /> 删除
-                    </Button>
-                  </div>
-                </Card>
-              ))
+                    </Card>
+                  </motion.div>
+                )
+              })
             )}
           </div>
 
-          <Card>
-            <div className="flex items-center justify-between mb-4">
-              <div className="flex items-center gap-2">
-                <Mic size={18} className={isDark ? 'text-gray-400' : 'text-gray-500'} />
-                <h2 className={`text-lg font-semibold ${isDark ? 'text-white' : 'text-gray-800'}`}>声音样本</h2>
+          {/* 右侧声音样本面板 */}
+          <Card className="flex flex-col h-fit xl:sticky xl:top-4">
+            <div className={`sticky top-0 z-10 ${isDark ? 'bg-gray-800' : 'bg-white'} pb-4`}>
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Mic size={18} className={isDark ? 'text-gray-400' : 'text-gray-500'} />
+                  <h2 className={`text-lg font-semibold ${isDark ? 'text-white' : 'text-gray-800'}`}>声音样本</h2>
+                </div>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={handleSyncVoiceSamples}
+                  disabled={!selectedCharacterId || syncingVoice}
+                >
+                  <RefreshCw size={14} className="mr-1" />
+                  {syncingVoice ? '同步中' : '同步向量'}
+                </Button>
               </div>
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={handleSyncVoiceSamples}
-                disabled={!selectedCharacterId || syncingVoice}
-              >
-                <RefreshCw size={14} className="mr-1" />
-                {syncingVoice ? '同步中' : '同步向量'}
-              </Button>
             </div>
 
+            <div className="flex-1 overflow-y-auto">
             {!selectedCharacter ? (
               <p className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>请选择左侧角色后查看和管理声音样本。</p>
             ) : (
               <div className="space-y-4">
                 <div className={`rounded-lg p-3 text-sm ${isDark ? 'bg-gray-800 text-gray-300' : 'bg-gray-50 text-gray-700'}`}>
-                  <div><span className="font-medium">当前角色：</span>{selectedCharacter.name}</div>
+                  <div className="flex items-center justify-between">
+                    <div><span className="font-medium">当前角色：</span>{selectedCharacter.name}</div>
+                    {selectedCharacter.importance_tier && (
+                      <span className={`px-2 py-0.5 text-xs rounded ${
+                        selectedCharacter.importance_tier === CharacterImportanceTier.PROTAGONIST ? 'bg-yellow-500 text-white' :
+                        selectedCharacter.importance_tier === CharacterImportanceTier.CO_PROTAGONIST ? 'bg-yellow-600 text-white' :
+                        [CharacterImportanceTier.DEUTERAGONIST, CharacterImportanceTier.MENTOR, CharacterImportanceTier.LOVE_INTEREST, CharacterImportanceTier.BEST_FRIEND, CharacterImportanceTier.ARCHENEMY].includes(selectedCharacter.importance_tier as any) ?
+                          (isDark ? 'bg-purple-900 text-purple-300' : 'bg-purple-100 text-purple-700') :
+                        'bg-gray-500 text-white'
+                      }`}>
+                        {TIER_DISPLAY_NAMES[selectedCharacter.importance_tier as CharacterImportanceTier] || selectedCharacter.importance_tier}
+                      </span>
+                    )}
+                  </div>
                   <div className="mt-1"><span className="font-medium">说话风格：</span>{selectedCharacter.speech_pattern || '未设置'}</div>
                   <div className="mt-1"><span className="font-medium">性格：</span>{selectedCharacter.personality || '未设置'}</div>
                   {selectedCharacter.has_agent && (
@@ -437,21 +653,19 @@ export default function Characters() {
                       </span>
                     </div>
                   )}
-                  {/* 生成性格按钮 */}
                   <div className="mt-3 flex gap-2">
                     <Button
                       size="sm"
                       variant="secondary"
-                      onClick={handleGeneratePersonality}
+                      onClick={handleGeneratePersonalityForSelected}
                       disabled={generatingPersonality}
                     >
                       <Sparkles size={14} className="mr-1" />
-                      {generatingPersonality ? '生成中...' : 'AI 生成性格'}
+                      {generatingPersonality ? '生成中...' : 'AI 生成外貌性格'}
                     </Button>
                   </div>
                 </div>
 
-                {/* Agent 信息面板 */}
                 {selectedCharacter.has_agent && (
                   <div className={`rounded-lg p-3 text-sm ${isDark ? 'bg-purple-900/20 border border-purple-700/30' : 'bg-purple-50 border border-purple-200'}`}>
                     <div className="flex items-center justify-between mb-2">
@@ -564,143 +778,318 @@ export default function Characters() {
                 </div>
               </div>
             )}
+            </div>
           </Card>
         </div>
       )}
 
+      {/* 编辑角色 Modal - 重新设计的标签页布局 */}
       <Modal
         isOpen={showModal}
         onClose={() => setShowModal(false)}
         title={editingChar ? '编辑角色' : '新建角色'}
-        size="lg"
+        size="xl"
       >
         <div className="space-y-4">
-          <Input
-            label="角色名称 *"
-            value={formData.name}
-            onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-            placeholder="输入角色名称"
-          />
-          <div className="grid grid-cols-2 gap-4">
-            <Input
-              label="角色定位"
-              value={formData.role}
-              onChange={(e) => setFormData({ ...formData, role: e.target.value })}
-              placeholder="如：主角 / 反派 / 配角"
-            />
-            <div>
-              <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>状态</label>
-              <select
-                className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'bg-white border-gray-300 text-gray-800'}`}
-                value={formData.status}
-                onChange={(e) => setFormData({ ...formData, status: e.target.value as Character['status'] })}
+          {/* 标签页导航 */}
+          <div className={`flex border-b ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+            {[
+              { key: 'basic', label: '基础信息', icon: User },
+              { key: 'appearance', label: '外观性格', icon: Heart },
+              { key: 'voice', label: '语言风格', icon: MessageSquare },
+              { key: 'agent', label: 'Agent 配置', icon: Bot },
+            ].map((tab) => (
+              <button
+                key={tab.key}
+                onClick={() => setActiveTab(tab.key as typeof activeTab)}
+                className={`flex items-center gap-1.5 px-4 py-2.5 text-sm font-medium border-b-2 transition-colors ${
+                  activeTab === tab.key
+                    ? `border-blue-500 ${isDark ? 'text-blue-400' : 'text-blue-600'}`
+                    : `border-transparent ${isDark ? 'text-gray-400 hover:text-gray-300' : 'text-gray-500 hover:text-gray-700'}`
+                }`}
               >
-                <option value="active">活跃</option>
-                <option value="inactive">不活跃</option>
-                <option value="dead">已故</option>
-                <option value="paused">暂停</option>
-              </select>
-            </div>
+                <tab.icon size={14} />
+                {tab.label}
+              </button>
+            ))}
           </div>
-          <TextArea
-            label="角色描述 *"
-            value={formData.description}
-            onChange={(e) => setFormData({ ...formData, description: e.target.value })}
-            placeholder="描述角色的基本情况..."
-          />
-          <TextArea
-            label="性格特点"
-            value={formData.personality || ''}
-            onChange={(e) => setFormData({ ...formData, personality: e.target.value })}
-            placeholder="描述角色的性格、习惯、口头禅等..."
-          />
-          <TextArea
-            label="说话风格"
-            value={formData.speech_pattern || ''}
-            onChange={(e) => setFormData({ ...formData, speech_pattern: e.target.value })}
-            placeholder="如：简短凌厉、爱反问、喜欢古风措辞"
-          />
-          <Input
-            label="常用词汇"
-            value={lexiconInput}
-            onChange={(e) => setLexiconInput(e.target.value)}
-            placeholder="用逗号分隔，如：江湖，义气，动手"
-          />
-          <Input
-            label="禁用词"
-            value={forbiddenWordsInput}
-            onChange={(e) => setForbiddenWordsInput(e.target.value)}
-            placeholder="用逗号分隔，如：斟酌，考量，之乎者也"
-          />
-          <TextArea
-            label="预置声音样本"
-            value={voiceSamplesInput}
-            onChange={(e) => setVoiceSamplesInput(e.target.value)}
-            placeholder="每行一条典型台词"
-          />
 
-          {/* Agent 配置区域 */}
-          <div className={`pt-4 mt-4 border-t ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
-            <div className="flex items-center gap-2 mb-3">
-              <Bot size={18} className={isDark ? 'text-purple-400' : 'text-purple-600'} />
-              <h3 className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>角色 Agent 配置</h3>
-            </div>
-            <p className={`text-sm mb-3 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
-              启用后，该角色将拥有独立的 Agent，可参与故事发展和对话
-            </p>
-
-            <label className={`flex items-center gap-2 mb-4 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
-              <input
-                type="checkbox"
-                checked={formData.has_agent || false}
-                onChange={(e) => setFormData({ ...formData, has_agent: e.target.checked })}
-                className="w-4 h-4 rounded"
-              />
-              <span>启用角色 Agent</span>
-            </label>
-
-            {formData.has_agent && (
-              <div className="space-y-4 pl-6 border-l-2 border-purple-500/30">
-                <label className={`flex items-center gap-2 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
-                  <input
-                    type="checkbox"
-                    checked={formData.agent_enabled ?? true}
-                    onChange={(e) => setFormData({ ...formData, agent_enabled: e.target.checked })}
-                    className="w-4 h-4 rounded"
+          {/* 标签页内容 */}
+          <div className="max-h-[60vh] overflow-y-auto pr-2">
+            {/* 基础信息 Tab */}
+            {activeTab === 'basic' && (
+              <div className="space-y-4">
+                <div className="grid grid-cols-2 gap-4">
+                  <Input
+                    label="角色名称 *"
+                    value={formData.name}
+                    onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+                    placeholder="输入角色名称"
                   />
-                  <span>Agent 激活状态</span>
-                </label>
+                  <div>
+                    <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+                      性别
+                    </label>
+                    <select
+                      className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'bg-white border-gray-300 text-gray-800'}`}
+                      value={formData.gender || ''}
+                      onChange={(e) => setFormData({ ...formData, gender: e.target.value })}
+                    >
+                      <option value="">未知</option>
+                      <option value="male">男</option>
+                      <option value="female">女</option>
+                      <option value="other">其他</option>
+                    </select>
+                  </div>
+                </div>
 
+                {/* 角色重要性层级 */}
                 <div>
-                  <label className={`block text-sm mb-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>
-                    <Target size={14} className="inline mr-1" /> Agent 目标
+                  <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+                    <Crown size={14} className="inline mr-1" /> 角色重要性层级
                   </label>
-                  <TextArea
-                    value={agentGoalsInput}
-                    onChange={(e) => setAgentGoalsInput(e.target.value)}
-                    placeholder="每行一个目标，如：&#10;保护主角安全&#10;寻找失散的家人&#10;提升自身实力"
-                    rows={3}
-                  />
+                  <select
+                    className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'bg-white border-gray-300 text-gray-800'}`}
+                    value={formData.importance_tier || CharacterImportanceTier.NPC}
+                    onChange={(e) => setFormData({ ...formData, importance_tier: e.target.value as CharacterImportanceTier })}
+                  >
+                    <optgroup label="主角层 (Tier 1) - 故事核心">
+                      <option value={CharacterImportanceTier.PROTAGONIST}>主角 - 故事核心，所有剧情围绕其展开</option>
+                      <option value={CharacterImportanceTier.CO_PROTAGONIST}>共同主角 - 与主角同等重要</option>
+                    </optgroup>
+                    <optgroup label="核心配角层 (Tier 2) - 贯穿全文">
+                      <option value={CharacterImportanceTier.DEUTERAGONIST}>第二主角 - 重要性仅次于主角</option>
+                      <option value={CharacterImportanceTier.MENTOR}>导师/引路人 - 指导主角成长</option>
+                      <option value={CharacterImportanceTier.LOVE_INTEREST}>恋爱对象 - 主角感情线核心</option>
+                      <option value={CharacterImportanceTier.BEST_FRIEND}>挚友/跟班 - 主角最亲密的伙伴</option>
+                      <option value={CharacterImportanceTier.ARCHENEMY}>宿敌/主要反派 - 贯穿全文的反派BOSS</option>
+                    </optgroup>
+                    <optgroup label="重要配角层 (Tier 3) - 有独立剧情线">
+                      <option value={CharacterImportanceTier.MAJOR_ALLY}>重要盟友</option>
+                      <option value={CharacterImportanceTier.MAJOR_ANTAGONIST}>重要反派 - 阶段性BOSS</option>
+                      <option value={CharacterImportanceTier.RIVAL}>竞争对手</option>
+                      <option value={CharacterImportanceTier.FAMILY_MEMBER}>家人</option>
+                      <option value={CharacterImportanceTier.GUARDIAN}>守护者</option>
+                    </optgroup>
+                    <optgroup label="阶段性角色层 (Tier 4)">
+                      <option value={CharacterImportanceTier.ARC_ANTAGONIST}>篇章反派</option>
+                      <option value={CharacterImportanceTier.ARC_ALLY}>篇章盟友</option>
+                      <option value={CharacterImportanceTier.RECURRING}>常驻配角</option>
+                      <option value={CharacterImportanceTier.CATALYST}>催化剂角色 - 推动剧情转折</option>
+                      <option value={CharacterImportanceTier.MYSTERY_FIGURE}>神秘人物</option>
+                    </optgroup>
+                    <optgroup label="功能性角色层 (Tier 5)">
+                      <option value={CharacterImportanceTier.MINION}>爪牙/手下</option>
+                      <option value={CharacterImportanceTier.INFORMANT}>消息提供者</option>
+                      <option value={CharacterImportanceTier.COMIC_RELIEF}>喜剧担当</option>
+                      <option value={CharacterImportanceTier.VICTIM}>受害者</option>
+                    </optgroup>
+                    <optgroup label="背景层 (Tier 6)">
+                      <option value={CharacterImportanceTier.NPC}>NPC - 路人角色</option>
+                      <option value={CharacterImportanceTier.BACKGROUND}>背景人物</option>
+                      <option value={CharacterImportanceTier.CAMEO}>客串</option>
+                    </optgroup>
+                  </select>
+                  <p className={`mt-1 text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+                    层级越高，Agent 在生成剧情时越优先考虑该角色
+                  </p>
                 </div>
 
                 <div>
-                  <label className={`block text-sm mb-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>
-                    <Brain size={14} className="inline mr-1" /> Agent 记忆要点
+                  <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>状态</label>
+                  <select
+                    className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'bg-white border-gray-300 text-gray-800'}`}
+                    value={formData.status}
+                    onChange={(e) => setFormData({ ...formData, status: e.target.value as Character['status'] })}
+                  >
+                    <option value="active">活跃</option>
+                    <option value="inactive">不活跃</option>
+                    <option value="dead">已故</option>
+                    <option value="ghost">幽灵</option>
+                    <option value="resurrected">复活</option>
+                    <option value="paused">暂停</option>
+                  </select>
+                </div>
+
+                <TextArea
+                  label="角色描述 *"
+                  value={formData.description}
+                  onChange={(e) => setFormData({ ...formData, description: e.target.value })}
+                  placeholder="描述角色的基本情况..."
+                  rows={3}
+                />
+
+                <TextArea
+                  label="背景故事"
+                  value={formData.background_story || ''}
+                  onChange={(e) => setFormData({ ...formData, background_story: e.target.value })}
+                  placeholder="角色的背景故事、经历..."
+                  rows={4}
+                />
+              </div>
+            )}
+
+            {/* 外观性格 Tab */}
+            {activeTab === 'appearance' && (
+              <div className="space-y-4">
+                {/* AI 生成按钮 */}
+                <div className={`p-4 rounded-lg ${isDark ? 'bg-gradient-to-r from-purple-900/30 to-blue-900/30 border border-purple-700/30' : 'bg-gradient-to-r from-purple-50 to-blue-50 border border-purple-200'}`}>
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h4 className={`font-medium ${isDark ? 'text-purple-300' : 'text-purple-700'}`}>
+                        <Sparkles size={16} className="inline mr-1.5" />
+                        AI 智能生成
+                      </h4>
+                      <p className={`text-xs mt-1 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+                        由设定 Agent 根据角色信息自动生成外貌和性格设定
+                      </p>
+                    </div>
+                    <Button
+                      onClick={handleGenerateAppearanceAndPersonality}
+                      disabled={generatingPersonality || !editingChar?.id}
+                    >
+                      {generatingPersonality ? (
+                        <>
+                          <RefreshCw size={14} className="mr-1.5 animate-spin" />
+                          生成中...
+                        </>
+                      ) : (
+                        <>
+                          <Sparkles size={14} className="mr-1.5" />
+                          {editingChar?.id ? '生成外貌和性格' : '保存后可生成'}
+                        </>
+                      )}
+                    </Button>
+                  </div>
+                  {!editingChar?.id && (
+                    <p className={`text-xs mt-2 ${isDark ? 'text-yellow-400/80' : 'text-yellow-600'}`}>
+                      💡 新建角色请先保存后再使用 AI 生成功能
+                    </p>
+                  )}
+                </div>
+
+                <TextArea
+                  label="外貌描述"
+                  value={formData.appearance || ''}
+                  onChange={(e) => setFormData({ ...formData, appearance: e.target.value })}
+                  placeholder="描述角色的外貌特征、穿着打扮、气质等..."
+                  rows={3}
+                />
+
+                <TextArea
+                  label="性格特点"
+                  value={formData.personality || ''}
+                  onChange={(e) => setFormData({ ...formData, personality: e.target.value })}
+                  placeholder="描述角色的性格、习惯、价值观等..."
+                  rows={4}
+                />
+              </div>
+            )}
+
+            {/* 语言风格 Tab */}
+            {activeTab === 'voice' && (
+              <div className="space-y-4">
+                <TextArea
+                  label="说话风格"
+                  value={formData.speech_pattern || ''}
+                  onChange={(e) => setFormData({ ...formData, speech_pattern: e.target.value })}
+                  placeholder="如：简短凌厉、爱反问、喜欢古风措辞"
+                  rows={2}
+                />
+
+                <Input
+                  label="常用词汇"
+                  value={lexiconInput}
+                  onChange={(e) => setLexiconInput(e.target.value)}
+                  placeholder="用逗号分隔，如：江湖，义气，动手"
+                />
+
+                <Input
+                  label="禁用词"
+                  value={forbiddenWordsInput}
+                  onChange={(e) => setForbiddenWordsInput(e.target.value)}
+                  placeholder="用逗号分隔，如：斟酌，考量，之乎者也"
+                />
+
+                <TextArea
+                  label="预置声音样本"
+                  value={voiceSamplesInput}
+                  onChange={(e) => setVoiceSamplesInput(e.target.value)}
+                  placeholder="每行一条典型台词"
+                  rows={5}
+                />
+              </div>
+            )}
+
+            {/* Agent 配置 Tab */}
+            {activeTab === 'agent' && (
+              <div className="space-y-4">
+                <div className={`p-4 rounded-lg ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
+                  <p className={`text-sm mb-3 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+                    启用后，该角色将拥有独立的 Agent，可参与故事发展和对话
+                  </p>
+
+                  <label className={`flex items-center gap-2 mb-4 cursor-pointer ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+                    <input
+                      type="checkbox"
+                      checked={formData.has_agent || false}
+                      onChange={(e) => setFormData({ ...formData, has_agent: e.target.checked })}
+                      className="w-4 h-4 rounded"
+                    />
+                    <span className="font-medium">启用角色 Agent</span>
                   </label>
-                  <TextArea
-                    value={agentMemoryInput}
-                    onChange={(e) => setAgentMemoryInput(e.target.value)}
-                    placeholder="每行一个记忆要点，如：&#10;曾受过主角救命之恩&#10;知道一个重要秘密&#10;与反派有深仇大恨"
-                    rows={3}
-                  />
+
+                  {formData.has_agent && (
+                    <div className="space-y-4 pl-4 border-l-2 border-purple-500/30">
+                      <label className={`flex items-center gap-2 cursor-pointer ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+                        <input
+                          type="checkbox"
+                          checked={formData.agent_enabled ?? true}
+                          onChange={(e) => setFormData({ ...formData, agent_enabled: e.target.checked })}
+                          className="w-4 h-4 rounded"
+                        />
+                        <span>Agent 激活状态</span>
+                      </label>
+
+                      <div>
+                        <label className={`block text-sm mb-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>
+                          <Target size={14} className="inline mr-1" /> Agent 目标
+                        </label>
+                        <TextArea
+                          value={agentGoalsInput}
+                          onChange={(e) => setAgentGoalsInput(e.target.value)}
+                          placeholder="每行一个目标，如：&#10;保护主角安全&#10;寻找失散的家人&#10;提升自身实力"
+                          rows={4}
+                        />
+                      </div>
+
+                      <div>
+                        <label className={`block text-sm mb-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>
+                          <Brain size={14} className="inline mr-1" /> Agent 记忆要点
+                        </label>
+                        <TextArea
+                          value={agentMemoryInput}
+                          onChange={(e) => setAgentMemoryInput(e.target.value)}
+                          placeholder="每行一个记忆要点，如：&#10;曾受过主角救命之恩&#10;知道一个重要秘密&#10;与反派有深仇大恨"
+                          rows={4}
+                        />
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             )}
           </div>
 
-          <div className="flex justify-end gap-3 pt-4">
-            <Button variant="secondary" onClick={() => setShowModal(false)}>取消</Button>
-            <Button onClick={saveCharacter}>{editingChar ? '保存修改' : '创建角色'}</Button>
+          {/* 底部操作按钮 */}
+          <div className={`flex justify-between items-center pt-4 border-t ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+            <div className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+              {formData.has_agent && '✓ Agent 已启用'}
+            </div>
+            <div className="flex gap-3">
+              <Button variant="secondary" onClick={() => setShowModal(false)}>取消</Button>
+              <Button onClick={saveCharacter}>{editingChar ? '保存修改' : '创建角色'}</Button>
+            </div>
           </div>
         </div>
       </Modal>

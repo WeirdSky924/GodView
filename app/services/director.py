@@ -16,12 +16,36 @@ from app.agents.director.writer import WriterAgent
 from app.agents.procgen import ProcGenAgent
 # Removed circular import: qdrant_db will be imported lazily
 # from app.api.app import qdrant_db
-from app.models.character import Character
+from app.models.character import Character, CharacterStatus
 from app.models.world import World
 # Removed to fix circular import: DirectorWorkflow will be imported lazily
 # from app.services.workflow import DirectorWorkflow
 
 logger = logging.getLogger(__name__)
+
+
+class CharacterEvent:
+    """角色事件"""
+    CHARACTER_CREATED = "character_created"
+    CHARACTER_DIED = "character_died"
+    CHARACTER_RESURRECTED = "character_resurrected"
+    CHARACTER_STATUS_CHANGED = "character_status_changed"
+    CHARACTER_ADDED_TO_SCENE = "character_added_to_scene"
+    CHARACTER_REMOVED_FROM_SCENE = "character_removed_from_scene"
+    CHARACTER_PRESENCE_CHANGED = "character_presence_changed"
+
+    def __init__(
+        self,
+        event_type: str,
+        character_id: str,
+        character_name: str,
+        data: Optional[Dict[str, Any]] = None,
+    ):
+        self.event_type = event_type
+        self.character_id = character_id
+        self.character_name = character_name
+        self.data = data or {}
+        self.timestamp = datetime.utcnow()
 
 
 class DirectorSystem:
@@ -56,6 +80,11 @@ class DirectorSystem:
         self.character_agents: Dict[str, CharacterAgent] = {}
         self._model_factory: Optional[Callable] = None
 
+        # v8: 角色事件回调（用于通知工作流引擎）
+        self._character_event_callbacks: List[Callable[[CharacterEvent], None]] = []
+        # 角色死亡记录（用于剧情追踪）
+        self.dead_characters: List[Dict[str, Any]] = []
+
         logger.info(f"导演系统初始化完成 (世界 ID: {self.world_id})")
 
     async def initialize(
@@ -84,7 +113,7 @@ class DirectorSystem:
         logger.info("导演系统 Agent 初始化完成")
 
     async def start_chapter(self, title: str, goal: Optional[str] = None) -> Dict[str, Any]:
-        chapter_id = f"chapter_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+        chapter_id = str(uuid.uuid4())
 
         self.current_chapter = {
             "id": chapter_id,
@@ -264,30 +293,195 @@ class DirectorSystem:
         return {"success": False, "error": result.error}
 
     async def manage_hooks(self) -> Dict[str, Any]:
+        """
+        管理伏笔 - 根据当前剧情和未来规划管理伏笔的埋设与回收
+
+        功能：
+        1. 加载项目中已有的伏笔（从数据库）
+        2. 根据当前剧情状态决定是否需要新伏笔
+        3. 检查已有伏笔是否可以回收
+        4. 更新伏笔状态
+        """
         if not self.hook_manager:
             raise RuntimeError("导演系统未初始化")
 
-        available_hooks = await self._get_available_hooks()
-        triggered_hooks = await self._get_triggered_hooks()
-        pending_hooks = await self._get_pending_hooks()
+        # 从数据库加载现有伏笔
+        existing_hooks = await self._load_hooks_from_database()
 
+        # 分析当前剧情状态
+        plot_context = self._build_plot_context()
+
+        # 构建完整的输入
         result = await self.hook_manager.execute({
-            "available_hooks": available_hooks,
-            "triggered_hooks": triggered_hooks,
-            "pending_hooks": pending_hooks,
+            "existing_hooks": existing_hooks,  # 数据库中的伏笔
+            "hooks_planted_in_chapter": self.hooks_planted,  # 本章节埋设的伏笔
+            "hooks_resolved_in_chapter": self.hooks_resolved,  # 本章节回收的伏笔
+            "plot_context": plot_context,
             "current_scene": self._get_current_scene_description(),
-            "recent_events": [e.get("summary", "") for e in self.chapter_events[-3:]],
+            "recent_events": [e.get("summary", "") for e in self.chapter_events[-5:]],
+            "chapter_goal": self.current_chapter.get("goal") if self.current_chapter else None,
         })
 
         if result.success:
             decisions = result.data
+
+            # 处理新伏笔埋设
+            planted_hooks = []
             for hook_info in decisions.get("hooks_to_plant", []):
-                await self._plant_hook(hook_info)
+                hook_id = await self._plant_hook_with_details(hook_info)
+                planted_hooks.append(hook_id)
+
+            # 处理伏笔回收
+            resolved_hooks = []
             for hook_info in decisions.get("hooks_to_resolve", []):
-                await self._resolve_hook(hook_info)
+                await self._resolve_hook_with_details(hook_info)
+                resolved_hooks.append(hook_info.get("id"))
+
+            # 更新伏笔状态
+            for update in decisions.get("hooks_status_updates", []):
+                await self._update_hook_status_in_db(update)
+
             self.state_machine["phase"] = "hooks_managed"
-            return decisions
+
+            return {
+                "success": True,
+                "planted_hooks": planted_hooks,
+                "resolved_hooks": resolved_hooks,
+                "suggestions": decisions.get("suggestions", []),
+                "reasoning": decisions.get("reasoning", ""),
+            }
+
         return {"success": False, "error": result.error}
+
+    async def _load_hooks_from_database(self) -> List[Dict[str, Any]]:
+        """从数据库加载项目的伏笔"""
+        from app.api.app import postgres_db
+
+        if not postgres_db or not self.project_id:
+            return []
+
+        try:
+            # 获取所有状态的伏笔
+            planted = await postgres_db.get_hooks_by_status("planted", self.project_id)
+            triggered = await postgres_db.get_hooks_by_status("triggered", self.project_id)
+            pending = await postgres_db.get_hooks_by_status("pending", self.project_id)
+
+            all_hooks = planted + triggered + pending
+            return all_hooks
+        except Exception as e:
+            logger.warning(f"加载伏笔失败: {e}")
+            return []
+
+    def _build_plot_context(self) -> Dict[str, Any]:
+        """构建剧情上下文"""
+        return {
+            "main_plot_progress": self.main_plot_progress,
+            "current_chapter": self.current_chapter.get("title") if self.current_chapter else None,
+            "chapter_events_count": len(self.chapter_events),
+            "character_count": len(self.character_agents),
+            "active_characters": [char.name for char in [a.character for a in self.character_agents.values()]],
+        }
+
+    async def _plant_hook_with_details(self, hook_info: Dict[str, Any]) -> str:
+        """埋设伏笔并保存到数据库"""
+        import uuid
+        from app.api.app import postgres_db
+
+        hook_id = str(uuid.uuid4())
+
+        hook_data = {
+            "id": hook_id,
+            "title": hook_info.get("title", f"伏笔-{len(self.hooks_planted) + 1}"),
+            "project_id": self.project_id,
+            "world_id": self.world_id,
+            "description": hook_info.get("description", ""),
+            "hook_type": hook_info.get("hook_type", "suspense"),  # suspense, foreshadow, twist
+            "status": "planted",
+            "related_characters": hook_info.get("related_characters", []),
+            "related_locations": hook_info.get("related_locations", []),
+            "related_objects": hook_info.get("related_objects", []),
+            "plant_context": self._get_current_scene_description(),
+            "plant_chapter": self.current_chapter.get("id") if self.current_chapter else None,
+            "resolution_hint": hook_info.get("resolution_hint"),
+            "resolution_context": None,
+            "resolution_chapter": None,
+            "priority": hook_info.get("priority", 5),
+        }
+
+        # 保存到数据库
+        if postgres_db:
+            try:
+                await postgres_db.save_hook(hook_data)
+            except Exception as e:
+                logger.warning(f"保存伏笔到数据库失败: {e}")
+
+        # 更新内存状态
+        if hook_id not in self.hooks_planted:
+            self.hooks_planted.append(hook_id)
+
+        if self.current_chapter is not None:
+            current = self.current_chapter.setdefault("hooks_planted", [])
+            if hook_id not in current:
+                current.append(hook_id)
+
+        return hook_id
+
+    async def _resolve_hook_with_details(self, hook_info: Dict[str, Any]):
+        """回收伏笔并更新数据库"""
+        from app.api.app import postgres_db
+        from datetime import datetime
+
+        hook_id = hook_info.get("id")
+        if not hook_id:
+            return
+
+        # 更新数据库
+        if postgres_db:
+            try:
+                update_data = {
+                    "id": hook_id,
+                    "status": "resolved",
+                    "resolution_context": hook_info.get("resolution_context", self._get_current_scene_description()),
+                    "resolution_chapter": self.current_chapter.get("id") if self.current_chapter else None,
+                    "resolved_at": datetime.utcnow().isoformat(),
+                }
+                await postgres_db.save_hook(update_data)
+            except Exception as e:
+                logger.warning(f"更新伏笔状态失败: {e}")
+
+        # 更新内存状态
+        if hook_id in self.hooks_planted:
+            self.hooks_planted.remove(hook_id)
+        if hook_id not in self.hooks_resolved:
+            self.hooks_resolved.append(hook_id)
+
+        if self.current_chapter is not None:
+            planted = self.current_chapter.get("hooks_planted", [])
+            if hook_id in planted:
+                planted.remove(hook_id)
+
+            resolved = self.current_chapter.setdefault("hooks_resolved", [])
+            if hook_id not in resolved:
+                resolved.append(hook_id)
+
+    async def _update_hook_status_in_db(self, update: Dict[str, Any]):
+        """更新伏笔状态"""
+        from app.api.app import postgres_db
+
+        hook_id = update.get("id")
+        new_status = update.get("new_status")
+
+        if not hook_id or not new_status:
+            return
+
+        if postgres_db:
+            try:
+                await postgres_db.save_hook({
+                    "id": hook_id,
+                    "status": new_status,
+                })
+            except Exception as e:
+                logger.warning(f"更新伏笔状态失败: {e}")
 
     async def generate_narrative(
         self,
@@ -409,7 +603,7 @@ class DirectorSystem:
         is_branch: bool = False,
         branch_reason: Optional[str] = None,
     ) -> Dict[str, Any]:
-        snapshot_id = f"snapshot_{uuid.uuid4().hex[:12]}"
+        snapshot_id = str(uuid.uuid4())
         snapshot = {
             "id": snapshot_id,
             "world_id": self.world_id,
@@ -478,7 +672,7 @@ class DirectorSystem:
         affected_characters: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         return {
-            "id": f"intervention_{uuid.uuid4().hex[:12]}",
+            "id": str(uuid.uuid4()),
             "snapshot_id": snapshot_id,
             "intervention_type": intervention_type,
             "description": description,
@@ -507,7 +701,60 @@ class DirectorSystem:
 
     def _create_character_agent(self, char_data: Dict[str, Any]) -> CharacterAgent:
         model = self._model_factory() if self._model_factory else None
-        character = char_data if isinstance(char_data, Character) else Character(**char_data)
+
+        # 如果已经是 Character 对象，直接使用
+        if isinstance(char_data, Character):
+            return CharacterAgent(character=char_data, model=model, project_id=self.project_id)
+
+        # 处理类型转换
+        char_dict = dict(char_data)
+
+        # UUID 转 string - 处理所有可能的 UUID 字段
+        uuid_fields = ["id", "project_id", "world_id", "current_location"]
+        for field in uuid_fields:
+            if field in char_dict and char_dict[field] is not None and not isinstance(char_dict[field], str):
+                char_dict[field] = str(char_dict[field])
+
+        # personality_traits: 处理各种格式
+        if "personality_traits" in char_dict:
+            traits = char_dict["personality_traits"]
+            if isinstance(traits, dict):
+                # dict 格式转 list
+                traits_list = []
+                for key, value in traits.items():
+                    if isinstance(value, dict):
+                        traits_list.append({"name": key, "value": value.get("value", 0.5), "description": value.get("description", "")})
+                    elif isinstance(value, (int, float)):
+                        traits_list.append({"name": key, "value": float(value)})
+                    else:
+                        traits_list.append({"name": key, "value": 0.5})
+                char_dict["personality_traits"] = traits_list
+            elif isinstance(traits, list):
+                # 确保列表元素是正确的格式
+                traits_list = []
+                for t in traits:
+                    if isinstance(t, dict):
+                        if "name" in t:
+                            traits_list.append({"name": t["name"], "value": t.get("value", 0.5), "description": t.get("description")})
+                    elif isinstance(t, str):
+                        traits_list.append({"name": t, "value": 0.5})
+                char_dict["personality_traits"] = traits_list
+        else:
+            char_dict["personality_traits"] = []
+
+        # 确保其他必要字段存在
+        if "name" not in char_dict:
+            char_dict["name"] = char_dict.get("id", "未知角色")
+        if "role" not in char_dict:
+            char_dict["role"] = "npc"
+        if "status" not in char_dict:
+            char_dict["status"] = "active"
+
+        # 确保有 background 字段（兼容 background_story）
+        if "background_story" in char_dict and "background" not in char_dict:
+            char_dict["background"] = char_dict.pop("background_story")
+
+        character = Character(**char_dict)
         return CharacterAgent(character=character, model=model, project_id=self.project_id)
 
     def _build_fallback_character(self, speaker_id: str) -> Dict[str, Any]:
@@ -749,8 +996,24 @@ class DirectorSystem:
     def _get_active_hooks(self) -> List[str]:
         return list(self.hooks_planted)
 
-    async def _get_pending_hooks(self) -> List[str]:
-        return [hook for hook in self.hooks_planted if hook not in self.hooks_resolved]
+    async def _get_pending_hooks(self) -> List[Dict[str, Any]]:
+        """获取待回收伏笔的详细信息（字典列表）"""
+        from app.api.app import postgres_db
+
+        pending_ids = [hook for hook in self.hooks_planted if hook not in self.hooks_resolved]
+
+        # 如果有数据库连接，从数据库获取完整信息
+        if postgres_db and pending_ids:
+            try:
+                all_hooks = await postgres_db.get_hooks_by_status("planted", self.project_id)
+                all_hooks += await postgres_db.get_hooks_by_status("triggered", self.project_id)
+                # 过滤出 pending_ids 中的伏笔
+                return [h for h in all_hooks if h.get("id") in pending_ids]
+            except Exception as e:
+                logger.warning(f"获取伏笔详情失败: {e}")
+
+        # 回退：返回基本信息
+        return [{"id": hook_id, "title": f"伏笔-{hook_id[:8]}", "priority": 5} for hook_id in pending_ids]
 
     async def _get_available_hooks(self) -> List[Dict[str, Any]]:
         return [{"id": hook_id, "status": "planted"} for hook_id in self.hooks_planted]
@@ -767,7 +1030,19 @@ class DirectorSystem:
         return self.current_chapter.get("goal", "") or self.current_chapter.get("title", "")
 
     async def _plant_hook(self, hook_info: Dict[str, Any]):
-        hook_id = hook_info.get("id") or hook_info.get("title") or f"hook_{len(self.hooks_planted)}"
+        # 生成有效的 UUID
+        provided_id = hook_info.get("id")
+        if provided_id:
+            # 验证是否为有效 UUID
+            try:
+                uuid.UUID(str(provided_id))
+                hook_id = str(provided_id)
+            except (ValueError, TypeError):
+                # 不是有效 UUID，生成新的
+                hook_id = str(uuid.uuid4())
+        else:
+            hook_id = str(uuid.uuid4())
+
         if hook_id not in self.hooks_planted:
             self.hooks_planted.append(hook_id)
         if self.current_chapter is not None:
@@ -820,7 +1095,7 @@ class DirectorSystem:
         """
         character_id = character_data.get("id")
         if not character_id:
-            character_id = f"char_{uuid.uuid4().hex[:12]}"
+            character_id = str(uuid.uuid4())
             character_data["id"] = character_id
 
         # 检查是否已存在
@@ -835,6 +1110,14 @@ class DirectorSystem:
         self.character_agents[character_id] = agent
 
         logger.info(f"角色 '{character_data.get('name', character_id)}' 已添加到导演系统")
+
+        # 发送角色创建事件
+        self._emit_character_event(CharacterEvent(
+            event_type=CharacterEvent.CHARACTER_CREATED,
+            character_id=character_id,
+            character_name=agent.character.name,
+            data={"role": agent.character.role, "source": "dynamic"},
+        ))
 
         return {
             "success": True,
@@ -870,6 +1153,255 @@ class DirectorSystem:
             "character_id": character_id,
             "name": character_name,
         }
+
+    def update_character_status(
+        self,
+        character_id: str,
+        new_status: CharacterStatus,
+        reason: Optional[str] = None,
+        death_detail: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        更新角色状态
+
+        Args:
+            character_id: 角色 ID
+            new_status: 新状态
+            reason: 状态变更原因
+            death_detail: 死亡详情（死亡时可选）
+
+        Returns:
+            Dict: 更新结果
+        """
+        if character_id not in self.character_agents:
+            return {
+                "success": False,
+                "error": f"角色 {character_id} 不存在",
+            }
+
+        agent = self.character_agents[character_id]
+        old_status = agent.character.status
+        agent.character.status = new_status
+
+        logger.info(f"角色 '{agent.character.name}' 状态变更: {old_status} -> {new_status}")
+
+        # 发送状态变更事件
+        self._emit_character_event(CharacterEvent(
+            event_type=CharacterEvent.CHARACTER_STATUS_CHANGED,
+            character_id=character_id,
+            character_name=agent.character.name,
+            data={
+                "old_status": old_status.value if hasattr(old_status, 'value') else str(old_status),
+                "new_status": new_status.value,
+                "reason": reason,
+            },
+        ))
+
+        # 如果是死亡状态，记录到死亡列表并设置在场形式
+        if new_status == CharacterStatus.DEAD:
+            from app.models.character import DeathDetail, CharacterPresence
+
+            # 设置死亡详情
+            if death_detail:
+                agent.character.death_detail = DeathDetail(**death_detail)
+            else:
+                agent.character.death_detail = DeathDetail(
+                    cause=reason,
+                    is_confirmed=True,
+                )
+
+            # 死亡角色可用的在场形式：回忆、闪回、尸体、被提及
+            agent.character.available_presence_types = [
+                CharacterPresence.MEMORY,
+                CharacterPresence.FLASHBACK,
+                CharacterPresence.CORPSE,
+                CharacterPresence.MENTIONED,
+                CharacterPresence.SPIRIT,  # 如果设定允许灵魂
+            ]
+
+            self.dead_characters.append({
+                "id": character_id,
+                "name": agent.character.name,
+                "death_time": datetime.utcnow().isoformat(),
+                "reason": reason,
+                "death_detail": agent.character.death_detail.model_dump() if agent.character.death_detail else None,
+            })
+            self._emit_character_event(CharacterEvent(
+                event_type=CharacterEvent.CHARACTER_DIED,
+                character_id=character_id,
+                character_name=agent.character.name,
+                data={"reason": reason, "death_detail": death_detail},
+            ))
+
+        # 如果是复活状态
+        elif new_status == CharacterStatus.RESURRECTED:
+            from app.models.character import CharacterPresence
+
+            # 清除死亡详情
+            agent.character.death_detail = None
+            # 恢复正常在场形式
+            agent.character.available_presence_types = [
+                CharacterPresence.PRESENT,
+            ]
+
+            self._emit_character_event(CharacterEvent(
+                event_type=CharacterEvent.CHARACTER_RESURRECTED,
+                character_id=character_id,
+                character_name=agent.character.name,
+                data={"reason": reason},
+            ))
+
+        return {
+            "success": True,
+            "character_id": character_id,
+            "name": agent.character.name,
+            "old_status": old_status.value if hasattr(old_status, 'value') else str(old_status),
+            "new_status": new_status.value,
+        }
+
+    def mark_character_dead(
+        self,
+        character_id: str,
+        reason: Optional[str] = None,
+        death_chapter: Optional[str] = None,
+        death_scene: Optional[str] = None,
+        witnesses: Optional[List[str]] = None,
+        resurrection_possible: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        标记角色死亡
+
+        Args:
+            character_id: 角色 ID
+            reason: 死亡原因
+            death_chapter: 死亡章节
+            death_scene: 死亡场景描述
+            witnesses: 目击者列表
+            resurrection_possible: 是否可能复活
+
+        Returns:
+            Dict: 结果
+        """
+        death_detail = {
+            "cause": reason,
+            "death_chapter": death_chapter,
+            "death_scene": death_scene,
+            "witnesses": witnesses or [],
+            "resurrection_possible": resurrection_possible,
+        }
+        return self.update_character_status(
+            character_id=character_id,
+            new_status=CharacterStatus.DEAD,
+            reason=reason,
+            death_detail=death_detail,
+        )
+
+    def resurrect_character(
+        self,
+        character_id: str,
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        复活角色
+
+        Args:
+            character_id: 角色 ID
+            reason: 复活原因
+
+        Returns:
+            Dict: 结果
+        """
+        if character_id not in self.character_agents:
+            return {
+                "success": False,
+                "error": f"角色 {character_id} 不存在",
+            }
+
+        agent = self.character_agents[character_id]
+        if agent.character.status != CharacterStatus.DEAD:
+            return {
+                "success": False,
+                "error": f"角色 {agent.character.name} 未处于死亡状态",
+            }
+
+        return self.update_character_status(
+            character_id=character_id,
+            new_status=CharacterStatus.RESURRECTED,
+            reason=reason,
+        )
+
+    def get_character_by_presence(
+        self,
+        presence_type: str,
+    ) -> List[CharacterAgent]:
+        """
+        根据在场形式获取角色列表
+
+        Args:
+            presence_type: 在场形式 (present/memory/flashback/spirit/corpse/mentioned)
+
+        Returns:
+            List[CharacterAgent]: 符合条件的角色列表
+        """
+        from app.models.character import CharacterPresence
+
+        try:
+            presence = CharacterPresence(presence_type)
+        except ValueError:
+            presence = CharacterPresence.PRESENT
+
+        result = []
+        for agent in self.character_agents.values():
+            if presence in agent.character.available_presence_types:
+                result.append(agent)
+        return result
+
+    def get_active_character_agents(self) -> Dict[str, CharacterAgent]:
+        """
+        获取所有活跃状态的 CharacterAgent
+
+        Returns:
+            Dict: 活跃角色 Agent 字典
+        """
+        return {
+            char_id: agent
+            for char_id, agent in self.character_agents.items()
+            if agent.character.status == CharacterStatus.ACTIVE
+        }
+
+    def get_character_agent(self, character_id: str) -> Optional[CharacterAgent]:
+        """
+        获取指定角色的 CharacterAgent
+
+        Args:
+            character_id: 角色 ID
+
+        Returns:
+            CharacterAgent 或 None
+        """
+        return self.character_agents.get(character_id)
+
+    def register_character_event_callback(self, callback: Callable[[CharacterEvent], None]):
+        """
+        注册角色事件回调
+
+        Args:
+            callback: 回调函数，接收 CharacterEvent 参数
+        """
+        self._character_event_callbacks.append(callback)
+
+    def _emit_character_event(self, event: CharacterEvent):
+        """
+        发送角色事件到所有注册的回调
+
+        Args:
+            event: 角色事件
+        """
+        for callback in self._character_event_callbacks:
+            try:
+                callback(event)
+            except Exception as e:
+                logger.error(f"角色事件回调执行失败: {e}")
 
     def get_all_characters(self) -> List[Dict[str, Any]]:
         """
@@ -1006,17 +1538,17 @@ class DirectorSystem:
 
     async def start_auto_mode(
         self,
-        initial_plot: str,
+        workflow_id: str,
         chapter_count: int = 3,
         words_per_chapter: int = 2000,
         style_reference: Optional[str] = None,
         callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
         """
-        启动全自动创作模式
+        启动连续创作模式 - 基于工作流循环执行
 
         Args:
-            initial_plot: 初始剧情设定/大纲
+            workflow_id: 工作流ID
             chapter_count: 目标章节数
             words_per_chapter: 每章目标字数
             style_reference: 风格参考文本
@@ -1040,19 +1572,28 @@ class DirectorSystem:
         }
 
         try:
-            # 1. 初始剧情规划
+            # 获取工作流定义
+            from app.services.workflow_engine import get_workflow_engine
+            from app.api.app import postgres_db
+
+            engine = get_workflow_engine()
+            workflow = await engine.get_workflow(workflow_id, postgres_db)
+
+            if not workflow:
+                return {"success": False, "error": f"工作流不存在: {workflow_id}"}
+
+            # 1. 基于项目状态规划剧情
             if callback:
-                callback("phase", {"phase": "plot_planning", "message": "正在规划整体剧情..."})
+                callback("phase", {"phase": "plot_planning", "message": "正在基于项目规划剧情..."})
 
             plot_plan = await self._plan_overall_plot(
-                initial_plot=initial_plot,
                 chapter_count=chapter_count,
             )
 
             if callback:
                 callback("plot_planned", {"plan": plot_plan})
 
-            # 2. 逐章生成
+            # 2. 逐章执行工作流
             for chapter_num in range(1, chapter_count + 1):
                 if self._auto_stop_flag:
                     if callback:
@@ -1060,7 +1601,7 @@ class DirectorSystem:
                     break
 
                 chapter_title = f"第{chapter_num}章 {plot_plan.get('chapter_titles', [f'第{chapter_num}章'])[chapter_num - 1] if chapter_num <= len(plot_plan.get('chapter_titles', [])) else f'第{chapter_num}章'}"
-                chapter_goal = plot_plan.get("chapter_goals", [initial_plot])[chapter_num - 1] if chapter_num <= len(plot_plan.get("chapter_goals", [])) else initial_plot
+                chapter_goal = plot_plan.get("chapter_goals", ["推进剧情发展"])[chapter_num - 1] if chapter_num <= len(plot_plan.get("chapter_goals", [])) else "推进剧情发展"
 
                 if callback:
                     callback("chapter_start", {
@@ -1069,93 +1610,116 @@ class DirectorSystem:
                         "goal": chapter_goal,
                     })
 
-                # 2.1 剧情推进
-                if callback:
-                    callback("agent_working", {"agent": "Master Plotter", "message": "正在推进剧情..."})
+                # 设置工作流执行上下文
+                initial_context = {
+                    "chapter_num": chapter_num,
+                    "chapter_title": chapter_title,
+                    "chapter_goal": chapter_goal,
+                    "target_word_count": words_per_chapter,
+                    "style_reference": style_reference,
+                }
 
-                plot_result = await self.advance_plot()
-                results["plots_advanced"].append(plot_result)
+                # 执行工作流
+                try:
+                    if not self.project_id:
+                        logger.error("无法获取项目ID，导演系统未正确初始化")
+                        results["error"] = "无法获取项目ID"
+                        break
 
-                if callback:
-                    callback("plot_advanced", {"chapter_num": chapter_num, "result": plot_result})
+                    execution_id = await engine.execute_workflow(
+                        workflow_id,
+                        self.project_id,
+                        initial_context,
+                        postgres_db,
+                    )
 
-                # 2.2 伏笔管理
-                if callback:
-                    callback("agent_working", {"agent": "Hook Manager", "message": "正在管理伏笔..."})
+                    # 等待工作流完成（简化版：直接运行到结束）
+                    execution = await engine.get_execution_state(execution_id, postgres_db)
 
-                hooks_result = await self.manage_hooks()
-                if hooks_result.get("hooks_to_plant"):
-                    results["hooks_planted"].extend(hooks_result["hooks_to_plant"])
-                if hooks_result.get("hooks_to_resolve"):
-                    results["hooks_resolved"].extend(hooks_result["hooks_to_resolve"])
+                    if execution and execution.status == "completed":
+                        # 获取工作流输出
+                        chapter_content = execution.context.get("chapter_content", "")
+                        word_count = len(chapter_content) if chapter_content else 0
 
-                if callback:
-                    callback("hooks_managed", {"chapter_num": chapter_num, "result": hooks_result})
+                        if chapter_content:
+                            results["chapters"].append({
+                                "chapter_num": chapter_num,
+                                "title": chapter_title,
+                                "content": chapter_content,
+                                "word_count": word_count,
+                            })
+                            results["total_words"] += word_count
 
-                # 2.3 自动写作章节
-                if callback:
-                    callback("agent_working", {"agent": "Writer", "message": f"正在写作: {chapter_title}..."})
+                            if callback:
+                                callback("chapter_completed", {
+                                    "chapter_num": chapter_num,
+                                    "title": chapter_title,
+                                    "word_count": word_count,
+                                    "content": chapter_content,
+                                })
+                    else:
+                        # 工作流执行失败，使用备用方案：直接调用 Director 方法
+                        if callback:
+                            callback("agent_working", {"agent": "Writer", "message": f"正在写作: {chapter_title}..."})
 
-                chapter_result = await self.auto_write_chapter(
-                    chapter_title=chapter_title,
-                    chapter_goal=chapter_goal,
-                    target_word_count=words_per_chapter,
-                    style_reference=style_reference,
-                )
+                        chapter_result = await self.auto_write_chapter(
+                            chapter_title=chapter_title,
+                            chapter_goal=chapter_goal,
+                            target_word_count=words_per_chapter,
+                            style_reference=style_reference,
+                        )
 
-                if chapter_result.get("success"):
-                    results["chapters"].append(chapter_result)
-                    results["total_words"] += chapter_result.get("word_count", 0)
+                        if chapter_result.get("success"):
+                            results["chapters"].append(chapter_result)
+                            results["total_words"] += chapter_result.get("word_count", 0)
 
-                    if callback:
-                        callback("chapter_completed", {
-                            "chapter_num": chapter_num,
-                            "title": chapter_title,
-                            "word_count": chapter_result.get("word_count", 0),
-                            "content": chapter_result.get("content", ""),
-                        })
-                else:
+                            if callback:
+                                callback("chapter_completed", {
+                                    "chapter_num": chapter_num,
+                                    "title": chapter_title,
+                                    "word_count": chapter_result.get("word_count", 0),
+                                    "content": chapter_result.get("content", ""),
+                                })
+
+                except Exception as e:
+                    logger.error(f"工作流执行失败: {e}")
                     if callback:
                         callback("chapter_error", {
                             "chapter_num": chapter_num,
-                            "error": chapter_result.get("error"),
+                            "error": str(e),
                         })
 
-                # 2.4 章节评估
-                if callback:
-                    callback("agent_working", {"agent": "Evaluator", "message": "正在评估章节..."})
-
-                evaluation = await self.check_chapter_end()
-                if callback:
-                    callback("chapter_evaluated", {"chapter_num": chapter_num, "evaluation": evaluation})
-
-                # 2.5 创建快照
+                # 创建快照
                 snapshot = await self.create_snapshot(
                     snapshot_type="auto_chapter",
-                    name=f"{chapter_title} 自动快照",
+                    branch_reason=f"连续创作 - {chapter_title}",
                 )
                 if callback:
-                    callback("snapshot_created", {"chapter_num": chapter_num, "snapshot_id": snapshot.get("id")})
-
-            # 3. 完成
-            self._auto_running = False
-            if callback:
-                callback("completed", {
-                    "total_chapters": len(results["chapters"]),
-                    "total_words": results["total_words"],
-                    "plots_count": len(results["plots_advanced"]),
-                    "hooks_planted": len(results["hooks_planted"]),
-                    "hooks_resolved": len(results["hooks_resolved"]),
-                })
-
-            return {"success": True, **results}
+                    callback("snapshot_created", {"snapshot_id": snapshot.get("id", "")})
 
         except Exception as e:
-            self._auto_running = False
-            logger.error(f"自动模式运行失败: {e}")
+            logger.error(f"连续创作模式运行失败: {e}")
             if callback:
                 callback("error", {"error": str(e)})
             return {"success": False, "error": str(e)}
+
+        finally:
+            self._auto_running = False
+            self._auto_stop_flag = False
+
+        if callback:
+            callback("completed", {
+                "total_chapters": len(results["chapters"]),
+                "total_words": results["total_words"],
+                "hooks_planted": len(results["hooks_planted"]),
+                "hooks_resolved": len(results["hooks_resolved"]),
+            })
+
+        return {
+            "success": True,
+            "chapters": results["chapters"],
+            "total_words": results["total_words"],
+        }
 
     def stop_auto_mode(self):
         """停止自动运行模式"""
@@ -1167,41 +1731,39 @@ class DirectorSystem:
 
     async def _plan_overall_plot(
         self,
-        initial_plot: str,
         chapter_count: int,
     ) -> Dict[str, Any]:
         """
-        规划整体剧情大纲
+        基于项目状态规划整体剧情大纲
 
         Args:
-            initial_plot: 初始剧情设定
             chapter_count: 章节数量
 
         Returns:
             Dict: 剧情规划结果
         """
+        # 构建项目上下文
+        project_context = self._build_project_context()
+
         if not self.master_plotter:
-            # 如果没有 Master Plotter，返回简单规划
+            # 如果没有 Master Plotter，返回基于项目状态的简单规划
             return {
                 "chapter_titles": [f"第{i+1}章" for i in range(chapter_count)],
-                "chapter_goals": [initial_plot for _ in range(chapter_count)],
+                "chapter_goals": [project_context.get("story_direction", "推进剧情发展") for _ in range(chapter_count)],
             }
-
-        # 获取角色信息
-        characters_summary = []
-        for char_id, agent in self.character_agents.items():
-            characters_summary.append(f"{agent.character.name}（{agent.character.role}）")
-
-        # 获取世界观信息
-        world_info = self._build_world_payload()
 
         result = await self.master_plotter.execute({
             "task": "plan_plot",
-            "initial_plot": initial_plot,
             "chapter_count": chapter_count,
-            "characters": characters_summary,
-            "world_info": world_info,
+            "project_context": project_context,
+            "characters": project_context.get("characters", []),
+            "world_info": project_context.get("world_info", {}),
             "main_plot_progress": self.main_plot_progress,
+            "current_state": {
+                "hooks_planted": self.hooks_planted,
+                "hooks_resolved": self.hooks_resolved,
+                "current_chapter": self.current_chapter,
+            },
         })
 
         if result.success:
@@ -1210,8 +1772,82 @@ class DirectorSystem:
         # 回退到简单规划
         return {
             "chapter_titles": [f"第{i+1}章" for i in range(chapter_count)],
-            "chapter_goals": [initial_plot for _ in range(chapter_count)],
+            "chapter_goals": [project_context.get("story_direction", "推进剧情发展") for _ in range(chapter_count)],
         }
+
+    def _build_project_context(self) -> Dict[str, Any]:
+        """
+        构建项目上下文，用于剧情规划
+
+        Returns:
+            Dict: 项目上下文信息
+        """
+        # 获取角色信息
+        characters_info = []
+        for char_id, agent in self.character_agents.items():
+            char = agent.character
+            characters_info.append({
+                "id": char_id,
+                "name": char.name,
+                "role": char.role,
+                "description": char.description or "",
+                "background": char.background_story or "",
+                "goals": char.goals or [],
+            })
+
+        # 获取世界观信息
+        world_info = self._build_world_payload()
+
+        # 构建故事方向
+        story_direction = self._infer_story_direction(characters_info, world_info)
+
+        return {
+            "characters": characters_info,
+            "world_info": world_info,
+            "story_direction": story_direction,
+            "regions": self.world_data.get("regions", []),
+            "hooks_pending": [h for h in self.hooks_planted if h not in self.hooks_resolved],
+        }
+
+    def _infer_story_direction(
+        self,
+        characters_info: List[Dict[str, Any]],
+        world_info: Dict[str, Any]
+    ) -> str:
+        """
+        基于角色和世界信息推断故事发展方向
+
+        Args:
+            characters_info: 角色信息列表
+            world_info: 世界观信息
+
+        Returns:
+            str: 故事方向描述
+        """
+        directions = []
+
+        # 从角色目标推断
+        main_char_goals = []
+        for char in characters_info:
+            if char.get("role") == "main" and char.get("goals"):
+                main_char_goals.extend(char["goals"])
+
+        if main_char_goals:
+            directions.append(f"主角目标：{', '.join(main_char_goals[:3])}")
+
+        # 从世界观推断
+        if world_info.get("name"):
+            directions.append(f"世界观：{world_info['name']}")
+
+        if self.hooks_planted:
+            pending_hooks = len(self.hooks_planted) - len(self.hooks_resolved)
+            if pending_hooks > 0:
+                directions.append(f"待回收伏笔：{pending_hooks} 个")
+
+        if directions:
+            return " | ".join(directions)
+
+        return "根据当前项目状态推进剧情发展"
 
     def _build_auto_write_prompt(
         self,

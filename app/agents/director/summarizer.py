@@ -10,6 +10,7 @@ from langchain_core.messages import HumanMessage
 
 from app.agents.base import BaseAgent, AgentResponse
 from app.models.agent_template import AgentType
+from app.models.token_usage import UsageCategory
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +73,7 @@ class SummarizerAgent(BaseAgent):
         Args:
             input_data: 包含以下字段
                 - dialogue_history: 对话历史列表
-                - participants: 参与角色列表
+                - participants: 参与角色列表（可以是字符串或字典）
                 - context: 当前情境
                 - active_hooks: 当前活跃的伏笔列表
 
@@ -85,17 +86,28 @@ class SummarizerAgent(BaseAgent):
             context = input_data.get("context", "")
             active_hooks = input_data.get("active_hooks", [])
 
+            # 规范化 participants：处理字典类型
+            normalized_participants = []
+            for p in participants:
+                if isinstance(p, dict):
+                    normalized_participants.append(p.get("name", p.get("title", "未知角色")))
+                elif isinstance(p, str):
+                    normalized_participants.append(p)
+                else:
+                    normalized_participants.append(str(p))
+
             # 构建用户消息
             user_message = self._build_user_message(
                 dialogue_history=dialogue_history,
-                participants=participants,
+                participants=normalized_participants,
                 context=context,
                 active_hooks=active_hooks,
             )
 
             # 调用 LLM
             response_text = await self._call_llm(
-                messages=[HumanMessage(content=user_message)], temperature=0.3
+                messages=[HumanMessage(content=user_message)], temperature=0.3,
+                category=UsageCategory.PLOT
             )
 
             # 解析响应
@@ -104,7 +116,7 @@ class SummarizerAgent(BaseAgent):
             return AgentResponse(
                 success=True,
                 data=result,
-                metadata={"participant_count": len(participants), "dialogue_turns": len(dialogue_history)},
+                metadata={"participant_count": len(normalized_participants), "dialogue_turns": len(dialogue_history)},
             )
 
         except Exception as e:
@@ -125,9 +137,10 @@ class SummarizerAgent(BaseAgent):
         if context:
             message_parts.append(f"【当前情境】\n{context}")
 
-        # 参与角色
+        # 参与角色（确保都是字符串）
         if participants:
-            message_parts.append(f"【参与角色】\n{', '.join(participants)}")
+            safe_participants = [str(p) if not isinstance(p, str) else p for p in participants]
+            message_parts.append(f"【参与角色】\n{', '.join(safe_participants)}")
 
         # 对话历史
         if dialogue_history:

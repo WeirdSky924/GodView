@@ -83,6 +83,7 @@ class AgentPromptService:
         agent_type: str,
         project_id: Optional[str] = None,
         variables: Optional[Dict[str, Any]] = None,
+        characters: Optional[List[Any]] = None,
     ) -> str:
         """
         构建 Agent 的完整 system prompt
@@ -91,6 +92,7 @@ class AgentPromptService:
             agent_type: Agent 类型
             project_id: 项目ID（用于加载写作规则等）
             variables: 模板变量
+            characters: 角色列表（用于构建角色层级信息）
 
         Returns:
             str: 完整的 system prompt
@@ -121,6 +123,13 @@ class AgentPromptService:
                     prompt_pieces.append(writing_prompt)
                 continue
 
+            # 特殊处理：character_hierarchy 插槽
+            if slot.slot_name == "character_hierarchy":
+                hierarchy_prompt = self._build_character_hierarchy_prompt(characters)
+                if hierarchy_prompt:
+                    prompt_pieces.append(hierarchy_prompt)
+                continue
+
             # 普通 Prompt 模板
             prompt_template_id = slot.prompt_template_id
             if not prompt_template_id:
@@ -144,6 +153,28 @@ class AgentPromptService:
                 prompt_pieces.append(rendered)
 
         return "\n\n".join(prompt_pieces)
+
+    def _build_character_hierarchy_prompt(self, characters: Optional[List[Any]]) -> str:
+        """
+        构建角色层级 prompt
+
+        Args:
+            characters: 角色列表
+
+        Returns:
+            str: 角色层级 prompt
+        """
+        if not characters:
+            return ""
+
+        try:
+            from app.services.character_hierarchy_service import CharacterHierarchyService
+
+            service = CharacterHierarchyService()
+            return service.build_character_hierarchy_prompt(characters)
+        except Exception as e:
+            logger.warning(f"构建角色层级 prompt 失败: {e}")
+            return ""
 
     async def _build_writing_rules_prompt(self, project_id: Optional[str]) -> str:
         """

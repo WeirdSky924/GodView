@@ -185,7 +185,7 @@ def create_app() -> FastAPI:
     )
 
     # 注册路由
-    from app.api.routes import characters, worlds, plots, websocket, config, time, simulation, projects, bootstrap, lore, setting_agent, skills, token_usage, writing_rules, prompts, agent_templates, agent_configs
+    from app.api.routes import characters, worlds, plots, websocket, config, time, simulation, projects, bootstrap, lore, setting_agent, skills, token_usage, writing_rules, prompts, agent_templates, agent_configs, workflows, interventions
 
     app.include_router(characters.router, prefix="/api/characters", tags=["角色管理"])
     app.include_router(worlds.router, prefix="/api/worlds", tags=["世界管理"])
@@ -204,6 +204,8 @@ def create_app() -> FastAPI:
     app.include_router(prompts.router, prefix="/api", tags=["Prompt 管理"])
     app.include_router(agent_templates.router, prefix="/api", tags=["Agent 模板管理"])
     app.include_router(agent_configs.router, prefix="/api", tags=["Agent 配置管理"])
+    app.include_router(workflows.router, prefix="/api/workflows", tags=["工作流管理"])
+    app.include_router(interventions.router, prefix="/api/interventions", tags=["干预管理"])
 
     # 健康检查
     @app.get("/health")

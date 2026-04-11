@@ -772,3 +772,25 @@ async def update_intervention_evaluation(intervention_id: str, evaluation_data: 
     except Exception as e:
         logger.error(f"更新干预评估失败：{e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/interventions/{intervention_id}", response_model=Dict[str, Any])
+async def delete_intervention(intervention_id: str):
+    """删除干预记录"""
+    from app.api.app import postgres_db
+
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+
+    # 检查是否存在
+    intervention_logs = await postgres_db.get_intervention_logs(limit=1000)
+    intervention = next((item for item in intervention_logs if item.get("id") == intervention_id), None)
+    if not intervention:
+        raise HTTPException(status_code=404, detail="干预记录不存在")
+
+    try:
+        await postgres_db.delete_intervention_log(intervention_id)
+        return {"success": True, "message": "干预记录已删除", "deleted_id": intervention_id}
+    except Exception as e:
+        logger.error(f"删除干预记录失败：{e}")
+        raise HTTPException(status_code=500, detail=str(e))

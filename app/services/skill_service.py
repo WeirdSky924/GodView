@@ -1,6 +1,7 @@
 """
 Skill 服务层
 管理 Skill 的创建、查询、分配和执行
+支持数据库持久化和与 Agent 模板的集成
 """
 
 import logging
@@ -14,16 +15,14 @@ from app.models.skill import (
     SkillExecutionLog,
     SkillType,
     SkillStatus,
+    SkillCategory,
     CreateSkillDTO,
     UpdateSkillDTO,
     AssignSkillDTO,
     ExecuteSkillDTO,
     SkillTestResult,
-)
-from app.models.prompt_template import (
-    PromptTemplate,
-    PromptTemplateCreate,
-    PromptCategory,
+    SkillParameter,
+    SkillOutputSpec,
 )
 
 logger = logging.getLogger(__name__)
@@ -32,8 +31,16 @@ logger = logging.getLogger(__name__)
 class SkillService:
     """Skill 服务"""
 
-    def __init__(self, prompt_template_service=None):
-        # 内存存储（生产环境应使用数据库）
+    def __init__(self, db=None, prompt_template_service=None):
+        """
+        初始化 Skill 服务
+
+        Args:
+            db: 数据库连接（可选，用于持久化）
+            prompt_template_service: Prompt 模板服务
+        """
+        self._db = db
+        # 内存存储（当没有数据库连接时使用）
         self._skills: Dict[str, Skill] = {}
         self._assignments: Dict[str, SkillAssignment] = {}
         self._execution_logs: Dict[str, SkillExecutionLog] = {}
@@ -261,6 +268,28 @@ class SkillService:
         # 按优先级排序
         skills.sort(key=lambda x: x.usage_count, reverse=True)
         return skills
+
+    async def get_skills_for_agent_type(self, agent_type: str) -> List[Skill]:
+        """
+        获取适用于某个 Agent 类型的所有 Skill
+
+        Args:
+            agent_type: Agent 类型
+
+        Returns:
+            List[Skill]: 适用的 Skill 列表
+        """
+        skills = await self.get_all_skills(status=SkillStatus.ACTIVE)
+
+        result = []
+        for skill in skills:
+            # 空列表表示所有 Agent 都可用
+            if not skill.applicable_agent_types or agent_type in skill.applicable_agent_types:
+                result.append(skill)
+
+        # 按优先级降序排序
+        result.sort(key=lambda x: -x.priority)
+        return result
 
     async def get_skill_assignments(self, skill_id: str) -> List[SkillAssignment]:
         """获取 Skill 的所有分配"""

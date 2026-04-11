@@ -333,7 +333,9 @@ function AgentStatusItem({ agent, isDark, index }: { agent: AgentStatus; isDark:
             <div className="flex items-center gap-2">
               <p className={`font-medium text-sm ${isDark ? 'text-white' : 'text-gray-800'}`}>{agent.name}</p>
               {!agent.isOptional && !agent.isCharacter && (
-                <Lock className={`w-3 h-3 ${isDark ? 'text-gray-500' : 'text-gray-400'}`} title="核心Agent" />
+                <span title="核心Agent">
+                  <Lock className={`w-3 h-3 ${isDark ? 'text-gray-500' : 'text-gray-400'}`} />
+                </span>
               )}
               {agent.isOptional && (
                 <span className={`text-xs px-1.5 py-0.5 rounded ${isDark ? 'bg-purple-900/50 text-purple-400' : 'bg-purple-100 text-purple-600'}`}>

@@ -8,11 +8,55 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 
-from app.models.character import Character, CharacterStatus, CharacterVoiceSample
+from app.models.character import (
+    Character,
+    CharacterStatus,
+    CharacterVoiceSample,
+    CharacterImportanceTier,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _derive_role_from_tier(importance_tier: str) -> str:
+    """
+    从重要性层级推导角色类型（向后兼容）
+
+    Args:
+        importance_tier: 角色重要性层级
+
+    Returns:
+        str: 角色类型 (main/antagonist/supporting/npc)
+    """
+    # 主角层
+    if importance_tier in [
+        CharacterImportanceTier.PROTAGONIST.value,
+        CharacterImportanceTier.CO_PROTAGONIST.value,
+        CharacterImportanceTier.DEUTERAGONIST.value,
+    ]:
+        return "main"
+
+    # 反派
+    if importance_tier in [
+        CharacterImportanceTier.ARCHENEMY.value,
+        CharacterImportanceTier.MAJOR_ANTAGONIST.value,
+        CharacterImportanceTier.ARC_ANtagonist.value,
+    ]:
+        return "antagonist"
+
+    # NPC / 背景
+    if importance_tier in [
+        CharacterImportanceTier.NPC.value,
+        CharacterImportanceTier.BACKGROUND.value,
+        CharacterImportanceTier.CAMEO.value,
+        CharacterImportanceTier.MINION.value,
+    ]:
+        return "npc"
+
+    # 其他都是配角
+    return "supporting"
 
 
 @router.get("", response_model=List[Dict[str, Any]])
@@ -102,6 +146,13 @@ async def create_character(character: Character):
     char_data["created_at"] = now
     char_data["updated_at"] = now
 
+    # 确保 importance_tier 有默认值
+    if not char_data.get("importance_tier"):
+        char_data["importance_tier"] = CharacterImportanceTier.NPC.value
+
+    # 从 importance_tier 推导 role（向后兼容数据库）
+    char_data["role"] = _derive_role_from_tier(char_data["importance_tier"])
+
     # 确保 JSON 字段有默认值
     for field in ['personality_traits', 'lexicon', 'voice_samples', 'attributes', 'goals', 'inventory', 'agent_goals', 'agent_memory']:
         if char_data.get(field) is None:
@@ -113,10 +164,8 @@ async def create_character(character: Character):
     if char_data.get('agent_enabled') is None:
         char_data['agent_enabled'] = True
 
-    # 为主要角色自动启用 Agent 并生成配置
-    role = char_data.get("role", "supporting")
-    if role in ["main", "antagonist", "supporting"]:
-        char_data = await _auto_configure_character_agent(char_data)
+    # 自动配置角色 Agent（基于 importance_tier）
+    char_data = await _auto_configure_character_agent(char_data)
 
     try:
         await postgres_db.save_character(char_data)
@@ -129,6 +178,7 @@ async def create_character(character: Character):
                     "name": char_data.get("name", ""),
                     "description": char_data.get("description", ""),
                     "role": char_data.get("role", "supporting"),
+                    "importance_tier": char_data.get("importance_tier", "npc"),
                     "status": char_data.get("status", "active"),
                     "personality_traits": json.dumps(char_data.get("personality_traits", [])),
                     "created_at": char_data["created_at"].isoformat() if hasattr(char_data["created_at"], 'isoformat') else str(char_data["created_at"]),
@@ -153,6 +203,11 @@ async def _auto_configure_character_agent(char_data: Dict[str, Any]) -> Dict[str
     """
     为角色自动配置 Agent（包括调用 Setting Agent 生成性格）
 
+    基于 importance_tier（角色重要性层级）决定是否启用 Agent：
+    - Tier 1-3（主角层、核心配角层、重要配角层）：自动启用 Agent
+    - Tier 4（阶段性角色层）：根据具体类型决定
+    - Tier 5-6（功能性角色层、背景层）：不启用 Agent
+
     Args:
         char_data: 角色数据字典
 
@@ -160,34 +215,87 @@ async def _auto_configure_character_agent(char_data: Dict[str, Any]) -> Dict[str
         Dict: 更新后的角色数据
     """
     from app.api.app import postgres_db
+    from app.models.character import CharacterImportanceTier
 
+    importance_tier = char_data.get("importance_tier", CharacterImportanceTier.NPC.value)
     role = char_data.get("role", "supporting")
     name = char_data.get("name", "")
     description = char_data.get("description", "")
     personality = char_data.get("personality", "")
-    background = char_data.get("background", "")
+    background = char_data.get("background_story") or char_data.get("background", "")
     existing_goals = char_data.get("goals", [])
     project_id = char_data.get("project_id")
 
-    # 根据角色定位决定是否启用 Agent
-    # 主角、反派、重要配角都启用 Agent
-    enable_agent_roles = ["main", "antagonist"]
+    # ========== 基于重要性层级决定是否启用 Agent ==========
+    # Tier 1-3: 必须启用 Agent
+    tier_1_3 = [
+        CharacterImportanceTier.PROTAGONIST.value,
+        CharacterImportanceTier.CO_PROTAGONIST.value,
+        CharacterImportanceTier.DEUTERAGONIST.value,
+        CharacterImportanceTier.MENTOR.value,
+        CharacterImportanceTier.LOVE_INTEREST.value,
+        CharacterImportanceTier.BEST_FRIEND.value,
+        CharacterImportanceTier.ARCHENEMY.value,
+        CharacterImportanceTier.MAJOR_ALLY.value,
+        CharacterImportanceTier.MAJOR_ANTAGONIST.value,
+        CharacterImportanceTier.RIVAL.value,
+        CharacterImportanceTier.FAMILY_MEMBER.value,
+        CharacterImportanceTier.GUARDIAN.value,
+    ]
 
-    if role in enable_agent_roles:
+    # Tier 4: 部分启用
+    tier_4_enable = [
+        CharacterImportanceTier.ARC_ALLY.value,
+        CharacterImportanceTier.ARC_ANtagonist.value,
+        CharacterImportanceTier.MYSTERY_FIGURE.value,
+        CharacterImportanceTier.CATALYST.value,
+    ]
+    tier_4_disable = [
+        CharacterImportanceTier.RECURRING.value,  # 常驻配角可以不启用
+    ]
+
+    # Tier 5-6: 不启用
+    tier_5_6 = [
+        CharacterImportanceTier.MINION.value,
+        CharacterImportanceTier.INFORMANT.value,
+        CharacterImportanceTier.MENTOR_FIGURE.value,
+        CharacterImportanceTier.COMIC_RELIEF.value,
+        CharacterImportanceTier.VICTIM.value,
+        CharacterImportanceTier.NPC.value,
+        CharacterImportanceTier.BACKGROUND.value,
+        CharacterImportanceTier.CAMEO.value,
+    ]
+
+    # 决定是否启用 Agent
+    if importance_tier in tier_1_3:
         char_data["has_agent"] = True
         char_data["agent_enabled"] = True
-    elif role == "supporting":
-        # 配角默认也启用，但可以根据描述判断重要性
+    elif importance_tier in tier_4_enable:
         char_data["has_agent"] = True
         char_data["agent_enabled"] = True
-    else:
-        # NPC 默认不启用 Agent
+    elif importance_tier in tier_4_disable:
+        # 阶段性配角可以选择性启用
+        char_data["has_agent"] = True
+        char_data["agent_enabled"] = True
+    elif importance_tier in tier_5_6:
         char_data["has_agent"] = False
         char_data["agent_enabled"] = False
         return char_data
+    else:
+        # 兜底：根据 role 判断
+        if role in ["main", "antagonist"]:
+            char_data["has_agent"] = True
+            char_data["agent_enabled"] = True
+        else:
+            char_data["has_agent"] = False
+            char_data["agent_enabled"] = False
+            return char_data
 
-    # 如果角色没有性格设定，调用 Setting Agent 生成
-    if not personality and project_id:
+    # ========== 调用 Setting Agent 生成性格设定 ==========
+    # 只有重要角色才生成性格
+    should_generate_personality = importance_tier in tier_1_3 or importance_tier in tier_4_enable
+
+    if not personality and project_id and should_generate_personality:
         try:
             from app.services.setting_agent_service import get_setting_agent_service
 
@@ -222,82 +330,102 @@ async def _auto_configure_character_agent(char_data: Dict[str, Any]) -> Dict[str
             logger.warning(f"调用 Setting Agent 生成性格失败: {e}")
             # 继续使用默认配置
 
-    # 如果还没有 Agent 目标，使用默认目标
+    # ========== 如果还没有 Agent 目标，根据层级生成默认目标 ==========
     if not char_data.get("agent_goals"):
-        # 自动生成 Agent 目标
         agent_goals = list(existing_goals) if existing_goals else []
 
-        # 根据角色定位添加默认目标
-        role_goals = {
-            "main": [
-                "推动故事发展",
-                "保持角色性格一致性",
-                "追求角色自身的目标",
+        # 根据重要性层级添加默认目标
+        tier_goals = {
+            # Tier 1: 主角层
+            CharacterImportanceTier.PROTAGONIST.value: [
+                "推动故事主线发展",
+                "展现人物成长与变化",
+                "追求角色的核心目标",
             ],
-            "antagonist": [
+            CharacterImportanceTier.CO_PROTAGONIST.value: [
+                "与主角共同推动剧情",
+                "展现独立的人物弧光",
+                "在关键时刻发挥作用",
+            ],
+            # Tier 2: 核心配角层
+            CharacterImportanceTier.DEUTERAGONIST.value: [
+                "辅助主线发展",
+                "展现自身的成长故事",
+                "与主角形成互动张力",
+            ],
+            CharacterImportanceTier.MENTOR.value: [
+                "引导主角成长",
+                "在关键时刻提供指导",
+                "传承知识或力量",
+            ],
+            CharacterImportanceTier.LOVE_INTEREST.value: [
+                "推动感情线发展",
+                "与主角形成情感纽带",
+                "影响主角的决策",
+            ],
+            CharacterImportanceTier.BEST_FRIEND.value: [
+                "陪伴主角成长",
+                "提供支持和帮助",
+                "增加故事的温暖感",
+            ],
+            CharacterImportanceTier.ARCHENEMY.value: [
                 "制造故事冲突",
                 "推动剧情走向高潮",
                 "与主角形成对立",
             ],
-            "supporting": [
-                "辅助主线发展",
-                "丰富故事层次",
-                "与主要角色互动",
+            # Tier 3: 重要配角层
+            CharacterImportanceTier.MAJOR_ALLY.value: [
+                "在关键时刻帮助主角",
+                "展现自身的故事线",
+                "丰富故事的层次",
+            ],
+            CharacterImportanceTier.MAJOR_ANTAGONIST.value: [
+                "制造阶段性冲突",
+                "推动特定篇章的发展",
+                "给主角带来挑战",
+            ],
+            CharacterImportanceTier.RIVAL.value: [
+                "与主角形成竞争关系",
+                "推动主角进步",
+                "增加故事张力",
+            ],
+            CharacterImportanceTier.FAMILY_MEMBER.value: [
+                "展现主角的背景",
+                "提供情感支持或冲突",
+                "丰富主角的人物形象",
+            ],
+            CharacterImportanceTier.GUARDIAN.value: [
+                "保护主角",
+                "在危急时刻出现",
+                "传递重要信息",
+            ],
+            # Tier 4: 阶段性角色层
+            CharacterImportanceTier.ARC_ANtagonist.value: [
+                "制造篇章冲突",
+                "推动篇章剧情发展",
+                "给主角带来阶段性挑战",
+            ],
+            CharacterImportanceTier.ARC_ALLY.value: [
+                "帮助主角完成篇章目标",
+                "丰富篇章内容",
+            ],
+            CharacterImportanceTier.CATALYST.value: [
+                "推动剧情转折",
+                "引发重要事件",
+            ],
+            CharacterImportanceTier.MYSTERY_FIGURE.value: [
+                "保持神秘感",
+                "在关键时刻揭示身份",
             ],
         }
 
-        # 添加角色定位相关的目标
-        if role in role_goals:
-            for goal in role_goals[role]:
-                if goal not in agent_goals:
-                    agent_goals.append(goal)
+        default_goals = tier_goals.get(importance_tier, [
+            "参与故事发展",
+            "保持角色一致性",
+        ])
 
-        # 根据描述提取可能的目标
-        if description:
-            keywords = _extract_goals_from_description(description, name)
-            for kw in keywords:
-                if kw not in agent_goals:
-                    agent_goals.append(kw)
-
-        char_data["agent_goals"] = agent_goals[:10]  # 限制目标数量
-
-    # 如果还没有 Agent 记忆，使用默认记忆
-    if not char_data.get("agent_memory"):
-        agent_memory = []
-
-        # 添加角色背景作为记忆
-        if background:
-            memory_points = _extract_memory_from_background(background)
-            agent_memory.extend(memory_points)
-
-        # 添加角色性格特点作为记忆
-        if char_data.get("personality"):
-            agent_memory.append(f"性格特点：{char_data['personality']}")
-
-        # 添加角色定位相关的基础记忆
-        role_memories = {
-            "main": [
-                "作为故事的核心人物，需关注剧情主线发展",
-                "与其他角色保持合理的关系和互动",
-            ],
-            "antagonist": [
-                "作为反派角色，需要推动冲突和矛盾",
-                "有自己完整的动机和目标",
-            ],
-            "supporting": [
-                "作为配角，在关键时刻发挥作用",
-                "有自己的故事线，但服务于主线",
-            ],
-        }
-
-        if role in role_memories:
-            for mem in role_memories[role]:
-                if mem not in agent_memory:
-                    agent_memory.append(mem)
-
-        char_data["agent_memory"] = agent_memory[:15]  # 限制记忆数量
-
-    logger.info(f"为角色 '{name}' 自动配置 Agent: has_agent={char_data['has_agent']}, goals={len(char_data.get('agent_goals', []))}, memory={len(char_data.get('agent_memory', []))}")
+        agent_goals.extend(default_goals)
+        char_data["agent_goals"] = agent_goals
 
     return char_data
 
@@ -769,7 +897,7 @@ async def get_character_agent_prompt(character_id: str):
 
     # 准备变量
     variables = {
-        "character_background": character.get("background") or character.get("description") or "一个神秘的角色",
+        "character_background": character.get("background_story") or character.get("background") or character.get("description") or "一个神秘的角色",
         "character_personality": character.get("personality") or character.get("speech_pattern") or "性格未知",
         "character_goals": "\n".join(character.get("agent_goals") or character.get("goals") or []),
     }
@@ -905,6 +1033,8 @@ async def generate_character_personality(character_id: str):
             }
 
         # 更新角色数据
+        if personality_result.get("appearance"):
+            character["appearance"] = personality_result["appearance"]
         if personality_result.get("personality"):
             character["personality"] = personality_result["personality"]
         if personality_result.get("speech_pattern"):
@@ -925,6 +1055,7 @@ async def generate_character_personality(character_id: str):
         return {
             "success": True,
             "message": f"已为角色 '{character['name']}' 生成性格设定",
+            "appearance": personality_result.get("appearance", ""),
             "personality": personality_result.get("personality", ""),
             "speech_pattern": personality_result.get("speech_pattern", ""),
             "agent_goals": personality_result.get("agent_goals", []),

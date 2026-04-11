@@ -10,6 +10,7 @@ from langchain_core.messages import HumanMessage
 
 from app.agents.base import BaseAgent, AgentResponse
 from app.models.agent_template import AgentType
+from app.models.token_usage import UsageCategory
 
 logger = logging.getLogger(__name__)
 
@@ -47,13 +48,34 @@ class MasterPlotterAgent(BaseAgent):
 
     def _build_default_system_prompt(self) -> str:
         """构建默认系统提示（向后兼容）"""
-        return """你是总编剧，负责把控主线进度和剧情走向。
+        return """你是总编剧，负责把控主线进度和剧情走向，并指导角色演绎环节。
 
-你的职责：
+【重要：长篇网文创作原则】
+这是一部长篇小说，你需要确保：
+1. **可持续发展**：剧情要能支撑后续几百章的发展，不要急于推进
+2. **渐进式展开**：设定和秘密要逐步揭示，留有余地给后续剧情
+3. **节奏把控**：避免开头即高潮的感觉，保持读者对后续内容的期待
+4. **伏笔管理**：埋下的伏笔不要急于回收，长线伏笔能增加故事深度
+5. **成长空间**：为主角和配角预留成长空间，不要让他们一开始就无敌
+6. **世界观层次**：世界观要有递进层次，让读者感觉还有更深的内容待探索
+
+【你的职责】
 1. 评估当前剧情是否应该推进到下一阶段
 2. 决定是否需要埋设"即将发生的事件"
 3. 如果触发强制推进，提供合理的外部事件
 4. 确保剧情不跑题、不拖沓
+5. 控制节奏，不要让故事感觉急于完结
+
+【角色演绎指导职责】
+当需要为角色演绎环节设定场景时，你需要：
+1. **场景选择**：选择能推进剧情的关键场景，避免无意义的日常
+2. **场景类型**：
+   - "interactive"（同场景互动）：适合角色对话、冲突、合作等需要互动的情节
+   - "parallel"（独立场景）：适合角色各自行动、内心独白等独立情节
+3. **角色分工**：为每个参与角色设定明确的定位和情绪状态
+4. **剧情焦点**：明确本段表演要推进的核心剧情
+5. **世界观融入**：确保表演中展现世界观元素
+6. **伏笔暗示**：指示可以埋下的伏笔点
 
 输出 JSON 格式：
 {
@@ -62,7 +84,16 @@ class MasterPlotterAgent(BaseAgent):
     "current_progress": 0.0-1.0,
     "foreshadow_event": "即将发生的事件描述（如有）",
     "forced_event": "强制推进事件（如触发阈值）",
-    "next_milestone": "下一个剧情里程碑"
+    "next_milestone": "下一个剧情里程碑",
+    "pacing_note": "节奏调整建议（如：当前太快/太慢）",
+    "long_term_setup": "为后续剧情埋下的铺垫建议",
+    "scene_directions": {
+        "scene_type": "interactive 或 parallel",
+        "main_scene": "场景描述",
+        "atmosphere": "氛围",
+        "character_roles": {"角色名": {"role": "定位", "emotion": "情绪"}},
+        "plot_focus": "剧情焦点"
+    }
 }"""
 
     async def execute(self, input_data: Dict[str, Any]) -> AgentResponse:
@@ -112,7 +143,8 @@ class MasterPlotterAgent(BaseAgent):
 
             # 调用 LLM
             response_text = await self._call_llm(
-                messages=[HumanMessage(content=user_message)], temperature=0.5
+                messages=[HumanMessage(content=user_message)], temperature=0.5,
+                category=UsageCategory.PLOT
             )
 
             # 解析响应
@@ -144,7 +176,7 @@ class MasterPlotterAgent(BaseAgent):
         执行整体剧情规划
 
         Args:
-            input_data: 包含初始剧情、章节数、角色、世界观
+            input_data: 包含初始剧情、章节数、角色、世界观、讨论历史
 
         Returns:
             AgentResponse: 剧情规划结果
@@ -154,45 +186,173 @@ class MasterPlotterAgent(BaseAgent):
         characters = input_data.get("characters", [])
         world_info = input_data.get("world_info", {})
         main_plot_progress = input_data.get("main_plot_progress", 0.0)
+        recent_discussions = input_data.get("recent_discussions", [])
+        last_discussion_summary = input_data.get("last_discussion_summary", "")
+        existing_hooks = input_data.get("existing_hooks", [])
 
-        prompt = f"""请根据以下信息，规划一部小说的整体剧情大纲：
-
-【世界观】
+        # 构建世界观部分（关键信息）
+        world_section = ""
+        if world_info:
+            world_section = f"""
+【世界观设定】
 名称：{world_info.get('name', '未知世界')}
 类型：{world_info.get('world_type', '奇幻')}
-描述：{world_info.get('description', '无')}
+基调：{world_info.get('tone', '正剧')}
+目标读者：{world_info.get('target_audience', '大众')}
 
-【主要角色】
-{chr(10).join([f'- {c}' for c in characters]) if characters else '暂无角色信息'}
+【世界背景】
+{world_info.get('description', '无详细描述')}
+{chr(10) + world_info.get('background', '') if world_info.get('background') else ''}
+
+【世界规则】
+"""
+            rules = world_info.get("rules", {})
+            if isinstance(rules, dict):
+                for key, value in rules.items():
+                    world_section += f"- {key}: {value}\n"
+            elif isinstance(rules, list):
+                for rule in rules:
+                    world_section += f"- {rule}\n"
+
+            themes = world_info.get("themes", [])
+            if themes:
+                world_section += f"\n【核心主题】\n{chr(10).join([f'- {t}' for t in themes])}\n"
+        else:
+            world_section = """
+【世界观设定】
+（暂无世界观信息，请根据初始剧情自行推断）
+"""
+
+        # 构建角色部分
+        characters_section = "【主要角色】\n"
+        if characters:
+            for char in characters:
+                if isinstance(char, dict):
+                    name = char.get("name", "未知角色")
+                    role = char.get("role", char.get("character_type", ""))
+                    desc = char.get("description", char.get("personality", ""))[:200]
+                    characters_section += f"- {name}"
+                    if role:
+                        characters_section += f"（{role}）"
+                    if desc:
+                        characters_section += f": {desc}"
+                    characters_section += "\n"
+                else:
+                    characters_section += f"- {char}\n"
+        else:
+            characters_section += "（暂无角色信息）\n"
+
+        # 构建伏笔部分
+        hooks_section = ""
+        if existing_hooks:
+            hooks_section = f"""
+【已有伏笔】
+{chr(10).join([f"- {h.get('title', h.get('id', '未知'))}: {h.get('description', '')[:100]}" for h in existing_hooks[:10]])}
+"""
+
+        # 构建讨论历史部分
+        discussion_section = ""
+        if recent_discussions:
+            discussion_summaries = []
+            for i, d in enumerate(recent_discussions[-2:]):  # 最近2次讨论
+                topic = d.get("topic", f"讨论{i+1}")
+                messages = d.get("messages", [])
+                if messages:
+                    summary_text = messages[-1].get("content", "")[:300] if messages else ""
+                    discussion_summaries.append(f"- {topic}: {summary_text}...")
+            if discussion_summaries:
+                discussion_section = f"""
+【团队讨论记录】
+{chr(10).join(discussion_summaries)}
+
+【最新讨论共识】
+{last_discussion_summary[:500] if last_discussion_summary else '暂无'}
+"""
+
+        prompt = f"""你是一位资深网文编剧，现在需要根据以下信息规划一部小说的整体剧情大纲。
+请确保剧情与世界观设定紧密结合，风格基调一致。
+
+【重要：长篇网文创作原则】
+这是一部长篇小说，你需要确保：
+1. **可持续发展**：剧情要能支撑后续几百章的发展，不要急于推进到高潮
+2. **渐进式展开**：设定和秘密要逐步揭示，让读者保持探索的好奇心
+3. **节奏把控**：前面章节主要是铺垫和建立，高潮要在后期逐步展开
+4. **伏笔管理**：埋下的伏笔不要急于回收，长线伏笔能增加故事深度
+5. **成长空间**：为主角和配角预留成长空间，不要让他们一开始就无敌
+6. **世界观层次**：世界观要有递进层次，让读者感觉还有更深的内容待探索
+
+【角色演绎指导原则】
+在规划章节时，你需要考虑角色演绎环节：
+- 为每章规划关键的角色表演场景
+- 明确角色的情绪状态和互动方式
+- 指定场景类型（同场景互动 vs 独立场景）
+- 确保表演能推进剧情，而非单纯的对话
+
+{world_section}
+
+{characters_section}
 
 【初始剧情设定】
-{initial_plot}
-
+{initial_plot if initial_plot else '（无初始设定，请根据世界观自行构思）'}
+{hooks_section}
 【当前主线进度】
 {main_plot_progress * 100:.1f}%
-
+{discussion_section}
 【目标】
 规划 {chapter_count} 个章节的大纲
 
 请输出 JSON 格式：
 {{
-    "overall_summary": "整体剧情概述（100字以内）",
+    "overall_summary": "整体剧情概述（详细描述，需体现世界观特色和长篇格局）",
+    "tone": "故事基调（如热血、黑暗、温馨、搞笑等）",
+    "writing_style": "建议的写作风格",
+    "pacing_strategy": "节奏策略（详细说明如何保持长篇的可持续发展）",
     "chapter_titles": ["第一章标题", "第二章标题", ...],
-    "chapter_goals": ["第一章目标/大纲", "第二章目标/大纲", ...],
+    "chapter_goals": [
+        {{
+            "goal": "本章主要目标",
+            "key_events": ["关键事件1", "关键事件2"],
+            "character_focus": ["重点关注角色"],
+            "environment": "主要场景环境",
+            "foreshadowing": "本章埋下的伏笔（如有）",
+            "performance_directions": {{
+                "scene_type": "interactive 或 parallel",
+                "main_scene": "主要表演场景",
+                "character_emotions": {{"角色名": "情绪状态"}},
+                "plot_focus": "表演要推进的剧情点"
+            }}
+        }},
+        ...
+    ],
     "main_conflicts": ["主要冲突1", "主要冲突2", ...],
+    "progression_phases": [
+        {{"phase": "前期（1-X章）", "focus": "主要内容和目标"}},
+        {{"phase": "中期（X-Y章）", "focus": "主要内容和目标"}},
+        {{"phase": "后期（Y-Z章）", "focus": "主要内容和目标"}}
+    ],
     "climax_chapter": 高潮章节编号,
-    "ending_hint": "结局暗示"
+    "ending_hint": "结局暗示",
+    "world_elements_used": ["本小说将运用的世界观元素"],
+    "long_term_hooks": ["长线伏笔（需要多章节才能回收）"],
+    "discussion_considerations": ["根据讨论记录需要考虑的事项"]
 }}
 
 要求：
-1. 章节标题要吸引人，符合网文风格
-2. 每章目标要具体，包含冲突和转折
-3. 确保有起承转合
-4. 伏笔和悬念要合理安排"""
+1. 章节标题要吸引人，符合网文风格，体现世界观特色
+2. 每章目标要具体，包含冲突和转折，场景要结合世界观设定
+3. 确保有起承转合，但前期不要急于推进到高潮
+4. 伏笔要分为短线（近期回收）和长线（后期回收）两种
+5. 必须与世界观设定保持一致，充分利用世界观的独特元素
+6. 角色行为要符合其设定和世界观规则
+7. 为每章规划角色表演场景，确保表演能推进剧情
+8. 明确角色在表演中的情绪状态和互动方式
+7. 如果有讨论记录，请在规划中体现讨论达成的共识和建议
+8. 确保长篇小说的可持续发展，不要让读者感觉开头就是高潮"""
 
         try:
             response_text = await self._call_llm(
-                messages=[HumanMessage(content=prompt)], temperature=0.7
+                messages=[HumanMessage(content=prompt)], temperature=0.7,
+                category=UsageCategory.PLOT
             )
             result = self._parse_json_response(response_text)
 
@@ -293,6 +453,7 @@ class MasterPlotterAgent(BaseAgent):
                 messages=[HumanMessage(content=prompt)],
                 temperature=0.7,
                 max_tokens=100,
+                category=UsageCategory.PLOT
             )
             return response.strip()
         except Exception:

@@ -1,19 +1,24 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, useCallback, useRef } from 'react'
 import { Card, Button, Input, TextArea, Modal } from '@/components/ui'
 import PageLayout from '@/components/PageLayout'
 import { useDynamicWebSocket } from '@/hooks/useWebSocket'
-import { getDirectorState, getSnapshotTree, getWorkflowGraph } from '@/api/director'
+import { getDirectorState, getSnapshotTree } from '@/api/director'
 import { getCharacters } from '@/api/characters'
-import { Play, Pause, RotateCcw, Zap, Target, BookOpen, MessageSquare, Map, GitBranch, RefreshCcw, Workflow, Mic, PenLine, FolderOpen, UserPlus, UserMinus, Users, ChevronDown, ChevronUp, Settings, Sparkles, FileText } from 'lucide-react'
+import { getWorkflows, type WorkflowDefinition } from '@/api/workflows'
+import {
+  Play, Pause, RotateCcw, Target, BookOpen, MessageSquare, GitBranch, Settings,
+  Sparkles, FileText, Network, FolderOpen, UserPlus, UserMinus, Users, ChevronDown,
+  ChevronUp, Send, X, Circle, Copy, Check
+} from 'lucide-react'
 import { useProject } from '@/contexts/ProjectContext'
 import { useTheme } from '@/contexts/ThemeContext'
 import { motion, AnimatePresence } from 'framer-motion'
 
+// ==================== Types ====================
 interface AgentStatus {
   name: string
   status: 'idle' | 'working' | 'completed' | 'error'
-  progress?: number
-  message?: string
+  message: string
 }
 
 interface SnapshotNode {
@@ -21,155 +26,646 @@ interface SnapshotNode {
   name?: string
   snapshot_type?: string
   parent_snapshot_id?: string | null
-  is_branch?: boolean
-  branch_reason?: string | null
-  created_at?: string
   children?: SnapshotNode[]
 }
 
-interface VoiceContext {
-  used_qdrant?: boolean
-  retrieved_samples?: string[]
-  retrieved_count?: number
-}
-
-interface VoiceReview {
-  checked?: boolean
-  is_ooc?: boolean
-  confidence?: number
-  issues?: string[]
-  suggestion?: string
-  reference_samples?: string[]
-}
-
-interface RewriteResult {
-  applied?: boolean
-  changes_made?: string[]
-  original_dialogue?: string
-  original_content?: string
-  target_character_id?: string
-  target_character_name?: string
-}
-
-interface DialoguePanelState {
-  speaker_id?: string
-  dialogue?: string
-  action?: string
-  emotion?: string
-  voice_context?: VoiceContext
-  voice_review?: VoiceReview
-  rewrite_result?: RewriteResult
-}
-
-interface NarrativeVoiceReviewEntry {
-  character_id?: string
-  character_name?: string
-  voice_context?: VoiceContext
-  voice_review?: VoiceReview
-}
-
-interface NarrativeVoiceReview {
-  checked?: boolean
-  has_ooc?: boolean
-  reason?: string
-  results?: NarrativeVoiceReviewEntry[]
-}
-
-interface NarrativePanelState {
-  content?: string
-  word_count?: number
-  voice_review?: NarrativeVoiceReview
-  rewrite_result?: RewriteResult
-}
-
 const defaultAgents: AgentStatus[] = [
-  { name: 'Summarizer', status: 'idle', message: '剧情总结员', progress: 0 },
-  { name: 'Master Plotter', status: 'idle', message: '总编剧', progress: 0 },
-  { name: 'Hook Manager', status: 'idle', message: '伏笔管理员', progress: 0 },
-  { name: 'Writer', status: 'idle', message: '内容执行官', progress: 0 },
-  { name: 'Evaluator', status: 'idle', message: '剧情评估员', progress: 0 },
-  { name: 'Character Agent', status: 'idle', message: '角色演绎', progress: 0 },
-  { name: 'ProcGen', status: 'idle', message: '世界生成', progress: 0 },
+  { name: 'Summarizer', status: 'idle', message: '剧情总结员' },
+  { name: 'Master Plotter', status: 'idle', message: '总编剧' },
+  { name: 'Hook Manager', status: 'idle', message: '伏笔管理员' },
+  { name: 'Writer', status: 'idle', message: '内容执行官' },
+  { name: 'Evaluator', status: 'idle', message: '剧情评估员' },
+  { name: 'Character Agent', status: 'idle', message: '角色演绎' },
+  { name: 'Setting', status: 'idle', message: '设定 Agent' },
+  { name: 'Event Generator', status: 'idle', message: '事件生成' },
+  { name: 'World Map', status: 'idle', message: '地图管理' },
 ]
 
-function splitMultiline(value: string) {
-  return value
-    .split(/[，,\n]/)
-    .map((item) => item.trim())
-    .filter(Boolean)
+// ==================== Sub Components ====================
+
+// Agent 状态配置
+const AGENT_CONFIG: Record<string, { icon: string; color: string; description: string }> = {
+  'Summarizer': { icon: '📝', color: 'blue', description: '剧情总结员' },
+  'Master Plotter': { icon: '🎬', color: 'purple', description: '总编剧' },
+  'Hook Manager': { icon: '🎯', color: 'orange', description: '伏笔管理员' },
+  'Writer': { icon: '✍️', color: 'green', description: '内容执行官' },
+  'Evaluator': { icon: '🔍', color: 'red', description: '剧情评估员' },
+  'Character Agent': { icon: '🎭', color: 'pink', description: '角色演绎' },
+  'Setting': { icon: '⚙️', color: 'indigo', description: '设定 Agent' },
+  'Event Generator': { icon: '🎲', color: 'pink', description: '事件生成' },
+  'World Map': { icon: '🗺️', color: 'teal', description: '地图管理' },
 }
 
-function parseCharacterMoods(value: string) {
-  return value
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .reduce<Record<string, string>>((acc, line) => {
-      const [name, ...rest] = line.split(':')
-      const mood = rest.join(':').trim()
-      if (name?.trim() && mood) {
-        acc[name.trim()] = mood
-      }
-      return acc
-    }, {})
+// Agent 名称到 agent_type 的映射（用于工作流）
+const AGENT_TYPE_MAP: Record<string, string> = {
+  'Summarizer': 'summarizer',
+  'Master Plotter': 'master_plotter',
+  'Hook Manager': 'hook_manager',
+  'Writer': 'writer',
+  'Evaluator': 'evaluator',
+  'Character Agent': 'character',
+  'ProcGen': 'procgen',
 }
+
+// 从节点标签/agent_type 映射到前端 Agent 名称
+const NODE_TO_AGENT_MAP: Record<string, string> = {
+  // agent_type -> Agent 名称
+  'summarizer': 'Summarizer',
+  'master_plotter': 'Master Plotter',
+  'plotter': 'Master Plotter',
+  'hook_manager': 'Hook Manager',
+  'writer': 'Writer',
+  'evaluator': 'Evaluator',
+  'character': 'Character Agent',
+  'setting': 'Setting',
+  'event_generator': 'Event Generator',
+  'world_map_manager': 'World Map',
+  // 节点标签 -> Agent 名称
+  '剧情总结员': 'Summarizer',
+  '总编剧': 'Master Plotter',
+  '编剧 Agent': 'Master Plotter',
+  '编剧': 'Master Plotter',
+  '伏笔管理员': 'Hook Manager',
+  '伏笔 Agent': 'Hook Manager',
+  '伏笔': 'Hook Manager',
+  '内容执行官': 'Writer',
+  '作家 Agent': 'Writer',
+  '作家': 'Writer',
+  '剧情评估员': 'Evaluator',
+  '评估 Agent': 'Evaluator',
+  '评估': 'Evaluator',
+  '角色演绎': 'Character Agent',
+  '角色 Agent': 'Character Agent',
+  '角色': 'Character Agent',
+  '设定 Agent': 'Setting',
+  '设定': 'Setting',
+  '事件 Agent': 'Event Generator',
+  '事件': 'Event Generator',
+  '地图 Agent': 'World Map',
+  '地图': 'World Map',
+  // 英文标签
+  'Map Agent': 'World Map',
+  'Event Agent': 'Event Generator',
+  'Setting Agent': 'Setting',
+  'Plotter Agent': 'Master Plotter',
+  'Character Agent': 'Character Agent',
+  'Writer Agent': 'Writer',
+  'Evaluator Agent': 'Evaluator',
+  'Hook Agent': 'Hook Manager',
+}
+
+// 节点类型到显示名称的映射
+const NODE_TYPE_DISPLAY_NAMES: Record<string, string> = {
+  'start': '开始节点',
+  'end': '结束节点',
+  'agent': 'Agent',
+  'condition': '条件判断',
+  'parallel': '并行执行',
+  'group_discussion': '集体讨论',
+  'input': '用户输入',
+}
+
+// 根据节点信息获取对应的显示名称
+function getDisplayNameFromNode(data: any): string {
+  // 1. 优先使用 label 映射到 Agent 名称
+  if (data.label && NODE_TO_AGENT_MAP[data.label]) {
+    return NODE_TO_AGENT_MAP[data.label]
+  }
+  // 2. 使用 agent_type 映射
+  if (data.agent_type && NODE_TO_AGENT_MAP[data.agent_type]) {
+    return NODE_TO_AGENT_MAP[data.agent_type]
+  }
+  // 3. 尝试模糊匹配 label
+  if (data.label) {
+    const labelLower = data.label.toLowerCase()
+    if (labelLower.includes('编剧') || labelLower.includes('plotter')) return 'Master Plotter'
+    if (labelLower.includes('作家') || labelLower.includes('writer')) return 'Writer'
+    if (labelLower.includes('伏笔') || labelLower.includes('hook')) return 'Hook Manager'
+    if (labelLower.includes('评估') || labelLower.includes('evaluator')) return 'Evaluator'
+    if (labelLower.includes('摘要') || labelLower.includes('summarizer')) return 'Summarizer'
+    if (labelLower.includes('角色') || labelLower.includes('character')) return 'Character Agent'
+    if (labelLower.includes('事件') || labelLower.includes('event')) return 'Event Generator'
+    if (labelLower.includes('地图') || labelLower.includes('map')) return 'World Map'
+    if (labelLower.includes('设定') || labelLower.includes('setting')) return 'Setting'
+    // 如果 label 存在但没匹配到 Agent，直接返回 label
+    return data.label
+  }
+  // 4. 使用 agent_type 模糊匹配
+  if (data.agent_type) {
+    const typeLower = data.agent_type.toLowerCase()
+    if (typeLower.includes('plotter')) return 'Master Plotter'
+    if (typeLower.includes('writer')) return 'Writer'
+    if (typeLower.includes('hook')) return 'Hook Manager'
+    if (typeLower.includes('evaluator')) return 'Evaluator'
+    if (typeLower.includes('summarizer')) return 'Summarizer'
+    if (typeLower.includes('character')) return 'Character Agent'
+    if (typeLower.includes('event')) return 'Event Generator'
+    if (typeLower.includes('world') || typeLower.includes('map')) return 'World Map'
+    if (typeLower.includes('setting')) return 'Setting'
+  }
+  // 5. 使用节点类型显示名称
+  if (data.node_type && NODE_TYPE_DISPLAY_NAMES[data.node_type]) {
+    return NODE_TYPE_DISPLAY_NAMES[data.node_type]
+  }
+  // 6. 最后返回节点 ID
+  return data.node_id || '未知节点'
+}
+
+// 保持向后兼容的函数
+function getAgentNameFromNode(data: any): string | null {
+  const displayName = getDisplayNameFromNode(data)
+  // 如果返回的是 Agent 名称，返回它；否则返回 null
+  const agentNames = ['Summarizer', 'Master Plotter', 'Writer', 'Evaluator', 'Hook Manager', 'Character Agent', 'Setting', 'Event Generator', 'World Map']
+  return agentNames.includes(displayName) ? displayName : null
+}
+
+// Agent 状态指示器
+function AgentStatusBar({ agents, isDark }: { agents: AgentStatus[], isDark: boolean }) {
+  const getStatusColor = (status: AgentStatus['status']) => {
+    switch (status) {
+      case 'working': return 'bg-blue-500 animate-pulse'
+      case 'completed': return 'bg-green-500'
+      case 'error': return 'bg-red-500'
+      default: return isDark ? 'bg-gray-600' : 'bg-gray-400'
+    }
+  }
+
+  return (
+    <div className="flex items-center gap-1.5">
+      {agents.map((agent) => (
+        <div
+          key={agent.name}
+          className={`w-2.5 h-2.5 rounded-full ${getStatusColor(agent.status)} transition-all cursor-pointer hover:scale-125`}
+          title={`${agent.name} - ${agent.message}`}
+        />
+      ))}
+    </div>
+  )
+}
+
+// Agent 详细状态卡片 - 新设计：输出+干预一体化
+function AgentStatusCard({
+  agent,
+  isDark,
+  lastOutput,
+  streamingContent,
+  interventionInput,
+  onInterventionChange,
+  onSendIntervention,
+}: {
+  agent: AgentStatus
+  isDark: boolean
+  lastOutput?: string
+  streamingContent?: string
+  interventionInput: string
+  onInterventionChange: (value: string) => void
+  onSendIntervention: () => void
+}) {
+  const config = AGENT_CONFIG[agent.name] || { icon: '🤖', color: 'gray', description: agent.name }
+  const isWorking = agent.status === 'working'
+  const hasOutput = streamingContent || lastOutput
+
+  const statusStyles = {
+    working: isDark ? 'border-blue-500 bg-blue-900/10' : 'border-blue-400 bg-blue-50',
+    completed: isDark ? 'border-green-500 bg-green-900/10' : 'border-green-400 bg-green-50',
+    error: isDark ? 'border-red-500 bg-red-900/10' : 'border-red-400 bg-red-50',
+    idle: isDark ? 'border-gray-700 bg-gray-800/30' : 'border-gray-200 bg-gray-50',
+  }
+
+  return (
+    <div className={`rounded-lg border-2 transition-all overflow-hidden ${statusStyles[agent.status] || statusStyles.idle}`}>
+      {/* 第一行：Agent名称和状态 */}
+      <div className={`flex items-center justify-between px-4 py-2 ${isDark ? 'bg-gray-800/50' : 'bg-gray-100'}`}>
+        <div className="flex items-center gap-2">
+          <span className={`text-xl ${isWorking ? 'animate-bounce' : ''}`}>{config.icon}</span>
+          <div>
+            <h4 className={`text-sm font-semibold ${isDark ? 'text-white' : 'text-gray-800'}`}>
+              {agent.name}
+            </h4>
+            <p className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+              {config.description}
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          {isWorking && (
+            <span className="flex items-center gap-1.5 text-xs text-blue-500 font-medium">
+              <div className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
+              工作中
+            </span>
+          )}
+          {agent.status === 'completed' && (
+            <span className="text-xs text-green-500 font-medium">✓ 完成</span>
+          )}
+          {agent.status === 'error' && (
+            <span className="text-xs text-red-500 font-medium">✗ 错误</span>
+          )}
+        </div>
+      </div>
+
+      {/* 第二行：输出文本框 */}
+      <div className={`min-h-[120px] max-h-[200px] overflow-y-auto p-3 ${
+        isDark ? 'bg-gray-900/50' : 'bg-white'
+      }`}>
+        {isWorking && streamingContent ? (
+          <div className="text-sm leading-relaxed whitespace-pre-wrap">
+            {streamingContent}
+            <span className="inline-block w-1.5 h-4 ml-0.5 bg-blue-500 animate-pulse" />
+          </div>
+        ) : hasOutput ? (
+          <div className={`text-sm leading-relaxed whitespace-pre-wrap ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+            {streamingContent || lastOutput}
+          </div>
+        ) : (
+          <div className={`text-sm italic ${isDark ? 'text-gray-600' : 'text-gray-400'}`}>
+            等待输出...
+          </div>
+        )}
+      </div>
+
+      {/* 第三行：干预输入框 */}
+      <div className={`flex gap-2 p-2 border-t ${isDark ? 'border-gray-700 bg-gray-800/30' : 'border-gray-200 bg-gray-50'}`}>
+        <input
+          type="text"
+          value={interventionInput}
+          onChange={(e) => onInterventionChange(e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && onSendIntervention()}
+          placeholder="输入干预指令..."
+          className={`flex-1 px-3 py-1.5 text-sm rounded border ${
+            isDark
+              ? 'bg-gray-900 border-gray-700 text-white placeholder-gray-500'
+              : 'bg-white border-gray-300 text-gray-800 placeholder-gray-400'
+          } focus:outline-none focus:ring-1 focus:ring-blue-500`}
+        />
+        <button
+          onClick={onSendIntervention}
+          disabled={!interventionInput.trim()}
+          className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-500 disabled:cursor-not-allowed text-white text-sm rounded transition-colors"
+        >
+          发送
+        </button>
+      </div>
+    </div>
+  )
+}
+
+// 集体会话卡片 - 与Agent卡片结构一致
+function GroupDiscussionCard({
+  discussion,
+  isDark,
+  input,
+  onInputChange,
+  onSend,
+  onEnd,
+}: {
+  discussion: {
+    topic: string
+    messages: Array<{ character: string; content: string; timestamp: string }>
+    characters: string[]
+    participants?: Array<{ type: string; name: string; role: string }>
+    isActive: boolean
+  }
+  isDark: boolean
+  input: string
+  onInputChange: (value: string) => void
+  onSend: () => void
+  onEnd: () => void
+}) {
+  const hasDiscussion = discussion.characters.length > 0 || discussion.messages.length > 0 || (discussion.participants?.length || 0) > 0
+  const recentMessages = discussion.messages.slice(-10)
+
+  // 判断消息是否来自Agent
+  const isAgentMessage = (character: string) => {
+    const agentNames = ['编剧', '作家', '评估员', '伏笔管理员', '设定管理员', '地图管理员', '事件生成器', '摘要员', '总编剧']
+    return agentNames.some(name => character.includes(name)) || character.startsWith('角色')
+  }
+
+  return (
+    <div className={`rounded-lg border-2 overflow-hidden ${
+      hasDiscussion
+        ? isDark ? 'border-purple-700 bg-purple-900/10' : 'border-purple-300 bg-purple-50'
+        : isDark ? 'border-gray-700 bg-gray-800/30' : 'border-gray-200 bg-gray-50'
+    }`}>
+      {/* 第一行：标题和状态 */}
+      <div className={`flex items-center justify-between px-4 py-2 ${
+        hasDiscussion
+          ? isDark ? 'bg-purple-900/30' : 'bg-purple-100'
+          : isDark ? 'bg-gray-800/50' : 'bg-gray-100'
+      }`}>
+        <div className="flex items-center gap-2">
+          <span className="text-xl">💬</span>
+          <div>
+            <h4 className={`text-sm font-semibold ${isDark ? 'text-white' : 'text-gray-800'}`}>
+              集体会话
+            </h4>
+            <p className={`text-xs ${hasDiscussion ? (isDark ? 'text-purple-300' : 'text-purple-600') : (isDark ? 'text-gray-500' : 'text-gray-400')}`}>
+              {discussion.topic || (hasDiscussion ? '讨论进行中' : '等待工作流启动集体会话')}
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          {discussion.isActive ? (
+            <span className="flex items-center gap-1.5 text-xs text-green-500 font-medium">
+              <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
+              进行中
+            </span>
+          ) : hasDiscussion ? (
+            <span className="text-xs text-gray-500">已结束</span>
+          ) : (
+            <span className={`text-xs ${isDark ? 'text-gray-600' : 'text-gray-400'}`}>待激活</span>
+          )}
+          {/* 参与者头像 */}
+          {(discussion.participants?.length || discussion.characters.length) > 0 ? (
+            <div className="flex -space-x-2">
+              {(discussion.participants || discussion.characters).slice(0, 5).map((p: any, i: number) => (
+                <div
+                  key={i}
+                  className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-medium ${
+                    isDark ? 'bg-purple-800 text-purple-200' : 'bg-purple-200 text-purple-700'
+                  }`}
+                  title={typeof p === 'string' ? p : p.name}
+                >
+                  {(typeof p === 'string' ? p : p.name).charAt(0)}
+                </div>
+              ))}
+              {(discussion.participants?.length || discussion.characters.length) > 5 && (
+                <div className={`w-6 h-6 rounded-full flex items-center justify-center text-xs ${
+                  isDark ? 'bg-gray-700 text-gray-300' : 'bg-gray-200 text-gray-500'
+                }`}>
+                  +{(discussion.participants?.length || discussion.characters.length) - 5}
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className={`w-6 h-6 rounded-full flex items-center justify-center text-xs ${
+              isDark ? 'bg-gray-700 text-gray-500' : 'bg-gray-200 text-gray-400'
+            }`}>
+              ?
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* 第二行：消息输出区域 */}
+      <div className={`min-h-[150px] max-h-[250px] overflow-y-auto p-3 space-y-2 ${
+        isDark ? 'bg-gray-900/50' : 'bg-white'
+      }`}>
+        {!hasDiscussion ? (
+          <div className="flex flex-col items-center justify-center h-full py-8">
+            <div className={`text-4xl mb-3 ${isDark ? 'opacity-50' : 'opacity-30'}`}>💬</div>
+            <p className={`text-sm ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+              工作流执行时，Agent集体讨论将在此显示
+            </p>
+            <p className={`text-xs mt-1 ${isDark ? 'text-gray-600' : 'text-gray-300'}`}>
+              使用工作流编辑器启动创作流程
+            </p>
+          </div>
+        ) : recentMessages.length === 0 ? (
+          <div className={`text-sm italic text-center py-4 ${isDark ? 'text-gray-600' : 'text-gray-400'}`}>
+            等待Agent发言...
+          </div>
+        ) : (
+          recentMessages.map((msg, i) => (
+            <div
+              key={i}
+              className={`p-2 rounded-lg ${
+                msg.character === '你'
+                  ? isDark ? 'bg-blue-900/30 border border-blue-800' : 'bg-blue-50 border border-blue-200'
+                  : isAgentMessage(msg.character)
+                    ? isDark ? 'bg-purple-900/20 border border-purple-800' : 'bg-purple-50 border border-purple-200'
+                    : isDark ? 'bg-gray-800' : 'bg-gray-50'
+              }`}
+            >
+              <div className="flex items-center gap-2 mb-1">
+                <span className={`text-xs font-medium ${
+                  msg.character === '你' ? 'text-blue-500' : isAgentMessage(msg.character) ? 'text-purple-500' : 'text-green-500'
+                }`}>
+                  {msg.character === '你' ? '👤 你' : isAgentMessage(msg.character) ? `🤖 ${msg.character}` : `🎭 ${msg.character}`}
+                </span>
+                <span className={`text-[10px] ${isDark ? 'text-gray-600' : 'text-gray-400'}`}>
+                  {msg.timestamp}
+                </span>
+              </div>
+              <p className={`text-sm ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>{msg.content}</p>
+            </div>
+          ))
+        )}
+      </div>
+
+      {/* 第三行：输入区域 */}
+      <div className={`flex gap-2 p-2 border-t ${hasDiscussion ? (isDark ? 'border-purple-800 bg-purple-900/20' : 'border-purple-200 bg-purple-50') : (isDark ? 'border-gray-700 bg-gray-800/30' : 'border-gray-200 bg-gray-50')}`}>
+        <input
+          type="text"
+          value={input}
+          onChange={(e) => onInputChange(e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && onSend()}
+          placeholder={hasDiscussion ? "参与讨论..." : "等待集体会话开始..."}
+          disabled={!discussion.isActive}
+          className={`flex-1 px-3 py-1.5 text-sm rounded border ${
+            isDark
+              ? 'bg-gray-900 border-gray-700 text-white placeholder-gray-500'
+              : 'bg-white border-gray-300 text-gray-800 placeholder-gray-400'
+          } focus:outline-none focus:ring-1 focus:ring-purple-500 disabled:opacity-50`}
+        />
+        <button
+          onClick={onSend}
+          disabled={!input.trim() || !discussion.isActive}
+          className="px-3 py-1.5 bg-purple-600 hover:bg-purple-700 disabled:bg-gray-500 disabled:cursor-not-allowed text-white text-sm rounded transition-colors"
+        >
+          发送
+        </button>
+        {discussion.isActive && (
+          <button
+            onClick={onEnd}
+            className="px-3 py-1.5 bg-gray-600 hover:bg-gray-700 text-white text-sm rounded transition-colors"
+          >
+            结束
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// 连接状态徽章
+function ConnectionBadge({ status, isDark }: { status: string, isDark: boolean }) {
+  const config = {
+    connected: { color: 'bg-green-500', text: '已连接', icon: Circle },
+    connecting: { color: 'bg-yellow-500 animate-pulse', text: '连接中', icon: Circle },
+    disconnected: { color: isDark ? 'bg-gray-600' : 'bg-gray-400', text: '未连接', icon: Circle },
+  }
+  const { color, text } = config[status as keyof typeof config] || config.disconnected
+
+  return (
+    <div className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium ${
+      isDark ? 'bg-gray-800 text-gray-300' : 'bg-gray-100 text-gray-600'
+    }`}>
+      <div className={`w-2 h-2 rounded-full ${color}`} />
+      {text}
+    </div>
+  )
+}
+
+// 工作状态横幅
+function WorkingBanner({ agentName, isDark }: { agentName: string | null, isDark: boolean }) {
+  if (!agentName) return null
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, height: 0 }}
+      animate={{ opacity: 1, height: 'auto' }}
+      exit={{ opacity: 0, height: 0 }}
+      className={`flex items-center gap-2 px-4 py-2 text-sm ${
+        isDark ? 'bg-blue-900/30 text-blue-300' : 'bg-blue-50 text-blue-600'
+      }`}
+    >
+      <div className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
+      <span>{agentName} 正在工作...</span>
+    </motion.div>
+  )
+}
+
+// 快速操作按钮
+function QuickActionButton({
+  icon: Icon,
+  label,
+  onClick,
+  disabled,
+  color = 'default',
+  isDark
+}: {
+  icon: React.ElementType
+  label: string
+  onClick: () => void
+  disabled?: boolean
+  color?: 'default' | 'primary' | 'danger'
+  isDark: boolean
+}) {
+  const colorClasses = {
+    default: isDark
+      ? 'bg-gray-800 hover:bg-gray-700 text-gray-300 border-gray-700'
+      : 'bg-white hover:bg-gray-50 text-gray-700 border-gray-200',
+    primary: 'bg-blue-600 hover:bg-blue-700 text-white border-blue-600',
+    danger: 'bg-red-600 hover:bg-red-700 text-white border-red-600',
+  }
+
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className={`flex items-center gap-2 px-4 py-2.5 rounded-lg border text-sm font-medium transition-all disabled:opacity-50 disabled:cursor-not-allowed ${colorClasses[color]}`}
+    >
+      <Icon size={16} />
+      {label}
+    </button>
+  )
+}
+
+// 章节卡片
+function ChapterCard({
+  chapter,
+  onCopy,
+  isDark
+}: {
+  chapter: { chapter_num: number; title: string; word_count: number; content: string }
+  onCopy: () => void
+  isDark: boolean
+}) {
+  const [copied, setCopied] = useState(false)
+
+  const handleCopy = () => {
+    navigator.clipboard.writeText(chapter.content)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+    onCopy()
+  }
+
+  return (
+    <details className={`group rounded-lg border ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+      <summary className={`flex items-center justify-between p-4 cursor-pointer list-none ${
+        isDark ? 'hover:bg-gray-800/50' : 'hover:bg-gray-50'
+      }`}>
+        <div className="flex items-center gap-3">
+          <span className={`text-xs font-mono px-2 py-0.5 rounded ${
+            isDark ? 'bg-gray-700 text-gray-400' : 'bg-gray-100 text-gray-500'
+          }`}>
+            #{chapter.chapter_num}
+          </span>
+          <span className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>
+            {chapter.title}
+          </span>
+          <span className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+            {chapter.word_count.toLocaleString()} 字
+          </span>
+        </div>
+        <button
+          onClick={(e) => { e.stopPropagation(); handleCopy() }}
+          className={`p-2 rounded-lg transition-colors ${
+            isDark ? 'hover:bg-gray-700' : 'hover:bg-gray-100'
+          }`}
+        >
+          {copied ? <Check size={16} className="text-green-500" /> : <Copy size={16} />}
+        </button>
+      </summary>
+      <div className={`px-4 pb-4 ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
+        <div className={`p-4 rounded-lg max-h-64 overflow-y-auto text-sm leading-relaxed whitespace-pre-wrap ${
+          isDark ? 'bg-gray-800/50' : 'bg-gray-50'
+        }`}>
+          {chapter.content}
+        </div>
+      </div>
+    </details>
+  )
+}
+
+// 日志条目
+function LogEntry({ log, isDark }: { log: string, isDark: boolean }) {
+  const isInfo = log.includes('✅') || log.includes('📖') || log.includes('🎉')
+  const isError = log.includes('❌') || log.includes('错误')
+  const isWarning = log.includes('⚠️') || log.includes('警告')
+
+  const colorClass = isError
+    ? 'text-red-400'
+    : isWarning
+      ? 'text-yellow-400'
+      : isInfo
+        ? 'text-green-400'
+        : isDark ? 'text-gray-300' : 'text-gray-600'
+
+  return (
+    <p className={`text-xs font-mono ${colorClass} leading-relaxed`}>
+      {log}
+    </p>
+  )
+}
+
+// ==================== Main Component ====================
 
 export default function Director() {
   const { currentProject } = useProject()
   const { theme } = useTheme()
   const isDark = theme === 'dark'
 
-  const [sessionId, setSessionId] = useState<string>('')
+  // Core state
+  const [sessionId, setSessionId] = useState('')
+  const [isConnected, setIsConnected] = useState(false) // 是否已主动连接
   const [isGenerating, setIsGenerating] = useState(false)
-  const [selectedAgent, setSelectedAgent] = useState<string>('')
-  const [agentCommand, setAgentCommand] = useState('')
   const [logs, setLogs] = useState<string[]>([])
-  const [showCommandModal, setShowCommandModal] = useState(false)
   const [agents, setAgents] = useState<AgentStatus[]>(defaultAgents)
   const [runtimeState, setRuntimeState] = useState<Record<string, any> | null>(null)
   const [snapshotTree, setSnapshotTree] = useState<SnapshotNode[]>([])
-  const [workflowGraph, setWorkflowGraph] = useState<{ nodes: Array<{ id: string; label: string }>; edges: Array<{ source: string; target: string }> } | null>(null)
-  const [regionPrompt, setRegionPrompt] = useState('向未知区域探索')
-  const [rollbackSnapshotId, setRollbackSnapshotId] = useState('')
-  const [dialoguePanel, setDialoguePanel] = useState<DialoguePanelState | null>(null)
-  const [narrativePanel, setNarrativePanel] = useState<NarrativePanelState | null>(null)
-  const [availableCharacters, setAvailableCharacters] = useState<Array<{ id: string; name: string }>>([])
-  const [dialogueForm, setDialogueForm] = useState({
-    speakerId: 'narrator',
-    context: '当前场景推进中',
-    presentCharacters: '',
-    intents: '推进剧情',
-    environment: '',
-    characterMoods: '',
-  })
-  const [showAddCharacterModal, setShowAddCharacterModal] = useState(false)
-  const [newCharacterForm, setNewCharacterForm] = useState({
-    name: '',
-    description: '',
-    role: 'supporting',
-    background_story: '',
-    speech_pattern: '',
-  })
-  const [showAutoWriteModal, setShowAutoWriteModal] = useState(false)
-  const [autoWriteForm, setAutoWriteForm] = useState({
-    chapter_title: '',
-    chapter_goal: '',
-    target_word_count: 2000,
-    style_reference: '',
-  })
-  const [autoWriteResult, setAutoWriteResult] = useState<{
-    chapter_id?: string
-    title?: string
-    content?: string
-    word_count?: number
-  } | null>(null)
-  const [showAutoModeModal, setShowAutoModeModal] = useState(false)
-  const [autoModeForm, setAutoModeForm] = useState({
-    initial_plot: '',
-    chapter_count: 3,
-    words_per_chapter: 2000,
-    style_reference: '',
-  })
+
+  // Agent 输出记录
+  const [agentOutputs, setAgentOutputs] = useState<Record<string, string>>({})
+
+  // Agent 实时流式输出（正在生成中）
+  const [agentStreaming, setAgentStreaming] = useState<Record<string, string>>({})
+
+  // Workflow state
+  const [savedWorkflows, setSavedWorkflows] = useState<WorkflowDefinition[]>([])
+  const [selectedWorkflowId, setSelectedWorkflowId] = useState('')
+
+  // Auto mode state
   const [autoModeRunning, setAutoModeRunning] = useState(false)
   const [autoModeChapters, setAutoModeChapters] = useState<Array<{
     chapter_num: number
@@ -177,166 +673,365 @@ export default function Director() {
     word_count: number
     content: string
   }>>([])
+  const [showAutoModeModal, setShowAutoModeModal] = useState(false)
+  const [autoModeForm, setAutoModeForm] = useState({
+    chapter_count: 3,
+    words_per_chapter: 2000,
+    style_reference: '',
+  })
 
-  // 高级设置折叠状态
-  const [showAdvancedControls, setShowAdvancedControls] = useState(false)
+  // UI state
   const [showLogs, setShowLogs] = useState(true)
 
+  // Character state
+  const [availableCharacters, setAvailableCharacters] = useState<Array<{ id: string; name: string }>>([])
+  const [showAddCharacterModal, setShowAddCharacterModal] = useState(false)
+  const [newCharacterForm, setNewCharacterForm] = useState({
+    name: '',
+    description: '',
+    importance_tier: 'npc' as string,
+  })
+
+  // 生成单章 state
+  const [showWriteChapterModal, setShowWriteChapterModal] = useState(false)
+  const [chapterForm, setChapterForm] = useState({
+    title: '',
+    goal: '',
+    targetWordCount: 2000,
+  })
+
+  // Discussion state
+  const [groupDiscussion, setGroupDiscussion] = useState<{
+    topic: string
+    messages: Array<{ character: string; content: string; timestamp: string }>
+    characters: string[]
+    participants?: Array<{ type: string; name: string; role: string }>
+    isActive: boolean
+  } | null>(null)
+  const [discussionInput, setDiscussionInput] = useState('')
+
+  // Intervention state - 每个Agent独立的干预输入
+  const [agentInterventionInputs, setAgentInterventionInputs] = useState<Record<string, string>>({})
+  const [interventionHistory, setInterventionHistory] = useState<Array<{
+    agent: string
+    message: string
+    response?: string
+    timestamp: string
+  }>>([])
+
+  // 设置特定Agent的干预输入
+  const setAgentInput = (agentName: string, value: string) => {
+    setAgentInterventionInputs(prev => ({ ...prev, [agentName]: value }))
+  }
+
+  // 发送干预到特定Agent
+  const sendAgentIntervention = (agentName: string) => {
+    const input = agentInterventionInputs[agentName] || ''
+    if (!input.trim() || !isGenerating || wsStatus !== 'connected') return
+
+    const timestamp = new Date().toLocaleTimeString()
+    // 获取 agent_type（用于工作流匹配）
+    const agentType = AGENT_TYPE_MAP[agentName] || agentName.toLowerCase().replace(' ', '_')
+
+    send({
+      type: 'intervention',
+      agent: agentName,
+      agent_type: agentType,  // 工作流使用的类型
+      message: input.trim(),
+    })
+    addLog(`📤 向 ${agentName} 发送干预: ${input.trim()}`)
+    setInterventionHistory(prev => [...prev, { agent: agentName, message: input.trim(), timestamp }])
+    setAgentInput(agentName, '') // 清空输入
+  }
+
+  // Modals
+  const [showCommandModal, setShowCommandModal] = useState(false)
+  const [selectedAgent, setSelectedAgent] = useState('')
+  const [agentCommand, setAgentCommand] = useState('')
+
+  // Ref to track if we've already attempted to start the session
+  const sessionStartAttempted = useRef(false)
+
+  // Helpers
   const addLog = (message: string) => {
     const timestamp = new Date().toLocaleTimeString()
-    setLogs((prev) => [`[${timestamp}] ${message}`, ...prev.slice(0, 199)])
+    setLogs(prev => [`[${timestamp}] ${message}`, ...prev.slice(0, 199)])
   }
-
-  const wsPath = useMemo(
-    () => (sessionId.trim() ? `/api/ws/connect/${sessionId.trim()}` : ''),
-    [sessionId]
-  )
 
   const updateAgent = (name: string, patch: Partial<AgentStatus>) => {
-    setAgents((prev) => prev.map((a) => (a.name === name ? { ...a, ...patch } : a)))
+    setAgents(prev => prev.map(a => a.name === name ? { ...a, ...patch } : a))
   }
 
-  const loadRuntimePanels = async () => {
-    if (!sessionId.trim()) return
-    try {
-      const [stateRes, workflowRes] = await Promise.all([
-        getDirectorState(sessionId.trim()),
-        getWorkflowGraph(sessionId.trim()),
-      ])
-      setRuntimeState(stateRes.data)
-      setWorkflowGraph(workflowRes)
-      if (stateRes.data?.world_id) {
-        const treeRes = await getSnapshotTree(stateRes.data.world_id)
-        setSnapshotTree(treeRes.data || [])
-      } else {
-        setSnapshotTree([])
-      }
-    } catch (error) {
-      console.error('Failed to load runtime panels:', error)
-    }
-  }
+  const getWorkingAgentName = () => agents.find(a => a.status === 'working')?.message || null
 
-  useEffect(() => {
-    if (sessionId.trim()) {
-      loadRuntimePanels()
-    }
-  }, [sessionId])
-
-  useEffect(() => {
-    const loadCharacters = async () => {
-      if (!currentProject) {
-        setAvailableCharacters([])
-        return
-      }
-      try {
-        const chars = await getCharacters(currentProject.id)
-        setAvailableCharacters(chars.map((c: any) => ({ id: c.id, name: c.name })))
-      } catch (error) {
-        console.error('Failed to load characters:', error)
-        setAvailableCharacters([])
-      }
-    }
-    loadCharacters()
-  }, [currentProject])
+  // WebSocket - 只有点击启动后才连接
+  const wsPath = useMemo(
+    () => (isConnected && sessionId.trim()) ? `/api/ws/connect/${sessionId.trim()}` : '',
+    [isConnected, sessionId]
+  )
 
   const { status: wsStatus, send } = useDynamicWebSocket(wsPath, {
-    onOpen: () => addLog('WebSocket 已连接'),
-    onClose: () => addLog('WebSocket 已关闭'),
-    onError: () => addLog('WebSocket 连接异常'),
+    onOpen: () => addLog('✅ WebSocket 已连接，正在启动会话...'),
+    onClose: () => {
+      addLog('WebSocket 已断开')
+      setIsGenerating(false)
+    },
+    onError: () => {
+      addLog('❌ WebSocket 连接异常')
+      setIsConnected(false)
+    },
     onMessage: (data) => {
       switch (data.type) {
         case 'log':
           addLog(data.message)
           break
         case 'agent_status':
-          updateAgent(data.agent, {
-            status: data.status,
-            message: data.message,
-            progress: data.progress,
-          })
+          updateAgent(data.agent, { status: data.status, message: data.message })
+          // 如果有输出数据，记录到agentOutputs
+          if (data.output) {
+            setAgentOutputs(prev => ({
+              ...prev,
+              [data.agent]: typeof data.output === 'string' ? data.output : JSON.stringify(data.output, null, 2)
+            }))
+          }
+          // 如果状态变为completed/idle/error，清除流式输出
+          if (data.status !== 'working') {
+            setAgentStreaming(prev => {
+              const next = { ...prev }
+              delete next[data.agent]
+              return next
+            })
+          }
+          break
+        case 'agent_streaming':
+          // Agent 流式输出 - 实时更新
+          {
+            const streamData = data.data || data
+            if (streamData.chunk) {
+              const agentName = getAgentNameFromNode({ agent_type: streamData.agent, label: streamData.label })
+              const streamKey = agentName || streamData.agent || streamData.node_id
+
+              // 调试日志
+              console.log(`[流式输出] agent: ${streamData.agent}, label: ${streamData.label}, agentName: ${agentName}, streamKey: ${streamKey}`)
+
+              setAgentStreaming(prev => ({
+                ...prev,
+                [streamKey]: (prev[streamKey] || '') + streamData.chunk
+              }))
+
+              // 同时更新 Agent 输出记录
+              if (agentName) {
+                setAgentOutputs(prev => ({
+                  ...prev,
+                  [agentName]: (prev[agentName] || '') + streamData.chunk
+                }))
+              }
+            }
+          }
+          break
+        case 'agent_output':
+          // Agent 完整输出
+          {
+            const outputData = data.data || data
+            if (outputData.agent && outputData.output) {
+              const outputStr = typeof outputData.output === 'string' ? outputData.output : JSON.stringify(outputData.output, null, 2)
+              setAgentOutputs(prev => ({
+                ...prev,
+                [outputData.agent]: outputStr.slice(0, 1000)
+              }))
+              // 清除流式输出
+              setAgentStreaming(prev => {
+                const next = { ...prev }
+                delete next[outputData.agent]
+                return next
+              })
+            }
+          }
+          break
+        case 'node_output':
+          // 工作流节点输出
+          {
+            const nodeData = data.data || data
+            if (nodeData.output) {
+              const outputStr = typeof nodeData.output === 'string' ? nodeData.output : JSON.stringify(nodeData.output, null, 2)
+              const agentName = getAgentNameFromNode(nodeData)
+
+              // 更新节点输出
+              if (nodeData.node_id) {
+                setAgentOutputs(prev => ({
+                  ...prev,
+                  [nodeData.node_id]: outputStr.slice(0, 500)
+                }))
+              }
+
+              // 同时更新对应 Agent 的输出
+              if (agentName) {
+                setAgentOutputs(prev => ({
+                  ...prev,
+                  [agentName]: outputStr.slice(0, 1000)
+                }))
+              }
+
+              const displayName = agentName || nodeData.label || nodeData.node_id
+              addLog(`📤 ${displayName}: ${outputStr.slice(0, 100)}...`)
+            }
+          }
+          break
+        case 'node_started':
+          // 节点开始执行
+          {
+            const nodeData = data.data || data
+            const agentName = getAgentNameFromNode(nodeData)
+            const displayName = agentName || nodeData.label || nodeData.node_id
+            addLog(`🔄 ${displayName} 开始执行`)
+
+            // 更新对应 Agent 的状态
+            if (agentName) {
+              updateAgent(agentName, { status: 'working', message: nodeData.label || '执行中' })
+            }
+
+            // 记录流式输出
+            if (nodeData.node_id) {
+              setAgentStreaming(prev => ({
+                ...prev,
+                [nodeData.node_id]: ''
+              }))
+            }
+          }
+          break
+        case 'node_completed':
+          // 节点执行完成
+          {
+            const nodeData = data.data || data
+            const agentName = getAgentNameFromNode(nodeData)
+            const displayName = agentName || nodeData.label || nodeData.node_id
+
+            // 检查是否失败
+            if (nodeData.status === 'failed' || nodeData.error) {
+              addLog(`❌ ${displayName} 执行失败: ${nodeData.error || '未知错误'}`)
+              if (agentName) {
+                updateAgent(agentName, { status: 'error', message: nodeData.error || '执行失败' })
+              }
+            } else {
+              addLog(`✅ ${displayName} 完成`)
+              if (agentName) {
+                updateAgent(agentName, { status: 'completed', message: nodeData.label || '完成' })
+              }
+            }
+
+            // 清除流式输出
+            if (nodeData.node_id) {
+              setAgentStreaming(prev => {
+                const next = { ...prev }
+                delete next[nodeData.node_id]
+                return next
+              })
+            }
+            if (agentName) {
+              setAgentStreaming(prev => {
+                const next = { ...prev }
+                delete next[agentName]
+                return next
+              })
+            }
+          }
+          break
+        case 'node_streaming':
+          // 节点流式输出
+          {
+            const nodeData = data.data || data
+            if (nodeData.chunk) {
+              const agentName = getAgentNameFromNode(nodeData)
+              const streamKey = agentName || nodeData.node_id
+
+              setAgentStreaming(prev => ({
+                ...prev,
+                [streamKey]: (prev[streamKey] || '') + nodeData.chunk
+              }))
+
+              // 同时更新 Agent 输出记录
+              if (agentName) {
+                setAgentOutputs(prev => ({
+                  ...prev,
+                  [agentName]: (prev[agentName] || '') + nodeData.chunk
+                }))
+              }
+            }
+          }
           break
         case 'session_started':
-          addLog(`会话已启动: ${data.data?.session_id || sessionId}`)
+          addLog(`✅ 会话已启动`)
+          setIsGenerating(true)
           loadRuntimePanels()
           break
         case 'session_stopped':
           addLog('会话已停止')
-          loadRuntimePanels()
-          break
-        case 'plot_advanced':
-          addLog(`剧情推进: ${data.data?.reason || '已完成'}`)
+          setIsGenerating(false)
+          setIsConnected(false)
           loadRuntimePanels()
           break
         case 'hooks_managed':
-          addLog('伏笔管理完成')
+          addLog('🎯 伏笔管理完成')
+          setAgentOutputs(prev => ({ ...prev, 'Hook Manager': JSON.stringify(data.data || {}, null, 2).slice(0, 500) }))
           loadRuntimePanels()
           break
-        case 'dialogue_generated':
-          addLog(`对话生成完成`)
-          setDialoguePanel(data.data || null)
-          loadRuntimePanels()
+        case 'group_discussion_started':
+          addLog(`🌟 集体讨论开始`)
+          // 处理从工作流引擎发送的讨论消息
+          const discussionMessages = data.data?.messages || []
+          const formattedMessages = discussionMessages.map((msg: any) => ({
+            character: msg.agent || msg.character || 'Agent',
+            content: msg.content || '',
+            timestamp: new Date().toLocaleTimeString(),
+          }))
+          setGroupDiscussion({
+            topic: data.data?.discussion_topic || '讨论',
+            messages: formattedMessages,
+            characters: data.data?.characters || [],
+            participants: data.data?.participants || [],
+            isActive: true,
+          })
           break
-        case 'narrative_generated':
-          addLog(`叙事生成完成: ${data.data?.word_count || 0} 字`)
-          setNarrativePanel(data.data || null)
-          loadRuntimePanels()
+        case 'discussion_message':
+          const speakerName = data.data?.agent || data.data?.character || '未知'
+          const messageContent = data.data?.content || ''
+          const isLLMGenerated = data.data?.is_llm_generated
+          // 添加日志
+          addLog(`💬 ${speakerName}: ${messageContent.slice(0, 50)}${messageContent.length > 50 ? '...' : ''}${isLLMGenerated ? ' 🤖' : ''}`)
+          // 更新讨论状态
+          setGroupDiscussion(prev => {
+            if (prev) {
+              return {
+                ...prev,
+                messages: [...prev.messages, {
+                  character: speakerName,
+                  content: messageContent,
+                  timestamp: new Date().toLocaleTimeString(),
+                  isLLMGenerated,
+                }],
+              }
+            } else {
+              // 如果讨论还未初始化，创建一个新的讨论状态
+              return {
+                topic: '创作讨论会',
+                messages: [{
+                  character: speakerName,
+                  content: messageContent,
+                  timestamp: new Date().toLocaleTimeString(),
+                  isLLMGenerated,
+                }],
+                characters: [],
+                participants: [],
+                isActive: true,
+              }
+            }
+          })
           break
-        case 'workflow_cycle_result':
-          addLog('工作流执行完成')
-          if (data.data?.dialogue) {
-            setDialoguePanel(data.data.dialogue)
+        case 'discussion_ended':
+          addLog('📝 集体讨论结束')
+          if (groupDiscussion) {
+            setGroupDiscussion(prev => prev ? { ...prev, isActive: false } : null)
           }
-          if (data.data?.narrative) {
-            setNarrativePanel(data.data.narrative)
-          }
-          loadRuntimePanels()
-          break
-        case 'chapter_end_result':
-          addLog(`章节评估: ${data.data?.reason || '完成'}${data.snapshot_id ? ` / 快照: ${data.snapshot_id}` : ''}`)
-          loadRuntimePanels()
-          break
-        case 'region_generated':
-          addLog(`新区域已生成: ${data.data?.region_name || data.data?.name || ''}`)
-          loadRuntimePanels()
-          break
-        case 'snapshot_created':
-          addLog(`快照已创建: ${data.data?.id || ''}`)
-          loadRuntimePanels()
-          break
-        case 'snapshot_rolled_back':
-          addLog(`已回档到快照: ${data.data?.snapshot_id || data.data?.id || ''}`)
-          loadRuntimePanels()
-          break
-        case 'agent_command_result':
-          addLog(`${data.data?.agent}: ${data.data?.result}`)
-          break
-        case 'character_added':
-          addLog(`角色已添加: ${data.data?.name || data.data?.character_id}`)
-          if (currentProject) {
-            getCharacters(currentProject.id).then((chars: any[]) => {
-              setAvailableCharacters(chars.map((c) => ({ id: c.id, name: c.name })))
-            })
-          }
-          break
-        case 'character_removed':
-          addLog(`角色已移除: ${data.data?.character_id}`)
-          if (currentProject) {
-            getCharacters(currentProject.id).then((chars: any[]) => {
-              setAvailableCharacters(chars.map((c) => ({ id: c.id, name: c.name })))
-            })
-          }
-          break
-        case 'characters_list':
-          addLog(`角色列表: ${data.data?.count || 0} 个角色`)
-          break
-        case 'auto_write_chapter_result':
-          if (data.status === 'success') {
-            addLog(`章节自动写作完成: ${data.data?.title} (${data.data?.word_count} 字)`)
-            setAutoWriteResult(data.data)
-          } else {
-            addLog(`章节自动写作失败: ${data.error}`)
-          }
-          loadRuntimePanels()
           break
         case 'auto_mode_chapter_start':
           addLog(`📖 开始写作第 ${data.chapter_num} 章: ${data.title}`)
@@ -352,41 +1047,152 @@ export default function Director() {
           break
         case 'auto_mode_completed':
           setAutoModeRunning(false)
-          addLog(`🎉 全自动创作完成！共 ${data.data?.total_chapters} 章，${data.data?.total_words} 字`)
+          addLog(`🎉 连续创作完成！共 ${data.data?.total_chapters} 章，${data.data?.total_words} 字`)
           loadRuntimePanels()
           break
         case 'auto_mode_error':
           setAutoModeRunning(false)
-          addLog(`❌ 自动模式错误: ${data.error}`)
+          addLog(`❌ 错误: ${data.error}`)
+          break
+        case 'auto_write_chapter_result':
+          if (data.status === 'success') {
+            addLog(`✅ 章节生成完成: ${data.data?.title} (${data.data?.word_count} 字)`)
+            setAutoModeChapters(prev => [...prev, {
+              chapter_num: data.data?.chapter_num || prev.length + 1,
+              title: data.data?.title || '',
+              word_count: data.data?.word_count || 0,
+              content: data.data?.content || '',
+            }])
+            loadRuntimePanels()
+          } else {
+            addLog(`❌ 章节生成失败: ${data.error}`)
+          }
+          break
+        case 'character_added':
+          addLog(`👤 角色已添加: ${data.data?.name}`)
+          if (currentProject) loadCharacters()
+          break
+        case 'character_removed':
+          addLog(`👤 角色已移除`)
+          if (currentProject) loadCharacters()
+          break
+        case 'agent_response':
+          // Agent 干预响应
+          addLog(`💬 ${data.agent}: ${data.response?.slice(0, 50) || '已响应'}...`)
+          setInterventionHistory(prev => prev.map(item =>
+            item.agent === data.agent && !item.response
+              ? { ...item, response: data.response }
+              : item
+          ))
+          if (data.agent) {
+            setAgentOutputs(prev => ({ ...prev, [data.agent]: data.response || '' }))
+          }
+          break
+        case 'intervention_response':
+          // 干预响应
+          addLog(`💬 ${data.agent}: ${data.response?.slice(0, 80) || '已响应'}...`)
+          setInterventionHistory(prev => prev.map(item =>
+            item.agent === data.agent && !item.response
+              ? { ...item, response: data.response }
+              : item
+          ))
+          if (data.agent) {
+            setAgentOutputs(prev => ({ ...prev, [data.agent]: data.response || '' }))
+          }
+          break
+        case 'intervention_queued':
+          // 干预已加入工作流队列
+          addLog(`📤 干预已排队，等待 ${data.agent} 执行`)
+          break
+        case 'intervention_applied':
+          // 干预已应用到Agent
+          addLog(`✅ 干预已应用到 ${data.agent} (${data.intervention_count} 条)`)
+          break
+        case 'intervention_logged':
+          addLog(`📝 干预已记录`)
           break
         case 'error':
-          addLog(`错误: ${data.message}`)
+          addLog(`❌ ${data.message}`)
           break
         default:
-          addLog(`收到消息: ${JSON.stringify(data)}`)
+          if (data.type !== 'heartbeat') {
+            addLog(`${data.type}: ${JSON.stringify(data.data || {}).slice(0, 50)}`)
+          }
       }
     },
   })
 
+  // Data loading
+  const loadRuntimePanels = async () => {
+    if (!sessionId.trim()) return
+    try {
+      const stateRes = await getDirectorState(sessionId.trim())
+      setRuntimeState(stateRes.data)
+      if (stateRes.data?.world_id) {
+        const treeRes = await getSnapshotTree(stateRes.data.world_id)
+        setSnapshotTree(treeRes.data || [])
+      }
+    } catch (error) {
+      console.error('Failed to load runtime panels:', error)
+    }
+  }
+
+  const loadCharacters = async () => {
+    if (!currentProject) return setAvailableCharacters([])
+    try {
+      const chars = await getCharacters(currentProject.id)
+      setAvailableCharacters(chars.map((c: any) => ({ id: c.id, name: c.name })))
+    } catch (error) {
+      console.error('Failed to load characters:', error)
+    }
+  }
+
+  const loadWorkflows = useCallback(async () => {
+    if (!currentProject) return setSavedWorkflows([])
+    try {
+      const workflows = await getWorkflows(currentProject.id, true)
+      setSavedWorkflows(workflows)
+    } catch (error) {
+      console.error('Failed to load workflows:', error)
+    }
+  }, [currentProject])
+
+  useEffect(() => { loadCharacters() }, [currentProject])
+  useEffect(() => { loadWorkflows() }, [loadWorkflows])
+  useEffect(() => { if (sessionId.trim()) loadRuntimePanels() }, [sessionId])
+
+  // 当 WebSocket 连接成功后，发送 start_session
+  useEffect(() => {
+    if (wsStatus === 'connected' && isConnected && !sessionStartAttempted.current && currentProject) {
+      sessionStartAttempted.current = true
+      const worldId = currentProject.world_id || `project-${currentProject.id}`
+      send({
+        type: 'start_session',
+        world_id: worldId,
+        project_id: currentProject.id,  // 传递 project_id
+        character_ids: availableCharacters.map(c => c.id)
+      })
+      setIsGenerating(true)
+    }
+    // Note: send and availableCharacters are intentionally omitted to prevent re-triggering
+    // sessionStartAttempted ref prevents multiple calls
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wsStatus, isConnected, currentProject])
+
+  // Actions
   const startSession = () => {
-    if (!sessionId.trim()) {
-      addLog('请输入会话 ID')
-      return
-    }
-    if (!currentProject) {
-      addLog('请先选择一个项目')
-      return
-    }
-    setIsGenerating(true)
-    const worldId = currentProject.world_id || `project-${currentProject.id}`
-    const characterIds = availableCharacters.map((c) => c.id)
-    addLog(`启动会话: 项目 ${currentProject.name}`)
-    send({ type: 'start_session', world_id: worldId, character_ids: characterIds })
+    if (!sessionId.trim()) return addLog('请输入会话 ID')
+    if (!currentProject) return addLog('请先选择项目')
+    // 重置标志并设置连接状态，触发 WebSocket 连接
+    sessionStartAttempted.current = false
+    setIsConnected(true)
   }
 
   const stopSession = () => {
+    send({ type: 'stop_session' }) // 先发送停止消息
     setIsGenerating(false)
-    send({ type: 'stop_session' })
+    setIsConnected(false) // 然后断开 WebSocket
+    sessionStartAttempted.current = false // 重置以便下次启动
   }
 
   const resetAll = () => {
@@ -394,130 +1200,22 @@ export default function Director() {
     setLogs([])
     setRuntimeState(null)
     setSnapshotTree([])
-    setWorkflowGraph(null)
-    setDialoguePanel(null)
-    setNarrativePanel(null)
-    setAutoWriteResult(null)
     setAutoModeChapters([])
-  }
-
-  const executeAgentCommand = () => {
-    if (!selectedAgent || !agentCommand.trim()) {
-      addLog('请选择 Agent 并输入命令')
-      return
-    }
-    send({
-      type: 'agent_command',
-      agent: selectedAgent,
-      command: agentCommand,
-    })
-    setAgentCommand('')
-    setShowCommandModal(false)
-  }
-
-  const buildDialoguePayload = () => ({
-    speaker_id: dialogueForm.speakerId.trim() || 'narrator',
-    context: dialogueForm.context.trim() || '当前场景推进中',
-    present_characters: splitMultiline(dialogueForm.presentCharacters),
-    intents: splitMultiline(dialogueForm.intents),
-    environment: dialogueForm.environment.trim(),
-    character_moods: parseCharacterMoods(dialogueForm.characterMoods),
-  })
-
-  const triggerDialogue = () => {
-    send({
-      type: 'generate_dialogue',
-      ...buildDialoguePayload(),
-    })
-  }
-
-  const triggerNarrative = () => {
-    const payload = buildDialoguePayload()
-    send({
-      type: 'generate_narrative',
-      intents: payload.intents,
-      environment: payload.environment,
-      character_moods: payload.character_moods,
-    })
-  }
-
-  const triggerWorkflowCycle = () => {
-    send({
-      type: 'workflow_cycle',
-      ...buildDialoguePayload(),
-    })
-  }
-
-  const handleAddCharacter = () => {
-    if (!newCharacterForm.name.trim()) {
-      addLog('请输入角色名称')
-      return
-    }
-    if (!currentProject) {
-      addLog('请先选择项目')
-      return
-    }
-    send({
-      type: 'add_character',
-      character_data: {
-        name: newCharacterForm.name.trim(),
-        description: newCharacterForm.description,
-        role: newCharacterForm.role,
-        background_story: newCharacterForm.background_story,
-        speech_pattern: newCharacterForm.speech_pattern,
-        project_id: currentProject.id,
-      },
-    })
-    setNewCharacterForm({
-      name: '',
-      description: '',
-      role: 'supporting',
-      background_story: '',
-      speech_pattern: '',
-    })
-    setShowAddCharacterModal(false)
-  }
-
-  const handleRemoveCharacter = (characterId: string) => {
-    if (!confirm('确定要移除这个角色吗？')) return
-    send({
-      type: 'remove_character',
-      character_id: characterId,
-    })
-  }
-
-  const handleAutoWriteChapter = () => {
-    if (!autoWriteForm.chapter_title.trim()) {
-      addLog('请输入章节标题')
-      return
-    }
-    if (!autoWriteForm.chapter_goal.trim()) {
-      addLog('请输入章节目标/大纲')
-      return
-    }
-    send({
-      type: 'auto_write_chapter',
-      chapter_title: autoWriteForm.chapter_title.trim(),
-      chapter_goal: autoWriteForm.chapter_goal.trim(),
-      target_word_count: autoWriteForm.target_word_count,
-      style_reference: autoWriteForm.style_reference.trim(),
-    })
-    setShowAutoWriteModal(false)
+    setIsConnected(false)
+    setIsGenerating(false)
+    sessionStartAttempted.current = false
   }
 
   const handleStartAutoMode = () => {
-    if (!autoModeForm.initial_plot.trim()) {
-      addLog('请输入初始剧情设定')
-      return
-    }
+    if (!selectedWorkflowId) return addLog('请先选择工作流')
     setAutoModeRunning(true)
     setAutoModeChapters([])
     send({
       type: 'start_auto_mode',
-      initial_plot: autoModeForm.initial_plot.trim(),
+      workflow_id: selectedWorkflowId,
       chapter_count: autoModeForm.chapter_count,
       words_per_chapter: autoModeForm.words_per_chapter,
-      style_reference: autoModeForm.style_reference.trim(),
+      style_reference: autoModeForm.style_reference,
     })
     setShowAutoModeModal(false)
   }
@@ -527,515 +1225,422 @@ export default function Director() {
     setAutoModeRunning(false)
   }
 
-  const getAgentColor = (status: AgentStatus['status']) => {
-    switch (status) {
-      case 'idle':
-        return isDark ? 'bg-gray-600' : 'bg-gray-300'
-      case 'working':
-        return 'bg-blue-500 animate-pulse'
-      case 'completed':
-        return 'bg-green-500'
-      case 'error':
-        return 'bg-red-500'
-      default:
-        return isDark ? 'bg-gray-600' : 'bg-gray-300'
-    }
+  const sendDiscussionMessage = () => {
+    if (!discussionInput.trim() || !groupDiscussion) return
+    send({ type: 'discussion_message', message: discussionInput.trim() })
+    setGroupDiscussion(prev => prev ? {
+      ...prev,
+      messages: [...prev.messages, { character: '你', content: discussionInput.trim(), timestamp: new Date().toLocaleTimeString() }],
+    } : null)
+    setDiscussionInput('')
   }
 
-  const getWorkingAgentName = () => agents.find(a => a.status === 'working')?.message || null
-
-  const renderSnapshotTree = (nodes: SnapshotNode[], depth = 0): React.ReactNode => {
-    return nodes.map((node) => (
-      <div key={node.id} className="space-y-2">
-        <div className={`rounded-lg border p-2 ${isDark ? 'border-gray-700' : 'border-gray-200'}`} style={{ marginLeft: `${depth * 12}px` }}>
-          <div className="flex items-center justify-between gap-2">
-            <div>
-              <p className={`text-xs font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>{node.name || node.id}</p>
-            </div>
-            <Button
-              variant="secondary"
-              size="sm"
-              onClick={() => setRollbackSnapshotId(node.id)}
-              disabled={!isGenerating || wsStatus !== 'connected'}
-              className="text-xs px-2 py-1"
-            >
-              回档
-            </Button>
-          </div>
-        </div>
-        {node.children && node.children.length > 0 ? renderSnapshotTree(node.children, depth + 1) : null}
-      </div>
-    ))
+  const endDiscussion = () => {
+    send({ type: 'end_discussion' })
+    setGroupDiscussion(prev => prev ? { ...prev, isActive: false } : null)
   }
 
+  const handleAddCharacter = () => {
+    if (!newCharacterForm.name.trim()) return addLog('请输入角色名称')
+    if (!currentProject) return addLog('请先选择项目')
+    send({
+      type: 'add_character',
+      character_data: { ...newCharacterForm, project_id: currentProject.id },
+    })
+    setNewCharacterForm({ name: '', description: '', importance_tier: 'npc' })
+    setShowAddCharacterModal(false)
+  }
+
+  const handleRemoveCharacter = (characterId: string) => {
+    if (!confirm('确定移除该角色？')) return
+    send({ type: 'remove_character', character_id: characterId })
+  }
+
+  const handleWriteChapter = () => {
+    if (!chapterForm.title.trim() || !chapterForm.goal.trim() || !selectedWorkflowId) return
+    send({
+      type: 'auto_write_chapter',
+      workflow_id: selectedWorkflowId,
+      chapter_title: chapterForm.title.trim(),
+      chapter_goal: chapterForm.goal.trim(),
+      target_word_count: chapterForm.targetWordCount,
+    })
+    addLog(`📝 开始生成章节: ${chapterForm.title}`)
+    setChapterForm({ title: '', goal: '', targetWordCount: 2000 })
+    setShowWriteChapterModal(false)
+  }
+
+  // Header actions
   const headerActions = (
-    <div className="flex items-center gap-3">
-      {/* Agent状态指示器 */}
-      <div className="flex items-center gap-1.5">
-        {agents.map((agent) => (
-          <div
-            key={agent.name}
-            className={`w-3 h-3 rounded-full ${getAgentColor(agent.status)} cursor-pointer transition-transform hover:scale-125`}
-            title={`${agent.name}: ${agent.message}`}
-          />
-        ))}
-      </div>
-      <span
-        className={`px-3 py-1 rounded-full text-sm ${
-          wsStatus === 'connected'
-            ? isDark ? 'bg-green-900 text-green-300' : 'bg-green-100 text-green-700'
-            : wsStatus === 'connecting'
-              ? isDark ? 'bg-yellow-900 text-yellow-300' : 'bg-yellow-100 text-yellow-700'
-              : isDark ? 'bg-gray-700 text-gray-300' : 'bg-gray-100 text-gray-600'
-        }`}
-      >
-        {wsStatus === 'connected' ? '● 已连接' : wsStatus === 'connecting' ? '◐ 连接中' : '○ 未连接'}
-      </span>
+    <div className="flex items-center gap-4">
+      <AgentStatusBar agents={agents} isDark={isDark} />
+      <ConnectionBadge status={wsStatus} isDark={isDark} />
     </div>
   )
+
+  if (!currentProject) {
+    return (
+      <PageLayout title="上帝模式">
+        <div className={`flex flex-col items-center justify-center h-[60vh] ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+          <FolderOpen size={48} className="mb-4 opacity-50" />
+          <p className="text-lg">请先在侧边栏选择一个项目</p>
+        </div>
+      </PageLayout>
+    )
+  }
 
   return (
     <PageLayout
       title="上帝模式"
-      description={currentProject ? `项目: ${currentProject.name}` : undefined}
+      description={currentProject.name}
       actions={headerActions}
     >
-      {!currentProject ? (
-        <div className={`text-center py-20 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
-          <FolderOpen size={48} className="mx-auto mb-4 opacity-50" />
-          <p>请先在侧边栏选择一个项目</p>
-        </div>
-      ) : (
-        <div className="space-y-6">
-          {/* 顶部控制栏 */}
-          <Card className="p-4">
-            <div className="flex items-center gap-4 flex-wrap">
-              <Input
-                placeholder="输入会话 ID"
-                value={sessionId}
-                onChange={(e) => setSessionId(e.target.value)}
-                className="w-48"
-              />
-              {!isGenerating ? (
-                <Button onClick={startSession} disabled={!currentProject}>
-                  <Play size={18} className="mr-2" />启动会话
-                </Button>
-              ) : (
-                <Button variant="danger" onClick={stopSession}>
-                  <Pause size={18} className="mr-2" />停止会话
-                </Button>
-              )}
-              <Button variant="secondary" onClick={resetAll}>
-                <RotateCcw size={18} className="mr-2" />重置
-              </Button>
-              <div className="flex-1" />
-              {/* 运行时状态摘要 */}
+      <div className="space-y-4">
+        {/* ========== 顶部控制栏 ========== */}
+        <div className={`rounded-xl border overflow-hidden ${isDark ? 'border-gray-800' : 'border-gray-200'}`}>
+          <div className={`grid grid-cols-1 lg:grid-cols-2 divide-y lg:divide-y-0 lg:divide-x ${
+            isDark ? 'divide-gray-800 bg-gray-900/50' : 'divide-gray-200 bg-white'
+          }`}>
+            {/* 会话控制 */}
+            <div className="p-4">
+              <div className="flex items-center gap-3">
+                <div className={`flex items-center gap-2 px-3 py-1.5 rounded-lg ${
+                  isDark ? 'bg-gray-800' : 'bg-gray-100'
+                }`}>
+                  <span className={`text-xs font-medium uppercase tracking-wide ${
+                    isDark ? 'text-gray-500' : 'text-gray-400'
+                  }`}>会话</span>
+                </div>
+                <div className="flex-1 flex items-center gap-2">
+                  <input
+                    type="text"
+                    placeholder="输入会话 ID..."
+                    value={sessionId}
+                    onChange={(e) => setSessionId(e.target.value)}
+                    disabled={isConnected}
+                    className={`flex-1 max-w-xs px-4 py-2 rounded-lg border text-sm transition-colors disabled:opacity-50 ${
+                      isDark
+                        ? 'bg-gray-800 border-gray-700 text-white placeholder-gray-500 focus:border-blue-500'
+                        : 'bg-white border-gray-200 text-gray-800 placeholder-gray-400 focus:border-blue-500'
+                    }`}
+                  />
+                  {!isConnected ? (
+                    <button
+                      onClick={startSession}
+                      disabled={!currentProject || !sessionId.trim()}
+                      className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg transition-colors disabled:opacity-50"
+                    >
+                      <Play size={16} /> 启动
+                    </button>
+                  ) : (
+                    <button
+                      onClick={stopSession}
+                      className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white text-sm font-medium rounded-lg transition-colors"
+                    >
+                      <Pause size={16} /> 停止
+                    </button>
+                  )}
+                  <button
+                    onClick={resetAll}
+                    className={`p-2 rounded-lg transition-colors ${
+                      isDark ? 'hover:bg-gray-800 text-gray-400' : 'hover:bg-gray-100 text-gray-500'
+                    }`}
+                    title="重置"
+                  >
+                    <RotateCcw size={18} />
+                  </button>
+                </div>
+              </div>
+              {/* 运行时状态 */}
               {runtimeState && (
-                <div className={`flex items-center gap-4 text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+                <div className={`flex items-center gap-6 mt-3 text-sm ${
+                  isDark ? 'text-gray-400' : 'text-gray-500'
+                }`}>
                   <span>阶段: <strong className={isDark ? 'text-white' : 'text-gray-800'}>{runtimeState?.state_machine?.phase || '-'}</strong></span>
-                  <span>进度: <strong className={isDark ? 'text-white' : 'text-gray-800'}>{typeof runtimeState?.main_plot_progress === 'number' ? `${Math.round(runtimeState.main_plot_progress * 100)}%` : '-'}</strong></span>
-                  <span>伏笔: <strong className={isDark ? 'text-white' : 'text-gray-800'}>{runtimeState?.hooks_planted?.length || 0}/{(runtimeState?.hooks_planted?.length || 0) + (runtimeState?.hooks_resolved?.length || 0)}</strong></span>
+                  <span>进度: <strong className={isDark ? 'text-white' : 'text-gray-800'}>{
+                    typeof runtimeState?.main_plot_progress === 'number'
+                      ? `${Math.round(runtimeState.main_plot_progress * 100)}%`
+                      : '-'
+                  }</strong></span>
+                  <span>伏笔: <strong className={isDark ? 'text-white' : 'text-gray-800'}>{runtimeState?.hooks_planted?.length || 0}</strong></span>
                 </div>
               )}
             </div>
-            {/* 当前工作状态 */}
-            {isGenerating && getWorkingAgentName() && (
-              <motion.div
-                initial={{ opacity: 0, y: -10 }}
-                animate={{ opacity: 1, y: 0 }}
-                className={`mt-3 flex items-center gap-2 text-sm ${isDark ? 'text-blue-400' : 'text-blue-600'}`}
-              >
-                <div className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
-                <span>{getWorkingAgentName()} 正在工作...</span>
-              </motion.div>
-            )}
-          </Card>
 
-          {/* 核心功能区 */}
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            {/* 左侧：全自动创作（核心功能） */}
-            <div className="lg:col-span-2 space-y-6">
-              {/* 全自动创作卡片 */}
-              <Card className={`overflow-hidden ${autoModeRunning ? 'ring-2 ring-purple-500' : ''}`}>
-                <div className="p-6">
-                  <div className="flex items-center gap-3 mb-4">
-                    <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center">
-                      <Sparkles className="w-6 h-6 text-white" />
-                    </div>
-                    <div>
-                      <h2 className={`text-xl font-bold ${isDark ? 'text-white' : 'text-gray-800'}`}>全自动创作</h2>
-                      <p className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>一键生成完整章节，AI 自动协调所有 Agent</p>
-                    </div>
-                  </div>
-
-                  {autoModeRunning ? (
-                    <div className="space-y-4">
-                      <div className={`p-4 rounded-lg ${isDark ? 'bg-purple-900/30' : 'bg-purple-50'}`}>
-                        <div className="flex items-center justify-between">
-                          <span className={`font-medium ${isDark ? 'text-purple-300' : 'text-purple-700'}`}>
-                            正在自动创作中...
-                          </span>
-                          <Button variant="danger" size="sm" onClick={handleStopAutoMode}>
-                            <Pause size={16} className="mr-1" /> 停止
-                          </Button>
-                        </div>
-                        <div className="mt-2 text-sm">
-                          已完成: {autoModeChapters.length} 章
-                        </div>
-                      </div>
-                    </div>
-                  ) : (
-                    <Button
-                      onClick={() => setShowAutoModeModal(true)}
-                      disabled={!isGenerating || wsStatus !== 'connected'}
-                      className="w-full justify-center py-3 text-lg"
-                      size="lg"
-                    >
-                      <Play size={20} className="mr-2" />
-                      开始全自动创作
-                    </Button>
-                  )}
+            {/* 工作流控制 */}
+            <div className="p-4">
+              <div className="flex items-center gap-3">
+                <div className={`flex items-center gap-2 px-3 py-1.5 rounded-lg ${
+                  isDark ? 'bg-gray-800' : 'bg-gray-100'
+                }`}>
+                  <Network size={14} className={isDark ? 'text-blue-400' : 'text-blue-600'} />
+                  <span className={`text-xs font-medium uppercase tracking-wide ${
+                    isDark ? 'text-gray-500' : 'text-gray-400'
+                  }`}>工作流</span>
                 </div>
-              </Card>
-
-              {/* 快速操作 */}
-              <Card title="快速操作">
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-                  <Button
-                    variant="secondary"
-                    onClick={() => send({ type: 'advance_plot' })}
-                    disabled={!isGenerating || wsStatus !== 'connected' || autoModeRunning}
-                    className="justify-center"
+                <div className="flex-1 flex items-center gap-2 flex-wrap">
+                  <select
+                    value={selectedWorkflowId}
+                    onChange={(e) => setSelectedWorkflowId(e.target.value)}
+                    className={`flex-1 max-w-[220px] px-4 py-2 rounded-lg border text-sm ${
+                      isDark
+                        ? 'bg-gray-800 border-gray-700 text-white'
+                        : 'bg-white border-gray-200 text-gray-800'
+                    }`}
                   >
-                    <Zap size={16} className="mr-2" />推进剧情
-                  </Button>
-                  <Button
-                    variant="secondary"
-                    onClick={() => send({ type: 'manage_hooks' })}
-                    disabled={!isGenerating || wsStatus !== 'connected' || autoModeRunning}
-                    className="justify-center"
-                  >
-                    <Target size={16} className="mr-2" />管理伏笔
-                  </Button>
-                  <Button
-                    variant="secondary"
-                    onClick={() => setShowAutoWriteModal(true)}
-                    disabled={!isGenerating || wsStatus !== 'connected' || autoModeRunning}
-                    className="justify-center"
-                  >
-                    <FileText size={16} className="mr-2" />写作章节
-                  </Button>
-                  <Button
-                    variant="secondary"
-                    onClick={() => send({ type: 'chapter_end_check' })}
-                    disabled={!isGenerating || wsStatus !== 'connected' || autoModeRunning}
-                    className="justify-center"
-                  >
-                    <BookOpen size={16} className="mr-2" />章节判定
-                  </Button>
-                </div>
-              </Card>
-
-              {/* 自动创作结果 */}
-              {autoModeChapters.length > 0 && (
-                <Card title={`📚 已生成章节 (${autoModeChapters.length} 章)`}>
-                  <div className="space-y-3 max-h-96 overflow-y-auto">
-                    {autoModeChapters.map((chapter, index) => (
-                      <details key={index} className={`rounded-lg border ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
-                        <summary className={`flex items-center justify-between p-3 cursor-pointer ${isDark ? 'hover:bg-gray-800' : 'hover:bg-gray-50'}`}>
-                          <div className="flex items-center gap-2">
-                            <span className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>
-                              {chapter.title}
-                            </span>
-                            <span className={`text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
-                              {chapter.word_count} 字
-                            </span>
-                          </div>
-                          <Button
-                            variant="secondary"
-                            size="sm"
-                            onClick={(e) => {
-                              e.stopPropagation()
-                              navigator.clipboard.writeText(chapter.content)
-                              addLog(`已复制: ${chapter.title}`)
-                            }}
-                          >
-                            复制
-                          </Button>
-                        </summary>
-                        <div className={`p-3 border-t ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
-                          <pre className={`text-sm whitespace-pre-wrap max-h-60 overflow-y-auto ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
-                            {chapter.content}
-                          </pre>
-                        </div>
-                      </details>
+                    <option value="">选择工作流...</option>
+                    {savedWorkflows.map(wf => (
+                      <option key={wf.id} value={wf.id}>{wf.name} ({wf.nodes.length} 节点)</option>
                     ))}
-                  </div>
-                </Card>
-              )}
-
-              {/* 自动写作结果 */}
-              {autoWriteResult && (
-                <Card title={`📝 ${autoWriteResult.title}`}>
-                  <div className="space-y-3">
-                    <div className="flex items-center justify-between">
-                      <span className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
-                        {autoWriteResult.word_count} 字 | ID: {autoWriteResult.chapter_id}
-                      </span>
-                      <div className="flex gap-2">
-                        <Button
-                          variant="secondary"
-                          size="sm"
-                          onClick={() => {
-                            navigator.clipboard.writeText(autoWriteResult.content || '')
-                            addLog('内容已复制')
-                          }}
-                        >
-                          复制
-                        </Button>
-                        <Button
-                          variant="secondary"
-                          size="sm"
-                          onClick={() => setAutoWriteResult(null)}
-                        >
-                          关闭
-                        </Button>
-                      </div>
-                    </div>
-                    <div className={`max-h-80 overflow-y-auto p-4 rounded-lg ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
-                      <pre className={`text-sm whitespace-pre-wrap ${isDark ? 'text-gray-200' : 'text-gray-700'}`}>
-                        {autoWriteResult.content}
-                      </pre>
-                    </div>
-                  </div>
-                </Card>
-              )}
-
-              {/* 生成结果：声音审查 + 叙事 */}
-              {(dialoguePanel || narrativePanel) && (
-                <Card title="生成结果">
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    {/* 对话结果 */}
-                    {dialoguePanel && (
-                      <div className={`p-4 rounded-lg border ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
-                        <div className="flex items-center gap-2 mb-2">
-                          <MessageSquare size={16} />
-                          <span className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>对话</span>
-                        </div>
-                        <p className={`text-sm ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
-                          <span className="font-medium">{dialoguePanel.speaker_id}:</span> {dialoguePanel.dialogue}
-                        </p>
-                        {dialoguePanel.voice_review?.is_ooc && (
-                          <p className="text-xs text-red-500 mt-2">⚠️ 检测到 OOC</p>
-                        )}
-                      </div>
-                    )}
-                    {/* 叙事结果 */}
-                    {narrativePanel && (
-                      <div className={`p-4 rounded-lg border ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
-                        <div className="flex items-center justify-between mb-2">
-                          <div className="flex items-center gap-2">
-                            <PenLine size={16} />
-                            <span className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>叙事</span>
-                          </div>
-                          <span className={`text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
-                            {narrativePanel.word_count} 字
-                          </span>
-                        </div>
-                        <p className={`text-sm line-clamp-3 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
-                          {narrativePanel.content}
-                        </p>
-                      </div>
-                    )}
-                  </div>
-                </Card>
-              )}
-
-              {/* 高级控制（可折叠） */}
-              <Card>
-                <button
-                  onClick={() => setShowAdvancedControls(!showAdvancedControls)}
-                  className={`w-full flex items-center justify-between p-4 ${isDark ? 'hover:bg-gray-800' : 'hover:bg-gray-50'}`}
-                >
-                  <span className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>高级控制</span>
-                  {showAdvancedControls ? <ChevronUp size={18} /> : <ChevronDown size={18} />}
-                </button>
-                <AnimatePresence>
-                  {showAdvancedControls && (
-                    <motion.div
-                      initial={{ height: 0, opacity: 0 }}
-                      animate={{ height: 'auto', opacity: 1 }}
-                      exit={{ height: 0, opacity: 0 }}
-                      className="overflow-hidden"
-                    >
-                      <div className="p-4 pt-0 space-y-4">
-                        {/* 角色管理 */}
-                        <div className="flex items-center justify-between">
-                          <div className="flex items-center gap-2">
-                            <Users size={16} />
-                            <span className={`text-sm ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
-                              角色 ({availableCharacters.length})
-                            </span>
-                          </div>
-                          <Button
-                            size="sm"
-                            variant="secondary"
-                            onClick={() => setShowAddCharacterModal(true)}
-                            disabled={!isGenerating || wsStatus !== 'connected'}
-                          >
-                            <UserPlus size={14} className="mr-1" /> 添加
-                          </Button>
-                        </div>
-                        <div className="flex flex-wrap gap-2">
-                          {availableCharacters.map((char) => (
-                            <span
-                              key={char.id}
-                              className={`px-2 py-1 rounded text-sm flex items-center gap-1 ${isDark ? 'bg-gray-700 text-gray-300' : 'bg-gray-100 text-gray-700'}`}
-                            >
-                              {char.name}
-                              <button
-                                onClick={() => handleRemoveCharacter(char.id)}
-                                className="hover:text-red-500"
-                              >
-                                <UserMinus size={12} />
-                              </button>
-                            </span>
-                          ))}
-                        </div>
-
-                        {/* 对话/工作流输入 */}
-                        <div className="grid grid-cols-2 gap-3">
-                          <Input
-                            placeholder="speaker_id"
-                            value={dialogueForm.speakerId}
-                            onChange={(e) => setDialogueForm(prev => ({ ...prev, speakerId: e.target.value }))}
-                          />
-                          <Input
-                            placeholder="present_characters"
-                            value={dialogueForm.presentCharacters}
-                            onChange={(e) => setDialogueForm(prev => ({ ...prev, presentCharacters: e.target.value }))}
-                          />
-                        </div>
-                        <TextArea
-                          placeholder="context / intents"
-                          value={dialogueForm.context}
-                          onChange={(e) => setDialogueForm(prev => ({ ...prev, context: e.target.value }))}
-                          rows={2}
-                        />
-                        <div className="flex gap-2">
-                          <Button size="sm" variant="secondary" onClick={triggerDialogue} disabled={!isGenerating || wsStatus !== 'connected'}>
-                            生成对话
-                          </Button>
-                          <Button size="sm" variant="secondary" onClick={triggerNarrative} disabled={!isGenerating || wsStatus !== 'connected'}>
-                            生成叙事
-                          </Button>
-                          <Button size="sm" variant="secondary" onClick={triggerWorkflowCycle} disabled={!isGenerating || wsStatus !== 'connected'}>
-                            执行工作流
-                          </Button>
-                        </div>
-
-                        {/* 其他操作 */}
-                        <div className="flex gap-2 flex-wrap">
-                          <Button size="sm" variant="secondary" onClick={() => send({ type: 'create_snapshot', snapshot_type: 'manual', is_branch: true })} disabled={!isGenerating || wsStatus !== 'connected'}>
-                            <GitBranch size={14} className="mr-1" />创建快照
-                          </Button>
-                          <Button size="sm" variant="secondary" onClick={() => setShowCommandModal(true)}>
-                            <Settings size={14} className="mr-1" />手动指令
-                          </Button>
-                        </div>
-                      </div>
-                    </motion.div>
-                  )}
-                </AnimatePresence>
-              </Card>
-            </div>
-
-            {/* 右侧：日志 + 快照 */}
-            <div className="space-y-6">
-              {/* 实时日志 */}
-              <Card>
-                <button
-                  onClick={() => setShowLogs(!showLogs)}
-                  className={`w-full flex items-center justify-between p-4 ${isDark ? 'hover:bg-gray-800' : 'hover:bg-gray-50'}`}
-                >
-                  <span className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>实时日志</span>
-                  <div className="flex items-center gap-2">
-                    <span className={`text-xs px-2 py-0.5 rounded ${isDark ? 'bg-gray-700 text-gray-300' : 'bg-gray-100 text-gray-600'}`}>
-                      {logs.length} 条
-                    </span>
-                    {showLogs ? <ChevronUp size={18} /> : <ChevronDown size={18} />}
-                  </div>
-                </button>
-                <AnimatePresence>
-                  {showLogs && (
-                    <motion.div
-                      initial={{ height: 0, opacity: 0 }}
-                      animate={{ height: 'auto', opacity: 1 }}
-                      exit={{ height: 0, opacity: 0 }}
-                      className="overflow-hidden"
-                    >
-                      <div className="p-4 pt-0">
-                        <div className={`h-80 overflow-y-auto space-y-1 font-mono text-xs p-3 rounded-lg ${isDark ? 'bg-gray-900 text-green-400' : 'bg-gray-900 text-green-400'}`}>
-                          {logs.length === 0 ? (
-                            <p className="text-gray-500">暂无日志...</p>
-                          ) : (
-                            logs.map((log, i) => <p key={i}>{log}</p>)
-                          )}
-                        </div>
-                      </div>
-                    </motion.div>
-                  )}
-                </AnimatePresence>
-              </Card>
-
-              {/* 版本树 */}
-              <Card title="快照版本">
-                <div className="space-y-2 max-h-60 overflow-y-auto">
-                  {snapshotTree.length > 0 ? (
-                    renderSnapshotTree(snapshotTree)
-                  ) : (
-                    <p className={`text-sm text-center py-4 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
-                      暂无快照
-                    </p>
-                  )}
+                  </select>
+                  <button
+                    onClick={() => setShowWriteChapterModal(true)}
+                    disabled={!selectedWorkflowId || !isGenerating || wsStatus !== 'connected' || autoModeRunning}
+                    className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg transition-colors disabled:opacity-50"
+                    title={!selectedWorkflowId ? '请先选择工作流' : ''}
+                  >
+                    <FileText size={16} /> 生成单章
+                  </button>
+                  <button
+                    onClick={() => setShowAutoModeModal(true)}
+                    disabled={!selectedWorkflowId || !isGenerating || wsStatus !== 'connected'}
+                    className="flex items-center gap-2 px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white text-sm font-medium rounded-lg transition-colors disabled:opacity-50"
+                    title={!selectedWorkflowId ? '请先选择工作流' : ''}
+                  >
+                    <Sparkles size={16} /> 连续创作
+                  </button>
                 </div>
-                {rollbackSnapshotId && (
-                  <div className="mt-3 pt-3 border-t flex gap-2">
-                    <Input
-                      value={rollbackSnapshotId}
-                      onChange={(e) => setRollbackSnapshotId(e.target.value)}
-                      placeholder="snapshot_id"
-                      className="flex-1 text-sm"
-                    />
-                    <Button
-                      size="sm"
-                      onClick={() => send({ type: 'rollback_snapshot', snapshot_id: rollbackSnapshotId })}
-                      disabled={!isGenerating || wsStatus !== 'connected'}
-                    >
-                      回档
-                    </Button>
-                  </div>
-                )}
-              </Card>
+              </div>
+              {savedWorkflows.length === 0 && (
+                <p className={`mt-3 text-xs ${isDark ? 'text-gray-600' : 'text-gray-400'}`}>
+                  💡 请先在「可视化工作台」创建工作流
+                </p>
+              )}
             </div>
           </div>
-        </div>
-      )}
 
-      {/* Modals */}
+          {/* 工作状态横幅 */}
+          <AnimatePresence>
+            {isGenerating && getWorkingAgentName() && (
+              <WorkingBanner agentName={getWorkingAgentName()} isDark={isDark} />
+            )}
+          </AnimatePresence>
+        </div>
+
+        {/* ========== 连续创作进度 ========== */}
+        {autoModeRunning && (
+          <Card className={`border-2 ${isDark ? 'border-purple-800 bg-purple-900/20' : 'border-purple-300 bg-purple-50'}`}>
+            <div className="p-4 flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className={`p-2 rounded-lg ${isDark ? 'bg-purple-800' : 'bg-purple-100'}`}>
+                  <Sparkles size={20} className="text-purple-500" />
+                </div>
+                <div>
+                  <h3 className={`font-semibold ${isDark ? 'text-white' : 'text-gray-800'}`}>连续创作进行中</h3>
+                  <p className={`text-sm ${isDark ? 'text-purple-300' : 'text-purple-600'}`}>
+                    已完成 {autoModeChapters.length} 章
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={handleStopAutoMode}
+                className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white text-sm font-medium rounded-lg"
+              >
+                <Pause size={16} /> 停止
+              </button>
+            </div>
+          </Card>
+        )}
+
+        {/* ========== 主内容区：Agent状态为核心 ========== */}
+        <div className="grid grid-cols-1 xl:grid-cols-4 gap-4">
+          {/* 左侧：Agent状态面板（大） */}
+          <div className="xl:col-span-3 space-y-4">
+            {/* 集体会话卡片 - 始终显示 */}
+            <GroupDiscussionCard
+              discussion={groupDiscussion || { topic: '', messages: [], characters: [], isActive: false }}
+              isDark={isDark}
+              input={discussionInput}
+              onInputChange={setDiscussionInput}
+              onSend={sendDiscussionMessage}
+              onEnd={endDiscussion}
+            />
+
+            {/* Agent 卡片网格 */}
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-2 gap-4">
+              {agents.map(agent => (
+                <AgentStatusCard
+                  key={agent.name}
+                  agent={agent}
+                  isDark={isDark}
+                  lastOutput={agentOutputs[agent.name]}
+                  streamingContent={agentStreaming[agent.name]}
+                  interventionInput={agentInterventionInputs[agent.name] || ''}
+                  onInterventionChange={(value) => setAgentInput(agent.name, value)}
+                  onSendIntervention={() => sendAgentIntervention(agent.name)}
+                />
+              ))}
+            </div>
+
+            {/* 已生成章节 */}
+            {autoModeChapters.length > 0 && (
+              <Card>
+                <div className="p-4">
+                  <h3 className={`text-sm font-semibold mb-3 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+                    已生成章节 ({autoModeChapters.length} 章)
+                  </h3>
+                  <div className="space-y-2 max-h-[300px] overflow-y-auto">
+                    {autoModeChapters.map((chapter, i) => (
+                      <ChapterCard
+                        key={i}
+                        chapter={chapter}
+                        onCopy={() => addLog(`已复制: ${chapter.title}`)}
+                        isDark={isDark}
+                      />
+                    ))}
+                  </div>
+                </div>
+              </Card>
+            )}
+          </div>
+
+          {/* 右侧：操作区 */}
+          <div className="space-y-4">
+            {/* Agent 状态总览 */}
+            <Card>
+              <div className="p-4">
+                <h3 className={`text-sm font-semibold mb-3 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+                  状态总览
+                </h3>
+                <AgentStatusBar agents={agents} isDark={isDark} />
+                <p className={`text-xs mt-2 ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+                  {agents.filter(a => a.status === 'working').length} / {agents.length} 工作中
+                </p>
+              </div>
+            </Card>
+
+            {/* 快速操作 */}
+            <Card>
+              <div className="p-4">
+                <h3 className={`text-sm font-semibold mb-3 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+                  快速操作
+                </h3>
+                <div className="grid grid-cols-2 gap-2">
+                  <QuickActionButton
+                    icon={Target}
+                    label="管理伏笔"
+                    onClick={() => send({ type: 'manage_hooks' })}
+                    disabled={!isGenerating || wsStatus !== 'connected' || autoModeRunning}
+                    isDark={isDark}
+                  />
+                  <QuickActionButton
+                    icon={BookOpen}
+                    label="章节判定"
+                    onClick={() => send({ type: 'chapter_end_check' })}
+                    disabled={!isGenerating || wsStatus !== 'connected' || autoModeRunning}
+                    isDark={isDark}
+                  />
+                  <QuickActionButton
+                    icon={GitBranch}
+                    label="创建快照"
+                    onClick={() => send({ type: 'create_snapshot', snapshot_type: 'manual', is_branch: true })}
+                    disabled={!isGenerating || wsStatus !== 'connected'}
+                    isDark={isDark}
+                  />
+                </div>
+              </div>
+            </Card>
+
+            {/* 实时日志 */}
+            <Card>
+              <button
+                onClick={() => setShowLogs(!showLogs)}
+                className={`w-full flex items-center justify-between p-4 ${isDark ? 'hover:bg-gray-800/50' : 'hover:bg-gray-50'}`}
+              >
+                <span className={`text-sm font-semibold ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+                  实时日志
+                </span>
+                <span className={`text-xs px-2 py-0.5 rounded ${isDark ? 'bg-gray-800 text-gray-500' : 'bg-gray-100 text-gray-500'}`}>
+                  {logs.length} 条
+                </span>
+              </button>
+              <AnimatePresence>
+                {showLogs && (
+                  <motion.div
+                    initial={{ height: 0, opacity: 0 }}
+                    animate={{ height: 'auto', opacity: 1 }}
+                    exit={{ height: 0, opacity: 0 }}
+                    className="overflow-hidden"
+                  >
+                    <div className="px-4 pb-4">
+                      <div className={`h-48 overflow-y-auto p-3 rounded-lg space-y-1 ${
+                        isDark ? 'bg-gray-900' : 'bg-gray-900'
+                      }`}>
+                        {logs.length === 0 ? (
+                          <p className="text-gray-500 text-xs font-mono">暂无日志...</p>
+                        ) : (
+                          logs.map((log, i) => <LogEntry key={i} log={log} isDark={isDark} />)
+                        )}
+                      </div>
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </Card>
+
+            {/* 快照版本 */}
+            <Card>
+              <div className="p-4">
+                <h3 className={`text-sm font-semibold mb-3 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+                  快照版本
+                </h3>
+                {snapshotTree.length > 0 ? (
+                  <div className="space-y-2 max-h-32 overflow-y-auto">
+                    {snapshotTree.map(node => (
+                      <div
+                        key={node.id}
+                        className={`p-2 rounded-lg flex items-center justify-between ${
+                          isDark ? 'bg-gray-800' : 'bg-gray-50'
+                        }`}
+                      >
+                        <span className="text-xs truncate">{node.name || node.id}</span>
+                        <button
+                          onClick={() => send({ type: 'rollback_snapshot', snapshot_id: node.id })}
+                          disabled={!isGenerating || wsStatus !== 'connected'}
+                          className="text-xs text-blue-500 hover:text-blue-600 disabled:opacity-50"
+                        >
+                          回档
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className={`text-sm text-center py-4 ${isDark ? 'text-gray-600' : 'text-gray-400'}`}>
+                    暂无快照
+                  </p>
+                )}
+              </div>
+            </Card>
+          </div>
+        </div>
+      </div>
+
+      {/* ========== Modals ========== */}
       <Modal isOpen={showCommandModal} onClose={() => setShowCommandModal(false)} title="手动 Agent 指令">
         <div className="space-y-4">
           <div>
-            <label className={`block text-sm font-medium mb-2 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>选择 Agent</label>
+            <label className={`block text-sm font-medium mb-2 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+              选择 Agent
+            </label>
             <select
-              className={`w-full px-3 py-2 border rounded-lg ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
               value={selectedAgent}
               onChange={(e) => setSelectedAgent(e.target.value)}
+              className={`w-full px-3 py-2 rounded-lg border ${
+                isDark ? 'bg-gray-800 border-gray-700 text-white' : 'border-gray-200'
+              }`}
             >
               <option value="">请选择...</option>
-              {agents.map((a) => (
-                <option key={a.name} value={a.name}>{a.name}</option>
-              ))}
+              {agents.map(a => <option key={a.name} value={a.name}>{a.name}</option>)}
             </select>
           </div>
           <TextArea
@@ -1046,37 +1651,100 @@ export default function Director() {
           />
           <div className="flex justify-end gap-3">
             <Button variant="secondary" onClick={() => setShowCommandModal(false)}>取消</Button>
-            <Button onClick={executeAgentCommand}>发送</Button>
+            <Button onClick={() => { send({ type: 'agent_command', agent: selectedAgent, command: agentCommand }); setShowCommandModal(false) }}>
+              发送
+            </Button>
           </div>
         </div>
       </Modal>
 
-      <Modal isOpen={showAddCharacterModal} onClose={() => setShowAddCharacterModal(false)} title="添加角色">
+      <Modal isOpen={showAddCharacterModal} onClose={() => setShowAddCharacterModal(false)} title="添加角色" size="lg">
         <div className="space-y-4">
-          <Input
-            label="角色名称 *"
-            value={newCharacterForm.name}
-            onChange={(e) => setNewCharacterForm({ ...newCharacterForm, name: e.target.value })}
-            placeholder="输入角色名称"
-          />
-          <div>
-            <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>角色类型</label>
-            <select
-              className={`w-full px-3 py-2 border rounded-lg ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
-              value={newCharacterForm.role}
-              onChange={(e) => setNewCharacterForm({ ...newCharacterForm, role: e.target.value })}
-            >
-              <option value="main">主角</option>
-              <option value="supporting">配角</option>
-              <option value="npc">NPC</option>
-            </select>
+          <div className="grid grid-cols-2 gap-4">
+            <Input
+              label="角色名称 *"
+              value={newCharacterForm.name}
+              onChange={(e) => setNewCharacterForm({ ...newCharacterForm, name: e.target.value })}
+            />
+            <div>
+              <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+                角色类型
+              </label>
+              <select
+                value={newCharacterForm.role}
+                onChange={(e) => setNewCharacterForm({ ...newCharacterForm, role: e.target.value })}
+                className={`w-full px-3 py-2 rounded-lg border ${
+                  isDark ? 'bg-gray-800 border-gray-700 text-white' : 'border-gray-200'
+                }`}
+              >
+                <option value="main">主角</option>
+                <option value="supporting">配角</option>
+                <option value="npc">NPC</option>
+                <option value="antagonist">反派</option>
+              </select>
+            </div>
           </div>
+
+          <div>
+            <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+              角色重要性层级
+            </label>
+            <select
+              value={newCharacterForm.importance_tier}
+              onChange={(e) => setNewCharacterForm({ ...newCharacterForm, importance_tier: e.target.value })}
+              className={`w-full px-3 py-2 rounded-lg border text-sm ${
+                isDark ? 'bg-gray-800 border-gray-700 text-white' : 'border-gray-200'
+              }`}
+            >
+              <optgroup label="主角层 (Tier 1)">
+                <option value="protagonist">主角 - 故事核心</option>
+                <option value="co_protagonist">共同主角</option>
+              </optgroup>
+              <optgroup label="核心配角层 (Tier 2)">
+                <option value="deuteragonist">第二主角</option>
+                <option value="mentor">导师/引路人</option>
+                <option value="love_interest">恋爱对象</option>
+                <option value="best_friend">挚友/跟班</option>
+                <option value="archenemy">宿敌/主要反派</option>
+              </optgroup>
+              <optgroup label="重要配角层 (Tier 3)">
+                <option value="major_ally">重要盟友</option>
+                <option value="major_antagonist">重要反派</option>
+                <option value="rival">竞争对手</option>
+                <option value="family_member">家人</option>
+                <option value="guardian">守护者</option>
+              </optgroup>
+              <optgroup label="阶段性角色层 (Tier 4)">
+                <option value="arc_antagonist">篇章反派</option>
+                <option value="arc_ally">篇章盟友</option>
+                <option value="recurring">常驻配角</option>
+                <option value="catalyst">催化剂角色</option>
+                <option value="mystery_figure">神秘人物</option>
+              </optgroup>
+              <optgroup label="功能性角色层 (Tier 5)">
+                <option value="minion">爪牙/手下</option>
+                <option value="informant">消息提供者</option>
+                <option value="comic_relief">喜剧担当</option>
+                <option value="victim">受害者</option>
+              </optgroup>
+              <optgroup label="背景层 (Tier 6)">
+                <option value="npc">NPC</option>
+                <option value="background">背景人物</option>
+                <option value="cameo">客串</option>
+              </optgroup>
+            </select>
+            <p className={`mt-1 text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+              层级越高，Agent 在生成剧情时越优先考虑该角色
+            </p>
+          </div>
+
           <TextArea
             label="角色描述"
             value={newCharacterForm.description}
             onChange={(e) => setNewCharacterForm({ ...newCharacterForm, description: e.target.value })}
-            rows={2}
+            placeholder="简要描述角色的背景、性格特点..."
           />
+
           <div className="flex justify-end gap-3">
             <Button variant="secondary" onClick={() => setShowAddCharacterModal(false)}>取消</Button>
             <Button onClick={handleAddCharacter} disabled={!newCharacterForm.name.trim()}>添加</Button>
@@ -1084,92 +1752,128 @@ export default function Director() {
         </div>
       </Modal>
 
-      <Modal isOpen={showAutoWriteModal} onClose={() => setShowAutoWriteModal(false)} title="自动写作章节">
-        <div className="space-y-4">
-          <Input
-            label="章节标题 *"
-            value={autoWriteForm.chapter_title}
-            onChange={(e) => setAutoWriteForm({ ...autoWriteForm, chapter_title: e.target.value })}
-            placeholder="如：第一章 相遇"
-          />
-          <TextArea
-            label="章节目标/大纲 *"
-            value={autoWriteForm.chapter_goal}
-            onChange={(e) => setAutoWriteForm({ ...autoWriteForm, chapter_goal: e.target.value })}
-            placeholder="描述本章的主要内容、情节走向..."
-            rows={4}
-          />
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>目标字数</label>
-              <input
-                type="number"
-                value={autoWriteForm.target_word_count}
-                onChange={(e) => setAutoWriteForm({ ...autoWriteForm, target_word_count: parseInt(e.target.value) || 2000 })}
-                className={`w-full px-3 py-2 border rounded-lg ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
-                min={500}
-                max={10000}
-              />
-            </div>
-          </div>
-          <div className="flex justify-end gap-3 pt-4">
-            <Button variant="secondary" onClick={() => setShowAutoWriteModal(false)}>取消</Button>
-            <Button onClick={handleAutoWriteChapter} disabled={!autoWriteForm.chapter_title.trim() || !autoWriteForm.chapter_goal.trim()}>
-              开始写作
-            </Button>
-          </div>
-        </div>
-      </Modal>
-
-      <Modal isOpen={showAutoModeModal} onClose={() => setShowAutoModeModal(false)} title="🚀 全自动创作模式" size="lg">
+      <Modal isOpen={showAutoModeModal} onClose={() => setShowAutoModeModal(false)} title="连续创作模式" size="lg">
         <div className="space-y-4">
           <div className={`p-4 rounded-lg ${isDark ? 'bg-purple-900/30' : 'bg-purple-50'}`}>
             <p className={`text-sm ${isDark ? 'text-purple-300' : 'text-purple-700'}`}>
-              全自动创作将自动规划剧情、逐章写作、管理伏笔。你只需要提供初始设定，剩下的交给 AI。
+              连续创作将循环执行选中的工作流，每执行一次生成一个章节。
             </p>
           </div>
-          <TextArea
-            label="初始剧情设定/大纲 *"
-            value={autoModeForm.initial_plot}
-            onChange={(e) => setAutoModeForm({ ...autoModeForm, initial_plot: e.target.value })}
-            placeholder="描述整体故事设定、主角、目标、世界观等...&#10;例如：少年林风偶然获得神秘玉佩，踏上修仙之路..."
-            rows={5}
-          />
+
+          {selectedWorkflowId && (
+            <div className={`p-3 rounded-lg border ${isDark ? 'border-blue-800 bg-blue-900/20' : 'border-blue-200 bg-blue-50'}`}>
+              <p className={`text-xs font-medium mb-1 ${isDark ? 'text-blue-400' : 'text-blue-600'}`}>当前工作流</p>
+              <p className={`text-sm font-semibold ${isDark ? 'text-blue-300' : 'text-blue-700'}`}>
+                {savedWorkflows.find(w => w.id === selectedWorkflowId)?.name}
+              </p>
+            </div>
+          )}
+
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>章节数量</label>
+              <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+                章节数量
+              </label>
               <input
                 type="number"
                 value={autoModeForm.chapter_count}
                 onChange={(e) => setAutoModeForm({ ...autoModeForm, chapter_count: parseInt(e.target.value) || 3 })}
-                className={`w-full px-3 py-2 border rounded-lg ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
+                className={`w-full px-3 py-2 rounded-lg border ${
+                  isDark ? 'bg-gray-800 border-gray-700 text-white' : 'border-gray-200'
+                }`}
                 min={1}
                 max={20}
               />
             </div>
             <div>
-              <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>每章字数</label>
+              <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+                每章字数
+              </label>
               <input
                 type="number"
                 value={autoModeForm.words_per_chapter}
                 onChange={(e) => setAutoModeForm({ ...autoModeForm, words_per_chapter: parseInt(e.target.value) || 2000 })}
-                className={`w-full px-3 py-2 border rounded-lg ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
+                className={`w-full px-3 py-2 rounded-lg border ${
+                  isDark ? 'bg-gray-800 border-gray-700 text-white' : 'border-gray-200'
+                }`}
                 min={500}
                 max={5000}
               />
             </div>
           </div>
+
           <TextArea
             label="风格参考（可选）"
             value={autoModeForm.style_reference}
             onChange={(e) => setAutoModeForm({ ...autoModeForm, style_reference: e.target.value })}
-            placeholder="粘贴一段你希望模仿风格的文字..."
-            rows={2}
+            placeholder="粘贴一段希望模仿风格的文字..."
           />
-          <div className="flex justify-end gap-3 pt-4">
+
+          <div className="flex justify-end gap-3 pt-2">
             <Button variant="secondary" onClick={() => setShowAutoModeModal(false)}>取消</Button>
-            <Button onClick={handleStartAutoMode} disabled={!autoModeForm.initial_plot.trim()}>
-              <Play size={16} className="mr-1" /> 开始自动创作
+            <Button onClick={handleStartAutoMode}>
+              <Play size={16} className="mr-1" /> 开始
+            </Button>
+          </div>
+        </div>
+      </Modal>
+
+      <Modal isOpen={showWriteChapterModal} onClose={() => setShowWriteChapterModal(false)} title="生成单章" size="lg">
+        <div className="space-y-4">
+          <div className={`p-4 rounded-lg ${isDark ? 'bg-green-900/30' : 'bg-green-50'}`}>
+            <p className={`text-sm ${isDark ? 'text-green-300' : 'text-green-700'}`}>
+              执行一次工作流生成单个章节，适合快速测试或补充章节。
+            </p>
+          </div>
+
+          {selectedWorkflowId && (
+            <div className={`p-3 rounded-lg border ${isDark ? 'border-blue-800 bg-blue-900/20' : 'border-blue-200 bg-blue-50'}`}>
+              <p className={`text-xs font-medium mb-1 ${isDark ? 'text-blue-400' : 'text-blue-600'}`}>当前工作流</p>
+              <p className={`text-sm font-semibold ${isDark ? 'text-blue-300' : 'text-blue-700'}`}>
+                {savedWorkflows.find(w => w.id === selectedWorkflowId)?.name}
+              </p>
+            </div>
+          )}
+
+          <Input
+            label="章节标题 *"
+            value={chapterForm.title}
+            onChange={(e) => setChapterForm({ ...chapterForm, title: e.target.value })}
+            placeholder="输入章节标题..."
+          />
+
+          <TextArea
+            label="章节目标 *"
+            value={chapterForm.goal}
+            onChange={(e) => setChapterForm({ ...chapterForm, goal: e.target.value })}
+            placeholder="描述本章要完成的剧情目标、要发生的冲突或转折..."
+            rows={3}
+          />
+
+          <div>
+            <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+              目标字数
+            </label>
+            <input
+              type="number"
+              value={chapterForm.targetWordCount}
+              onChange={(e) => setChapterForm({ ...chapterForm, targetWordCount: parseInt(e.target.value) || 2000 })}
+              className={`w-full px-3 py-2 rounded-lg border ${
+                isDark ? 'bg-gray-800 border-gray-700 text-white' : 'border-gray-200'
+              }`}
+              min={500}
+              max={10000}
+              step={100}
+            />
+            <p className={`mt-1 text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+              建议 1500-3000 字
+            </p>
+          </div>
+
+          <div className="flex justify-end gap-3 pt-2">
+            <Button variant="secondary" onClick={() => setShowWriteChapterModal(false)}>取消</Button>
+            <Button onClick={handleWriteChapter} disabled={!chapterForm.title.trim() || !chapterForm.goal.trim()}>
+              <FileText size={16} className="mr-1" /> 生成章节
             </Button>
           </div>
         </div>

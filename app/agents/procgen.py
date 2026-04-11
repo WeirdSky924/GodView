@@ -11,6 +11,7 @@ from langchain_core.messages import HumanMessage
 from app.agents.base import BaseAgent, AgentResponse
 from app.models.world import World, Region, RegionType, TerrainType
 from app.models.agent_template import AgentType
+from app.models.token_usage import UsageCategory
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +109,8 @@ class ProcGenAgent(BaseAgent):
 
             # 调用 LLM
             response_text = await self._call_llm(
-                messages=[HumanMessage(content=user_message)]
+                messages=[HumanMessage(content=user_message)],
+                category=UsageCategory.WORLD
             )
 
             # 解析响应
@@ -215,7 +217,8 @@ class ProcGenAgent(BaseAgent):
 
         try:
             response_text = await self._call_llm(
-                messages=[HumanMessage(content=prompt)]
+                messages=[HumanMessage(content=prompt)],
+                category=UsageCategory.WORLD
             )
             encounter_data = self._parse_json_response(response_text)
             return AgentResponse(success=True, data=encounter_data)

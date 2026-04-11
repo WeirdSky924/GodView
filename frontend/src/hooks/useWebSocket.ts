@@ -14,6 +14,12 @@ export interface MessageHandler {
 export function useWebSocket(url: string, handlers?: MessageHandler) {
   const [status, setStatus] = useState<'connecting' | 'connected' | 'closed'>('closed')
   const wsRef = useRef<WebSocket | null>(null)
+  const handlersRef = useRef(handlers)
+
+  // Keep handlers ref up to date without triggering re-renders
+  useEffect(() => {
+    handlersRef.current = handlers
+  }, [handlers])
 
   useEffect(() => {
     if (!url) {
@@ -30,23 +36,23 @@ export function useWebSocket(url: string, handlers?: MessageHandler) {
 
     wsRef.current.onopen = () => {
       setStatus('connected')
-      handlers?.onOpen?.()
+      handlersRef.current?.onOpen?.()
     }
 
     wsRef.current.onclose = () => {
       setStatus('closed')
-      handlers?.onClose?.()
+      handlersRef.current?.onClose?.()
     }
 
     wsRef.current.onerror = (error) => {
       setStatus('closed')
-      handlers?.onError?.(error)
+      handlersRef.current?.onError?.(error)
     }
 
     wsRef.current.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data)
-        handlers?.onMessage?.(data)
+        handlersRef.current?.onMessage?.(data)
       } catch (e) {
         console.error('Failed to parse WebSocket message:', e)
       }
@@ -58,7 +64,7 @@ export function useWebSocket(url: string, handlers?: MessageHandler) {
         wsRef.current = null
       }
     }
-  }, [url, handlers])
+  }, [url]) // Only depend on url, not handlers
 
   const send = (data: any) => {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
@@ -81,6 +87,12 @@ export function useWebSocket(url: string, handlers?: MessageHandler) {
 export function useDynamicWebSocket(path: string, handlers?: MessageHandler) {
   const [status, setStatus] = useState<'connecting' | 'connected' | 'closed'>('closed')
   const wsRef = useRef<WebSocket | null>(null)
+  const handlersRef = useRef(handlers)
+
+  // Keep handlers ref up to date without triggering re-renders
+  useEffect(() => {
+    handlersRef.current = handlers
+  }, [handlers])
 
   useEffect(() => {
     if (!path) {
@@ -108,28 +120,28 @@ export function useDynamicWebSocket(path: string, handlers?: MessageHandler) {
         wsRef.current.onopen = () => {
           if (mounted) {
             setStatus('connected')
-            handlers?.onOpen?.()
+            handlersRef.current?.onOpen?.()
           }
         }
 
         wsRef.current.onclose = () => {
           if (mounted) {
             setStatus('closed')
-            handlers?.onClose?.()
+            handlersRef.current?.onClose?.()
           }
         }
 
         wsRef.current.onerror = (error) => {
           if (mounted) {
             setStatus('closed')
-            handlers?.onError?.(error)
+            handlersRef.current?.onError?.(error)
           }
         }
 
         wsRef.current.onmessage = (event) => {
           try {
             const data = JSON.parse(event.data)
-            handlers?.onMessage?.(data)
+            handlersRef.current?.onMessage?.(data)
           } catch (e) {
             console.error('Failed to parse WebSocket message:', e)
           }
@@ -151,7 +163,7 @@ export function useDynamicWebSocket(path: string, handlers?: MessageHandler) {
         wsRef.current = null
       }
     }
-  }, [path, handlers])
+  }, [path]) // Only depend on path, not handlers
 
   const send = (data: any) => {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {

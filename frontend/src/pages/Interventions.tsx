@@ -1,12 +1,13 @@
 import { useState, useEffect } from 'react'
 import { Card, Button, Modal, TextArea } from '@/components/ui'
 import PageLayout from '@/components/PageLayout'
-import { GitCompare, Flag, Users, Edit3, Save, AlertCircle, FolderOpen } from 'lucide-react'
+import { GitCompare, Flag, Users, Edit3, Save, AlertCircle, FolderOpen, Trash2, AlertTriangle } from 'lucide-react'
 import {
   createIntervention,
   getInterventions,
   getSnapshots,
   updateInterventionEvaluation,
+  deleteIntervention,
 } from '@/api/interventions'
 import type { Intervention, SnapshotOption } from '@/api/interventions'
 import { useProject } from '@/contexts/ProjectContext'
@@ -20,6 +21,8 @@ export default function Interventions() {
   const [interventions, setInterventions] = useState<Intervention[]>([])
   const [showModal, setShowModal] = useState(false)
   const [showImpactModal, setShowImpactModal] = useState(false)
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState<string | null>(null)
+  const [deleting, setDeleting] = useState(false)
   const [selectedIntervention, setSelectedIntervention] = useState<Intervention | null>(null)
   const [snapshots, setSnapshots] = useState<SnapshotOption[]>([])
   const [selectedSnapshotId, setSelectedSnapshotId] = useState('')
@@ -134,6 +137,20 @@ export default function Interventions() {
     setShowImpactModal(true)
   }
 
+  const handleDelete = async (interventionId: string) => {
+    setDeleting(true)
+    try {
+      await deleteIntervention(interventionId)
+      setInterventions(prev => prev.filter(i => i.id !== interventionId))
+      setShowDeleteConfirm(null)
+    } catch (error) {
+      console.error('Failed to delete intervention:', error)
+      alert('删除失败，请重试')
+    } finally {
+      setDeleting(false)
+    }
+  }
+
   const getAffectedCount = (intervention: Intervention) => {
     const chars = intervention.affected_characters?.length || 0
     const hooks = intervention.affected_hooks?.length || 0
@@ -241,9 +258,18 @@ export default function Interventions() {
                           )}
                         </td>
                         <td className="px-4 py-3">
-                          <Button variant="secondary" size="sm" onClick={() => viewImpact(item)}>
-                            查看影响
-                          </Button>
+                          <div className="flex items-center gap-2">
+                            <Button variant="secondary" size="sm" onClick={() => viewImpact(item)}>
+                              查看影响
+                            </Button>
+                            <button
+                              onClick={() => setShowDeleteConfirm(item.id || null)}
+                              className="p-1.5 rounded hover:bg-red-100 dark:hover:bg-red-900/30 text-red-500"
+                              title="删除"
+                            >
+                              <Trash2 size={16} />
+                            </button>
+                          </div>
                         </td>
                       </tr>
                     ))
@@ -373,6 +399,51 @@ export default function Interventions() {
               </div>
             )}
           </Modal>
+
+          {/* 删除确认弹窗 */}
+          {showDeleteConfirm && (
+            <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+              <div className={`p-6 rounded-lg shadow-xl max-w-sm w-full mx-4 ${
+                isDark ? 'bg-gray-800' : 'bg-white'
+              }`}>
+                <div className="flex items-center gap-3 mb-4">
+                  <div className="w-10 h-10 rounded-full bg-red-100 dark:bg-red-900/30 flex items-center justify-center">
+                    <AlertTriangle size={20} className="text-red-500" />
+                  </div>
+                  <div>
+                    <h3 className={`font-semibold ${isDark ? 'text-white' : 'text-gray-900'}`}>
+                      确认删除
+                    </h3>
+                    <p className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+                      此操作无法撤销
+                    </p>
+                  </div>
+                </div>
+                <p className={`text-sm mb-6 ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
+                  确定要删除这条干预记录吗？
+                </p>
+                <div className="flex justify-end gap-3">
+                  <button
+                    onClick={() => setShowDeleteConfirm(null)}
+                    className={`px-4 py-2 rounded text-sm ${
+                      isDark
+                        ? 'bg-gray-700 hover:bg-gray-600 text-gray-300'
+                        : 'bg-gray-100 hover:bg-gray-200 text-gray-700'
+                    }`}
+                  >
+                    取消
+                  </button>
+                  <button
+                    onClick={() => handleDelete(showDeleteConfirm)}
+                    disabled={deleting}
+                    className="px-4 py-2 bg-red-500 hover:bg-red-600 text-white text-sm rounded disabled:opacity-50"
+                  >
+                    {deleting ? '删除中...' : '确认删除'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
         </>
       )}
     </PageLayout>

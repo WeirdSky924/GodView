@@ -10,6 +10,7 @@ from langchain_core.messages import HumanMessage
 
 from app.agents.base import BaseAgent, AgentResponse
 from app.models.agent_template import AgentType
+from app.models.token_usage import UsageCategory
 
 logger = logging.getLogger(__name__)
 
@@ -73,16 +74,39 @@ class EvaluatorAgent(BaseAgent):
         hooks_planted = input_data.get("hooks_planted", [])
         word_count = input_data.get("word_count", 0)
         chapter_content = input_data.get("chapter_content", "")
+        chapter_num = input_data.get("chapter_num", 1)
+        total_chapters = input_data.get("total_chapters", 10)
+        world_info = input_data.get("world_info", {})
+
+        # 构建世界观部分
+        world_section = ""
+        if world_info:
+            world_section = f"""
+【世界观设定】
+世界：{world_info.get('name', '未知世界')}
+类型：{world_info.get('world_type', '奇幻')}
+基调：{world_info.get('tone', '正剧')}
+"""
 
         prompt = f"""你是章节结束判定员。请评估当前章节是否可以收尾。
+{world_section}
+【重要：长篇网文评估原则】
+- 当前是第 {chapter_num} 章，全书共 {total_chapters} 章
+- 前期章节（前20%）主要是铺垫和建立，不需要太多高潮
+- 中期章节（20%-80%）才是剧情推进和冲突升级的主要阶段
+- 不要期望前期章节就有太多高潮和反转
+- 确保内容可持续发展，不要急于推进到结局感
 
 【评估标准】
-1. 本章信息增量是否足够（至少 3 个有效情节点）
-2. 是否埋设了至少 1 个新悬念
-3. 主线进度是否达标
+1. 本章信息增量是否足够（前期至少 2 个情节点，后期至少 3 个）
+2. 是否埋设了悬念或伏笔（长篇需要）
+3. 字数是否达标（至少目标字数的80%）
 4. 章节节奏是否完整
+5. 是否为后续剧情留有余地
+6. 内容是否符合世界观设定
 
 【当前章节数据】
+- 章节号：第 {chapter_num} 章
 - 已发生事件数量：{len(events)}
 - 事件列表：{events}
 - 埋设的伏笔：{hooks_planted}
@@ -95,17 +119,31 @@ class EvaluatorAgent(BaseAgent):
     "reason": "判断理由",
     "missing_elements": ["缺失元素列表"],
     "suggested_continuation": "建议的后续发展方向",
+    "pacing_check": {{
+        "is_appropriate": true/false,
+        "note": "节奏是否适合当前章节位置"
+    }},
+    "long_term_check": {{
+        "has_room_for_future": true/false,
+        "note": "是否为后续剧情留有余地"
+    }},
+    "world_consistency_check": {{
+        "is_consistent": true/false,
+        "issues": ["世界观一致性问题"]
+    }},
     "scores": {{
         "info_gain": 0.0,
         "suspense": 0.0,
         "pacing": 0.0,
-        "completeness": 0.0
+        "completeness": 0.0,
+        "world_consistency": 0.0
     }}
 }}"""
 
         try:
             response_text = await self._call_llm(
-                messages=[HumanMessage(content=prompt)], temperature=0.5
+                messages=[HumanMessage(content=prompt)], temperature=0.5,
+                category=UsageCategory.DIRECTOR
             )
             result = self._parse_json_response(response_text)
             return AgentResponse(success=True, data=result)
@@ -119,11 +157,32 @@ class EvaluatorAgent(BaseAgent):
         """
         chapter_content = input_data.get("chapter_content", "")
         chapter_title = input_data.get("chapter_title", "无标题")
+        chapter_num = input_data.get("chapter_num", 1)
+        total_chapters = input_data.get("total_chapters", 10)
+        world_info = input_data.get("world_info", {})
 
         if not chapter_content:
             return AgentResponse(success=False, error="章节内容为空")
 
-        prompt = f"""你是一名首次阅读的挑剔读者。请对刚生成的章节进行评分。
+        # 构建世界观部分
+        world_section = ""
+        if world_info:
+            world_section = f"""
+【世界观设定】
+世界：{world_info.get('name', '未知世界')}
+类型：{world_info.get('world_type', '奇幻')}
+基调：{world_info.get('tone', '正剧')}
+"""
+
+        prompt = f"""你是一名首次阅读的挑剔读者，正在阅读一部长篇网文。
+请对刚生成的章节进行评分。
+{world_section}
+【重要：长篇网文读者视角】
+- 当前是第 {chapter_num} 章，全书共 {total_chapters} 章
+- 作为读者，你希望看到可持续发展的剧情，而不是急于完结
+- 前期章节主要是建立世界观和角色，不需要太多高潮
+- 你希望看到伏笔和悬念，让你期待后续内容
+- 如果感觉"开头就是高潮，马上要大结局"，你会感到失望
 
 【章节信息】
 标题：{chapter_title}
@@ -133,11 +192,13 @@ class EvaluatorAgent(BaseAgent):
 
 【评分维度】（1-10 分）
 1. 开篇吸引力 - 开头是否抓人
-2. 节奏把控 - 快慢是否适中
-3. 悬念设置 - 是否有吸引人的悬念
+2. 节奏把控 - 快慢是否适中（不要过于急促）
+3. 悬念设置 - 是否有吸引人的悬念或伏笔
 4. 角色魅力 - 角色是否讨喜/有趣
 5. 情感共鸣 - 是否能引发情感波动
 6. 阅读流畅度 - 文字是否流畅
+7. 长篇期待感 - 是否让你想继续看后续内容
+8. 世界观沉浸 - 世界观是否有吸引力
 
 请输出 JSON 格式：
 {{
@@ -147,16 +208,27 @@ class EvaluatorAgent(BaseAgent):
         "suspense": 0,
         "character": 0,
         "emotion": 0,
-        "flow": 0
+        "flow": 0,
+        "long_term_appeal": 0,
+        "world_immersion": 0
     }},
     "overall": 0,
-    "comments": "具体评价（100 字左右）",
-    "suggestions": ["改进建议列表"]
+    "comments": "具体评价（尽可能详细）",
+    "detailed_analysis": {{
+        "opening_analysis": "开篇详细分析",
+        "pacing_analysis": "节奏详细分析",
+        "character_analysis": "角色表现详细分析",
+        "world_building_analysis": "世界观呈现详细分析"
+    }},
+    "suggestions": ["改进建议列表（详细）"],
+    "long_term_feedback": "作为读者，对后续内容的期待或担忧（详细描述）",
+    "world_feedback": "对世界观呈现的评价和期待（详细描述）"
 }}"""
 
         try:
             response_text = await self._call_llm(
-                messages=[HumanMessage(content=prompt)], temperature=0.3
+                messages=[HumanMessage(content=prompt)], temperature=0.3,
+                category=UsageCategory.DIRECTOR
             )
             result = self._parse_json_response(response_text)
 
@@ -231,7 +303,8 @@ class EvaluatorAgent(BaseAgent):
 
         try:
             response_text = await self._call_llm(
-                messages=[HumanMessage(content=prompt)], temperature=0.2
+                messages=[HumanMessage(content=prompt)], temperature=0.2,
+                category=UsageCategory.CHARACTER
             )
             result = self._parse_json_response(response_text)
             return AgentResponse(success=True, data=result)

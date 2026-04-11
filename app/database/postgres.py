@@ -6,6 +6,7 @@ PostgreSQL 数据库操作层
 import asyncio
 import json
 import logging
+import uuid as uuid_module
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, AsyncIterator, Dict, List, Optional
@@ -19,6 +20,29 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy import text
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_uuid(value: Any) -> Optional[str]:
+    """
+    验证并转换为有效的 UUID 字符串
+
+    Args:
+        value: 输入值（可以是 UUID 对象、字符串或 None）
+
+    Returns:
+        Optional[str]: 有效的 UUID 字符串，或 None 如果无效
+    """
+    if value is None:
+        return None
+    try:
+        # 如果是 UUID 对象，转为字符串
+        if hasattr(value, 'hex'):
+            return str(value)
+        # 验证是否为有效 UUID 字符串
+        uuid_module.UUID(str(value))
+        return str(value)
+    except (ValueError, TypeError, AttributeError):
+        return None
 
 
 def _prepare_json_params(data: Dict[str, Any], json_fields: List[str]) -> Dict[str, Any]:
@@ -232,9 +256,15 @@ class PostgresDatabase:
 
         params = character_data.copy()
 
+        # 验证 id 字段（必须是有效 UUID）
+        char_id = _validate_uuid(params.get('id'))
+        if not char_id:
+            char_id = str(uuid_module.uuid4())
+        params['id'] = char_id
+
         # 处理 JSONB 字段 (包括数组和对象类型)
-        jsonb_list_fields = ['lexicon', 'forbidden_words', 'voice_samples', 'goals', 'inventory', 'agent_goals', 'agent_memory']
-        jsonb_dict_fields = ['personality_traits', 'attributes']
+        jsonb_list_fields = ['lexicon', 'forbidden_words', 'voice_samples', 'goals', 'inventory', 'agent_goals', 'agent_memory', 'personality_traits', 'relationships', 'major_events']
+        jsonb_dict_fields = ['attributes', 'key_relationships']
 
         # 处理字段名映射 (background -> background_story)
         if 'background' in params and 'background_story' not in params:
@@ -272,13 +302,31 @@ class PostgresDatabase:
         if params.get('personality') is None:
             params['personality'] = None
 
-        # 处理可选的 UUID 字段
-        if params.get('world_id') is None:
-            params['world_id'] = None
+        # 处理可选的 UUID 字段 - 验证是否为有效 UUID
+        params['world_id'] = _validate_uuid(params.get('world_id'))
+        params['project_id'] = _validate_uuid(params.get('project_id'))
 
         # 处理布尔字段
         params['has_agent'] = params.get('has_agent', False)
         params['agent_enabled'] = params.get('agent_enabled', True)
+
+        # 处理角色层级字段
+        params['importance_tier'] = params.get('importance_tier', 'npc')
+        params['narrative_weight'] = params.get('narrative_weight', 'minimal')
+        params['story_arc_role'] = params.get('story_arc_role', 'neutral')
+        params['plot_priority'] = params.get('plot_priority', 0)
+
+        # 处理登场控制字段
+        params['debut_chapter'] = params.get('debut_chapter')
+        params['debut_scene'] = params.get('debut_scene')
+        params['exit_chapter'] = params.get('exit_chapter')
+        params['exit_reason'] = params.get('exit_reason')
+        params['active_arc'] = params.get('active_arc')
+
+        # 处理统计字段
+        params['total_scenes'] = params.get('total_scenes', 0)
+        params['dialogue_count'] = params.get('dialogue_count', 0)
+        # major_events is already handled in jsonb_list_fields
 
         # 确保 datetime 字段是 datetime 对象
         for field in ['created_at', 'updated_at']:
@@ -292,15 +340,25 @@ class PostgresDatabase:
 
         # 使用 SQLAlchemy text 查询
         query = """
-        INSERT INTO characters (id, name, project_id, world_id, description, role, status, appearance, age, gender,
+        INSERT INTO characters (id, name, project_id, world_id, description, role, status,
+                                importance_tier, narrative_weight, story_arc_role, plot_priority,
+                                debut_chapter, debut_scene, exit_chapter, exit_reason, active_arc,
+                                relationships, key_relationships,
+                                appearance, age, gender,
                                 personality, personality_traits, background_story, speech_pattern, lexicon,
                                 forbidden_words, voice_samples, attributes, goals, inventory, current_location,
-                                has_agent, agent_enabled, agent_goals, agent_memory)
-        VALUES (:id, :name, :project_id, :world_id, :description, :role, :status, :appearance, :age, :gender,
+                                has_agent, agent_enabled, agent_goals, agent_memory,
+                                total_scenes, dialogue_count, major_events)
+        VALUES (:id, :name, :project_id, :world_id, :description, :role, :status,
+                :importance_tier, :narrative_weight, :story_arc_role, :plot_priority,
+                :debut_chapter, :debut_scene, :exit_chapter, :exit_reason, :active_arc,
+                CAST(:relationships AS jsonb), CAST(:key_relationships AS jsonb),
+                :appearance, :age, :gender,
                 :personality, CAST(:personality_traits AS jsonb), :background_story, :speech_pattern, CAST(:lexicon AS jsonb),
                 CAST(:forbidden_words AS jsonb), CAST(:voice_samples AS jsonb), CAST(:attributes AS jsonb),
                 CAST(:goals AS jsonb), CAST(:inventory AS jsonb), :current_location,
-                :has_agent, :agent_enabled, CAST(:agent_goals AS jsonb), CAST(:agent_memory AS jsonb))
+                :has_agent, :agent_enabled, CAST(:agent_goals AS jsonb), CAST(:agent_memory AS jsonb),
+                :total_scenes, :dialogue_count, CAST(:major_events AS jsonb))
         ON CONFLICT (id) DO UPDATE SET
             name = EXCLUDED.name,
             project_id = EXCLUDED.project_id,
@@ -308,6 +366,17 @@ class PostgresDatabase:
             description = EXCLUDED.description,
             role = EXCLUDED.role,
             status = EXCLUDED.status,
+            importance_tier = EXCLUDED.importance_tier,
+            narrative_weight = EXCLUDED.narrative_weight,
+            story_arc_role = EXCLUDED.story_arc_role,
+            plot_priority = EXCLUDED.plot_priority,
+            debut_chapter = EXCLUDED.debut_chapter,
+            debut_scene = EXCLUDED.debut_scene,
+            exit_chapter = EXCLUDED.exit_chapter,
+            exit_reason = EXCLUDED.exit_reason,
+            active_arc = EXCLUDED.active_arc,
+            relationships = EXCLUDED.relationships,
+            key_relationships = EXCLUDED.key_relationships,
             appearance = EXCLUDED.appearance,
             age = EXCLUDED.age,
             gender = EXCLUDED.gender,
@@ -326,6 +395,9 @@ class PostgresDatabase:
             agent_enabled = EXCLUDED.agent_enabled,
             agent_goals = EXCLUDED.agent_goals,
             agent_memory = EXCLUDED.agent_memory,
+            total_scenes = EXCLUDED.total_scenes,
+            dialogue_count = EXCLUDED.dialogue_count,
+            major_events = EXCLUDED.major_events,
             updated_at = CURRENT_TIMESTAMP
         """
         await self.execute_write(query, params)
@@ -389,8 +461,10 @@ class PostgresDatabase:
 
     async def save_project(self, project_data: Dict[str, Any]) -> str:
         """保存项目数据"""
-        # 如果有 id，将其转换为 UUID
-        project_id = project_data.get("id")
+        # 验证 id 字段（必须是有效 UUID）
+        project_id = _validate_uuid(project_data.get("id"))
+        if not project_id:
+            project_id = str(uuid_module.uuid4())
 
         # 处理 metadata，确保是 JSON 字符串
         metadata = project_data.get("metadata") or {}
@@ -401,19 +475,22 @@ class PostgresDatabase:
                 metadata = {}
         metadata_str = json.dumps(metadata)
 
+        # 验证 UUID 字段
+        world_id = _validate_uuid(project_data.get("world_id"))
+
         params = {
-            "id": project_data.get("id"),
+            "id": project_id,
             "name": project_data.get("name"),
             "description": project_data.get("description"),
             "user_id": project_data.get("user_id"),
             "status": project_data.get("status", "draft"),
-            "world_id": project_data.get("world_id"),
+            "world_id": world_id,
             "metadata": metadata_str
         }
 
         query = """
         INSERT INTO projects (id, name, description, user_id, status, world_id, metadata)
-        VALUES (CAST(:id AS UUID), :name, :description, :user_id, :status, :world_id, CAST(:metadata AS jsonb))
+        VALUES (CAST(:id AS UUID), :name, :description, :user_id, :status, """ + ("CAST(:world_id AS UUID)" if world_id else "NULL") + """, CAST(:metadata AS jsonb))
         ON CONFLICT (id) DO UPDATE SET
             name = EXCLUDED.name,
             description = EXCLUDED.description,
@@ -519,6 +596,15 @@ class PostgresDatabase:
         # 处理 JSON 字段
         params = _prepare_json_params(world_data, ['rules', 'factions'])
 
+        # 验证 id 字段（必须是有效 UUID）
+        world_id = _validate_uuid(params.get('id'))
+        if not world_id:
+            world_id = str(uuid_module.uuid4())
+        params['id'] = world_id
+
+        # 验证 UUID 字段
+        params['project_id'] = _validate_uuid(params.get('project_id'))
+
         # 确保 datetime 字段是 datetime 对象
         for field in ['created_at', 'updated_at']:
             if field in params and isinstance(params[field], str):
@@ -529,10 +615,13 @@ class PostgresDatabase:
             elif field not in params or params[field] is None:
                 params[field] = datetime.now()
 
+        # 动态构建 SQL
+        project_id_sql = "CAST(:project_id AS UUID)" if params.get('project_id') else "NULL"
+
         query = """
         INSERT INTO worlds (id, name, project_id, description, world_type, tone, rules, power_system,
                            technology_level, history, geography, factions, created_at, updated_at)
-        VALUES (:id, :name, CAST(:project_id AS UUID), :description, :world_type, :tone, CAST(:rules AS jsonb), :power_system,
+        VALUES (:id, :name, """ + project_id_sql + """, :description, :world_type, :tone, CAST(:rules AS jsonb), :power_system,
                 :technology_level, :history, :geography, CAST(:factions AS jsonb), :created_at, :updated_at)
         ON CONFLICT (id) DO UPDATE SET
             name = EXCLUDED.name,
@@ -601,6 +690,15 @@ class PostgresDatabase:
             region_data["atmosphere"] = ""
         logger.info(f"save_region after fix: area_size={region_data.get('area_size')}")
 
+        # 验证 id 字段（必须是有效 UUID）
+        region_id = _validate_uuid(region_data.get('id'))
+        if not region_id:
+            region_id = str(uuid_module.uuid4())
+        region_data['id'] = region_id
+
+        # 验证 UUID 字段
+        region_data['world_id'] = _validate_uuid(region_data.get('world_id'))
+
         # 处理 JSONB 字段 - 转换为 JSON 字符串
         json_fields = ['coordinates', 'terrain_features', 'landmarks', 'encounters', 'connections', 'local_rules']
         for field in json_fields:
@@ -625,12 +723,15 @@ class PostgresDatabase:
                 except:
                     region_data[field] = datetime.utcnow()
 
+        # 动态构建 world_id 的 SQL
+        world_id_sql = "CAST(:world_id AS UUID)" if region_data.get('world_id') else "NULL"
+
         query = """
         INSERT INTO regions (id, name, world_id, region_type, terrain_type, description,
                             atmosphere, coordinates, area_size, terrain_features, landmarks,
                             encounters, connections, local_rules, is_generated, visit_count,
                             created_at, updated_at)
-        VALUES (:id, :name, :world_id, :region_type, :terrain_type, :description,
+        VALUES (:id, :name, """ + world_id_sql + """, :region_type, :terrain_type, :description,
                 :atmosphere, CAST(:coordinates AS jsonb), :area_size, CAST(:terrain_features AS jsonb),
                 CAST(:landmarks AS jsonb), CAST(:encounters AS jsonb), CAST(:connections AS jsonb),
                 CAST(:local_rules AS jsonb), :is_generated, :visit_count, :created_at, :updated_at)
@@ -678,9 +779,18 @@ class PostgresDatabase:
         """保存伏笔数据"""
         # 处理可选字段，设置默认值
         params = hook_data.copy()
-        for field in ['world_id', 'plant_chapter', 'resolution_chapter']:
-            if params.get(field) is None:
-                params[field] = None
+
+        # 验证 UUID 字段（包括 id）
+        hook_id = _validate_uuid(params.get('id'))
+        if not hook_id:
+            # 如果 id 无效，生成新的 UUID
+            hook_id = str(uuid_module.uuid4())
+        params['id'] = hook_id
+
+        params['project_id'] = _validate_uuid(params.get('project_id'))
+        params['world_id'] = _validate_uuid(params.get('world_id'))
+        params['plant_chapter'] = _validate_uuid(params.get('plant_chapter'))
+        params['resolution_chapter'] = _validate_uuid(params.get('resolution_chapter'))
 
         # 确保 datetime 字段是 datetime 对象
         for field in ['created_at', 'resolved_at']:
@@ -692,14 +802,20 @@ class PostgresDatabase:
             elif field == 'created_at' and (field not in params or params[field] is None):
                 params[field] = datetime.now()
 
+        # 动态构建 SQL
+        project_id_sql = "CAST(:project_id AS UUID)" if params.get('project_id') else "NULL"
+        world_id_sql = "CAST(:world_id AS UUID)" if params.get('world_id') else "NULL"
+        plant_chapter_sql = "CAST(:plant_chapter AS UUID)" if params.get('plant_chapter') else "NULL"
+        resolution_chapter_sql = "CAST(:resolution_chapter AS UUID)" if params.get('resolution_chapter') else "NULL"
+
         query = """
         INSERT INTO hooks (id, title, project_id, world_id, description, hook_type, status, related_characters,
                           related_locations, related_objects, plant_context, plant_chapter,
                           resolution_hint, resolution_context, resolution_chapter, priority,
                           created_at, resolved_at)
-        VALUES (:id, :title, CAST(:project_id AS UUID), :world_id, :description, :hook_type, :status, :related_characters,
-                :related_locations, :related_objects, :plant_context, :plant_chapter,
-                :resolution_hint, :resolution_context, :resolution_chapter, :priority,
+        VALUES (:id, :title, """ + project_id_sql + """, """ + world_id_sql + """, :description, :hook_type, :status, :related_characters,
+                :related_locations, :related_objects, :plant_context, """ + plant_chapter_sql + """,
+                :resolution_hint, :resolution_context, """ + resolution_chapter_sql + """, :priority,
                 :created_at, :resolved_at)
         ON CONFLICT (id) DO UPDATE SET
             title = EXCLUDED.title,
@@ -801,16 +917,36 @@ class PostgresDatabase:
 
     async def save_chapter(self, chapter_data: Dict[str, Any]) -> str:
         """保存章节数据"""
+        import uuid as uuid_module
+
         # 处理 JSON 字段
         params = _prepare_json_params(chapter_data, [
             'events', 'hooks_planted', 'hooks_resolved', 'main_plot_progress', 'reader_scores'
         ])
 
-        # 处理可选字段
-        if params.get('world_id') is None:
-            params['world_id'] = None
-        if params.get('project_id') is None:
-            params['project_id'] = None
+        # 验证 id 字段（必须是有效 UUID）
+        chapter_id = _validate_uuid(params.get('id'))
+        if not chapter_id:
+            chapter_id = str(uuid_module.uuid4())
+        params['id'] = chapter_id
+
+        # 处理可选的 UUID 字段 - 验证是否为有效 UUID
+        for field in ['world_id', 'project_id']:
+            value = params.get(field)
+            if value is not None:
+                try:
+                    # 如果是 UUID 对象，转为字符串
+                    if hasattr(value, 'hex'):
+                        params[field] = str(value)
+                    else:
+                        # 验证是否为有效 UUID 字符串
+                        uuid_module.UUID(str(value))
+                        params[field] = str(value)
+                except (ValueError, TypeError, AttributeError):
+                    # 不是有效的 UUID，设为 None
+                    params[field] = None
+            else:
+                params[field] = None
 
         # 确保 datetime 字段是 datetime 对象
         for field in ['created_at', 'updated_at', 'completed_at']:
@@ -822,11 +958,15 @@ class PostgresDatabase:
             elif field in ['created_at', 'updated_at'] and (field not in params or params[field] is None):
                 params[field] = datetime.now()
 
+        # 构建 SQL，world_id 和 project_id 可能为 NULL
+        world_id_value = params.get('world_id')
+        project_id_value = params.get('project_id')
+
         query = """
         INSERT INTO chapters (id, title, project_id, world_id, summary, content, word_count, status, events,
                              hooks_planted, hooks_resolved, main_plot_progress, reader_scores,
                              created_at, updated_at, completed_at)
-        VALUES (:id, :title, CAST(:project_id AS UUID), :world_id, :summary, :content, :word_count, :status, :events,
+        VALUES (:id, :title, """ + (f"CAST(:project_id AS UUID)" if project_id_value else "NULL") + """, """ + (f"CAST(:world_id AS UUID)" if world_id_value else "NULL") + """, :summary, :content, :word_count, :status, :events,
                 :hooks_planted, :hooks_resolved, :main_plot_progress, :reader_scores,
                 :created_at, :updated_at, :completed_at)
         ON CONFLICT (id) DO UPDATE SET
@@ -900,6 +1040,17 @@ class PostgresDatabase:
         """保存世界快照"""
         from datetime import datetime
 
+        # 验证 UUID 字段（包括 id）
+        snapshot_id = _validate_uuid(snapshot_data.get('id'))
+        if not snapshot_id:
+            # 如果 id 无效，生成新的 UUID
+            snapshot_id = str(uuid_module.uuid4())
+        snapshot_data['id'] = snapshot_id
+
+        snapshot_data['world_id'] = _validate_uuid(snapshot_data.get('world_id'))
+        snapshot_data['chapter_id'] = _validate_uuid(snapshot_data.get('chapter_id'))
+        snapshot_data['parent_snapshot_id'] = _validate_uuid(snapshot_data.get('parent_snapshot_id'))
+
         # 处理 JSONB 字段 - 转换为 JSON 字符串
         json_fields = ['characters', 'relationships', 'regions', 'hooks', 'completed_events', 'character_locations']
         for field in json_fields:
@@ -922,16 +1073,21 @@ class PostgresDatabase:
             except:
                 snapshot_data['created_at'] = datetime.utcnow()
 
+        # 动态构建 SQL
+        world_id_sql = "CAST(:world_id AS UUID)" if snapshot_data.get('world_id') else "NULL"
+        chapter_id_sql = "CAST(:chapter_id AS UUID)" if snapshot_data.get('chapter_id') else "NULL"
+        parent_snapshot_id_sql = "CAST(:parent_snapshot_id AS UUID)" if snapshot_data.get('parent_snapshot_id') else "NULL"
+
         query = """
         INSERT INTO world_snapshots (id, world_id, chapter_id, snapshot_type, name, description,
                                      characters, relationships, regions, hooks, main_plot_progress,
                                      completed_events, character_locations, created_at, created_by,
                                      parent_snapshot_id, is_branch, branch_reason)
-        VALUES (:id, :world_id, :chapter_id, :snapshot_type, :name, :description,
+        VALUES (:id, """ + world_id_sql + """, """ + chapter_id_sql + """, :snapshot_type, :name, :description,
                 CAST(:characters AS jsonb), CAST(:relationships AS jsonb), CAST(:regions AS jsonb),
                 CAST(:hooks AS jsonb), :main_plot_progress, CAST(:completed_events AS jsonb),
                 CAST(:character_locations AS jsonb), :created_at, :created_by,
-                :parent_snapshot_id, :is_branch, :branch_reason)
+                """ + parent_snapshot_id_sql + """, :is_branch, :branch_reason)
         """
         await self.execute_write(query, snapshot_data)
         return snapshot_data.get("id", "")
@@ -984,31 +1140,55 @@ class PostgresDatabase:
 
     async def log_intervention(self, intervention_data: Dict[str, Any]) -> str:
         """记录干预日志"""
+        params = intervention_data.copy()
+
+        # 验证并生成 UUID
+        intervention_id = _validate_uuid(params.get('id'))
+        if not intervention_id:
+            intervention_id = str(uuid_module.uuid4())
+        params['id'] = intervention_id
+
+        # snapshot_id 可以为空，但如果提供则需要验证
+        snapshot_id = _validate_uuid(params.get('snapshot_id'))
+        params['snapshot_id'] = snapshot_id  # 可以为 None
+
         # 处理 JSONB 字段
         json_fields = ['details', 'affected_hooks', 'affected_relationships', 'affected_characters']
         for field in json_fields:
-            if field in intervention_data and intervention_data[field] is not None:
-                value = intervention_data[field]
+            if field in params and params[field] is not None:
+                value = params[field]
                 if isinstance(value, str):
                     try:
                         value = json.loads(value)
                     except:
                         value = {} if field == 'details' else []
                 if isinstance(value, (list, dict)):
-                    intervention_data[field] = json.dumps(value)
+                    params[field] = json.dumps(value)
                 elif value is None:
-                    intervention_data[field] = '{}' if field == 'details' else '[]'
+                    params[field] = '{}' if field == 'details' else '[]'
 
-        query = """
+        # 处理 datetime 字段
+        if 'created_at' in params and isinstance(params['created_at'], str):
+            try:
+                params['created_at'] = datetime.fromisoformat(params['created_at'].replace('Z', '+00:00'))
+            except:
+                params['created_at'] = datetime.now()
+        elif 'created_at' not in params or params.get('created_at') is None:
+            params['created_at'] = datetime.now()
+
+        # 动态构建 SQL
+        snapshot_id_sql = "CAST(:snapshot_id AS UUID)" if params.get('snapshot_id') else "NULL"
+
+        query = f"""
         INSERT INTO intervention_logs (id, snapshot_id, intervention_type, description, details,
                                        affected_hooks, affected_relationships, affected_characters,
                                        outcome_rating, outcome_notes, created_at)
-        VALUES (:id, :snapshot_id, :intervention_type, :description, CAST(:details AS jsonb),
+        VALUES (:id, {snapshot_id_sql}, :intervention_type, :description, CAST(:details AS jsonb),
                 CAST(:affected_hooks AS jsonb), CAST(:affected_relationships AS jsonb), CAST(:affected_characters AS jsonb),
                 :outcome_rating, :outcome_notes, :created_at)
         """
-        await self.execute_write(query, intervention_data)
-        return intervention_data.get("id", "")
+        await self.execute_write(query, params)
+        return intervention_id
 
     async def update_intervention_evaluation(
         self,
@@ -1044,6 +1224,12 @@ class PostgresDatabase:
         """
         rows = await self.execute_query(query, {"limit": limit})
         return [dict(row) for row in rows]
+
+    async def delete_intervention_log(self, intervention_id: str) -> bool:
+        """删除单条干预日志"""
+        query = "DELETE FROM intervention_logs WHERE id = :id"
+        await self.execute_write(query, {"id": intervention_id})
+        return True
 
     # ==================== 初始化表结构 ====================
 
@@ -1457,3 +1643,350 @@ class PostgresDatabase:
                 "total_tokens": token_stats[0]["total_tokens"] if token_stats else 0,
                 "total_cost": float(token_stats[0]["total_cost"]) if token_stats else 0.0,
             }
+
+    # ==================== v8 工作流相关操作 ====================
+
+    async def save_workflow_definition(self, workflow_data: Dict[str, Any]) -> str:
+        """
+        保存工作流定义
+
+        Args:
+            workflow_data: 工作流定义数据
+
+        Returns:
+            str: 工作流 ID
+        """
+        # 验证 UUID 字段
+        workflow_data['project_id'] = _validate_uuid(workflow_data.get('project_id'))
+
+        # 处理 JSON 字段
+        json_fields = ['nodes', 'edges', 'variables']
+        for field in json_fields:
+            if field in workflow_data and workflow_data[field] is not None:
+                value = workflow_data[field]
+                if isinstance(value, str):
+                    try:
+                        value = json.loads(value)
+                    except:
+                        value = [] if field != 'variables' else {}
+                if isinstance(value, (list, dict)):
+                    workflow_data[field] = json.dumps(value)
+
+        # 处理时间字段
+        for field in ['created_at', 'updated_at']:
+            if field in workflow_data and isinstance(workflow_data[field], str):
+                try:
+                    workflow_data[field] = datetime.fromisoformat(
+                        workflow_data[field].replace('Z', '+00:00')
+                    )
+                except:
+                    workflow_data[field] = datetime.now()
+            elif field not in workflow_data or workflow_data[field] is None:
+                workflow_data[field] = datetime.now()
+
+        # 动态构建 SQL
+        project_id_sql = "CAST(:project_id AS UUID)" if workflow_data.get('project_id') else "NULL"
+
+        query = """
+        INSERT INTO workflow_definitions (id, project_id, name, description, nodes, edges, variables, is_template, created_at, updated_at)
+        VALUES (:id, """ + project_id_sql + """, :name, :description, :nodes, :edges, :variables, :is_template, :created_at, :updated_at)
+        ON CONFLICT (id) DO UPDATE SET
+            name = EXCLUDED.name,
+            description = EXCLUDED.description,
+            nodes = EXCLUDED.nodes,
+            edges = EXCLUDED.edges,
+            variables = EXCLUDED.variables,
+            is_template = EXCLUDED.is_template,
+            updated_at = EXCLUDED.updated_at
+        """
+        await self.execute_write(query, workflow_data)
+        return workflow_data.get("id", "")
+
+    async def get_workflow_definition(self, workflow_id: str) -> Optional[Dict[str, Any]]:
+        """
+        获取工作流定义
+
+        Args:
+            workflow_id: 工作流 ID
+
+        Returns:
+            Optional[Dict]: 工作流定义
+        """
+        query = "SELECT * FROM workflow_definitions WHERE id = :id"
+        results = await self.execute_query(query, {"id": workflow_id})
+        return results[0] if results else None
+
+    async def get_all_workflows(
+        self,
+        project_id: str,
+        include_templates: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        获取工作流列表
+
+        Args:
+            project_id: 项目 ID
+            include_templates: 是否包含模板
+
+        Returns:
+            List: 工作流列表
+        """
+        if include_templates:
+            query = """
+            SELECT * FROM workflow_definitions
+            WHERE project_id = :project_id OR is_template = true
+            ORDER BY created_at DESC
+            """
+        else:
+            query = """
+            SELECT * FROM workflow_definitions
+            WHERE project_id = :project_id
+            ORDER BY created_at DESC
+            """
+        return await self.execute_query(query, {"project_id": project_id})
+
+    async def delete_workflow_definition(self, workflow_id: str) -> bool:
+        """
+        删除工作流定义
+
+        Args:
+            workflow_id: 工作流 ID
+
+        Returns:
+            bool: 是否成功
+        """
+        query = "DELETE FROM workflow_definitions WHERE id = :id"
+        await self.execute_write(query, {"id": workflow_id})
+        return True
+
+    async def save_workflow_execution(self, execution_data: Dict[str, Any]) -> str:
+        """
+        保存工作流执行记录
+
+        Args:
+            execution_data: 执行记录数据
+
+        Returns:
+            str: 执行 ID
+        """
+        # 验证 UUID 字段
+        execution_data['project_id'] = _validate_uuid(execution_data.get('project_id'))
+
+        # 处理 JSON 字段
+        json_fields = ['node_states', 'context', 'intervention_ids']
+        for field in json_fields:
+            if field in execution_data and execution_data[field] is not None:
+                value = execution_data[field]
+                if isinstance(value, str):
+                    try:
+                        value = json.loads(value)
+                    except:
+                        value = {} if field != 'intervention_ids' else []
+                if isinstance(value, (list, dict)):
+                    execution_data[field] = json.dumps(value)
+
+        # 处理时间字段
+        for field in ['started_at', 'completed_at']:
+            if field in execution_data and isinstance(execution_data[field], str):
+                try:
+                    execution_data[field] = datetime.fromisoformat(
+                        execution_data[field].replace('Z', '+00:00')
+                    )
+                except:
+                    execution_data[field] = None
+
+        # 动态构建 SQL
+        project_id_sql = "CAST(:project_id AS UUID)" if execution_data.get('project_id') else "NULL"
+
+        query = """
+        INSERT INTO workflow_executions (id, workflow_id, project_id, status, current_node, node_states, context, intervention_ids, started_at, completed_at, total_duration_ms, error)
+        VALUES (:id, :workflow_id, """ + project_id_sql + """, :status, :current_node, :node_states, :context, :intervention_ids, :started_at, :completed_at, :total_duration_ms, :error)
+        ON CONFLICT (id) DO UPDATE SET
+            status = EXCLUDED.status,
+            current_node = EXCLUDED.current_node,
+            node_states = EXCLUDED.node_states,
+            context = EXCLUDED.context,
+            intervention_ids = EXCLUDED.intervention_ids,
+            completed_at = EXCLUDED.completed_at,
+            total_duration_ms = EXCLUDED.total_duration_ms,
+            error = EXCLUDED.error
+        """
+        await self.execute_write(query, execution_data)
+        return execution_data.get("id", "")
+
+    async def get_workflow_execution(self, execution_id: str) -> Optional[Dict[str, Any]]:
+        """
+        获取工作流执行记录
+
+        Args:
+            execution_id: 执行 ID
+
+        Returns:
+            Optional[Dict]: 执行记录
+        """
+        query = "SELECT * FROM workflow_executions WHERE id = :id"
+        results = await self.execute_query(query, {"id": execution_id})
+        return results[0] if results else None
+
+    async def get_workflow_executions_by_project(
+        self,
+        project_id: str,
+        status: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """
+        获取项目的工作流执行记录列表
+
+        Args:
+            project_id: 项目 ID
+            status: 状态过滤
+            limit: 返回数量限制
+
+        Returns:
+            List: 执行记录列表
+        """
+        conditions = ["project_id = :project_id"]
+        params: Dict[str, Any] = {"project_id": project_id, "limit": limit}
+
+        if status:
+            conditions.append("status = :status")
+            params["status"] = status
+
+        where_clause = f"WHERE {' AND '.join(conditions)}"
+        query = f"SELECT * FROM workflow_executions {where_clause} ORDER BY started_at DESC LIMIT :limit"
+
+        return await self.execute_query(query, params)
+
+    async def save_v8_intervention_log(self, log_data: Dict[str, Any]) -> str:
+        """
+        保存 v8 干预日志
+
+        Args:
+            log_data: 干预日志数据
+
+        Returns:
+            str: 日志 ID
+        """
+        # 验证 UUID 字段
+        log_data['project_id'] = _validate_uuid(log_data.get('project_id'))
+
+        # 处理 JSON 字段
+        json_fields = ['context_snapshot']
+        for field in json_fields:
+            if field in log_data and log_data[field] is not None:
+                value = log_data[field]
+                if isinstance(value, str):
+                    try:
+                        value = json.loads(value)
+                    except:
+                        value = {}
+                if isinstance(value, (list, dict)):
+                    log_data[field] = json.dumps(value)
+
+        # 处理时间字段
+        if 'created_at' in log_data and isinstance(log_data['created_at'], str):
+            try:
+                log_data['created_at'] = datetime.fromisoformat(
+                    log_data['created_at'].replace('Z', '+00:00')
+                )
+            except:
+                log_data['created_at'] = datetime.now()
+        elif 'created_at' not in log_data or log_data['created_at'] is None:
+            log_data['created_at'] = datetime.now()
+
+        # 动态构建 SQL
+        project_id_sql = "CAST(:project_id AS UUID)" if log_data.get('project_id') else "NULL"
+
+        query = """
+        INSERT INTO v8_intervention_logs (id, project_id, workflow_execution_id, node_id, agent_type, agent_name, intervention_type, user_message, agent_response, context_snapshot, response_time_ms, created_at)
+        VALUES (:id, """ + project_id_sql + """, :workflow_execution_id, :node_id, :agent_type, :agent_name, :intervention_type, :user_message, :agent_response, :context_snapshot, :response_time_ms, :created_at)
+        """
+        await self.execute_write(query, log_data)
+        return log_data.get("id", "")
+
+    async def get_v8_intervention_logs(
+        self,
+        project_id: str,
+        workflow_execution_id: Optional[str] = None,
+        agent_type: Optional[str] = None,
+        keyword: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """
+        获取 v8 干预日志列表
+
+        Args:
+            project_id: 项目 ID
+            workflow_execution_id: 工作流执行 ID
+            agent_type: Agent 类型过滤
+            keyword: 关键词搜索
+            limit: 返回数量
+            offset: 偏移量
+
+        Returns:
+            List: 干预日志列表
+        """
+        conditions = ["project_id = :project_id"]
+        params: Dict[str, Any] = {
+            "project_id": project_id,
+            "limit": limit,
+            "offset": offset,
+        }
+
+        if workflow_execution_id:
+            conditions.append("workflow_execution_id = :workflow_execution_id")
+            params["workflow_execution_id"] = workflow_execution_id
+
+        if agent_type:
+            conditions.append("agent_type = :agent_type")
+            params["agent_type"] = agent_type
+
+        if keyword:
+            conditions.append("(user_message ILIKE :keyword OR agent_response ILIKE :keyword)")
+            params["keyword"] = f"%{keyword}%"
+
+        where_clause = f"WHERE {' AND '.join(conditions)}"
+        query = f"""
+        SELECT * FROM v8_intervention_logs
+        {where_clause}
+        ORDER BY created_at DESC
+        LIMIT :limit OFFSET :offset
+        """
+
+        return await self.execute_query(query, params)
+
+    async def get_v8_intervention_log(self, log_id: str) -> Optional[Dict[str, Any]]:
+        """
+        获取单个 v8 干预日志
+
+        Args:
+            log_id: 日志 ID
+
+        Returns:
+            Optional[Dict]: 干预日志
+        """
+        query = "SELECT * FROM v8_intervention_logs WHERE id = :id"
+        results = await self.execute_query(query, {"id": log_id})
+        return results[0] if results else None
+
+    async def delete_v8_intervention_logs_by_execution(self, execution_id: str) -> int:
+        """
+        删除某次执行的所有干预日志
+
+        Args:
+            execution_id: 执行 ID
+
+        Returns:
+            int: 删除数量
+        """
+        # 先获取数量
+        count_query = "SELECT COUNT(*) as count FROM v8_intervention_logs WHERE workflow_execution_id = :execution_id"
+        count_result = await self.execute_query(count_query, {"execution_id": execution_id})
+        count = count_result[0]["count"] if count_result else 0
+
+        # 删除
+        delete_query = "DELETE FROM v8_intervention_logs WHERE workflow_execution_id = :execution_id"
+        await self.execute_write(delete_query, {"execution_id": execution_id})
+
+        return count

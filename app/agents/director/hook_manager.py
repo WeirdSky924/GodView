@@ -1,5 +1,11 @@
 """
 伏笔管理员 Agent - 负责伏笔的埋设与回收
+
+核心职责：
+1. 管理项目中已有的伏笔（从数据库加载）
+2. 根据剧情需要决定是否创建新伏笔
+3. 识别伏笔回收的最佳时机
+4. 更新伏笔状态
 """
 
 import logging
@@ -10,6 +16,7 @@ from langchain_core.messages import HumanMessage
 
 from app.agents.base import BaseAgent, AgentResponse
 from app.models.agent_template import AgentType
+from app.models.token_usage import UsageCategory
 
 logger = logging.getLogger(__name__)
 
@@ -42,25 +49,72 @@ class HookManagerAgent(BaseAgent):
         """获取默认变量（HookManager 特定）"""
         return {
             "agent_role": "伏笔管理员",
-            "task_description": "负责在日常互动中埋设和回收伏笔",
+            "task_description": "负责管理故事伏笔的埋设与回收",
         }
 
     def _build_default_system_prompt(self) -> str:
-        """构建默认系统提示（向后兼容）"""
-        return """你是伏笔管理员，负责在日常互动中埋设和回收伏笔。
+        """构建默认系统提示"""
+        return """你是伏笔管理员，负责管理小说中的伏笔系统。
 
-你的职责：
-1. 根据当前场景选择合适的伏笔进行埋设
-2. 识别伏笔回收的最佳时机
-3. 确保伏笔的"展示"而非"告知"
-4. 追踪伏笔状态变化
+## 核心职责
 
-输出 JSON 格式：
+1. **管理现有伏笔** - 首先检查数据库中已有的伏笔，评估其状态
+2. **战略性埋设** - 根据剧情发展需要，决定是否埋设新伏笔
+3. **适时回收** - 识别已有伏笔回收的最佳时机
+4. **状态追踪** - 更新伏笔的生命周期状态
+
+## 伏笔类型
+
+- **suspense** (悬念): 让读者产生疑问，期待后续解答
+- **foreshadow** (伏笔): 暗示未来事件，制造"原来如此"的体验
+- **twist** (转折): 为意外的剧情转折做铺垫
+
+## 伏笔原则
+
+1. **展示而非告知** - 通过细节、对话、行为暗示，而非直接说明
+2. **自然融入** - 伏笔不应突兀，要与场景和角色行为融合
+3. **有始有终** - 埋设的伏笔必须在合适时机回收
+4. **情感价值** - 回收时能给读者带来惊喜或情感冲击
+
+## 输出格式
+
+```json
 {
-    "hooks_to_plant": [{"hook_id": "ID", "method": "埋设方式", "context": "具体情境"}],
-    "hooks_to_resolve": [{"hook_id": "ID", "resolution": "回收方式"}],
-    "hooks_status_updates": [{"hook_id": "ID", "new_status": "triggered/resolved"}]
-}"""
+    "reasoning": "决策理由，说明为什么这样处理伏笔",
+    "hooks_to_plant": [
+        {
+            "title": "伏笔标题",
+            "description": "伏笔内容描述",
+            "hook_type": "suspense/foreshadow/twist",
+            "resolution_hint": "未来如何回收这个伏笔",
+            "priority": 1-10,
+            "related_characters": ["相关角色"],
+            "related_objects": ["相关物品"]
+        }
+    ],
+    "hooks_to_resolve": [
+        {
+            "id": "伏笔ID（从现有伏笔中选择）",
+            "resolution_context": "回收的具体方式"
+        }
+    ],
+    "hooks_status_updates": [
+        {
+            "id": "伏笔ID",
+            "new_status": "triggered/ready_for_resolution",
+            "reason": "状态变更原因"
+        }
+    ],
+    "suggestions": ["对伏笔管理的建议"]
+}
+```
+
+## 重要原则
+
+- 不要随意创建新伏笔，优先考虑现有伏笔
+- 如果现有伏笔已经足够，不需要新增
+- 回收伏笔比创建新伏笔更重要
+- 伏笔数量要适中，太多会让故事混乱"""
 
     async def execute(self, input_data: Dict[str, Any]) -> AgentResponse:
         """
@@ -68,34 +122,41 @@ class HookManagerAgent(BaseAgent):
 
         Args:
             input_data: 包含以下字段
-                - available_hooks: 可用伏笔池
-                - triggered_hooks: 已触发伏笔
-                - pending_hooks: 待回收伏笔
+                - existing_hooks: 数据库中的现有伏笔
+                - hooks_planted_in_chapter: 本章节埋设的伏笔
+                - hooks_resolved_in_chapter: 本章节回收的伏笔
+                - plot_context: 剧情上下文
                 - current_scene: 当前场景描述
                 - recent_events: 最近发生的事件
+                - chapter_goal: 章节目标
 
         Returns:
             AgentResponse: 伏笔管理决策
         """
         try:
-            available_hooks = input_data.get("available_hooks", [])
-            triggered_hooks = input_data.get("triggered_hooks", [])
-            pending_hooks = input_data.get("pending_hooks", [])
+            existing_hooks = input_data.get("existing_hooks", [])
+            planted_in_chapter = input_data.get("hooks_planted_in_chapter", [])
+            resolved_in_chapter = input_data.get("hooks_resolved_in_chapter", [])
+            plot_context = input_data.get("plot_context", {})
             current_scene = input_data.get("current_scene", "")
             recent_events = input_data.get("recent_events", [])
+            chapter_goal = input_data.get("chapter_goal", "")
 
             # 构建用户消息
             user_message = self._build_user_message(
-                available_hooks=available_hooks,
-                triggered_hooks=triggered_hooks,
-                pending_hooks=pending_hooks,
+                existing_hooks=existing_hooks,
+                planted_in_chapter=planted_in_chapter,
+                resolved_in_chapter=resolved_in_chapter,
+                plot_context=plot_context,
                 current_scene=current_scene,
                 recent_events=recent_events,
+                chapter_goal=chapter_goal,
             )
 
             # 调用 LLM
             response_text = await self._call_llm(
-                messages=[HumanMessage(content=user_message)], temperature=0.5
+                messages=[HumanMessage(content=user_message)], temperature=0.5,
+                category=UsageCategory.HOOK
             )
 
             # 解析响应
@@ -105,8 +166,8 @@ class HookManagerAgent(BaseAgent):
                 success=True,
                 data=result,
                 metadata={
-                    "available_count": len(available_hooks),
-                    "pending_count": len(pending_hooks),
+                    "existing_hooks_count": len(existing_hooks),
+                    "planted_in_chapter_count": len(planted_in_chapter),
                 },
             )
 
@@ -116,44 +177,81 @@ class HookManagerAgent(BaseAgent):
 
     def _build_user_message(
         self,
-        available_hooks: List[Dict[str, Any]],
-        triggered_hooks: List[Dict[str, Any]],
-        pending_hooks: List[Dict[str, Any]],
+        existing_hooks: List[Dict[str, Any]],
+        planted_in_chapter: List[str],
+        resolved_in_chapter: List[str],
+        plot_context: Dict[str, Any],
         current_scene: str,
         recent_events: List[str],
+        chapter_goal: str,
     ) -> str:
         """构建用户消息"""
         message_parts = []
+
+        # 剧情上下文
+        if plot_context:
+            context_text = f"""
+- 主线进度: {plot_context.get('main_plot_progress', 0):.1%}
+- 当前章节: {plot_context.get('current_chapter', '未知')}
+- 章节事件数: {plot_context.get('chapter_events_count', 0)}
+- 活跃角色: {', '.join(plot_context.get('active_characters', []))}"""
+            message_parts.append(f"【剧情上下文】{context_text}")
+
+        # 章节目标
+        if chapter_goal:
+            message_parts.append(f"【章节目标】\n{chapter_goal}")
 
         # 当前场景
         if current_scene:
             message_parts.append(f"【当前场景】\n{current_scene}")
 
-        # 可用伏笔池
-        if available_hooks:
-            hooks_text = "\n".join(
-                [f"- {h.get('id')}: {h.get('title', '无标题')} (类型：{h.get('hook_type', 'unknown')})" for h in available_hooks[:10]]
-            )
-            message_parts.append(f"【可用伏笔池】\n{hooks_text}")
-
-        # 已触发待回收伏笔
-        if pending_hooks:
-            hooks_text = "\n".join(
-                [f"- {h.get('id')}: {h.get('title', '无标题')} (优先级：{h.get('priority', 1)})" for h in pending_hooks]
-            )
-            message_parts.append(f"【待回收伏笔】\n{hooks_text}")
-            message_parts.append("请识别回收这些伏笔的最佳时机。")
-
         # 最近事件
         if recent_events:
-            message_parts.append(f"【最近事件】\n{chr(10).join(recent_events)}")
+            message_parts.append(f"【最近发生的事件】\n{chr(10).join(f'- {e}' for e in recent_events)}")
 
-        message_parts.append(
-            "\n请决定：\n"
-            "1. 哪些伏笔应该在此时埋设（hooks_to_plant）\n"
-            "2. 哪些伏笔应该在此时回收（hooks_to_resolve）\n"
-            "3. 伏笔状态更新（hooks_status_updates）"
-        )
+        # 现有伏笔（重点！）
+        if existing_hooks:
+            hooks_text = []
+            for h in existing_hooks[:15]:  # 最多显示15个
+                status = h.get('status', 'unknown')
+                title = h.get('title', '无标题')
+                hook_type = h.get('hook_type', '未知')
+                priority = h.get('priority', 5)
+                desc = h.get('description', '')[:50]  # 截断描述
+                hooks_text.append(f"- [{status}] {title} (类型:{hook_type}, 优先级:{priority})")
+                if desc:
+                    hooks_text.append(f"  描述: {desc}...")
+
+            message_parts.append(f"【现有伏笔 ({len(existing_hooks)}个)】\n{chr(10).join(hooks_text)}")
+            message_parts.append("⚠️ 以上是数据库中已存在的伏笔，请优先考虑如何利用和管理这些伏笔。")
+        else:
+            message_parts.append("【现有伏笔】\n暂无已存储的伏笔。")
+
+        # 本章节伏笔状态
+        if planted_in_chapter:
+            message_parts.append(f"【本章节已埋设】\n{chr(10).join(f'- {h}' for h in planted_in_chapter)}")
+        if resolved_in_chapter:
+            message_parts.append(f"【本章节已回收】\n{chr(10).join(f'- {h}' for h in resolved_in_chapter)}")
+
+        # 决策引导
+        message_parts.append("""
+【决策要点】
+
+1. **伏笔回收优先**: 检查现有伏笔是否可以在当前场景回收
+   - 回收时机是否合适？
+   - 回收方式是否能产生"原来如此"的效果？
+
+2. **伏笔状态更新**: 对于不能立即回收的伏笔
+   - 是否已触发（开始显现）？
+   - 是否需要调整优先级？
+
+3. **新伏笔创建**: 仅在确实需要时创建新伏笔
+   - 是否有明确的回收计划？
+   - 是否与现有伏笔重复？
+   - 是否对未来剧情有重要价值？
+
+请输出 JSON 格式的决策。
+""")
 
         return "\n\n".join(message_parts)
 
@@ -203,7 +301,8 @@ class HookManagerAgent(BaseAgent):
 
         try:
             response_text = await self._call_llm(
-                messages=[HumanMessage(content=prompt)], temperature=0.6
+                messages=[HumanMessage(content=prompt)], temperature=0.6,
+                category=UsageCategory.HOOK
             )
             result = self._parse_json_response(response_text)
             return AgentResponse(success=True, data=result)
@@ -252,7 +351,8 @@ class HookManagerAgent(BaseAgent):
 
         try:
             response_text = await self._call_llm(
-                messages=[HumanMessage(content=prompt)], temperature=0.5
+                messages=[HumanMessage(content=prompt)], temperature=0.5,
+                category=UsageCategory.HOOK
             )
             result = self._parse_json_response(response_text)
             return AgentResponse(success=True, data=result)

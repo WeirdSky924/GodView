@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Optional, Callable
 from app.models.world import World
 from app.models.character import Character
 from app.services.model_router import create_llm
+from app.services.token_tracker import token_tracker
+from app.models.token_usage import UsageCategory
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +154,9 @@ class CollaboratorSystem:
             model = self.model_factory()
             response = await model.ainvoke(prompt)
 
+            # 记录 token 使用量
+            await self._record_token_usage(request, prompt, response)
+
             # 解析响应
             result = self._parse_response(response, request.request_type)
 
@@ -178,6 +183,62 @@ class CollaboratorSystem:
             request.status = "failed"
             request.error = str(e)
             logger.error(f"协作请求处理失败: {request.id} - {e}")
+
+    async def _record_token_usage(self, request: CollaborationRequest, prompt: List[Dict], response: Any):
+        """记录 token 使用量"""
+        try:
+            # 获取 project_id（从上下文中获取）
+            project_id = request.context.get("project_id")
+            if not project_id:
+                return
+
+            # 计算输入 token（估算）
+            input_text = " ".join([msg.get("content", "") for msg in prompt])
+            input_tokens = len(input_text) // 4
+
+            # 计算输出 token
+            output_text = ""
+            if hasattr(response, "content"):
+                output_text = response.content
+            elif isinstance(response, dict):
+                output_text = response.get("content", "")
+            elif isinstance(response, str):
+                output_text = response
+            output_tokens = len(output_text) // 4
+
+            # 尝试从响应中获取实际 token 使用量
+            if hasattr(response, 'usage_metadata') and response.usage_metadata:
+                input_tokens = response.usage_metadata.get('input_tokens', input_tokens)
+                output_tokens = response.usage_metadata.get('output_tokens', output_tokens)
+            elif hasattr(response, 'response_metadata') and response.response_metadata:
+                token_usage = response.response_metadata.get('token_usage', {})
+                if token_usage:
+                    input_tokens = token_usage.get('prompt_tokens', input_tokens)
+                    output_tokens = token_usage.get('completion_tokens', output_tokens)
+
+            # 确定 category
+            category = UsageCategory.DIRECTOR
+            if request.role == CollaborationRole.CHARACTER_CONSULTANT:
+                category = UsageCategory.CHARACTER
+            elif request.role == CollaborationRole.WORLD_BUILDER:
+                category = UsageCategory.WORLD
+            elif request.role == CollaborationRole.PLOT_ADVISOR:
+                category = UsageCategory.PLOT
+            elif request.role == CollaborationRole.DIALOGUE_WRITER:
+                category = UsageCategory.CHAPTER
+
+            await token_tracker.record_usage(
+                project_id=project_id,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                provider="unknown",
+                model="collaborator",
+                category=category,
+                agent_name=f"Collaborator-{request.role.value}",
+                metadata={"request_type": request.request_type},
+            )
+        except Exception as e:
+            logger.warning(f"记录协作 token 使用失败: {e}")
 
     def _prepare_prompt(self, request: CollaborationRequest, role_profile: Dict[str, Any]) -> List[Dict[str, Any]]:
         """准备提示词"""

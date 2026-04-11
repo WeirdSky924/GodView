@@ -6,10 +6,12 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from langchain_core.language_models import BaseLanguageModel
+from langchain_core.messages import HumanMessage
 
 from app.agents.base import BaseAgent, AgentResponse
 from app.models.character import Character
 from app.models.agent_template import AgentType
+from app.models.token_usage import UsageCategory
 
 logger = logging.getLogger(__name__)
 
@@ -46,9 +48,17 @@ class CharacterAgent(BaseAgent):
     def _get_default_variables(self) -> Dict[str, Any]:
         """获取默认变量（Character 特定）"""
         char = self.character
-        traits_desc = ", ".join(
-            [f"{t.name}({t.value})" for t in char.personality_traits]
-        )
+
+        # 处理 personality_traits - 可能是 PersonalityTrait 对象列表或字典列表
+        traits_list = []
+        for t in (char.personality_traits or []):
+            if hasattr(t, 'name') and hasattr(t, 'value'):
+                traits_list.append(f"{t.name}({t.value})")
+            elif isinstance(t, dict):
+                traits_list.append(f"{t.get('name', '未知')}({t.get('value', 0)})")
+            else:
+                traits_list.append(str(t))
+        traits_desc = ", ".join(traits_list)
 
         return {
             "character_name": char.name,
@@ -67,9 +77,16 @@ class CharacterAgent(BaseAgent):
         """构建角色系统提示"""
         char = self.character
 
-        traits_desc = ", ".join(
-            [f"{t.name}({t.value})" for t in char.personality_traits]
-        )
+        # 处理 personality_traits - 可能是 PersonalityTrait 对象列表或字典列表
+        traits_list = []
+        for t in (char.personality_traits or []):
+            if hasattr(t, 'name') and hasattr(t, 'value'):
+                traits_list.append(f"{t.name}({t.value})")
+            elif isinstance(t, dict):
+                traits_list.append(f"{t.get('name', '未知')}({t.get('value', 0)})")
+            else:
+                traits_list.append(str(t))
+        traits_desc = ", ".join(traits_list)
 
         prompt = f"""你是{char.name}，一个虚构故事中的角色。请完全沉浸在这个角色中。
 
@@ -129,7 +146,8 @@ class CharacterAgent(BaseAgent):
 
             # 调用 LLM
             response_text = await self._call_llm(
-                messages=[HumanMessage(content=user_message)]
+                messages=[HumanMessage(content=user_message)],
+                category=UsageCategory.CHARACTER
             )
 
             # 解析响应

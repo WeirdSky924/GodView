@@ -834,6 +834,7 @@ class SettingAgentService:
 
             return {
                 "success": True,
+                "appearance": personality_data.get("appearance", ""),
                 "personality": personality_data.get("personality", ""),
                 "speech_pattern": personality_data.get("speech_pattern", ""),
                 "personality_traits": personality_data.get("personality_traits", []),
@@ -886,10 +887,16 @@ class SettingAgentService:
                 context_parts.append(f"叙事基调：{metadata['tone']}")
 
             # 获取关键设定
-            lores = await postgres_db.get_all_lore_entries(project_id, limit=10)
-            if lores:
-                lore_titles = [l.get("title", "") for l in lores[:5]]
-                context_parts.append(f"关键设定：{', '.join(lore_titles)}")
+            try:
+                lores = await postgres_db.execute_query(
+                    "SELECT title FROM lore_entries WHERE project_id = CAST(:project_id AS UUID) ORDER BY priority, created_at DESC LIMIT 5",
+                    {"project_id": project_id}
+                )
+                if lores:
+                    lore_titles = [l.get("title", "") for l in lores]
+                    context_parts.append(f"关键设定：{', '.join(lore_titles)}")
+            except Exception:
+                pass  # lore_entries 表可能不存在
 
             return "\n".join(context_parts)
 
@@ -908,7 +915,7 @@ class SettingAgentService:
         name = character_data.get("name", "")
         role = character_data.get("role", "supporting")
         description = character_data.get("description", "")
-        background = character_data.get("background", "")
+        background = character_data.get("background_story") or character_data.get("background", "")
 
         # 角色定位说明
         role_descriptions = {
@@ -943,15 +950,17 @@ class SettingAgentService:
 【输出要求】
 请生成以下内容，以 JSON 格式输出：
 
-1. **personality**: 性格描述（2-3句话，描述核心性格特点）
-2. **speech_pattern**: 说话风格（如：简短凌厉、幽默风趣、文绉绉等）
-3. **personality_traits**: 性格特质列表（3-5个，如["勇敢", "冲动", "正义感强"]）
-4. **agent_goals**: 作为角色 Agent 的目标（2-3个，用于驱动角色行为）
-5. **agent_memory**: 角色应记住的关键信息（1-2条，如重要经历、关系等）
+1. **appearance**: 外貌描述（2-3句话，描述外貌特征、穿着打扮、气质等）
+2. **personality**: 性格描述（2-3句话，描述核心性格特点）
+3. **speech_pattern**: 说话风格（如：简短凌厉、幽默风趣、文绉绉等）
+4. **personality_traits**: 性格特质列表（3-5个，如["勇敢", "冲动", "正义感强"]）
+5. **agent_goals**: 作为角色 Agent 的目标（2-3个，用于驱动角色行为）
+6. **agent_memory**: 角色应记住的关键信息（1-2条，如重要经历、关系等）
 
 【输出格式】
 ```json
 {{
+  "appearance": "外貌描述",
   "personality": "性格描述",
   "speech_pattern": "说话风格",
   "personality_traits": ["特质1", "特质2", "特质3"],
@@ -961,6 +970,7 @@ class SettingAgentService:
 ```
 
 请确保：
+- 外貌描述要有辨识度，符合角色身份和世界设定
 - 性格与角色定位相符
 - 与现有角色有区分度
 - 性格要有优缺点，避免脸谱化

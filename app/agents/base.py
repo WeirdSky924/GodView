@@ -50,6 +50,8 @@ class BaseAgent(ABC):
         self.project_id = project_id
         self.message_history: List = []
         self._lock = asyncio.Lock()
+        # 流式输出回调（由 workflow_engine 设置）
+        self._stream_callback: Optional[callable] = None
 
         # 如果有 project_id 且没有手动指定 system_prompt，尝试从模板加载
         if project_id and not system_prompt and self.AGENT_TYPE:
@@ -131,20 +133,116 @@ class BaseAgent(ABC):
         if not self.model:
             raise ValueError(f"Agent {self.name} 未配置模型")
 
+        # 如果设置了流式回调，使用流式输出
+        if self._stream_callback:
+            return await self._stream_llm(
+                messages, temperature, max_tokens, category,
+                on_chunk=self._stream_callback
+            )
+
         if self.system_prompt:
             messages = [SystemMessage(content=self.system_prompt)] + messages
-
-        # 记录输入 token 数（估算）
-        input_tokens = sum(len(msg.content) // 4 for msg in messages)
 
         response = await self.model.ainvoke(messages)
         content = response.content
 
-        # 尝试获取实际 token 使用量
-        output_tokens = len(content) // 4  # 估算输出 token
+        # 尝试从响应中获取实际 token 使用量
+        input_tokens = 0
+        output_tokens = 0
+
+        # LangChain 响应对象包含 usage_metadata
+        if hasattr(response, 'usage_metadata') and response.usage_metadata:
+            input_tokens = response.usage_metadata.get('input_tokens', 0)
+            output_tokens = response.usage_metadata.get('output_tokens', 0)
+        elif hasattr(response, 'response_metadata') and response.response_metadata:
+            # OpenAI 格式
+            token_usage = response.response_metadata.get('token_usage', {})
+            if token_usage:
+                input_tokens = token_usage.get('prompt_tokens', 0)
+                output_tokens = token_usage.get('completion_tokens', 0)
+
+        # 如果无法获取实际值，使用估算
+        if input_tokens == 0:
+            input_tokens = sum(len(msg.content) // 4 for msg in messages)
+        if output_tokens == 0:
+            output_tokens = len(content) // 4
+
         self._record_token_usage(input_tokens, output_tokens, category)
 
         return content
+
+    async def _stream_llm(
+        self,
+        messages: List,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        category: UsageCategory = UsageCategory.OTHER,
+        on_chunk: Optional[callable] = None,
+    ) -> str:
+        """
+        流式调用 LLM，支持实时输出
+
+        Args:
+            messages: 消息列表
+            temperature: 温度参数
+            max_tokens: 最大 token 数
+            category: 使用类别
+            on_chunk: 每个 chunk 的回调函数，接收 (chunk_text: str) 参数
+
+        Returns:
+            str: 完整的响应内容
+        """
+        if not self.model:
+            raise ValueError(f"Agent {self.name} 未配置模型")
+
+        if self.system_prompt:
+            messages = [SystemMessage(content=self.system_prompt)] + messages
+
+        full_content = ""
+        last_chunk = None
+        chunk_count = 0
+
+        try:
+            logger.info(f"Agent {self.name} 开始流式调用 LLM...")
+            # 使用 astream 进行流式输出
+            async for chunk in self.model.astream(messages):
+                chunk_text = chunk.content if hasattr(chunk, 'content') else str(chunk)
+                full_content += chunk_text
+                last_chunk = chunk
+                chunk_count += 1
+
+                # 调用回调函数
+                if on_chunk:
+                    try:
+                        await on_chunk(chunk_text) if asyncio.iscoroutinefunction(on_chunk) else on_chunk(chunk_text)
+                    except Exception as e:
+                        logger.warning(f"流式输出回调失败: {e}")
+
+            logger.info(f"Agent {self.name} 流式调用完成，共 {chunk_count} 个 chunk，总长度 {len(full_content)} 字符")
+
+        except Exception as e:
+            logger.error(f"流式调用 LLM 失败: {e}")
+            # 如果流式失败，回退到普通调用
+            full_content = await self._call_llm(messages, temperature, max_tokens, category)
+            return full_content
+
+        # 尝试从最后一个 chunk 获取 token 使用量
+        input_tokens = 0
+        output_tokens = 0
+
+        if last_chunk and hasattr(last_chunk, 'usage_metadata') and last_chunk.usage_metadata:
+            input_tokens = last_chunk.usage_metadata.get('input_tokens', 0)
+            output_tokens = last_chunk.usage_metadata.get('output_tokens', 0)
+
+        # 如果无法获取实际值，使用估算
+        if input_tokens == 0:
+            input_tokens = sum(len(msg.content) // 4 for msg in messages)
+        if output_tokens == 0:
+            output_tokens = len(full_content) // 4
+
+        self._record_token_usage(input_tokens, output_tokens, category)
+
+        return full_content
 
     def _record_token_usage(
         self,
