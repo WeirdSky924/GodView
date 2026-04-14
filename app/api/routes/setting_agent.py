@@ -49,6 +49,18 @@ class ExecuteChangeRequest(BaseModel):
     override_conflicts: bool = False
 
 
+class SavePendingLoresRequest(BaseModel):
+    """保存待确认设定请求"""
+    project_id: str
+    lores: List[Dict[str, Any]]
+
+
+class SavePendingCharactersRequest(BaseModel):
+    """保存待确认角色请求"""
+    project_id: str
+    characters: List[Dict[str, Any]]
+
+
 # ==================== API 端点 ====================
 
 @router.post("/chat")
@@ -60,6 +72,8 @@ async def chat_with_setting_agent(request: ChatRequest):
     - 询问设定相关的问题
     - 请求添加/修改设定
     - 获取设定建议
+
+    注意：返回的 pending_lores 需要用户确认后才保存到数据库
     """
     service = get_setting_agent_service()
 
@@ -70,6 +84,52 @@ async def chat_with_setting_agent(request: ChatRequest):
             context=request.context,
         )
         return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/save-lores")
+async def save_pending_lores(request: SavePendingLoresRequest):
+    """
+    保存用户确认的设定
+
+    在设定助手的确认弹窗中，用户确认后调用此接口保存设定
+    """
+    service = get_setting_agent_service()
+
+    try:
+        saved_count = await service.save_pending_lores(
+            project_id=request.project_id,
+            lores=request.lores,
+        )
+        return {
+            "success": True,
+            "saved_count": saved_count,
+            "message": f"成功保存 {saved_count} 个设定" if saved_count > 0 else "没有需要保存的设定"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/save-characters")
+async def save_pending_characters(request: SavePendingCharactersRequest):
+    """
+    保存用户确认的角色
+
+    在设定助手的确认弹窗中，用户确认后调用此接口保存角色
+    """
+    service = get_setting_agent_service()
+
+    try:
+        saved_count = await service.save_pending_characters(
+            project_id=request.project_id,
+            characters=request.characters,
+        )
+        return {
+            "success": True,
+            "saved_count": saved_count,
+            "message": f"成功保存 {saved_count} 个角色" if saved_count > 0 else "没有需要保存的角色"
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

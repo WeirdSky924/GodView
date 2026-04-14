@@ -1,7 +1,7 @@
 services:
-  # PostgreSQL 数据库
+  # PostgreSQL 数据库 (带 pgvector 扩展)
   postgres:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:pg16
     container_name: godview-postgres
     restart: unless-stopped
     environment:

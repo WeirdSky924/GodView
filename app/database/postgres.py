@@ -593,8 +593,14 @@ class PostgresDatabase:
         """保存世界数据"""
         from datetime import datetime
 
+        # 确保 JSON 字段存在并有默认值
+        json_fields = ['rules', 'factions', 'content_styles', 'protagonist_types', 'character_archetypes', 'power_types']
+        for field in json_fields:
+            if field not in world_data or world_data[field] is None:
+                world_data[field] = []
+
         # 处理 JSON 字段
-        params = _prepare_json_params(world_data, ['rules', 'factions'])
+        params = _prepare_json_params(world_data, json_fields)
 
         # 验证 id 字段（必须是有效 UUID）
         world_id = _validate_uuid(params.get('id'))
@@ -615,14 +621,19 @@ class PostgresDatabase:
             elif field not in params or params[field] is None:
                 params[field] = datetime.now()
 
+        # 确保字符串字段有默认值
+        for field in ['name', 'description', 'world_type', 'tone', 'power_system', 'technology_level', 'history', 'geography']:
+            if field not in params:
+                params[field] = ''
+
         # 动态构建 SQL
         project_id_sql = "CAST(:project_id AS UUID)" if params.get('project_id') else "NULL"
 
         query = """
         INSERT INTO worlds (id, name, project_id, description, world_type, tone, rules, power_system,
-                           technology_level, history, geography, factions, created_at, updated_at)
+                           technology_level, history, geography, factions, content_styles, protagonist_types, character_archetypes, power_types, created_at, updated_at)
         VALUES (:id, :name, """ + project_id_sql + """, :description, :world_type, :tone, CAST(:rules AS jsonb), :power_system,
-                :technology_level, :history, :geography, CAST(:factions AS jsonb), :created_at, :updated_at)
+                :technology_level, :history, :geography, CAST(:factions AS jsonb), CAST(:content_styles AS jsonb), CAST(:protagonist_types AS jsonb), CAST(:character_archetypes AS jsonb), CAST(:power_types AS jsonb), :created_at, :updated_at)
         ON CONFLICT (id) DO UPDATE SET
             name = EXCLUDED.name,
             project_id = EXCLUDED.project_id,
@@ -635,6 +646,10 @@ class PostgresDatabase:
             history = EXCLUDED.history,
             geography = EXCLUDED.geography,
             factions = EXCLUDED.factions,
+            content_styles = EXCLUDED.content_styles,
+            protagonist_types = EXCLUDED.protagonist_types,
+            character_archetypes = EXCLUDED.character_archetypes,
+            power_types = EXCLUDED.power_types,
             updated_at = EXCLUDED.updated_at
         """
         await self.execute_write(query, params)

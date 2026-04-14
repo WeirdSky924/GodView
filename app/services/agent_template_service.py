@@ -96,6 +96,68 @@ class AgentTemplateService:
             updated_at=row.get('updated_at', datetime.now()),
         )
 
+    async def _merge_skill_assignments(self, template: AgentTemplate) -> AgentTemplate:
+        """
+        将 skill_assignments 表中的分配关系合并到模板的 skill_slots 中
+
+        这确保前端显示和运行时使用的 Skills 列表一致。
+
+        Args:
+            template: Agent 模板
+
+        Returns:
+            AgentTemplate: 合并后的模板
+        """
+        if not self._db:
+            return template
+
+        try:
+            # 从 skill_assignments 表加载该 agent_type 的所有分配
+            rows = await self._db.execute_query(
+                """
+                SELECT sa.skill_id, sa.slot_name, sa.priority, sa.is_enabled,
+                       sa.is_required, sa.variable_overrides, sa.execution_condition,
+                       s.name as skill_name, s.description as skill_description
+                FROM skill_assignments sa
+                JOIN skills s ON sa.skill_id = s.id
+                WHERE sa.agent_type = :agent_type
+                  AND sa.is_enabled = true
+                  AND s.is_enabled = true
+                  AND s.status = 'active'
+                ORDER BY sa.priority DESC
+                """,
+                {"agent_type": template.agent_type.value}
+            )
+
+            # 获取现有的 skill_slots 中的 skill_id 集合
+            existing_skill_ids = {slot.skill_id for slot in template.skill_slots if slot.skill_id}
+
+            # 添加新的 skill_slots（不覆盖已存在的）
+            for row in rows:
+                if row['skill_id'] not in existing_skill_ids:
+                    new_slot = SkillSlot(
+                        slot_name=row['slot_name'] or row['skill_name'],
+                        description=row['skill_description'] or '',
+                        skill_id=row['skill_id'],
+                        is_enabled=row['is_enabled'],
+                        is_required=row['is_required'],
+                        priority=row['priority'],
+                        variable_overrides=row.get('variable_overrides', {}) or {},
+                        execution_condition=row.get('execution_condition'),
+                    )
+                    template.skill_slots.append(new_slot)
+                    existing_skill_ids.add(row['skill_id'])
+
+            # 按 priority 降序排列
+            template.skill_slots.sort(key=lambda x: -x.priority)
+
+            logger.debug(f"模板 {template.id} 合并了 {len(rows)} 个 skill_assignments，现有 {len(template.skill_slots)} 个插槽")
+
+        except Exception as e:
+            logger.warning(f"合并 skill_assignments 失败: {e}")
+
+        return template
+
     def _template_to_db_dict(self, template: AgentTemplate) -> Dict[str, Any]:
         """将 AgentTemplate 对象转换为数据库字典"""
         return {
@@ -164,14 +226,17 @@ class AgentTemplateService:
     async def get_template(self, template_id: str) -> Optional[AgentTemplate]:
         """获取 Agent 模板"""
         await self._ensure_cache()
-        return self._templates.get(template_id)
+        template = self._templates.get(template_id)
+        if template:
+            template = await self._merge_skill_assignments(template)
+        return template
 
     async def get_template_by_type(self, agent_type: AgentType) -> Optional[AgentTemplate]:
         """按类型获取 Agent 模板（返回第一个匹配的系统模板）"""
         await self._ensure_cache()
         for template in self._templates.values():
             if template.agent_type == agent_type and template.is_system:
-                return template
+                return await self._merge_skill_assignments(template)
         return None
 
     async def list_templates(
@@ -181,6 +246,7 @@ class AgentTemplateService:
         tags: Optional[List[str]] = None,
         limit: int = 50,
         offset: int = 0,
+        merge_skill_assignments: bool = True,
     ) -> List[AgentTemplate]:
         """获取 Agent 模板列表"""
         await self._ensure_cache()
@@ -204,7 +270,14 @@ class AgentTemplateService:
         # 分页
         start = offset
         end = start + limit
-        return templates[start:end]
+        result = templates[start:end]
+
+        # 合并 skill_assignments
+        if merge_skill_assignments and self._db:
+            for template in result:
+                await self._merge_skill_assignments(template)
+
+        return result
 
     async def update_template(
         self, template_id: str, dto: AgentTemplateUpdate

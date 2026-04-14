@@ -9,11 +9,40 @@ const API_BASE = '/setting-agent'
 
 // ==================== 类型定义 ====================
 
+export interface PendingLore {
+  title: string
+  category: string
+  priority: string
+  content: string
+  summary: string
+  keywords: string[]
+  tags: string[]
+  constraints: string[]
+  related_characters: string[]
+  related_locations: string[]
+  related_items: string[]
+}
+
+export interface PendingCharacter {
+  name: string
+  importance_tier: string
+  description: string
+  appearance: string
+  personality: string
+  background_story: string
+  speech_pattern: string
+  age: number | null
+  gender: string
+  goals: string[]
+}
+
 export interface ChatResponse {
   response: string
   session_id: string
   mode: string
   lore_saved?: boolean
+  pending_lores?: PendingLore[]
+  pending_characters?: PendingCharacter[]
 }
 
 export interface SettingConflict {
@@ -193,5 +222,31 @@ export async function createOrGetSession(
 ): Promise<{ success: boolean; session: Record<string, unknown> }> {
   return await api.post(`${API_BASE}/${projectId}/session`, null, {
     params: { mode },
+  })
+}
+
+/**
+ * 保存用户确认的设定
+ */
+export async function savePendingLores(
+  projectId: string,
+  lores: PendingLore[]
+): Promise<{ success: boolean; saved_count: number; message: string }> {
+  return await api.post(`${API_BASE}/save-lores`, {
+    project_id: projectId,
+    lores,
+  })
+}
+
+/**
+ * 保存用户确认的角色
+ */
+export async function savePendingCharacters(
+  projectId: string,
+  characters: PendingCharacter[]
+): Promise<{ success: boolean; saved_count: number; message: string }> {
+  return await api.post(`${API_BASE}/save-characters`, {
+    project_id: projectId,
+    characters,
   })
 }

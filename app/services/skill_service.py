@@ -234,6 +234,9 @@ class SkillService:
                     data
                 )
                 logger.info(f"创建 Skill 到数据库: {skill_id} - {skill.name}")
+
+                # 自动同步到 skill_assignments 表
+                await self._sync_applicable_agent_types_to_assignments(skill)
             except Exception as e:
                 logger.error(f"创建 Skill 到数据库失败: {e}")
                 raise
@@ -243,6 +246,106 @@ class SkillService:
         self._cache_valid = True
 
         return skill
+
+    async def _sync_applicable_agent_types_to_assignments(self, skill: Skill):
+        """
+        将 Skill 的 applicable_agent_types 同步到 skill_assignments 表
+
+        这是统一系统的核心方法：确保 skill_assignments 表是唯一数据源。
+        当 Skill 的 applicable_agent_types 更新时，自动同步分配关系。
+        """
+        if not self._db:
+            return
+
+        try:
+            # 获取现有的分配
+            existing_rows = await self._db.execute_query(
+                "SELECT agent_type, slot_name FROM skill_assignments WHERE skill_id = :skill_id",
+                {"skill_id": skill.id}
+            )
+            existing_agents = {row['agent_type'] for row in existing_rows}
+
+            # 计算需要添加和删除的
+            new_agents = set(skill.applicable_agent_types or [])
+            to_add = new_agents - existing_agents
+            to_remove = existing_agents - new_agents
+
+            # 删除不再适用的分配
+            if to_remove:
+                for agent_type in to_remove:
+                    await self._db.execute_write(
+                        "DELETE FROM skill_assignments WHERE skill_id = :skill_id AND agent_type = :agent_type",
+                        {"skill_id": skill.id, "agent_type": agent_type}
+                    )
+                    logger.info(f"移除 Skill {skill.id} 对 Agent {agent_type} 的分配")
+
+            # 添加新的分配
+            if to_add:
+                for agent_type in to_add:
+                    assignment_id = f"assign_{skill.id}_{agent_type}"
+                    await self._db.execute_write(
+                        """
+                        INSERT INTO skill_assignments
+                        (id, skill_id, agent_type, slot_name, priority, is_enabled, is_required, variable_overrides, assigned_by)
+                        VALUES (:id, :skill_id, :agent_type, :slot_name, :priority, true, false, '{}', 'system')
+                        ON CONFLICT (skill_id, agent_type, slot_name) DO UPDATE SET
+                            priority = :priority, is_enabled = true
+                        """,
+                        {
+                            "id": assignment_id,
+                            "skill_id": skill.id,
+                            "agent_type": agent_type,
+                            "slot_name": skill.category,  # 使用 category 作为默认 slot_name
+                            "priority": skill.priority,
+                        }
+                    )
+                    logger.info(f"同步 Skill {skill.id} 到 skill_assignments: Agent {agent_type}")
+
+        except Exception as e:
+            logger.warning(f"同步 Skill {skill.id} 的分配关系失败: {e}")
+
+    async def _sync_applicable_agent_types_to_assignments_simple(
+        self,
+        skill_id: str,
+        applicable_agent_types: List[str],
+        category: str,
+        priority: int,
+    ):
+        """
+        简化版的分配关系同步（用于 MD 文件同步）
+
+        Args:
+            skill_id: Skill ID
+            applicable_agent_types: 适用的 Agent 类型列表
+            category: Skill 分类
+            priority: 优先级
+        """
+        if not self._db:
+            return
+
+        try:
+            for agent_type in applicable_agent_types:
+                assignment_id = f"assign_{skill_id}_{agent_type}"
+                await self._db.execute_write(
+                    """
+                    INSERT INTO skill_assignments
+                    (id, skill_id, agent_type, slot_name, priority, is_enabled, is_required, variable_overrides, assigned_by)
+                    VALUES (:id, :skill_id, :agent_type, :slot_name, :priority, true, false, '{}', 'system')
+                    ON CONFLICT (skill_id, agent_type, slot_name) DO UPDATE SET
+                        priority = :priority, is_enabled = true
+                    """,
+                    {
+                        "id": assignment_id,
+                        "skill_id": skill_id,
+                        "agent_type": agent_type,
+                        "slot_name": category,
+                        "priority": priority,
+                    }
+                )
+                logger.debug(f"同步 Skill {skill_id} 分配到 Agent {agent_type}")
+
+        except Exception as e:
+            logger.warning(f"同步 Skill {skill_id} 的分配关系失败: {e}")
 
     async def create_skill_from_model(self, skill: Skill) -> Skill:
         """从 Skill 模型创建（用于初始化默认 Skills）"""
@@ -258,6 +361,10 @@ class SkillService:
                     data
                 )
                 logger.info(f"创建 Skill 到数据库: {skill.id} - {skill.name}")
+
+                # 同步分配关系
+                if skill.applicable_agent_types:
+                    await self._sync_applicable_agent_types_to_assignments(skill)
             except Exception as e:
                 logger.error(f"创建 Skill 到数据库失败: {e}")
                 # 不抛出异常，继续处理
@@ -323,6 +430,9 @@ class SkillService:
         if not skill:
             return None
 
+        # 记录是否更新了 applicable_agent_types
+        need_sync_assignments = 'applicable_agent_types' in dto.model_dump(exclude_unset=True)
+
         # 更新字段
         update_data = dto.model_dump(exclude_unset=True)
         for key, value in update_data.items():
@@ -342,6 +452,10 @@ class SkillService:
                     f"UPDATE skills SET {set_clause} WHERE id = :skill_id",
                     data
                 )
+
+                # 如果更新了 applicable_agent_types，同步到 skill_assignments
+                if need_sync_assignments:
+                    await self._sync_applicable_agent_types_to_assignments(skill)
             except Exception as e:
                 logger.error(f"更新 Skill 到数据库失败: {e}")
 
@@ -453,11 +567,23 @@ class SkillService:
         """
         获取适用于某个 Agent 类型的所有 Skill
 
+        统一从 skill_assignments 表读取，确保与前端显示一致。
+
         Args:
             agent_type: Agent 类型
 
         Returns:
             List[Skill]: 适用的 Skill 列表
+        """
+        # 使用统一的分配表查询
+        assigned = await self.get_assigned_skills_for_agent(agent_type)
+        return [skill for skill, _ in assigned]
+
+    async def get_skills_for_agent_type_legacy(self, agent_type: str) -> List[Skill]:
+        """
+        [已废弃] 旧方法：从 Skill.applicable_agent_types 读取
+
+        保留此方法仅用于向后兼容，新代码应使用 get_skills_for_agent_type()
         """
         skills = await self.get_all_skills(status=SkillStatus.ACTIVE)
 
@@ -1200,6 +1326,13 @@ class SkillService:
                         """,
                         data
                     )
+
+                    # 同步 applicable_agent_types 到 skill_assignments 表
+                    applicable_agent_types = md_skill.get('applicable_agent_types', [])
+                    if applicable_agent_types:
+                        await self._sync_applicable_agent_types_to_assignments_simple(
+                            skill_id, applicable_agent_types, category.value, md_skill.get('priority', 50)
+                        )
 
                     synced += 1
                     logger.debug(f"同步 Skill 到数据库: {skill_id}")

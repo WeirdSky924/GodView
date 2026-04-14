@@ -87,6 +87,10 @@ coverage.xml
 *.cover
 .hypothesis/
 
+# 测试和脚本目录
+tests/
+scripts/
+
 # ======================== 模型缓存 ========================
 # HuggingFace 模型缓存
 models/

@@ -335,8 +335,8 @@ export default function Lore() {
 
             {/* 中间：设定列表/树形视图 */}
             <div className="lg:col-span-1">
-              <Card className="h-[calc(100vh-200px)] overflow-hidden flex flex-col">
-                <div className={`p-4 border-b sticky top-0 flex items-center justify-between ${isDark ? 'bg-gray-900 border-gray-700' : 'bg-white border-gray-200'}`}>
+              <Card className="h-[calc(100vh-200px)] overflow-hidden flex flex-col" noPadding>
+                <div className={`p-4 border-b flex items-center justify-between flex-shrink-0 ${isDark ? 'bg-gray-900 border-gray-700' : 'bg-white border-gray-200'}`}>
                   <h3 className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>
                     {viewMode === 'list' ? `设定列表 (${filteredLore.length})` : '设定树'}
                   </h3>
@@ -357,7 +357,7 @@ export default function Lore() {
                     </button>
                   </div>
                 </div>
-                <div className="flex-1 overflow-y-auto">
+                <div className="flex-1 overflow-y-auto min-h-0">
                   {viewMode === 'list' ? (
                     <div className="divide-y">
                       {filteredLore.length === 0 ? (

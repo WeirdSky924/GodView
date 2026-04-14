@@ -584,6 +584,7 @@ class DatabaseManager:
 -- 启用必要的扩展
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS "pg_trgm";  -- 用于模糊搜索
+CREATE EXTENSION IF NOT EXISTS "vector";   -- pgvector 向量搜索扩展
 
 -- ================== 项目表 ==================
 CREATE TABLE IF NOT EXISTS projects (
@@ -796,7 +797,7 @@ SELECT 'Database initialization completed!' AS status;
         compose_content = f"""services:
   # PostgreSQL 数据库
   postgres:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:pg16
     container_name: godview-postgres
     restart: unless-stopped
     environment:

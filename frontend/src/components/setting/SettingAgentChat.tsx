@@ -1,10 +1,14 @@
 import { useState, useRef, useEffect } from 'react'
-import { MessageCircle, Send, AlertTriangle, CheckCircle, X, Loader2 } from 'lucide-react'
+import { MessageCircle, Send, AlertTriangle, CheckCircle, X, Loader2, Save, Trash2 } from 'lucide-react'
 import { Button, Card } from '@/components/ui'
 import {
   chatWithSettingAgent,
   negotiateConflict,
+  savePendingLores,
+  savePendingCharacters,
   SettingConflict,
+  PendingLore,
+  PendingCharacter,
 } from '@/api/settingAgent'
 
 interface Message {
@@ -44,6 +48,10 @@ export default function SettingAgentChat({
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const [currentConflict, setCurrentConflict] = useState<SettingConflict | null>(null)
+  const [pendingLores, setPendingLores] = useState<PendingLore[]>([])
+  const [pendingCharacters, setPendingCharacters] = useState<PendingCharacter[]>([])
+  const [showConfirmModal, setShowConfirmModal] = useState(false)
+  const [showCharacterModal, setShowCharacterModal] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
   // 初始欢迎消息
@@ -89,9 +97,36 @@ export default function SettingAgentChat({
 
       setMessages((prev) => [...prev, assistantMessage])
 
-      // 如果保存了新设定，刷新设定列表
-      if (response.lore_saved) {
-        onLoreChange?.()
+      // 检查是否有待确认的设定
+      if (response.pending_lores && response.pending_lores.length > 0) {
+        setPendingLores(response.pending_lores)
+        setShowConfirmModal(true)
+        // 添加提示消息
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `pending_${Date.now()}`,
+            role: 'assistant',
+            content: `我检测到您确认了以下新设定，请确认是否保存到设定库：\n\n${response.pending_lores.map((l, i) => `${i + 1}. ${l.title} (${l.category})`).join('\n')}`,
+            timestamp: new Date(),
+          },
+        ])
+      }
+
+      // 检查是否有待确认的角色
+      if (response.pending_characters && response.pending_characters.length > 0) {
+        setPendingCharacters(response.pending_characters)
+        setShowCharacterModal(true)
+        // 添加提示消息
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `pending_char_${Date.now()}`,
+            role: 'assistant',
+            content: `我检测到您确认了以下新角色，请确认是否保存到角色库：\n\n${response.pending_characters.map((c, i) => `${i + 1}. ${c.name} (${c.importance_tier})`).join('\n')}`,
+            timestamp: new Date(),
+          },
+        ])
       }
     } catch (error) {
       console.error('Chat error:', error)
@@ -107,6 +142,92 @@ export default function SettingAgentChat({
     } finally {
       setLoading(false)
     }
+  }
+
+  // 保存用户确认的设定
+  const handleConfirmSave = async () => {
+    if (pendingLores.length === 0) return
+
+    setLoading(true)
+    try {
+      const result = await savePendingLores(projectId, pendingLores)
+      if (result.success) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `saved_${Date.now()}`,
+            role: 'assistant',
+            content: result.message,
+            timestamp: new Date(),
+          },
+        ])
+        onLoreChange?.()
+      }
+    } catch (error) {
+      console.error('Save error:', error)
+    } finally {
+      setPendingLores([])
+      setShowConfirmModal(false)
+      setLoading(false)
+    }
+  }
+
+  // 拒绝保存设定
+  const handleRejectSave = () => {
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: `rejected_${Date.now()}`,
+        role: 'assistant',
+        content: '已取消保存设定。',
+        timestamp: new Date(),
+      },
+    ])
+    setPendingLores([])
+    setShowConfirmModal(false)
+  }
+
+  // 保存用户确认的角色
+  const handleConfirmSaveCharacters = async () => {
+    if (pendingCharacters.length === 0) return
+
+    setLoading(true)
+    try {
+      const result = await savePendingCharacters(projectId, pendingCharacters)
+      if (result.success) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `saved_char_${Date.now()}`,
+            role: 'assistant',
+            content: result.message,
+            timestamp: new Date(),
+          },
+        ])
+        onLoreChange?.()
+      }
+    } catch (error) {
+      console.error('Save characters error:', error)
+    } finally {
+      setPendingCharacters([])
+      setShowCharacterModal(false)
+      setLoading(false)
+    }
+  }
+
+  // 拒绝保存角色
+  const handleRejectSaveCharacters = () => {
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: `rejected_char_${Date.now()}`,
+        role: 'assistant',
+        content: '已取消保存角色。',
+        timestamp: new Date(),
+      },
+    ])
+    setPendingCharacters([])
+    setShowCharacterModal(false)
   }
 
   const handleSuggestionClick = async (suggestion: string, conflictId: string) => {
@@ -299,6 +420,137 @@ export default function SettingAgentChat({
 
         <div ref={messagesEndRef} />
       </div>
+
+      {/* 设定确认弹窗 */}
+      {showConfirmModal && pendingLores.length > 0 && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-lg shadow-xl max-w-lg w-full mx-4 max-h-[80vh] overflow-hidden">
+            <div className="p-4 border-b bg-blue-50 flex items-center justify-between">
+              <h3 className="font-semibold text-lg text-gray-800 flex items-center gap-2">
+                <CheckCircle className="text-blue-600" size={20} />
+                确认保存设定
+              </h3>
+              <button onClick={handleRejectSave} className="text-gray-400 hover:text-gray-600">
+                <X size={20} />
+              </button>
+            </div>
+            <div className="p-4 max-h-96 overflow-y-auto space-y-4">
+              {pendingLores.map((lore, idx) => (
+                <div key={idx} className="border rounded-lg p-3 bg-gray-50">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="font-medium text-gray-800">{lore.title}</span>
+                    <span className="text-xs px-2 py-0.5 bg-blue-100 text-blue-700 rounded">
+                      {lore.category}
+                    </span>
+                  </div>
+                  {lore.summary && (
+                    <p className="text-sm text-gray-600 mb-2">{lore.summary}</p>
+                  )}
+                  <p className="text-xs text-gray-500 line-clamp-3">{lore.content}</p>
+                  {lore.keywords.length > 0 && (
+                    <div className="flex flex-wrap gap-1 mt-2">
+                      {lore.keywords.map((kw, i) => (
+                        <span key={i} className="text-xs px-2 py-0.5 bg-gray-200 text-gray-600 rounded">
+                          {kw}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+            <div className="p-4 border-t bg-gray-50 flex justify-end gap-3">
+              <Button
+                variant="secondary"
+                onClick={handleRejectSave}
+                disabled={loading}
+              >
+                <Trash2 size={16} className="mr-1" />
+                取消
+              </Button>
+              <Button
+                onClick={handleConfirmSave}
+                disabled={loading}
+              >
+                {loading ? (
+                  <Loader2 size={16} className="animate-spin mr-1" />
+                ) : (
+                  <Save size={16} className="mr-1" />
+                )}
+                确认保存
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 角色确认弹窗 */}
+      {showCharacterModal && pendingCharacters.length > 0 && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-lg shadow-xl max-w-lg w-full mx-4 max-h-[80vh] overflow-hidden">
+            <div className="p-4 border-b bg-green-50 flex items-center justify-between">
+              <h3 className="font-semibold text-lg text-gray-800 flex items-center gap-2">
+                <CheckCircle className="text-green-600" size={20} />
+                确认保存角色
+              </h3>
+              <button onClick={handleRejectSaveCharacters} className="text-gray-400 hover:text-gray-600">
+                <X size={20} />
+              </button>
+            </div>
+            <div className="p-4 max-h-96 overflow-y-auto space-y-4">
+              {pendingCharacters.map((char, idx) => (
+                <div key={idx} className="border rounded-lg p-3 bg-gray-50">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="font-medium text-gray-800">{char.name}</span>
+                    <span className="text-xs px-2 py-0.5 bg-green-100 text-green-700 rounded">
+                      {char.importance_tier}
+                    </span>
+                  </div>
+                  {char.description && (
+                    <p className="text-sm text-gray-600 mb-2">{char.description}</p>
+                  )}
+                  {char.appearance && (
+                    <p className="text-xs text-gray-500">外貌：{char.appearance}</p>
+                  )}
+                  {char.personality && (
+                    <p className="text-xs text-gray-500">性格：{char.personality}</p>
+                  )}
+                  {char.goals && char.goals.length > 0 && (
+                    <div className="flex flex-wrap gap-1 mt-2">
+                      {char.goals.map((goal, i) => (
+                        <span key={i} className="text-xs px-2 py-0.5 bg-gray-200 text-gray-600 rounded">
+                          {goal}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+            <div className="p-4 border-t bg-gray-50 flex justify-end gap-3">
+              <Button
+                variant="secondary"
+                onClick={handleRejectSaveCharacters}
+                disabled={loading}
+              >
+                <Trash2 size={16} className="mr-1" />
+                取消
+              </Button>
+              <Button
+                onClick={handleConfirmSaveCharacters}
+                disabled={loading}
+              >
+                {loading ? (
+                  <Loader2 size={16} className="animate-spin mr-1" />
+                ) : (
+                  <Save size={16} className="mr-1" />
+                )}
+                确认保存
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* 输入框 */}
       <div className="p-4 border-t flex-shrink-0">

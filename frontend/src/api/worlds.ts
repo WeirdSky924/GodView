@@ -6,12 +6,18 @@ export interface World {
   description: string
   world_type?: string
   tone?: string
+  project_id?: string
   rules?: string[]
   power_system?: string
   technology_level?: string
   history?: string
   geography?: string
   factions?: string[]
+  // 多选标签字段
+  content_styles?: string[]
+  protagonist_types?: string[]
+  character_archetypes?: string[]
+  power_types?: string[]
   created_at?: string
   updated_at?: string
 }
@@ -21,6 +27,12 @@ export interface CreateWorldDTO {
   description: string
   world_type?: string
   tone?: string
+  project_id?: string
+  // 多选标签字段
+  content_styles?: string[]
+  protagonist_types?: string[]
+  character_archetypes?: string[]
+  power_types?: string[]
 }
 
 export interface UpdateWorldDTO {
@@ -28,6 +40,12 @@ export interface UpdateWorldDTO {
   description: string
   world_type?: string
   tone?: string
+  project_id?: string
+  // 多选标签字段
+  content_styles?: string[]
+  protagonist_types?: string[]
+  character_archetypes?: string[]
+  power_types?: string[]
 }
 
 export async function getWorlds(projectId?: string) {

@@ -5,7 +5,7 @@
 
 import { api } from './client'
 
-const API_BASE = '/api/outlines'
+const API_BASE = '/outlines'
 
 // ==================== 类型定义 ====================
 
