@@ -236,6 +236,12 @@ async def preview_agent_template(
     if not template:
         raise HTTPException(status_code=404, detail="Agent 模板不存在")
 
+    logger.info(f"预览 Agent 模板: {template_id}, skill_slots 数量: {len(template.skill_slots)}")
+
+    # 构建 available_skills 内容
+    skills_content = await _build_available_skills_content(template)
+    logger.info(f"available_skills 内容长度: {len(skills_content)} 字符")
+
     # 构建渲染结果
     rendered_prompts = []
     prompt_order = template.default_prompt_order
@@ -256,6 +262,8 @@ async def preview_agent_template(
         # 特殊处理：writing_rules 插槽（动态加载）
         if slot_name == "writing_rules" and not slot.prompt_template_id:
             prompt_content = await _build_writing_rules_prompt(project_id)
+            # 替换 available_skills 占位符
+            prompt_content = _inject_skills(prompt_content, skills_content)
             rendered_prompts.append({
                 "slot_name": slot_name,
                 "description": slot.description,
@@ -282,6 +290,9 @@ async def preview_agent_template(
                     logger.warning(f"Failed to render prompt {slot.prompt_template_id}: {e}")
                     prompt_content = prompt_template.content
 
+        # 替换 available_skills 占位符
+        prompt_content = _inject_skills(prompt_content, skills_content)
+
         rendered_prompts.append({
             "slot_name": slot_name,
             "description": slot.description,
@@ -295,6 +306,107 @@ async def preview_agent_template(
         "rendered_prompts": rendered_prompts,
         "final_prompt": "\n\n".join([p["content"] for p in rendered_prompts if p["content"]]),
     }
+
+
+def _inject_skills(content: str, skills_content: str) -> str:
+    """
+    将 available_skills 内容注入到 prompt 中
+
+    Args:
+        content: Prompt 内容
+        skills_content: Skills 内容
+
+    Returns:
+        str: 注入后的内容
+    """
+    if "{{available_skills}}" in content:
+        logger.debug(f"发现 {{available_skills}} 占位符，注入 {len(skills_content)} 字符内容")
+        return content.replace("{{available_skills}}", skills_content)
+    return content
+
+
+async def _build_available_skills_content(template: AgentTemplate) -> str:
+    """
+    构建可用 Skills 列表
+
+    从模板的 skill_slots 加载 Skills 并构建简洁的列表，
+    让 Agent 知道自己有哪些技能可用，而不是注入完整内容。
+
+    Agent 在执行时会根据需要自主调用这些 skills。
+
+    Args:
+        template: Agent 模板
+
+    Returns:
+        str: Skills 列表（名称 + 用途说明）
+    """
+    if not template.skill_slots:
+        logger.debug(f"模板 {template.id} 没有配置 skill_slots")
+        return ""
+
+    try:
+        from app.services.skill_service import get_skill_service
+        skill_service = get_skill_service()
+
+        skill_items = []
+        for slot in template.skill_slots:
+            logger.debug(f"处理 skill_slot: {slot.slot_name}, skill_id={slot.skill_id}, is_enabled={slot.is_enabled}")
+
+            if not slot.is_enabled or not slot.skill_id:
+                logger.debug(f"跳过插槽 {slot.slot_name}: is_enabled={slot.is_enabled}, skill_id={slot.skill_id}")
+                continue
+
+            skill = await skill_service.get_skill(slot.skill_id)
+            if not skill:
+                logger.warning(f"未找到 Skill: {slot.skill_id}")
+                continue
+
+            if not skill.is_enabled:
+                logger.debug(f"Skill {slot.skill_id} 已禁用")
+                continue
+
+            # 只收集名称和描述，不注入完整内容
+            skill_items.append({
+                "name": skill.name,
+                "id": skill.id,
+                "description": skill.description,
+                "skill_type": skill.skill_type.value,
+                "load_mode": skill.load_mode.value,
+            })
+            logger.debug(f"Skill {slot.skill_id}: 已添加到可用列表")
+
+        if skill_items:
+            # 构建简洁的技能列表（不包含标题，标题在prompt模板中已定义）
+            lines = ["\n你可以使用以下技能来完成任务：\n"]
+
+            for i, item in enumerate(skill_items, 1):
+                skill_type_label = {
+                    "knowledge": "知识",
+                    "prompt": "提示词",
+                    "function": "函数",
+                    "workflow": "工作流",
+                }.get(item["skill_type"], item["skill_type"])
+
+                load_mode_label = "核心" if item["load_mode"] == "core" else "按需"
+
+                lines.append(
+                    f"{i}. **{item['name']}** (`{item['id']}`) [{skill_type_label}/{load_mode_label}]"
+                )
+                if item["description"]:
+                    lines.append(f"   - {item['description']}")
+
+            lines.append("\n**使用方式**：根据任务需要，调用对应的 skill 来辅助完成工作。")
+
+            result = "\n".join(lines)
+            logger.info(f"为模板 {template.id} 构建了 {len(skill_items)} 个 Skills 列表")
+            return result
+        else:
+            logger.warning(f"模板 {template.id} 没有找到任何有效的 Skills")
+
+    except Exception as e:
+        logger.warning(f"Failed to build available_skills content: {e}")
+
+    return ""
 
 
 async def _build_writing_rules_prompt(project_id: Optional[str]) -> str:
@@ -508,7 +620,7 @@ async def get_workflow_node_types(project_id: Optional[str] = Query(default=None
     获取工作流节点类型（用于可视化工作台）
 
     返回三类节点：
-    1. Agent 节点 - 系统 Agent
+    1. Agent 节点 - 系统 Agent（根据模板启用状态过滤）
     2. 交互节点 - 场景演绎、集体讨论
     3. 控制节点 - 开始、结束、条件、并行等
 
@@ -525,6 +637,8 @@ async def get_workflow_node_types(project_id: Optional[str] = Query(default=None
         CONTROL_NODES,
         NodeTypeInfo,
     )
+    from app.services.agent_template_service import AgentTemplateService
+    from app.api.app import postgres_db
 
     def serialize_node(node: NodeTypeInfo) -> Dict[str, Any]:
         """序列化节点，确保枚举转换为字符串"""
@@ -539,9 +653,33 @@ async def get_workflow_node_types(project_id: Optional[str] = Query(default=None
         "character_nodes": [],  # 项目角色 Agent
     }
 
-    # 系统 Agent 节点
+    # 获取 Agent 模板的启用状态
+    # 逻辑：只有当模板存在且 is_enabled=False 时才禁用
+    # 如果模板不存在，则默认启用
+    disabled_agent_types = set()
+    if postgres_db:
+        try:
+            template_service = AgentTemplateService(postgres_db)
+            templates = await template_service.list_templates(limit=100)
+
+            # 只记录被明确禁用的 Agent 类型
+            for template in templates:
+                if not template.is_enabled:
+                    disabled_agent_types.add(template.agent_type.value)
+
+            logger.info(f"已禁用的 Agent 类型: {disabled_agent_types}")
+        except Exception as e:
+            logger.warning(f"获取 Agent 模板启用状态失败: {e}")
+
+    # 系统 Agent 节点 - 过滤掉被禁用的
     for node in SYSTEM_AGENT_NODES:
-        result["agent_nodes"].append(serialize_node(node))
+        if node.agent_type and node.agent_type not in disabled_agent_types:
+            result["agent_nodes"].append(serialize_node(node))
+        elif not node.agent_type:
+            # 没有指定 agent_type 的节点也包含
+            result["agent_nodes"].append(serialize_node(node))
+
+    logger.info(f"返回 {len(result['agent_nodes'])} 个 Agent 节点")
 
     # 交互节点
     for node in INTERACTION_NODES:
@@ -560,7 +698,7 @@ async def get_workflow_node_types(project_id: Optional[str] = Query(default=None
                 """
                 SELECT id, name, role, importance_tier, has_agent, agent_enabled
                 FROM characters
-                WHERE project_id = $1 AND has_agent = true
+                WHERE project_id = $1 AND has_agent = true AND agent_enabled = true
                 ORDER BY importance_tier, name
                 """,
                 project_id

@@ -3,16 +3,20 @@
 Agent Prompt 服务
 负责动态加载和组装 Agent 的完整 system prompt
 集成 Skills 系统，支持从数据库加载 Agent 技能
+
+支持双层 Skill 加载：
+- 核心层(CORE): 始终加载到上下文中，如"不可抄袭"等基础规则
+- 按需层(ON_DEMAND): 根据 Embedding + LLM 智能检索动态加载
 """
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from app.data.system_prompts import SYSTEM_PROMPTS, PROMPTS_FOR_AGENT_TYPE
 from app.data.system_agent_templates import TEMPLATES_BY_TYPE, SYSTEM_AGENT_TEMPLATES
 from app.models.agent_template import AgentTemplate, AgentType, SkillSlot
 from app.models.prompt_template import PromptTemplate
-from app.models.skill import Skill, SkillType
+from app.models.skill import Skill, SkillType, SkillLoadMode
 from app.services.writing_rules_init import build_writing_prompt
 
 logger = logging.getLogger(__name__)
@@ -49,43 +53,203 @@ class AgentPromptService:
             # 同时按 agent_type 索引
             self._template_cache[template.agent_type] = template
 
-    async def _load_skills_for_agent(self, agent_type: str) -> List[Skill]:
+    async def _load_skills_for_agent(
+        self,
+        agent_type: str,
+        context_query: Optional[str] = None,
+        context_keywords: Optional[List[str]] = None,
+        context_scene: Optional[str] = None,
+        use_intelligent_retrieval: bool = True,
+    ) -> List[tuple[Skill, Dict[str, Any]]]:
         """
-        加载 Agent 的 Skills
+        加载 Agent 的 Skills（双层加载 + 智能检索）
 
-        优先从数据库加载，如果数据库不可用则使用默认 Skills
+        加载优先级：
+        1. 首先从 agent_templates.skill_slots 加载绑定的 Skills
+        2. 然后根据 load_mode 决定是核心层还是按需层
+        3. 按需层通过 Embedding + LLM 智能检索进一步筛选
+
+        Args:
+            agent_type: Agent 类型
+            context_query: 场景描述/用户指令（用于智能检索）
+            context_keywords: 上下文关键词列表（传统关键词匹配）
+            context_scene: 当前场景类型（传统场景匹配）
+            use_intelligent_retrieval: 是否使用智能检索
+
+        Returns:
+            List[tuple[Skill, Dict]]: (Skill, 参数) 元组列表
+        """
+        skills_with_params: List[tuple[Skill, Dict[str, Any]]] = []
+
+        try:
+            # 首先尝试从 agent_templates.skill_slots 加载（这是前端UI管理的绑定）
+            slot_skills = await self._load_skills_from_template_slots(agent_type)
+            if slot_skills:
+                logger.info(f"从 agent_templates.skill_slots 加载 {len(slot_skills)} 个 Skills")
+                # 按优先级排序
+                slot_skills.sort(key=lambda x: -x[0].priority)
+                return slot_skills
+
+            # 如果 skill_slots 为空，尝试从 SkillService 加载（兼容旧逻辑）
+            from app.services.skill_service import get_skill_service
+            service = get_skill_service()
+
+            # 加载核心层 Skills（始终加载）
+            core_skills = await service.get_core_skills_for_agent(agent_type)
+            for skill in core_skills:
+                skills_with_params.append((skill, {}))
+
+            # 按需层 Skills
+            if use_intelligent_retrieval and context_query:
+                # 智能检索：Embedding + LLM
+                on_demand_skills = await self._intelligent_skill_retrieval(
+                    agent_type, context_query
+                )
+                skills_with_params.extend(on_demand_skills)
+            else:
+                # 传统检索：关键词匹配
+                on_demand_skills = await service.get_on_demand_skills_for_agent(
+                    agent_type,
+                    context_keywords=context_keywords,
+                    context_scene=context_scene,
+                )
+                for skill in on_demand_skills:
+                    skills_with_params.append((skill, {}))
+
+            # 去重
+            seen_ids: Set[str] = set()
+            unique_skills: List[tuple[Skill, Dict[str, Any]]] = []
+            for skill, params in skills_with_params:
+                if skill.id not in seen_ids:
+                    seen_ids.add(skill.id)
+                    unique_skills.append((skill, params))
+
+            # 按优先级降序排序
+            unique_skills.sort(key=lambda x: -x[0].priority)
+
+            logger.info(
+                f"加载 Agent {agent_type} 的 Skills: {len(core_skills)} 核心 + "
+                f"{len(unique_skills) - len(core_skills)} 按需 = {len(unique_skills)} 总计"
+                f"{'(智能检索)' if use_intelligent_retrieval and context_query else '(关键词匹配)'}"
+            )
+
+            return unique_skills
+
+        except Exception as e:
+            logger.warning(f"从 SkillService 加载 Skills 失败: {e}，使用默认 Skills")
+            # 使用默认 Skills
+            default_skills = self._get_default_skills_for_agent(agent_type)
+            return [(s, {}) for s in default_skills]
+
+    async def _load_skills_from_template_slots(
+        self,
+        agent_type: str,
+    ) -> List[tuple[Skill, Dict[str, Any]]]:
+        """
+        从 agent_templates.skill_slots 加载 Skills
+
+        这是前端 UI 管理的绑定关系的真实数据源。
+        优先从数据库加载，如果数据库不可用则使用内存缓存。
 
         Args:
             agent_type: Agent 类型
 
         Returns:
-            List[Skill]: Skill 列表（按优先级降序）
+            List[tuple[Skill, Dict]]: (Skill, 参数) 元组列表
         """
-        # 检查缓存
-        if self._skills_cache_valid and agent_type in self._skills_cache:
-            return self._skills_cache[agent_type]
-
-        skills = []
-
         try:
-            # 尝试从 SkillService 加载
+            template = None
+
+            # 优先从数据库加载 AgentTemplate（使用 AgentTemplateService）
+            try:
+                from app.services.agent_template_service import AgentTemplateService
+                from app.api.app import postgres_db
+                from app.models.agent_template import AgentType as AgentTypeEnum
+
+                template_service = AgentTemplateService(db=postgres_db)
+                template = await template_service.get_template_by_type(
+                    AgentTypeEnum(agent_type)
+                )
+                if template:
+                    logger.debug(f"从数据库加载 AgentTemplate: {agent_type}")
+            except Exception as e:
+                logger.debug(f"从数据库加载 AgentTemplate 失败: {e}，使用内存缓存")
+
+            # 如果数据库中没有，使用内存缓存
+            if not template:
+                template = self.get_agent_template(agent_type)
+
+            if not template or not template.skill_slots:
+                return []
+
             from app.services.skill_service import get_skill_service
             service = get_skill_service()
-            skills = await service.get_skills_for_agent_type(agent_type)
 
-            # 更新缓存
-            self._skills_cache[agent_type] = skills
-            self._skills_cache_valid = True
+            results: List[tuple[Skill, Dict[str, Any]]] = []
 
-            logger.info(f"从 SkillService 加载 {agent_type} 的 Skills: {len(skills)} 个")
+            for slot in template.skill_slots:
+                # 跳过禁用的插槽
+                if not slot.is_enabled:
+                    continue
+
+                # 获取绑定的 Skill
+                if not slot.skill_id:
+                    continue
+
+                skill = await service.get_skill(slot.skill_id)
+                if not skill:
+                    logger.warning(f"Skill {slot.skill_id} 不存在，跳过")
+                    continue
+
+                if not skill.is_enabled:
+                    continue
+
+                # 合并变量覆盖
+                params = slot.variable_overrides.copy() if slot.variable_overrides else {}
+                results.append((skill, params))
+
+            return results
 
         except Exception as e:
-            logger.warning(f"从 SkillService 加载 Skills 失败: {e}，使用默认 Skills")
-            # 使用默认 Skills
-            skills = self._get_default_skills_for_agent(agent_type)
-            self._skills_cache[agent_type] = skills
+            logger.error(f"从 template skill_slots 加载 Skills 失败: {e}")
+            return []
 
-        return skills
+    async def _intelligent_skill_retrieval(
+        self,
+        agent_type: str,
+        context_query: str,
+    ) -> List[tuple[Skill, Dict[str, Any]]]:
+        """
+        智能技能检索：Embedding 粗筛 + LLM 精决
+
+        Args:
+            agent_type: Agent 类型
+            context_query: 场景描述/用户指令
+
+        Returns:
+            List[tuple[Skill, Dict]]: (Skill, 参数) 元组列表
+        """
+        try:
+            from app.services.skill_retrieval import get_skill_retrieval_service
+            from app.services.skill_service import get_skill_service
+
+            skill_service = get_skill_service()
+            retrieval_service = get_skill_retrieval_service(skill_service=skill_service)
+
+            # 两阶段检索
+            result = await retrieval_service.retrieve_skills(
+                query=context_query,
+                agent_type=agent_type,
+                top_k=5,
+                min_similarity=0.3,
+            )
+
+            # 返回最终激活的 Skills
+            return result.final_skills
+
+        except Exception as e:
+            logger.error(f"智能技能检索失败: {e}")
+            return []
 
     def _get_default_skills_for_agent(self, agent_type: str) -> List[Skill]:
         """
@@ -122,6 +286,22 @@ class AgentPromptService:
         """使 Skills 缓存失效"""
         self._skills_cache_valid = False
         self._skills_cache.clear()
+
+    async def _update_skill_usage_counts(self, skills: List[Skill]):
+        """更新Skills的使用计数"""
+        try:
+            from app.services.skill_service import get_skill_service
+            service = get_skill_service()
+
+            for skill in skills:
+                if not skill.is_enabled:
+                    continue
+
+                # 更新使用计数
+                await service.increment_skill_usage(skill.id)
+
+        except Exception as e:
+            logger.warning(f"更新Skill使用计数失败: {e}")
 
     def get_skill_cache_status(self) -> Dict[str, Any]:
         """获取 Skills 缓存状态"""
@@ -173,6 +353,10 @@ class AgentPromptService:
         variables: Optional[Dict[str, Any]] = None,
         characters: Optional[List[Any]] = None,
         include_skills: bool = True,
+        context_query: Optional[str] = None,
+        context_keywords: Optional[List[str]] = None,
+        context_scene: Optional[str] = None,
+        use_intelligent_retrieval: bool = True,
     ) -> str:
         """
         构建 Agent 的完整 system prompt
@@ -183,6 +367,10 @@ class AgentPromptService:
             variables: 模板变量
             characters: 角色列表（用于构建角色层级信息）
             include_skills: 是否包含 Skills
+            context_query: 场景描述/用户指令（用于智能检索）
+            context_keywords: 上下文关键词列表（传统关键词匹配）
+            context_scene: 当前场景类型（传统场景匹配）
+            use_intelligent_retrieval: 是否使用智能检索
 
         Returns:
             str: 完整的 system prompt
@@ -202,9 +390,16 @@ class AgentPromptService:
         # 组装 prompt 片段
         prompt_pieces = []
 
-        # 1. 首先加载并渲染 Skills（最高优先级）
+        # 1. 首先加载并渲染 Skills（最高优先级，智能检索）
         if include_skills:
-            skills_content = await self._build_skills_prompt(agent_type, variables)
+            skills_content = await self._build_skills_prompt(
+                agent_type,
+                variables,
+                context_query=context_query,
+                context_keywords=context_keywords,
+                context_scene=context_scene,
+                use_intelligent_retrieval=use_intelligent_retrieval,
+            )
             if skills_content:
                 prompt_pieces.append(skills_content)
 
@@ -255,9 +450,15 @@ class AgentPromptService:
         self,
         agent_type: str,
         variables: Optional[Dict[str, Any]] = None,
+        context_query: Optional[str] = None,
+        context_keywords: Optional[List[str]] = None,
+        context_scene: Optional[str] = None,
+        use_intelligent_retrieval: bool = True,
     ) -> str:
         """
-        构建 Agent 的 Skills prompt
+        构建 Agent 的 Skills prompt（双层加载 + 智能检索）
+
+        核心层 Skills 始终加载，按需层 Skills 通过智能检索加载。
 
         按优先级加载和渲染 Skills：
         1. KNOWLEDGE 类型：直接提供知识内容
@@ -266,49 +467,85 @@ class AgentPromptService:
         Args:
             agent_type: Agent 类型
             variables: 模板变量
+            context_query: 场景描述/用户指令（用于智能检索）
+            context_keywords: 上下文关键词列表（传统关键词匹配）
+            context_scene: 当前场景类型（传统场景匹配）
+            use_intelligent_retrieval: 是否使用智能检索
 
         Returns:
             str: Skills 组合后的 prompt
         """
-        # 加载 Skills
-        skills = await self._load_skills_for_agent(agent_type)
+        # 加载 Skills（双层加载 + 智能检索）
+        skills_with_params = await self._load_skills_for_agent(
+            agent_type,
+            context_query=context_query,
+            context_keywords=context_keywords,
+            context_scene=context_scene,
+            use_intelligent_retrieval=use_intelligent_retrieval,
+        )
 
-        if not skills:
+        if not skills_with_params:
             return ""
 
-        # 按类型分组
-        knowledge_pieces = []
-        prompt_pieces = []
+        # 按类型和加载模式分组
+        core_knowledge_pieces = []
+        core_prompt_pieces = []
+        on_demand_knowledge_pieces = []
+        on_demand_prompt_pieces = []
 
-        for skill in skills:
+        # 更新Skills使用计数
+        skills_only = [s for s, _ in skills_with_params]
+        await self._update_skill_usage_counts(skills_only)
+
+        for skill, params in skills_with_params:
             if not skill.is_enabled:
                 continue
 
+            # 合并参数：默认值 + 传入参数
+            merged_vars = variables.copy() if variables else {}
+            merged_vars.update(params)
+
             try:
+                is_core = skill.load_mode == SkillLoadMode.CORE
+
                 if skill.skill_type == SkillType.KNOWLEDGE:
                     # 知识类型：直接使用内容
                     content = skill.knowledge_content or ""
                     if content:
                         # 渲染变量
-                        rendered = self._render_skill_content(skill, content, variables)
-                        knowledge_pieces.append(rendered)
+                        rendered = self._render_skill_content(skill, content, merged_vars)
+                        if is_core:
+                            core_knowledge_pieces.append(rendered)
+                        else:
+                            on_demand_knowledge_pieces.append(rendered)
 
                 elif skill.skill_type == SkillType.PROMPT:
                     # Prompt 类型：渲染模板
                     content = skill.prompt_template or ""
                     if content:
-                        rendered = self._render_skill_content(skill, content, variables)
-                        prompt_pieces.append(rendered)
+                        rendered = self._render_skill_content(skill, content, merged_vars)
+                        if is_core:
+                            core_prompt_pieces.append(rendered)
+                        else:
+                            on_demand_prompt_pieces.append(rendered)
 
             except Exception as e:
                 logger.warning(f"渲染 Skill {skill.id} 失败: {e}")
 
-        # 组合：知识在前，prompt 在后
+        # 组合：核心层在前，按需层在后
         pieces = []
-        if knowledge_pieces:
-            pieces.append("【核心知识与原则】\n" + "\n\n".join(knowledge_pieces))
-        if prompt_pieces:
-            pieces.append("【技能指导】\n" + "\n\n".join(prompt_pieces))
+
+        # 核心层（始终加载）
+        if core_knowledge_pieces:
+            pieces.append("【核心知识与原则】\n" + "\n\n".join(core_knowledge_pieces))
+        if core_prompt_pieces:
+            pieces.append("【核心技能指导】\n" + "\n\n".join(core_prompt_pieces))
+
+        # 按需层（根据上下文智能加载）
+        if on_demand_knowledge_pieces:
+            pieces.append("【场景知识】\n" + "\n\n".join(on_demand_knowledge_pieces))
+        if on_demand_prompt_pieces:
+            pieces.append("【场景技能指导】\n" + "\n\n".join(on_demand_prompt_pieces))
 
         return "\n\n".join(pieces)
 
@@ -482,20 +719,37 @@ class AgentPromptService:
             }
         return summary
 
-    async def get_agent_skills_info(self, agent_type: str) -> List[Dict[str, Any]]:
+    async def get_agent_skills_info(
+        self,
+        agent_type: str,
+        context_query: Optional[str] = None,
+        context_keywords: Optional[List[str]] = None,
+        context_scene: Optional[str] = None,
+        use_intelligent_retrieval: bool = True,
+    ) -> List[Dict[str, Any]]:
         """
         获取 Agent 的 Skills 详细信息
 
         Args:
             agent_type: Agent 类型
+            context_query: 场景描述/用户指令（用于智能检索）
+            context_keywords: 上下文关键词列表（传统关键词匹配）
+            context_scene: 当前场景类型（传统场景匹配）
+            use_intelligent_retrieval: 是否使用智能检索
 
         Returns:
             List[Dict]: Skill 信息列表
         """
-        skills = await self._load_skills_for_agent(agent_type)
+        skills_with_params = await self._load_skills_for_agent(
+            agent_type,
+            context_query=context_query,
+            context_keywords=context_keywords,
+            context_scene=context_scene,
+            use_intelligent_retrieval=use_intelligent_retrieval,
+        )
 
         result = []
-        for skill in skills:
+        for skill, params in skills_with_params:
             result.append({
                 "id": skill.id,
                 "name": skill.name,
@@ -505,9 +759,53 @@ class AgentPromptService:
                 "priority": skill.priority,
                 "is_enabled": skill.is_enabled,
                 "is_system": skill.is_system,
+                "load_mode": skill.load_mode.value,
+                "trigger_keywords": skill.trigger_keywords,
+                "trigger_scenes": skill.trigger_scenes,
+                "extracted_params": params,  # LLM 提取的参数
             })
 
         return result
+
+    def extract_keywords_from_text(self, text: str) -> List[str]:
+        """
+        从文本中提取关键词（用于按需 Skill 匹配）
+
+        简单实现：提取中文词汇和英文单词
+        实际使用时可替换为更复杂的 NLP 方法
+
+        Args:
+            text: 输入文本
+
+        Returns:
+            List[str]: 关键词列表
+        """
+        import re
+
+        if not text:
+            return []
+
+        keywords = []
+
+        # 提取中文词汇（连续的中文字符）
+        chinese_pattern = r'[\u4e00-\u9fff]+'
+        chinese_matches = re.findall(chinese_pattern, text)
+        keywords.extend(chinese_matches)
+
+        # 提取英文单词
+        english_pattern = r'[a-zA-Z]+'
+        english_matches = re.findall(english_pattern, text)
+        keywords.extend([w.lower() for w in english_matches])
+
+        # 去重并保持顺序
+        seen = set()
+        unique_keywords = []
+        for kw in keywords:
+            if kw not in seen:
+                seen.add(kw)
+                unique_keywords.append(kw)
+
+        return unique_keywords
 
 
 # 全局单例

@@ -179,7 +179,7 @@ export default function Visualizer() {
       const result = await getWorkflowNodeTypes(currentProject?.id)
       setNodeTypesData(result)
     } catch (error) {
-      console.error('Failed to load node types:', error)
+      console.error('[Visualizer] Failed to load node types:', error)
     } finally {
       setLoadingNodeTypes(false)
     }
@@ -456,6 +456,9 @@ export default function Visualizer() {
     <PageLayout
       title="可视化工作台"
       description="可视化展示工作流、剧情树和版本树"
+      tabs={tabs}
+      activeTab={activeTab}
+      onTabChange={(key) => setActiveTab(key as TabType)}
       actions={
         <div className="flex items-center gap-4">
           {activeTab === 'workflow' && (
@@ -496,26 +499,6 @@ export default function Visualizer() {
         </div>
       }
     >
-      {/* Tab 切换 */}
-      <div className="mb-4 flex gap-4">
-        {tabs.map((tab) => (
-          <button
-            key={tab.key}
-            onClick={() => setActiveTab(tab.key as TabType)}
-            className={`px-4 py-2 rounded-lg font-medium transition-colors ${
-              activeTab === tab.key
-                ? 'bg-blue-500 text-white'
-                : isDark
-                  ? 'bg-gray-800 text-gray-300 hover:bg-gray-700'
-                  : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
-            }`}
-          >
-            <span className="inline mr-2">{tab.icon}</span>
-            {tab.label}
-          </button>
-        ))}
-      </div>
-
       {activeTab === 'workflow' ? (
         <div className="flex gap-4" style={{ height: 'calc(100vh - 280px)', minHeight: '500px' }}>
           {/* 左侧面板 */}
@@ -592,7 +575,8 @@ export default function Visualizer() {
                           }`}
                           title={node.label}
                         >
-                          {node.label.replace(' Agent', '').replace('管理员', '')}
+			
+                         {node.label.replace(' Agent', '').replace('管理员', '')}
                         </button>
                       ))}
                     </div>

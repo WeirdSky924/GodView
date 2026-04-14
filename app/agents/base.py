@@ -188,6 +188,9 @@ class BaseAgent(ABC):
         """
         获取记忆上下文（用于注入到 prompt 中）
 
+        这是同步版本，使用静态选择策略。
+        对于上下文感知选择，请使用 get_enhanced_memory_context()
+
         Returns:
             str: 格式化的记忆上下文
         """
@@ -217,6 +220,80 @@ class BaseAgent(ABC):
                 )
 
         return "\n".join(context_parts)
+
+    async def get_enhanced_memory_context(
+        self,
+        task_type: Optional[str] = None,
+        query_text: Optional[str] = None,
+        current_context: Optional[Dict[str, Any]] = None,
+        db=None,
+    ) -> str:
+        """
+        获取增强的记忆上下文（支持语义检索和上下文感知）
+
+        Args:
+            task_type: 任务类型（如 "outline_generation", "chapter_writing"）
+            query_text: 查询文本（用于语义匹配）
+            current_context: 当前上下文（章节号、角色等）
+            db: 数据库连接
+
+        Returns:
+            str: 格式化的记忆上下文
+        """
+        if not self._memory or not self.project_id:
+            return ""
+
+        try:
+            from app.services.enhanced_memory_service import get_enhanced_memory_service
+
+            # 获取增强记忆服务
+            enhanced_service = get_enhanced_memory_service(db=db)
+
+            # 如果指定了任务类型，使用上下文感知选择
+            if task_type:
+                memories = await enhanced_service.get_context_aware_memories(
+                    project_id=self.project_id,
+                    agent_type=self.AGENT_TYPE or self.name,
+                    task_type=task_type,
+                    current_context=current_context,
+                    query_text=query_text,
+                )
+            elif query_text:
+                # 使用语义检索
+                results = await enhanced_service.get_semantic_memories(
+                    project_id=self.project_id,
+                    agent_type=self.AGENT_TYPE or self.name,
+                    query_text=query_text,
+                    limit=10,
+                )
+                memories = [entry for entry, _ in results]
+            else:
+                # 降级到默认选择
+                memories = await enhanced_service._default_memory_selection(
+                    self.project_id,
+                    self.AGENT_TYPE or self.name,
+                )
+
+            if not memories:
+                return ""
+
+            # 格式化输出
+            context_parts = ["【相关记忆】"]
+
+            for entry in memories:
+                importance_marker = ""
+                if entry.importance.value in ["critical", "high"]:
+                    importance_marker = "⭐ "
+
+                context_parts.append(
+                    f"- {importance_marker}[{entry.type.value}] {entry.content[:150]}"
+                )
+
+            return "\n".join(context_parts)
+
+        except Exception as e:
+            logger.warning(f"获取增强记忆上下文失败: {e}，降级到基础方法")
+            return self.get_memory_context()
 
     async def _ensure_system_prompt_loaded(self):
         """
@@ -268,7 +345,22 @@ class BaseAgent(ABC):
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
         category: UsageCategory = UsageCategory.OTHER,
+        memory_task_type: Optional[str] = None,
+        memory_query_text: Optional[str] = None,
+        db=None,
     ) -> str:
+        """
+        调用 LLM
+
+        Args:
+            messages: 消息列表
+            temperature: 温度参数
+            max_tokens: 最大 token 数
+            category: 使用类别
+            memory_task_type: 记忆选择的任务类型（用于上下文感知选择）
+            memory_query_text: 记忆选择的查询文本（用于语义检索）
+            db: 数据库连接（用于增强记忆服务）
+        """
         if not self.model:
             raise ValueError(f"Agent {self.name} 未配置模型")
 
@@ -279,13 +371,24 @@ class BaseAgent(ABC):
         if self._stream_callback:
             return await self._stream_llm(
                 messages, temperature, max_tokens, category,
-                on_chunk=self._stream_callback
+                on_chunk=self._stream_callback,
+                memory_task_type=memory_task_type,
+                memory_query_text=memory_query_text,
+                db=db,
             )
 
         # 构建完整的 system prompt（包含记忆上下文）
         full_system_prompt = self.system_prompt
         if self._memory:
-            memory_context = self.get_memory_context()
+            # 使用增强记忆上下文（如果提供了 task_type 或 query_text）
+            if memory_task_type or memory_query_text:
+                memory_context = await self.get_enhanced_memory_context(
+                    task_type=memory_task_type,
+                    query_text=memory_query_text,
+                    db=db,
+                )
+            else:
+                memory_context = self.get_memory_context()
             if memory_context:
                 full_system_prompt = f"{self.system_prompt}\n\n{memory_context}"
 
@@ -327,6 +430,9 @@ class BaseAgent(ABC):
         max_tokens: Optional[int] = None,
         category: UsageCategory = UsageCategory.OTHER,
         on_chunk: Optional[callable] = None,
+        memory_task_type: Optional[str] = None,
+        memory_query_text: Optional[str] = None,
+        db=None,
     ) -> str:
         """
         流式调用 LLM，支持实时输出
@@ -337,6 +443,9 @@ class BaseAgent(ABC):
             max_tokens: 最大 token 数
             category: 使用类别
             on_chunk: 每个 chunk 的回调函数，接收 (chunk_text: str) 参数
+            memory_task_type: 记忆选择的任务类型
+            memory_query_text: 记忆选择的查询文本
+            db: 数据库连接
 
         Returns:
             str: 完整的响应内容
@@ -350,7 +459,15 @@ class BaseAgent(ABC):
         # 构建完整的 system prompt（包含记忆上下文）
         full_system_prompt = self.system_prompt
         if self._memory:
-            memory_context = self.get_memory_context()
+            # 使用增强记忆上下文（如果提供了 task_type 或 query_text）
+            if memory_task_type or memory_query_text:
+                memory_context = await self.get_enhanced_memory_context(
+                    task_type=memory_task_type,
+                    query_text=memory_query_text,
+                    db=db,
+                )
+            else:
+                memory_context = self.get_memory_context()
             if memory_context:
                 full_system_prompt = f"{self.system_prompt}\n\n{memory_context}"
 

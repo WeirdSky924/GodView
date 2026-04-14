@@ -118,15 +118,24 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     else:
         logger.info("Qdrant 未配置，跳过初始化")
 
-    # 初始化系统 Prompt 模板
+    # 初始化系统 Prompt 模板（从 MD 文件同步）
     try:
         from app.api.routes.prompts import set_prompt_service
         from app.services.prompt_template_service import PromptTemplateService
-        from app.data.system_prompts import SYSTEM_PROMPTS
-        prompt_service = PromptTemplateService()
-        await prompt_service.initialize_system_templates(SYSTEM_PROMPTS)
+        prompt_service = PromptTemplateService(db=postgres_db)
+
+        # 先从数据库加载已有数据
+        await prompt_service._ensure_cache()
+
+        # 尝试从 MD 文件同步（覆盖数据库中的旧数据）
+        try:
+            sync_result = await prompt_service.sync_md_files_to_db()
+            logger.info(f"从 MD 文件同步 Prompts: {sync_result}")
+        except Exception as sync_error:
+            logger.warning(f"MD 文件同步失败，使用数据库中的数据: {sync_error}")
+
         set_prompt_service(prompt_service)
-        logger.info(f"系统 Prompt 模板初始化完成: {len(SYSTEM_PROMPTS)} 个模板")
+        logger.info(f"系统 Prompt 模板初始化完成: {len(prompt_service._templates)} 个模板")
     except Exception as e:
         logger.warning(f"系统 Prompt 模板初始化失败：{e}")
 
@@ -143,6 +152,26 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         logger.info(f"系统 Agent 模板初始化完成: {len(SYSTEM_AGENT_TEMPLATES)} 个模板")
     except Exception as e:
         logger.warning(f"系统 Agent 模板初始化失败：{e}")
+
+    # 初始化 Skill 服务（从 MD 文件同步）
+    try:
+        from app.services.skill_service import set_skill_service, SkillService
+        skill_service = SkillService(db=postgres_db)
+
+        # 先从数据库加载已有数据
+        await skill_service._ensure_cache()
+
+        # 尝试从 MD 文件同步（覆盖数据库中的旧数据）
+        try:
+            sync_result = await skill_service.sync_md_files_to_db()
+            logger.info(f"从 MD 文件同步 Skills: {sync_result}")
+        except Exception as sync_error:
+            logger.warning(f"MD 文件同步失败，使用数据库中的数据: {sync_error}")
+
+        set_skill_service(skill_service)
+        logger.info(f"系统 Skills 初始化完成: {len(skill_service._skills_cache)} 个技能")
+    except Exception as e:
+        logger.warning(f"系统 Skills 初始化失败：{e}")
 
     logger.info("应用初始化完成，开始服务...")
 
@@ -185,7 +214,7 @@ def create_app() -> FastAPI:
     )
 
     # 注册路由
-    from app.api.routes import characters, worlds, plots, websocket, config, time, simulation, projects, bootstrap, lore, setting_agent, skills, token_usage, writing_rules, prompts, agent_templates, agent_configs, workflows, interventions
+    from app.api.routes import characters, worlds, plots, websocket, config, time, simulation, projects, bootstrap, lore, setting_agent, skills, token_usage, writing_rules, prompts, agent_templates, agent_configs, workflows, interventions, quality_checks, chapter_outlines, villains, memories, volumes, genre_templates, character_depth, golden_three_rules, world_expansion
 
     app.include_router(characters.router, prefix="/api/characters", tags=["角色管理"])
     app.include_router(worlds.router, prefix="/api/worlds", tags=["世界管理"])
@@ -206,6 +235,15 @@ def create_app() -> FastAPI:
     app.include_router(agent_configs.router, prefix="/api", tags=["Agent 配置管理"])
     app.include_router(workflows.router, prefix="/api/workflows", tags=["工作流管理"])
     app.include_router(interventions.router, prefix="/api/interventions", tags=["干预管理"])
+    app.include_router(quality_checks.router, prefix="/api/quality", tags=["质量检测"])
+    app.include_router(chapter_outlines.router, prefix="/api/outlines", tags=["章节大纲"])
+    app.include_router(villains.router, prefix="/api/villains", tags=["反派管理"])
+    app.include_router(memories.router, prefix="/api/memories", tags=["记忆管理"])
+    app.include_router(volumes.router, prefix="/api/volumes", tags=["卷规划"])
+    app.include_router(genre_templates.router, tags=["题材模板"])
+    app.include_router(character_depth.router, tags=["角色深度"])
+    app.include_router(golden_three_rules.router, tags=["黄金三章规则"])
+    app.include_router(world_expansion.router, tags=["世界观展开"])
 
     # 健康检查
     @app.get("/health")

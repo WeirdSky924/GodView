@@ -23,6 +23,7 @@ import Skills from './pages/Skills'
 import Prompts from './pages/Prompts'
 import AgentTemplates from './pages/AgentTemplates'
 import WritingRules from './pages/WritingRules'
+import Outlines from './pages/Outlines'
 
 function App() {
   return (
@@ -52,6 +53,7 @@ function App() {
         <Route path="/prompts" element={<Prompts />} />
         <Route path="/agent-templates" element={<AgentTemplates />} />
         <Route path="/writing-rules" element={<WritingRules />} />
+        <Route path="/outlines" element={<Outlines />} />
       </Routes>
     </Layout>
   )

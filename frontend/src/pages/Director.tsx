@@ -9,12 +9,18 @@ import { useWorkflowAgents, type AgentStatus } from '@/hooks/useWorkflowAgents'
 import {
   Play, Pause, RotateCcw, Target, BookOpen, MessageSquare, GitBranch, Settings,
   Sparkles, FileText, Network, FolderOpen, UserPlus, UserMinus, Users, ChevronDown,
-  ChevronUp, Send, X, Circle, Copy, Check
+  ChevronUp, Send, X, Circle, Copy, Check, Shield, Zap, Brain
 } from 'lucide-react'
 import { useProject } from '@/contexts/ProjectContext'
 import { useTheme } from '@/contexts/ThemeContext'
 import { motion, AnimatePresence } from 'framer-motion'
 import WorkflowHelp from '@/components/workflow/WorkflowHelp'
+import GoldenThreeChecker from '@/components/quality/GoldenThreeChecker'
+import SatisfactionAnalyzer from '@/components/quality/SatisfactionAnalyzer'
+import MemoryViewer from '@/components/memory/MemoryViewer'
+import OpeningDesigner from '@/components/OpeningDesigner'
+import VillainManager from '@/components/VillainManager'
+import VolumePlanner from '@/components/VolumePlanner'
 
 // ==================== Types ====================
 
@@ -32,6 +38,7 @@ interface SnapshotNode {
 const AGENT_CONFIG: Record<string, { icon: string; color: string; description: string }> = {
   'Summarizer': { icon: '📝', color: 'blue', description: '剧情总结员' },
   'Master Plotter': { icon: '🎬', color: 'purple', description: '总编剧' },
+  'Plotter': { icon: '📋', color: 'violet', description: '编剧' },
   'Hook Manager': { icon: '🎯', color: 'orange', description: '伏笔管理员' },
   'Writer': { icon: '✍️', color: 'green', description: '内容执行官' },
   'Evaluator': { icon: '🔍', color: 'red', description: '剧情评估员' },
@@ -39,17 +46,28 @@ const AGENT_CONFIG: Record<string, { icon: string; color: string; description: s
   'Setting': { icon: '⚙️', color: 'indigo', description: '设定 Agent' },
   'Event Generator': { icon: '🎲', color: 'pink', description: '事件生成' },
   'World Map': { icon: '🗺️', color: 'teal', description: '地图管理' },
+  'ProcGen': { icon: '⚡', color: 'yellow', description: '过程生成' },
+  'Dungeon Generator': { icon: '🏰', color: 'emerald', description: '副本生成' },
+  'Plot Outline': { icon: '📑', color: 'rose', description: '章节大纲' },
+  'Scene Coordinator': { icon: '🎪', color: 'sky', description: '场景协调' },
 }
 
 // Agent 名称到 agent_type 的映射（用于工作流）
 const AGENT_TYPE_MAP: Record<string, string> = {
   'Summarizer': 'summarizer',
   'Master Plotter': 'master_plotter',
+  'Plotter': 'plotter',
   'Hook Manager': 'hook_manager',
   'Writer': 'writer',
   'Evaluator': 'evaluator',
   'Character Agent': 'character',
-  'ProcGen': 'procgen',
+  'Setting': 'setting',
+  'Event Generator': 'event_generator',
+  'World Map': 'world_map_manager',
+  'ProcGen': 'proc_gen',
+  'Dungeon Generator': 'dungeon_generator',
+  'Plot Outline': 'plot_outline',
+  'Scene Coordinator': 'scene_coordinator',
 }
 
 // 从节点标签/agent_type 映射到前端 Agent 名称
@@ -57,7 +75,7 @@ const NODE_TO_AGENT_MAP: Record<string, string> = {
   // agent_type -> Agent 名称
   'summarizer': 'Summarizer',
   'master_plotter': 'Master Plotter',
-  'plotter': 'Master Plotter',
+  'plotter': 'Plotter',
   'hook_manager': 'Hook Manager',
   'writer': 'Writer',
   'evaluator': 'Evaluator',
@@ -65,11 +83,15 @@ const NODE_TO_AGENT_MAP: Record<string, string> = {
   'setting': 'Setting',
   'event_generator': 'Event Generator',
   'world_map_manager': 'World Map',
+  'proc_gen': 'ProcGen',
+  'dungeon_generator': 'Dungeon Generator',
+  'plot_outline': 'Plot Outline',
+  'scene_coordinator': 'Scene Coordinator',
   // 节点标签 -> Agent 名称
   '剧情总结员': 'Summarizer',
   '总编剧': 'Master Plotter',
-  '编剧 Agent': 'Master Plotter',
-  '编剧': 'Master Plotter',
+  '编剧 Agent': 'Plotter',
+  '编剧': 'Plotter',
   '伏笔管理员': 'Hook Manager',
   '伏笔 Agent': 'Hook Manager',
   '伏笔': 'Hook Manager',
@@ -92,11 +114,20 @@ const NODE_TO_AGENT_MAP: Record<string, string> = {
   'Map Agent': 'World Map',
   'Event Agent': 'Event Generator',
   'Setting Agent': 'Setting',
-  'Plotter Agent': 'Master Plotter',
+  'Plotter Agent': 'Plotter',
   'Character Agent': 'Character Agent',
   'Writer Agent': 'Writer',
   'Evaluator Agent': 'Evaluator',
   'Hook Agent': 'Hook Manager',
+  'ProcGen Agent': 'ProcGen',
+  'Dungeon Agent': 'Dungeon Generator',
+  'Dungeon Generator Agent': 'Dungeon Generator',
+  'Plot Outline Agent': 'Plot Outline',
+  'Scene Coordinator Agent': 'Scene Coordinator',
+  '过程生成 Agent': 'ProcGen',
+  '副本生成 Agent': 'Dungeon Generator',
+  '章节大纲 Agent': 'Plot Outline',
+  '场景协调 Agent': 'Scene Coordinator',
 }
 
 // 节点类型到显示名称的映射
@@ -326,7 +357,7 @@ function GroupDiscussionCard({
 
   // 判断消息是否来自Agent
   const isAgentMessage = (character: string) => {
-    const agentNames = ['编剧', '作家', '评估员', '伏笔管理员', '设定管理员', '地图管理员', '事件生成器', '摘要员', '总编剧']
+    const agentNames = ['编剧', '作家', '评估', '伏笔', '设定', '地图', '事件', '摘要', '总编剧', '角色', '过程生成', '副本', '章节大纲', '场景协调']
     return agentNames.some(name => character.includes(name)) || character.startsWith('角色')
   }
 
@@ -754,6 +785,9 @@ export default function Director() {
   const [showCommandModal, setShowCommandModal] = useState(false)
   const [selectedAgent, setSelectedAgent] = useState('')
   const [agentCommand, setAgentCommand] = useState('')
+
+  // Quality panels state
+  const [activeQualityPanel, setActiveQualityPanel] = useState<string | null>(null)
 
   // Ref to track if we've already attempted to start the session
   const sessionStartAttempted = useRef(false)
@@ -1563,6 +1597,83 @@ export default function Director() {
               </div>
             </Card>
 
+            {/* 质量检测入口 */}
+            <Card>
+              <div className="p-4">
+                <h3 className={`text-sm font-semibold mb-3 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+                  质量检测
+                </h3>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    onClick={() => setActiveQualityPanel('goldenThree')}
+                    className={`flex items-center gap-2 px-3 py-2 rounded-lg border text-sm transition-colors ${
+                      isDark
+                        ? 'bg-gray-800 hover:bg-gray-700 text-gray-300 border-gray-700'
+                        : 'bg-white hover:bg-gray-50 text-gray-700 border-gray-200'
+                    }`}
+                  >
+                    <Shield size={14} className="text-yellow-500" />
+                    黄金三章
+                  </button>
+                  <button
+                    onClick={() => setActiveQualityPanel('satisfaction')}
+                    className={`flex items-center gap-2 px-3 py-2 rounded-lg border text-sm transition-colors ${
+                      isDark
+                        ? 'bg-gray-800 hover:bg-gray-700 text-gray-300 border-gray-700'
+                        : 'bg-white hover:bg-gray-50 text-gray-700 border-gray-200'
+                    }`}
+                  >
+                    <Zap size={14} className="text-purple-500" />
+                    爽点分析
+                  </button>
+                  <button
+                    onClick={() => setActiveQualityPanel('memory')}
+                    className={`flex items-center gap-2 px-3 py-2 rounded-lg border text-sm transition-colors ${
+                      isDark
+                        ? 'bg-gray-800 hover:bg-gray-700 text-gray-300 border-gray-700'
+                        : 'bg-white hover:bg-gray-50 text-gray-700 border-gray-200'
+                    }`}
+                  >
+                    <Brain size={14} className="text-blue-500" />
+                    记忆系统
+                  </button>
+                  <button
+                    onClick={() => setActiveQualityPanel('opening')}
+                    className={`flex items-center gap-2 px-3 py-2 rounded-lg border text-sm transition-colors ${
+                      isDark
+                        ? 'bg-gray-800 hover:bg-gray-700 text-gray-300 border-gray-700'
+                        : 'bg-white hover:bg-gray-50 text-gray-700 border-gray-200'
+                    }`}
+                  >
+                    <Sparkles size={14} className="text-green-500" />
+                    开局设计
+                  </button>
+                  <button
+                    onClick={() => setActiveQualityPanel('villain')}
+                    className={`flex items-center gap-2 px-3 py-2 rounded-lg border text-sm transition-colors ${
+                      isDark
+                        ? 'bg-gray-800 hover:bg-gray-700 text-gray-300 border-gray-700'
+                        : 'bg-white hover:bg-gray-50 text-gray-700 border-gray-200'
+                    }`}
+                  >
+                    <Users size={14} className="text-red-500" />
+                    反派管理
+                  </button>
+                  <button
+                    onClick={() => setActiveQualityPanel('volume')}
+                    className={`flex items-center gap-2 px-3 py-2 rounded-lg border text-sm transition-colors ${
+                      isDark
+                        ? 'bg-gray-800 hover:bg-gray-700 text-gray-300 border-gray-700'
+                        : 'bg-white hover:bg-gray-50 text-gray-700 border-gray-200'
+                    }`}
+                  >
+                    <BookOpen size={14} className="text-indigo-500" />
+                    卷规划
+                  </button>
+                </div>
+              </div>
+            </Card>
+
             {/* 实时日志 */}
             <Card>
               <button
@@ -1636,6 +1747,51 @@ export default function Director() {
           </div>
         </div>
       </div>
+
+      {/* ========== Quality Panels ========== */}
+      <Modal
+        isOpen={activeQualityPanel !== null}
+        onClose={() => setActiveQualityPanel(null)}
+        title={
+          activeQualityPanel === 'goldenThree' ? '黄金三章检测' :
+          activeQualityPanel === 'satisfaction' ? '爽点分析' :
+          activeQualityPanel === 'memory' ? '记忆系统' :
+          activeQualityPanel === 'opening' ? '开局设计向导' :
+          activeQualityPanel === 'villain' ? '反派与冲突管理' :
+          activeQualityPanel === 'volume' ? '卷规划编辑器' : ''
+        }
+        size="lg"
+      >
+        <div className="max-h-[70vh] overflow-y-auto">
+          {activeQualityPanel === 'goldenThree' && currentProject && (
+            <GoldenThreeChecker
+              projectId={currentProject.id}
+              onCheckComplete={(result) => addLog(`黄金三章检测完成: ${result.total_score}分`)}
+            />
+          )}
+          {activeQualityPanel === 'satisfaction' && currentProject && (
+            <SatisfactionAnalyzer
+              projectId={currentProject.id}
+              onAnalyzeComplete={(result) => addLog(`爽点分析完成: ${result.satisfaction_score}分`)}
+            />
+          )}
+          {activeQualityPanel === 'memory' && currentProject && (
+            <MemoryViewer projectId={currentProject.id} />
+          )}
+          {activeQualityPanel === 'opening' && currentProject && (
+            <OpeningDesigner
+              projectId={currentProject.id}
+              onDesignComplete={(result) => addLog(`开局设计完成: ${result.golden_finger.name}`)}
+            />
+          )}
+          {activeQualityPanel === 'villain' && currentProject && (
+            <VillainManager projectId={currentProject.id} />
+          )}
+          {activeQualityPanel === 'volume' && currentProject && (
+            <VolumePlanner projectId={currentProject.id} />
+          )}
+        </div>
+      </Modal>
 
       {/* ========== Modals ========== */}
       <Modal isOpen={showCommandModal} onClose={() => setShowCommandModal(false)} title="手动 Agent 指令">

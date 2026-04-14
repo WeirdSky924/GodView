@@ -21,6 +21,11 @@ const AGENT_TYPE_OPTIONS = [
   { value: 'hook_manager', label: '伏笔 Agent' },
   { value: 'event_generator', label: '事件 Agent' },
   { value: 'world_map_manager', label: '地图 Agent' },
+  { value: 'proc_gen', label: '过程生成 Agent' },
+  { value: 'dungeon_generator', label: '副本生成 Agent' },
+  // v9 新增
+  { value: 'plot_outline', label: '章节大纲 Agent' },
+  { value: 'scene_coordinator', label: '场景协调 Agent' },
 ]
 
 // 数据输入来源选项

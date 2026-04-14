@@ -49,6 +49,285 @@ def set_workflow_engine(engine):
     _workflow_engine = engine
 
 
+# ==================== 节点类型 API ====================
+
+from fastapi import Response
+
+@router.get("/node-types", response_model=Dict[str, Any])
+async def get_node_types(
+    project_id: Optional[str] = Query(None, description="项目ID（用于获取角色Agent）"),
+):
+    """
+    获取工作流节点类型列表
+
+    返回所有可用的节点类型，包括：
+    - 系统 Agent 节点（根据模板启用状态过滤）
+    - 角色 Agent 节点（如果提供了 project_id）
+    - 交互节点
+    - 控制节点
+    """
+    from app.models.agent_template import AgentType
+    from app.services.agent_template_service import AgentTemplateService
+
+    # 所有系统 Agent 节点定义
+    all_agent_nodes = [
+        {
+            "type": "agent",
+            "agent_type": AgentType.SETTING.value,
+            "label": "设定 Agent",
+            "description": "管理世界观、设定条目",
+            "category": "agent",
+            "icon": "Settings",
+            "color": "blue",
+            "is_system": True,
+        },
+        {
+            "type": "agent",
+            "agent_type": AgentType.WRITER.value,
+            "label": "作家 Agent",
+            "description": "生成小说内容",
+            "category": "agent",
+            "icon": "PenTool",
+            "color": "purple",
+            "is_system": True,
+        },
+        {
+            "type": "agent",
+            "agent_type": AgentType.MASTER_PLOTTER.value,
+            "label": "总编剧 Agent",
+            "description": "规划整体剧情结构",
+            "category": "agent",
+            "icon": "GitBranch",
+            "color": "indigo",
+            "is_system": True,
+        },
+        {
+            "type": "agent",
+            "agent_type": AgentType.SUMMARIZER.value,
+            "label": "摘要 Agent",
+            "description": "生成内容摘要",
+            "category": "agent",
+            "icon": "BookOpen",
+            "color": "amber",
+            "is_system": True,
+        },
+        {
+            "type": "agent",
+            "agent_type": AgentType.EVALUATOR.value,
+            "label": "评估 Agent",
+            "description": "评估内容质量",
+            "category": "agent",
+            "icon": "Search",
+            "color": "orange",
+            "is_system": True,
+        },
+        {
+            "type": "agent",
+            "agent_type": AgentType.HOOK_MANAGER.value,
+            "label": "伏笔 Agent",
+            "description": "管理伏笔和悬念",
+            "category": "agent",
+            "icon": "Link",
+            "color": "cyan",
+            "is_system": True,
+        },
+        {
+            "type": "agent",
+            "agent_type": AgentType.EVENT_GENERATOR.value,
+            "label": "事件 Agent",
+            "description": "生成随机事件",
+            "category": "agent",
+            "icon": "Dices",
+            "color": "pink",
+            "is_system": True,
+        },
+        {
+            "type": "agent",
+            "agent_type": AgentType.WORLD_MAP_MANAGER.value,
+            "label": "地图 Agent",
+            "description": "管理世界地图和地点",
+            "category": "agent",
+            "icon": "Map",
+            "color": "teal",
+            "is_system": True,
+        },
+        {
+            "type": "agent",
+            "agent_type": AgentType.PROC_GEN.value,
+            "label": "过程生成 Agent",
+            "description": "过程化生成内容",
+            "category": "agent",
+            "icon": "Zap",
+            "color": "yellow",
+            "is_system": True,
+        },
+        {
+            "type": "agent",
+            "agent_type": AgentType.DUNGEON_GENERATOR.value,
+            "label": "副本生成 Agent",
+            "description": "生成副本和关卡",
+            "category": "agent",
+            "icon": "Globe",
+            "color": "emerald",
+            "is_system": True,
+        },
+        {
+            "type": "agent",
+            "agent_type": AgentType.PLOT_OUTLINE.value,
+            "label": "章节大纲 Agent",
+            "description": "规划章节大纲",
+            "category": "agent",
+            "icon": "BookOpen",
+            "color": "rose",
+            "is_system": True,
+        },
+    ]
+
+    # 获取 Agent 模板的启用状态
+    # 逻辑：只有当模板存在且 is_enabled=False 时才禁用
+    # 如果模板不存在，则默认启用
+    disabled_agent_types = set()
+    db = get_db()
+    if db:
+        try:
+            template_service = AgentTemplateService(db)
+            templates = await template_service.list_templates(limit=100)
+
+            # 只记录被明确禁用的 Agent 类型
+            for template in templates:
+                if not template.is_enabled:
+                    disabled_agent_types.add(template.agent_type.value)
+
+            logger.info(f"已禁用的 Agent 类型: {disabled_agent_types}")
+        except Exception as e:
+            logger.warning(f"获取 Agent 模板启用状态失败: {e}")
+
+    # 过滤掉被禁用的 Agent 节点
+    agent_nodes = [
+        node for node in all_agent_nodes
+        if node.get("agent_type") not in disabled_agent_types
+    ]
+
+    logger.info(f"返回 {len(agent_nodes)} 个 Agent 节点")
+
+    # 角色 Agent 节点（从项目角色生成）
+    character_nodes = []
+    if project_id:
+        if db:
+            try:
+                characters = await db.execute_query(
+                    "SELECT id, name, importance_tier FROM characters WHERE project_id = :project_id ORDER BY importance_tier DESC, name",
+                    {"project_id": project_id}
+                )
+                for char in characters:
+                    character_nodes.append({
+                        "type": "agent",
+                        "agent_type": "character",
+                        "label": f"{char['name']} Agent",
+                        "description": f"角色 {char['name']} 的专属 Agent",
+                        "category": "agent",
+                        "icon": "User",
+                        "color": "green",
+                        "is_system": False,
+                        "character_id": str(char["id"]),
+                        "character_name": char["name"],
+                        "importance_tier": char.get("importance_tier", 1),
+                    })
+            except Exception as e:
+                logger.warning(f"获取项目角色失败: {e}")
+
+    # 交互节点
+    interaction_nodes = [
+        {
+            "type": "input",
+            "label": "用户输入",
+            "description": "暂停等待用户输入",
+            "category": "interaction",
+            "icon": "MessageSquare",
+            "color": "blue",
+            "is_system": True,
+            "config_hints": {
+                "prompt": {"type": "string", "default": "请输入内容", "description": "提示语"}
+            }
+        },
+        {
+            "type": "group_discussion",
+            "label": "集体讨论",
+            "description": "多个Agent进行创作会议",
+            "category": "interaction",
+            "icon": "MessageCircle",
+            "color": "purple",
+            "is_system": True,
+            "supports_multiple": True,
+        },
+        {
+            "type": "scene_performance",
+            "label": "场景演绎",
+            "description": "多角色同台飙戏",
+            "category": "interaction",
+            "icon": "Users",
+            "color": "green",
+            "is_system": True,
+            "supports_multiple": True,
+        },
+    ]
+
+    # 控制节点
+    control_nodes = [
+        {
+            "type": "start",
+            "label": "开始",
+            "description": "工作流起点",
+            "category": "control",
+            "icon": "Play",
+            "color": "green",
+            "is_system": True,
+        },
+        {
+            "type": "end",
+            "label": "结束",
+            "description": "工作流终点",
+            "category": "control",
+            "icon": "Square",
+            "color": "red",
+            "is_system": True,
+        },
+        {
+            "type": "condition",
+            "label": "条件分支",
+            "description": "根据条件选择分支",
+            "category": "control",
+            "icon": "GitBranch",
+            "color": "amber",
+            "is_system": True,
+            "config_hints": {
+                "condition": {"type": "string", "default": "", "description": "条件表达式"}
+            }
+        },
+        {
+            "type": "parallel",
+            "label": "并行执行",
+            "description": "同时执行多个分支",
+            "category": "control",
+            "icon": "Layers",
+            "color": "indigo",
+            "is_system": True,
+        },
+    ]
+
+    # 返回数据（添加版本号便于调试）
+    result = {
+        "version": "v9.0",
+        "agent_nodes": agent_nodes,
+        "character_nodes": character_nodes,
+        "interaction_nodes": interaction_nodes,
+        "control_nodes": control_nodes,
+    }
+
+    logger.info(f"返回节点类型: {len(agent_nodes)} 个 Agent 节点")
+    return result
+
+
 # ==================== 工作流定义 API ====================
 
 @router.get("", response_model=List[Dict[str, Any]])
@@ -208,6 +487,56 @@ async def validate_workflow(workflow_id: str):
 
 # ==================== 工作流执行 API ====================
 
+async def _setup_agent_provider_for_execution(project_id: str):
+    """
+    为工作流执行设置 Agent provider
+
+    创建 DirectorSystem 实例并设置 Agent provider 回调
+    """
+    from app.services.workflow_engine import get_workflow_engine
+    from app.services.director import DirectorSystem
+    from app.config import settings
+    from app.api.app import postgres_db
+
+    # 创建 DirectorSystem 实例
+    director = DirectorSystem(
+        world_data={"id": f"world_workflow_{project_id}", "name": "Workflow World", "regions": [], "relationships": {}},
+        config={
+            "max_turns_threshold": settings.max_turns_threshold,
+            "target_word_count_per_intent": settings.target_word_count_per_intent,
+        },
+        project_id=project_id,
+    )
+
+    # 初始化 DirectorSystem
+    from app.services.model_router import create_model_factory
+    model_factory = create_model_factory()
+
+    # 加载角色
+    characters = []
+    if postgres_db:
+        try:
+            characters = await postgres_db.get_all_characters(project_id)
+        except Exception as e:
+            logger.warning(f"加载角色失败: {e}")
+
+    await director.initialize(model_factory, characters=characters)
+    logger.info(f"DirectorSystem 已为工作流初始化: project_id={project_id}, characters={len(characters)}")
+
+    # 设置 Agent provider
+    engine = get_workflow_engine()
+
+    async def _agent_provider_wrapper(agent_type: str, proj_id: str):
+        """Agent provider 包装器"""
+        from app.api.routes.websocket import create_agent_provider
+        provider = await create_agent_provider(director)
+        return await provider(agent_type, proj_id)
+
+    engine.set_agent_provider(_agent_provider_wrapper)
+
+    return director
+
+
 @router.post("/{workflow_id}/execute", response_model=Dict[str, Any])
 async def execute_workflow(
     workflow_id: str,
@@ -229,6 +558,9 @@ async def execute_workflow(
     db = get_db()
 
     try:
+        # 初始化 Agent provider
+        await _setup_agent_provider_for_execution(project_id)
+
         execution_id = await engine.execute_workflow(
             workflow_id,
             project_id,

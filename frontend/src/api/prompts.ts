@@ -9,13 +9,14 @@ const API_BASE = '/prompts'
 
 // ==================== 类型定义 ====================
 
+// 与后端 PromptCategory 枚举保持一致
 export type PromptCategory =
-  | 'role_definition'
-  | 'function'
-  | 'constraint'
-  | 'style'
-  | 'context'
-  | 'output_format'
+  | 'base'        // 基础 prompt
+  | 'role'        // 角色定义
+  | 'function'    // 功能规范
+  | 'value'       // 价值观/风格
+  | 'output'      // 输出格式
+  | 'constraint'  // 约束条件
 
 export interface PromptVariable {
   name: string

@@ -3,7 +3,7 @@
  * 显示工作流节点使用指南
  */
 
-import { useState } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { useTheme } from '@/contexts/ThemeContext'
 import { Modal } from '@/components/ui'
 import {
@@ -24,7 +24,8 @@ import {
   MessageCircle,
   ChevronDown,
   ChevronRight,
-  X,
+  Zap,
+  Globe,
 } from 'lucide-react'
 
 interface HelpSection {
@@ -32,7 +33,7 @@ interface HelpSection {
   title: string
   icon?: React.ReactNode
   content: React.ReactNode
-  subsections?: HelpSection[]
+  defaultExpanded?: boolean
 }
 
 export default function WorkflowHelp() {
@@ -40,6 +41,7 @@ export default function WorkflowHelp() {
   const isDark = theme === 'dark'
   const [isOpen, setIsOpen] = useState(false)
   const [expandedSections, setExpandedSections] = useState<Set<string>>(new Set(['quick-start']))
+  const contentRef = useRef<HTMLDivElement>(null)
 
   const toggleSection = (id: string) => {
     setExpandedSections((prev) => {
@@ -53,45 +55,12 @@ export default function WorkflowHelp() {
     })
   }
 
-  const Section = ({ section, level = 0 }: { section: HelpSection; level?: number }) => {
-    const isExpanded = expandedSections.has(section.id)
-    const hasSubsections = section.subsections && section.subsections.length > 0
-
-    return (
-      <div className={`${level > 0 ? 'ml-4' : ''}`}>
-        <button
-          onClick={() => toggleSection(section.id)}
-          className={`w-full flex items-center gap-2 py-2 px-3 rounded-lg text-left transition-colors ${
-            isExpanded
-              ? isDark
-                ? 'bg-blue-900/30 text-blue-300'
-                : 'bg-blue-50 text-blue-700'
-              : isDark
-                ? 'hover:bg-gray-800 text-gray-300'
-                : 'hover:bg-gray-50 text-gray-700'
-          }`}
-        >
-          {hasSubsections && (
-            <span className="w-4 h-4">
-              {isExpanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
-            </span>
-          )}
-          {!hasSubsections && <span className="w-4" />}
-          {section.icon}
-          <span className="font-medium">{section.title}</span>
-        </button>
-
-        {isExpanded && (
-          <div className={`mt-1 mb-2 ${hasSubsections ? '' : 'px-3 py-2'}`}>
-            {section.content}
-            {hasSubsections && section.subsections!.map((sub) => (
-              <Section key={sub.id} section={sub} level={level + 1} />
-            ))}
-          </div>
-        )}
-      </div>
-    )
-  }
+  // 防止滚动跳动
+  useEffect(() => {
+    if (isOpen && contentRef.current) {
+      contentRef.current.scrollTop = 0
+    }
+  }, [isOpen])
 
   const NodeCard = ({
     icon,
@@ -129,6 +98,7 @@ export default function WorkflowHelp() {
       id: 'quick-start',
       title: '快速入门',
       icon: <Play size={16} />,
+      defaultExpanded: true,
       content: (
         <div className="space-y-3">
           <ol className={`list-decimal list-inside space-y-2 text-sm ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
@@ -185,33 +155,6 @@ export default function WorkflowHelp() {
           />
         </div>
       ),
-      subsections: [
-        {
-          id: 'condition-detail',
-          title: '条件分支详解',
-          icon: <GitBranch size={14} />,
-          content: (
-            <div className="space-y-2 text-sm">
-              <p className={isDark ? 'text-gray-300' : 'text-gray-600'}>
-                条件分支节点是实现质量评估循环的核心：
-              </p>
-              <ol className={`list-decimal list-inside space-y-1 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
-                <li>从节点<strong>左侧</strong>拖线到「通过」目标</li>
-                <li>从节点<strong>右侧</strong>拖线到「重试」目标</li>
-                <li>选中连线，在右侧面板设置条件结果</li>
-              </ol>
-              <div className={`p-2 rounded mt-2 font-mono text-xs ${isDark ? 'bg-gray-900' : 'bg-gray-100'}`}>
-                <pre>{`开始 → 作家 → 评估员 → 条件判断 → 结束
-                    ↓ retry
-                   作家 ←──重试循环──┘`}</pre>
-              </div>
-              <p className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
-                ⚠️ 重试最多 3 次，超过后自动通过
-              </p>
-            </div>
-          ),
-        },
-      ],
     },
     {
       id: 'agent-nodes',
@@ -225,14 +168,17 @@ export default function WorkflowHelp() {
             </p>
           </div>
           <div className="grid grid-cols-2 gap-2">
-            <NodeCard icon={<GitBranch size={14} />} name="总编剧" color="purple" description="规划剧情大纲、章节结构" />
+            <NodeCard icon={<GitBranch size={14} />} name="总编剧" color="purple" description="规划整体剧情架构" />
             <NodeCard icon={<PenTool size={14} />} name="作家" color="green" description="执行章节内容写作" />
-            <NodeCard icon={<BookOpen size={14} />} name="摘要员" color="cyan" description="生成内容摘要" />
-            <NodeCard icon={<Search size={14} />} name="评估员" color="red" description="评估内容质量" />
-            <NodeCard icon={<Link size={14} />} name="伏笔管理员" color="orange" description="管理伏笔埋设回收" />
-            <NodeCard icon={<Settings size={14} />} name="设定管理员" color="blue" description="维护世界观设定" />
-            <NodeCard icon={<Dices size={14} />} name="事件生成器" color="pink" description="生成故事事件" />
-            <NodeCard icon={<Map size={14} />} name="地图管理员" color="teal" description="管理地点空间" />
+            <NodeCard icon={<BookOpen size={14} />} name="摘要" color="cyan" description="生成内容摘要" />
+            <NodeCard icon={<Search size={14} />} name="评估" color="orange" description="评估内容质量" />
+            <NodeCard icon={<Link size={14} />} name="伏笔" color="amber" description="管理伏笔埋设回收" />
+            <NodeCard icon={<Settings size={14} />} name="设定" color="blue" description="维护世界观设定" />
+            <NodeCard icon={<Dices size={14} />} name="事件" color="pink" description="生成故事事件" />
+            <NodeCard icon={<Map size={14} />} name="地图" color="teal" description="管理地点空间" />
+            <NodeCard icon={<Zap size={14} />} name="过程生成" color="yellow" description="过程化生成内容" />
+            <NodeCard icon={<Globe size={14} />} name="副本生成" color="emerald" description="生成副本和关卡" />
+            <NodeCard icon={<BookOpen size={14} />} name="章节大纲" color="rose" description="规划章节大纲" />
           </div>
         </div>
       ),
@@ -247,7 +193,7 @@ export default function WorkflowHelp() {
             icon={<Users size={14} />}
             name="场景演绎"
             color="rose"
-            description="多角色同台演绎场景，自动协调角色Agent"
+            description="多角色同台演绎场景，自动协调角色表演"
             usage="在属性面板选择参与角色"
           />
           <div className={`p-2 rounded text-xs ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
@@ -255,6 +201,9 @@ export default function WorkflowHelp() {
               <strong>场景模式：</strong><br />
               • <strong>互动模式</strong>：角色之间有互动对话<br />
               • <strong>并行模式</strong>：各角色独立行动
+            </p>
+            <p className={`mt-2 ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+              💡 场景演绎节点会自动调用角色Agent进行表演，无需单独使用角色节点
             </p>
           </div>
           <NodeCard
@@ -297,37 +246,262 @@ export default function WorkflowHelp() {
     },
     {
       id: 'examples',
-      title: '典型示例',
+      title: '典型工作流示例',
       icon: <BookOpen size={16} />,
       content: (
         <div className="space-y-4">
+          {/* 示例1：基础写作流程 */}
           <div className={`p-3 rounded-lg ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
             <h4 className={`font-semibold mb-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>
-              示例 1：简单写作流程
+              示例 1：基础写作流程
             </h4>
-            <div className={`font-mono text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
-              开始 → 设定管理员 → 总编剧 → 作家 → 结束
+            <div className={`font-mono text-xs mb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+              开始 → 设定 → 总编剧 → 作家 → 结束
+            </div>
+            <p className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+              最简单的线性流程，适合快速生成短篇内容
+            </p>
+          </div>
+
+          {/* 示例2：标准创作流程 */}
+          <div className={`p-3 rounded-lg ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
+            <h4 className={`font-semibold mb-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>
+              示例 2：标准创作流程
+            </h4>
+            <div className={`font-mono text-xs mb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+              <pre>{`开始
+  ↓
+设定 → 伏笔
+  ↓      ↓
+总编剧 → 事件
+  ↓
+章节大纲
+  ↓
+作家
+  ↓
+评估 → 条件判断 → (retry) → 作家
+  ↓ pass
+摘要
+  ↓
+结束`}</pre>
+            </div>
+            <p className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+              包含评估循环的完整创作流程，确保内容质量
+            </p>
+          </div>
+
+          {/* 示例3：并行准备流程 */}
+          <div className={`p-3 rounded-lg ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
+            <h4 className={`font-semibold mb-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>
+              示例 3：并行准备流程
+            </h4>
+            <div className={`font-mono text-xs mb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+              <pre>{`         ┌→ 设定 ──────┐
+         │              │
+开始 → 并行 ──→ 事件 ────┼→ 场景演绎 → 结束
+         │              │
+         └→ 地图 ──────┘`}</pre>
+            </div>
+            <p className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+              并行准备设定、事件、地图等素材，然后进行场景演绎（自动协调角色表演）
+            </p>
+          </div>
+
+          {/* 示例4：完整小说创作流程 */}
+          <div className={`p-3 rounded-lg ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
+            <h4 className={`font-semibold mb-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>
+              示例 4：完整小说创作流程
+            </h4>
+            <div className={`font-mono text-xs mb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+              <pre>{`开始
+  ↓
+     ┌─────────── 并行 ───────────┐
+     ↓            ↓              ↓
+   设定        伏笔           地图
+     ↓            ↓              ↓
+     └─────────── 并行 ───────────┘
+                   ↓
+               总编剧
+                   ↓
+              章节大纲
+                   ↓
+     ┌─────────── 并行 ───────────┐
+     ↓            ↓              ↓
+   事件        过程生成       副本生成
+     ↓            ↓              ↓
+     └─────────── 并行 ───────────┘
+                   ↓
+              场景演绎
+                   ↓
+                作家
+                   ↓
+                评估 → 条件判断 → (retry) → 作家
+                   ↓ pass
+                摘要
+                   ↓
+            ┌─────判断─────┐
+            ↓              ↓
+        (继续下章)      (完结)
+            ↓              ↓
+        章节大纲 ←────    结束
+            ↓
+        循环...`}</pre>
+            </div>
+            <p className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+              最完整的小说创作流程，包含所有Agent节点的协作
+            </p>
+          </div>
+
+          {/* 示例5：副本生成流程 */}
+          <div className={`p-3 rounded-lg ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
+            <h4 className={`font-semibold mb-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>
+              示例 5：副本/关卡生成流程
+            </h4>
+            <div className={`font-mono text-xs mb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+              <pre>{`开始
+  ↓
+设定
+  ↓
+地图
+  ↓
+     ┌───── 并行 ─────┐
+     ↓                ↓
+ 过程生成        副本生成
+     ↓                ↓
+     └───── 并行 ─────┘
+            ↓
+        事件
+            ↓
+        场景演绎
+            ↓
+        作家
+            ↓
+        评估 → 条件判断
+            ↓ pass
+        结束`}</pre>
+            </div>
+            <p className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+              适合游戏副本、冒险关卡的内容生成
+            </p>
+          </div>
+
+          {/* 示例6：集体讨论流程 */}
+          <div className={`p-3 rounded-lg ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
+            <h4 className={`font-semibold mb-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>
+              示例 6：集体讨论流程
+            </h4>
+            <div className={`font-mono text-xs mb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+              <pre>{`开始
+  ↓
+设定
+  ↓
+     ┌─────── 集体讨论 ───────┐
+     │   (总编剧+章节大纲+作家)   │
+     └───────────────────────┘
+            ↓
+        章节大纲
+            ↓
+        作家
+            ↓
+        结束`}</pre>
+            </div>
+            <p className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+              多个Agent共同讨论后再进行创作
+            </p>
+          </div>
+        </div>
+      ),
+    },
+    {
+      id: 'node-order',
+      title: '节点推荐顺序',
+      icon: <Layers size={16} />,
+      content: (
+        <div className="space-y-4">
+          <div className={`p-3 rounded-lg ${isDark ? 'bg-blue-900/30' : 'bg-blue-50'}`}>
+            <p className={`text-sm ${isDark ? 'text-blue-300' : 'text-blue-700'}`}>
+              以下是各类节点在工作流中的推荐执行顺序
+            </p>
+          </div>
+
+          {/* 前期准备阶段 */}
+          <div className={`p-3 rounded-lg border ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+            <h4 className={`font-semibold mb-2 ${isDark ? 'text-green-400' : 'text-green-600'}`}>
+              📋 前期准备阶段
+            </h4>
+            <div className={`text-sm space-y-1 ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
+              <p>1. <strong>设定</strong> - 加载世界观设定</p>
+              <p>2. <strong>地图</strong> - 确认地点信息</p>
+              <p>3. <strong>伏笔</strong> - 准备伏笔池</p>
+              <p>4. <strong>事件</strong> - 生成事件池</p>
+              <p className="text-xs opacity-70 mt-2">💡 这些节点可以并行执行</p>
             </div>
           </div>
 
-          <div className={`p-3 rounded-lg ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
-            <h4 className={`font-semibold mb-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>
-              示例 2：带评估循环
+          {/* 规划阶段 */}
+          <div className={`p-3 rounded-lg border ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+            <h4 className={`font-semibold mb-2 ${isDark ? 'text-purple-400' : 'text-purple-600'}`}>
+              🎯 规划阶段
             </h4>
-            <div className={`font-mono text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
-              <pre>{`开始 → 作家 → 评估员 → 条件判断 → 结束
-                      ↑_______↓ retry`}</pre>
+            <div className={`text-sm space-y-1 ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
+              <p>1. <strong>总编剧</strong> - 整体剧情架构</p>
+              <p>2. <strong>章节大纲</strong> - 章节细纲与场景规划</p>
             </div>
           </div>
 
+          {/* 执行阶段 */}
+          <div className={`p-3 rounded-lg border ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+            <h4 className={`font-semibold mb-2 ${isDark ? 'text-orange-400' : 'text-orange-600'}`}>
+              ✍️ 执行阶段
+            </h4>
+            <div className={`text-sm space-y-1 ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
+              <p>1. <strong>事件</strong> - 事件生成</p>
+              <p>2. <strong>过程生成</strong> - 动态生成内容</p>
+              <p>3. <strong>副本生成</strong> - 关卡/副本内容</p>
+              <p>4. <strong>场景演绎</strong> - 多角色场景表演（自动协调角色）</p>
+              <p>5. <strong>作家</strong> - 最终输出</p>
+            </div>
+          </div>
+
+          {/* 评估阶段 */}
+          <div className={`p-3 rounded-lg border ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+            <h4 className={`font-semibold mb-2 ${isDark ? 'text-red-400' : 'text-red-600'}`}>
+              🔍 评估阶段
+            </h4>
+            <div className={`text-sm space-y-1 ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
+              <p>1. <strong>评估</strong> - 质量检查</p>
+              <p>2. <strong>条件判断</strong> - 通过/重试</p>
+              <p>3. <strong>摘要</strong> - 内容摘要（通过后）</p>
+            </div>
+          </div>
+
+          {/* 完整顺序图 */}
           <div className={`p-3 rounded-lg ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
             <h4 className={`font-semibold mb-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>
-              示例 3：并行准备
+              完整推荐顺序
             </h4>
             <div className={`font-mono text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
-              <pre>{`         ┌→ 设定管理员 ┐
-开始 → 并行 ──┼→ 事件生成器 ─┼→ 场景演绎 → 结束
-         └→ 地图管理员 ┘`}</pre>
+              <pre>{`设定/地图/伏笔/事件 (并行)
+        ↓
+      总编剧
+        ↓
+     章节大纲
+        ↓
+事件/过程生成/副本生成 (并行)
+        ↓
+     场景演绎
+        ↓
+       作家
+        ↓
+       评估
+        ↓
+    条件判断
+   ↙      ↘
+retry      pass
+  ↓          ↓
+作家       摘要
+            ↓
+          结束`}</pre>
             </div>
           </div>
         </div>
@@ -345,11 +519,19 @@ export default function WorkflowHelp() {
           </div>
           <div>
             <p className={`font-semibold ${isDark ? 'text-white' : 'text-gray-800'}`}>Q: 条件分支不工作？</p>
-            <p className={isDark ? 'text-gray-400' : 'text-gray-600'}>A: 检查评估员是否正确连接，确保两条出边都设置了条件</p>
+            <p className={isDark ? 'text-gray-400' : 'text-gray-600'}>A: 检查评估节点是否正确连接，确保两条出边都设置了条件</p>
           </div>
           <div>
             <p className={`font-semibold ${isDark ? 'text-white' : 'text-gray-800'}`}>Q: 场景演绎如何选择角色？</p>
             <p className={isDark ? 'text-gray-400' : 'text-gray-600'}>A: 需先在「角色管理」创建角色，然后在节点属性面板选择</p>
+          </div>
+          <div>
+            <p className={`font-semibold ${isDark ? 'text-white' : 'text-gray-800'}`}>Q: 重试次数有限制吗？</p>
+            <p className={isDark ? 'text-gray-400' : 'text-gray-600'}>A: 重试最多 3 次，超过后自动通过</p>
+          </div>
+          <div>
+            <p className={`font-semibold ${isDark ? 'text-white' : 'text-gray-800'}`}>Q: 哪些节点可以并行？</p>
+            <p className={isDark ? 'text-gray-400' : 'text-gray-600'}>A: 设定、地图、伏笔、事件等准备类节点适合并行；总编剧→章节大纲→作家等依赖类节点需要顺序执行</p>
           </div>
         </div>
       ),
@@ -374,18 +556,46 @@ export default function WorkflowHelp() {
 
       {/* 帮助模态框 */}
       <Modal isOpen={isOpen} onClose={() => setIsOpen(false)} title="工作流使用指南" size="xl">
-        <div className={`h-[70vh] overflow-y-auto ${isDark ? 'bg-gray-900' : 'bg-white'}`}>
+        <div className={`h-[70vh] overflow-y-auto ${isDark ? 'bg-gray-900' : 'bg-white'}`} ref={contentRef}>
           <div className="p-4 space-y-2">
-            {helpSections.map((section) => (
-              <Section key={section.id} section={section} />
-            ))}
+            {helpSections.map((section) => {
+              const isExpanded = expandedSections.has(section.id)
+              return (
+                <div key={section.id}>
+                  <button
+                    onClick={() => toggleSection(section.id)}
+                    className={`w-full flex items-center gap-2 py-2 px-3 rounded-lg text-left transition-colors ${
+                      isExpanded
+                        ? isDark
+                          ? 'bg-blue-900/30 text-blue-300'
+                          : 'bg-blue-50 text-blue-700'
+                        : isDark
+                          ? 'hover:bg-gray-800 text-gray-300'
+                          : 'hover:bg-gray-50 text-gray-700'
+                    }`}
+                  >
+                    <span className="w-4 h-4 flex-shrink-0">
+                      {isExpanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                    </span>
+                    {section.icon}
+                    <span className="font-medium">{section.title}</span>
+                  </button>
+
+                  {isExpanded && (
+                    <div className="mt-1 mb-2 px-3 py-2">
+                      {section.content}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
           </div>
         </div>
 
         {/* 底部操作 */}
         <div className={`flex justify-between items-center p-4 border-t ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
           <p className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
-            详细文档：docs/workflow-node-guide.md
+            点击标题展开/折叠详细内容
           </p>
           <button
             onClick={() => setIsOpen(false)}

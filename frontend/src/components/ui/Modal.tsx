@@ -1,4 +1,5 @@
 import { ReactNode } from 'react'
+import { createPortal } from 'react-dom'
 import { X } from 'lucide-react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { useTheme } from '@/contexts/ThemeContext'
@@ -25,10 +26,10 @@ export function Modal({ isOpen, onClose, title, children, size = 'md', className
     '3xl': 'max-w-6xl',
   }
 
-  return (
+  const modalContent = (
     <AnimatePresence>
       {isOpen && (
-        <div className="fixed inset-0 z-50 overflow-y-auto">
+        <div className="fixed inset-0 z-[9999] overflow-y-auto">
           <div className="flex min-h-screen items-center justify-center p-4">
             {/* 背景遮罩 */}
             <motion.div
@@ -72,4 +73,7 @@ export function Modal({ isOpen, onClose, title, children, size = 'md', className
       )}
     </AnimatePresence>
   )
+
+  // 使用 Portal 渲染到 body，避免被父容器裁剪
+  return createPortal(modalContent, document.body)
 }

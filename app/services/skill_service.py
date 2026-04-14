@@ -18,6 +18,7 @@ from app.models.skill import (
     SkillType,
     SkillStatus,
     SkillCategory,
+    SkillLoadMode,
     CreateSkillDTO,
     UpdateSkillDTO,
     AssignSkillDTO,
@@ -67,15 +68,29 @@ class SkillService:
 
     def _row_to_skill(self, row: Dict) -> Skill:
         """将数据库行转换为 Skill 对象"""
+        skill_id = row['id']
+
+        # 运行时读取策略：
+        # 1. 优先使用数据库内容（完整持久化）
+        # 2. 数据库为空时，从 MD 文件读取（回退）
+        prompt_template = row.get('prompt_template')
+
+        if not prompt_template:
+            # 数据库为空，尝试从 MD 文件读取
+            md_content = self._try_load_md_content(skill_id)
+            if md_content is not None:
+                prompt_template = md_content
+                logger.debug(f"从 MD 文件加载 Skill 内容: {skill_id}")
+
         return Skill(
-            id=row['id'],
+            id=skill_id,
             name=row['name'],
             description=row['description'] or '',
             skill_type=SkillType(row['skill_type']),
             category=SkillCategory(row.get('category', 'general')),
             tags=json.loads(row.get('tags', '[]')) if isinstance(row.get('tags'), str) else row.get('tags', []),
             applicable_agent_types=json.loads(row.get('applicable_agent_types', '[]')) if isinstance(row.get('applicable_agent_types'), str) else row.get('applicable_agent_types', []),
-            prompt_template=row.get('prompt_template'),
+            prompt_template=prompt_template,
             prompt_template_id=row.get('prompt_template_id'),
             function_code=row.get('function_code'),
             workflow_steps=json.loads(row.get('workflow_steps', 'null')) if isinstance(row.get('workflow_steps'), str) else row.get('workflow_steps'),
@@ -91,6 +106,9 @@ class SkillService:
             is_system=row.get('is_system', False),
             is_enabled=row.get('is_enabled', True),
             is_composable=row.get('is_composable', True),
+            load_mode=SkillLoadMode(row.get('load_mode', 'on_demand')),
+            trigger_keywords=json.loads(row.get('trigger_keywords', '[]')) if isinstance(row.get('trigger_keywords'), str) else row.get('trigger_keywords', []),
+            trigger_scenes=json.loads(row.get('trigger_scenes', '[]')) if isinstance(row.get('trigger_scenes'), str) else row.get('trigger_scenes', []),
             creator_project_id=row.get('creator_project_id'),
             creator_agent_id=row.get('creator_agent_id'),
             creator_user_id=row.get('creator_user_id'),
@@ -102,6 +120,24 @@ class SkillService:
             created_at=row.get('created_at', datetime.now()),
             updated_at=row.get('updated_at', datetime.now()),
         )
+
+    def _try_load_md_content(self, skill_id: str) -> Optional[str]:
+        """
+        尝试从 MD 文件加载 Skill 内容
+
+        Args:
+            skill_id: Skill ID
+
+        Returns:
+            Optional[str]: MD 文件内容，如果不存在则返回 None
+        """
+        try:
+            from app.services.md_file_service import get_md_file_service
+            md_service = get_md_file_service()
+            return md_service.get_skill_content(skill_id)
+        except Exception as e:
+            logger.debug(f"从 MD 文件加载失败 {skill_id}: {e}")
+            return None
 
     def _skill_to_db_dict(self, skill: Skill) -> Dict:
         """将 Skill 对象转换为数据库字典"""
@@ -129,6 +165,9 @@ class SkillService:
             'is_system': skill.is_system,
             'is_enabled': skill.is_enabled,
             'is_composable': skill.is_composable,
+            'load_mode': skill.load_mode.value,
+            'trigger_keywords': json.dumps(skill.trigger_keywords, ensure_ascii=False),
+            'trigger_scenes': json.dumps(skill.trigger_scenes, ensure_ascii=False),
             'creator_project_id': skill.creator_project_id,
             'creator_agent_id': skill.creator_agent_id,
             'creator_user_id': skill.creator_user_id,
@@ -174,6 +213,9 @@ class SkillService:
             status=SkillStatus.DRAFT,
             is_enabled=True,
             is_composable=dto.is_composable if dto.is_composable is not None else True,
+            load_mode=dto.load_mode or SkillLoadMode.ON_DEMAND,
+            trigger_keywords=dto.trigger_keywords or [],
+            trigger_scenes=dto.trigger_scenes or [],
             examples=dto.examples or [],
             creator_project_id=dto.creator_project_id,
             creator_agent_id=dto.creator_agent_id,
@@ -367,6 +409,8 @@ class SkillService:
             execution_condition=dto.execution_condition,
             is_enabled=dto.is_enabled if dto.is_enabled is not None else True,
             is_required=dto.is_required if dto.is_required is not None else False,
+            load_mode=dto.load_mode,
+            trigger_keywords=dto.trigger_keywords or [],
         )
 
         # 存入数据库
@@ -376,12 +420,13 @@ class SkillService:
                     """
                     INSERT INTO skill_assignments
                     (id, skill_id, agent_type, slot_name, custom_parameters, variable_overrides,
-                     priority, execution_condition, is_enabled, is_required)
+                     priority, execution_condition, is_enabled, is_required, load_mode, trigger_keywords)
                     VALUES (:id, :skill_id, :agent_type, :slot_name, :custom_parameters, :variable_overrides,
-                     :priority, :execution_condition, :is_enabled, :is_required)
+                     :priority, :execution_condition, :is_enabled, :is_required, :load_mode, :trigger_keywords)
                     ON CONFLICT (skill_id, agent_type, slot_name) DO UPDATE SET
                     custom_parameters = :custom_parameters, variable_overrides = :variable_overrides, priority = :priority,
-                    execution_condition = :execution_condition, is_enabled = :is_enabled, is_required = :is_required
+                    execution_condition = :execution_condition, is_enabled = :is_enabled, is_required = :is_required,
+                    load_mode = :load_mode, trigger_keywords = :trigger_keywords
                     """,
                     {
                         "id": assignment_id,
@@ -394,6 +439,8 @@ class SkillService:
                         "execution_condition": dto.execution_condition,
                         "is_enabled": dto.is_enabled if dto.is_enabled is not None else True,
                         "is_required": dto.is_required if dto.is_required is not None else False,
+                        "load_mode": dto.load_mode.value if dto.load_mode else None,
+                        "trigger_keywords": json.dumps(dto.trigger_keywords or [], ensure_ascii=False),
                     }
                 )
             except Exception as e:
@@ -424,6 +471,200 @@ class SkillService:
         result.sort(key=lambda x: -x.priority)
         return result
 
+    async def get_assigned_skills_for_agent(
+        self,
+        agent_type: str,
+    ) -> List[tuple[Skill, SkillAssignment]]:
+        """
+        获取已分配给某个 Agent 类型的 Skill 及其分配配置
+
+        只返回已通过插槽分配的 Skill，确保插槽绑定约束。
+
+        Args:
+            agent_type: Agent 类型
+
+        Returns:
+            List[tuple[Skill, SkillAssignment]]: (Skill, Assignment) 元组列表
+        """
+        await self._ensure_cache()
+
+        if not self._db:
+            return []
+
+        try:
+            rows = await self._db.execute_query(
+                """
+                SELECT sa.*, s.*
+                FROM skill_assignments sa
+                JOIN skills s ON sa.skill_id = s.id
+                WHERE sa.agent_type = :agent_type
+                  AND sa.is_enabled = true
+                  AND s.status = 'active'
+                  AND s.is_enabled = true
+                ORDER BY sa.priority DESC, s.priority DESC
+                """,
+                {"agent_type": agent_type}
+            )
+
+            results = []
+            for row in rows:
+                # 构建 Skill 对象（使用 skills 表的字段）
+                skill_data = {
+                    'id': row['skill_id'],
+                    'name': row['name'],
+                    'description': row.get('description', ''),
+                    'skill_type': row.get('skill_type', 'prompt'),
+                    'category': row.get('category', 'general'),
+                    'tags': row.get('tags', '[]'),
+                    'applicable_agent_types': row.get('applicable_agent_types', '[]'),
+                    'prompt_template': row.get('prompt_template'),
+                    'prompt_template_id': row.get('prompt_template_id'),
+                    'function_code': row.get('function_code'),
+                    'workflow_steps': row.get('workflow_steps'),
+                    'knowledge_content': row.get('knowledge_content'),
+                    'parameters': row.get('parameters', '[]'),
+                    'output_spec': row.get('output_spec', '[]'),
+                    'temperature': row.get('temperature', 0.7),
+                    'max_tokens': row.get('max_tokens'),
+                    'timeout': row.get('timeout', 60),
+                    'retry_count': row.get('retry_count', 0),
+                    'priority': row.get('priority', 50),
+                    'status': row.get('status', 'active'),
+                    'is_system': row.get('is_system', False),
+                    'is_enabled': row.get('is_enabled', True),
+                    'is_composable': row.get('is_composable', True),
+                    'load_mode': row.get('load_mode', 'on_demand'),
+                    'trigger_keywords': row.get('trigger_keywords', '[]'),
+                    'trigger_scenes': row.get('trigger_scenes', '[]'),
+                    'creator_project_id': row.get('creator_project_id'),
+                    'creator_agent_id': row.get('creator_agent_id'),
+                    'creator_user_id': row.get('creator_user_id'),
+                    'version': row.get('version', '1.0.0'),
+                    'author': row.get('author', 'system'),
+                    'examples': row.get('examples', '[]'),
+                    'usage_count': row.get('usage_count', 0),
+                    'last_used_at': row.get('last_used_at'),
+                    'created_at': row.get('created_at', datetime.now()),
+                    'updated_at': row.get('updated_at', datetime.now()),
+                }
+                skill = self._row_to_skill(skill_data)
+
+                # 构建 SkillAssignment 对象（使用 skill_assignments 表的字段）
+                assignment_data = {
+                    'id': row['id'],
+                    'skill_id': row['skill_id'],
+                    'agent_type': row['agent_type'],
+                    'slot_name': row.get('slot_name', ''),
+                    'custom_parameters': row.get('custom_parameters', '{}'),
+                    'variable_overrides': row.get('variable_overrides', '{}'),
+                    'priority': row.get('priority', 50),
+                    'execution_condition': row.get('execution_condition'),
+                    'is_enabled': row.get('is_enabled', True),
+                    'is_required': row.get('is_required', False),
+                    'load_mode': row.get('load_mode'),  # assignment 表可能有自己的覆盖
+                    'trigger_keywords': row.get('trigger_keywords', '[]'),
+                    'assigned_by': row.get('assigned_by', 'user'),
+                    'assigned_at': row.get('assigned_at', datetime.now()),
+                }
+                assignment = self._row_to_assignment(assignment_data)
+
+                results.append((skill, assignment))
+
+            logger.info(f"获取 Agent {agent_type} 的已分配 Skills: {len(results)} 个")
+            return results
+
+        except Exception as e:
+            logger.error(f"获取 Agent 分配的 Skills 失败: {e}")
+            return []
+
+    async def get_core_skills_for_agent(self, agent_type: str) -> List[Skill]:
+        """
+        获取 Agent 的核心层 Skills（始终加载）
+
+        核心层 Skills 满足以下条件之一：
+        1. Skill 本身的 load_mode = CORE
+        2. 分配配置中 load_mode 覆盖为 CORE
+
+        Args:
+            agent_type: Agent 类型
+
+        Returns:
+            List[Skill]: 核心 Skills 列表
+        """
+        assigned_skills = await self.get_assigned_skills_for_agent(agent_type)
+
+        core_skills = []
+        for skill, assignment in assigned_skills:
+            # 检查分配配置中的 load_mode 覆盖
+            if assignment.load_mode == SkillLoadMode.CORE:
+                core_skills.append(skill)
+            # 如果分配配置未覆盖，使用 Skill 本身的 load_mode
+            elif assignment.load_mode is None and skill.load_mode == SkillLoadMode.CORE:
+                core_skills.append(skill)
+
+        logger.info(f"获取 Agent {agent_type} 的核心 Skills: {len(core_skills)} 个")
+        return core_skills
+
+    async def get_on_demand_skills_for_agent(
+        self,
+        agent_type: str,
+        context_keywords: Optional[List[str]] = None,
+        context_scene: Optional[str] = None,
+    ) -> List[Skill]:
+        """
+        获取 Agent 的按需加载 Skills（根据上下文关键词/场景匹配）
+
+        按需层 Skills 满足以下条件：
+        1. load_mode = ON_DEMAND
+        2. trigger_keywords 或 trigger_scenes 匹配当前上下文
+
+        Args:
+            agent_type: Agent 类型
+            context_keywords: 上下文关键词列表
+            context_scene: 当前场景类型
+
+        Returns:
+            List[Skill]: 匹配的按需 Skills 列表
+        """
+        assigned_skills = await self.get_assigned_skills_for_agent(agent_type)
+
+        on_demand_skills = []
+        for skill, assignment in assigned_skills:
+            # 确定加载模式（分配配置优先）
+            load_mode = assignment.load_mode or skill.load_mode
+
+            if load_mode != SkillLoadMode.ON_DEMAND:
+                continue
+
+            # 获取触发条件（分配配置可覆盖）
+            trigger_keywords = assignment.trigger_keywords if assignment.trigger_keywords else skill.trigger_keywords
+            trigger_scenes = skill.trigger_scenes  # 场景只在 Skill 级别定义
+
+            # 检查是否匹配
+            matched = False
+
+            # 关键词匹配
+            if context_keywords and trigger_keywords:
+                for keyword in context_keywords:
+                    if any(kw.lower() in keyword.lower() or keyword.lower() in kw.lower()
+                           for kw in trigger_keywords):
+                        matched = True
+                        break
+
+            # 场景匹配
+            if not matched and context_scene and trigger_scenes:
+                if context_scene.lower() in [s.lower() for s in trigger_scenes]:
+                    matched = True
+
+            # 如果没有设置触发条件，默认不加载
+            # 如果设置了触发条件但未提供上下文，也不加载
+
+            if matched:
+                on_demand_skills.append(skill)
+
+        logger.info(f"获取 Agent {agent_type} 的按需 Skills: {len(on_demand_skills)} 个 (关键词: {context_keywords}, 场景: {context_scene})")
+        return on_demand_skills
+
     async def get_skill_assignments(self, skill_id: str) -> List[SkillAssignment]:
         """获取 Skill 的所有分配"""
         if not self._db:
@@ -441,6 +682,11 @@ class SkillService:
 
     def _row_to_assignment(self, row: Dict) -> SkillAssignment:
         """将数据库行转换为 SkillAssignment 对象"""
+        # 解析 load_mode，可能为 None（表示使用 Skill 的默认设置）
+        load_mode = None
+        if row.get('load_mode'):
+            load_mode = SkillLoadMode(row['load_mode'])
+
         return SkillAssignment(
             id=row['id'],
             skill_id=row['skill_id'],
@@ -452,6 +698,8 @@ class SkillService:
             execution_condition=row.get('execution_condition'),
             is_enabled=row.get('is_enabled', True),
             is_required=row.get('is_required', False),
+            load_mode=load_mode,
+            trigger_keywords=json.loads(row.get('trigger_keywords', '[]')) if isinstance(row.get('trigger_keywords'), str) else row.get('trigger_keywords', []),
             assigned_by=row.get('assigned_by', 'user'),
             assigned_at=row.get('assigned_at', datetime.now()),
         )
@@ -818,6 +1066,157 @@ class SkillService:
         )
 
         return await self.create_skill_from_model(skill)
+
+    async def increment_skill_usage(self, skill_id: str):
+        """增加 Skill 的使用计数"""
+        await self._ensure_cache()
+
+        skill = self._skills_cache.get(skill_id)
+        if not skill:
+            return
+
+        # 更新内存中的计数
+        skill.usage_count += 1
+        skill.last_used_at = datetime.now()
+
+        # 更新数据库
+        if self._db:
+            try:
+                await self._db.execute_write(
+                    "UPDATE skills SET usage_count = :usage_count, last_used_at = :last_used_at WHERE id = :skill_id",
+                    {
+                        "usage_count": skill.usage_count,
+                        "last_used_at": skill.last_used_at,
+                        "skill_id": skill.id,
+                    }
+                )
+            except Exception as e:
+                logger.warning(f"更新 Skill 使用统计失败: {e}")
+
+    # ==================== MD 文件同步 ====================
+
+    async def sync_md_files_to_db(self) -> Dict[str, int]:
+        """
+        将 MD 文件同步到数据库
+
+        这个方法会：
+        1. 扫描 skills/ 目录下的所有 MD 文件
+        2. 提取 frontmatter 作为元数据
+        3. 将元数据存入数据库（prompt_template 字段可以为空）
+
+        Returns:
+            Dict[str, int]: 同步结果统计
+        """
+        if not self._db:
+            logger.warning("数据库未连接，无法同步 MD 文件")
+            return {"error": 1, "synced": 0, "skipped": 0}
+
+        try:
+            from app.services.md_file_service import get_md_file_service
+            md_service = get_md_file_service()
+            md_service.invalidate_cache()
+
+            # 获取所有 MD 文件中的 Skills
+            md_skills = md_service.list_skills()
+
+            synced = 0
+            skipped = 0
+            errors = 0
+
+            for md_skill in md_skills:
+                skill_id = md_skill['id']
+                content = md_skill.get('content', '')
+                logger.debug(f"同步 Skill: {skill_id}, 内容长度: {len(content)} 字符")
+
+                try:
+                    # 解析 skill_type
+                    skill_type_str = md_skill.get('skill_type', 'prompt')
+                    try:
+                        skill_type = SkillType(skill_type_str)
+                    except ValueError:
+                        skill_type = SkillType.PROMPT
+
+                    # 解析 category
+                    category_str = md_skill.get('category', 'general')
+                    try:
+                        category = SkillCategory(category_str)
+                    except ValueError:
+                        category = SkillCategory.GENERAL
+
+                    # 解析 load_mode
+                    load_mode_str = md_skill.get('load_mode', 'on_demand')
+                    try:
+                        load_mode = SkillLoadMode(load_mode_str)
+                    except ValueError:
+                        load_mode = SkillLoadMode.ON_DEMAND
+
+                    # 准备数据
+                    # 完整持久化：元数据 + 内容都存入数据库
+                    # MD 文件是编辑入口，数据库是运行时数据源
+                    data = {
+                        'id': skill_id,
+                        'name': md_skill.get('name', skill_id),
+                        'description': md_skill.get('description', ''),
+                        'skill_type': skill_type.value,
+                        'category': category.value,
+                        'tags': json.dumps(md_skill.get('tags', []), ensure_ascii=False),
+                        'applicable_agent_types': json.dumps(md_skill.get('applicable_agent_types', []), ensure_ascii=False),
+                        'prompt_template': md_skill.get('content', ''),  # 完整内容存入数据库
+                        'prompt_template_id': md_skill.get('prompt_template_id'),
+                        'function_code': md_skill.get('function_code'),
+                        'workflow_steps': json.dumps(md_skill.get('workflow_steps'), ensure_ascii=False) if md_skill.get('workflow_steps') else None,
+                        'knowledge_content': md_skill.get('knowledge_content'),
+                        'parameters': json.dumps(md_skill.get('parameters', []), ensure_ascii=False),
+                        'output_spec': json.dumps(md_skill.get('output_spec', []), ensure_ascii=False),
+                        'temperature': md_skill.get('temperature', 0.7),
+                        'max_tokens': md_skill.get('max_tokens'),
+                        'timeout': md_skill.get('timeout', 60),
+                        'retry_count': md_skill.get('retry_count', 0),
+                        'priority': md_skill.get('priority', 50),
+                        'status': md_skill.get('status', 'active'),
+                        'is_system': md_skill.get('is_system', True),
+                        'is_enabled': md_skill.get('is_enabled', True),
+                        'is_composable': md_skill.get('is_composable', True),
+                        'load_mode': load_mode.value,
+                        'trigger_keywords': json.dumps(md_skill.get('trigger_keywords', []), ensure_ascii=False),
+                        'trigger_scenes': json.dumps(md_skill.get('trigger_scenes', []), ensure_ascii=False),
+                        'version': md_skill.get('version', '1.0.0'),
+                        'author': md_skill.get('author', 'system'),
+                        'examples': json.dumps(md_skill.get('examples', []), ensure_ascii=False),
+                    }
+
+                    # UPSERT
+                    columns = ', '.join(data.keys())
+                    placeholders = ', '.join([f':{k}' for k in data.keys()])
+                    update_clauses = ', '.join([
+                        f"{k} = :{k}" for k in data.keys() if k != 'id'
+                    ])
+
+                    await self._db.execute_write(
+                        f"""
+                        INSERT INTO skills ({columns})
+                        VALUES ({placeholders})
+                        ON CONFLICT (id) DO UPDATE SET {update_clauses}
+                        """,
+                        data
+                    )
+
+                    synced += 1
+                    logger.debug(f"同步 Skill 到数据库: {skill_id}")
+
+                except Exception as e:
+                    errors += 1
+                    logger.error(f"同步 Skill {skill_id} 失败: {e}")
+
+            # 刷新缓存
+            self.invalidate_cache()
+
+            logger.info(f"MD 文件同步完成: {synced} 个成功, {skipped} 个跳过, {errors} 个错误")
+            return {"synced": synced, "skipped": skipped, "errors": errors}
+
+        except Exception as e:
+            logger.error(f"同步 MD 文件失败: {e}")
+            return {"error": 1, "synced": 0, "skipped": 0}
 
 
 # 全局单例

@@ -458,35 +458,41 @@ class AgentTemplateService:
 
     async def initialize_system_templates(self, templates: List[AgentTemplate]):
         """
-        初始化系统内置模板
+        初始化系统内置模板（数据库优先）
 
-        先检查数据库，如果不存在则插入
+        逻辑：
+        1. 先从数据库加载已有的模板（通过 _ensure_cache）
+        2. 只在数据库中不存在时，才使用硬编码模板作为默认值
+        3. 数据库中的版本优先级高于硬编码版本
+
+        这确保了：
+        - 迁移文件中的数据更新会被正确使用
+        - 硬编码模板仅作为首次初始化的默认值
+        - 不会用旧版硬编码数据覆盖数据库中的新版本
+
+        Args:
+            templates: 硬编码的系统模板列表（作为默认值）
         """
+        # 先确保从数据库加载
         await self._ensure_cache()
 
-        for template in templates:
-            # 检查数据库中是否已存在
-            if self._db:
-                try:
-                    existing = await self._db.execute_query(
-                        "SELECT id FROM agent_templates WHERE id = :id",
-                        {'id': template.id}
-                    )
-                    if existing:
-                        # 已存在，加载到内存
-                        if template.id not in self._templates:
-                            self._templates[template.id] = template
-                        continue
-                except Exception as e:
-                    logger.warning(f"检查模板存在失败: {e}")
+        added_count = 0
+        skipped_count = 0
 
-            # 不存在，插入数据库
+        for template in templates:
+            if template.id in self._templates:
+                # 数据库中已存在，跳过硬编码版本
+                skipped_count += 1
+                logger.debug(f"数据库中已存在 Agent模板 {template.id}，跳过硬编码版本")
+                continue
+
+            # 数据库中不存在，添加硬编码版本
             template.is_system = True
 
+            # 写入数据库
             if self._db:
                 try:
                     data = self._template_to_db_dict(template)
-                    # 添加 created_at
                     if 'created_at' not in data:
                         data['created_at'] = datetime.now()
 
@@ -497,11 +503,12 @@ class AgentTemplateService:
                         f"INSERT INTO agent_templates ({columns}) VALUES ({placeholders})",
                         data
                     )
-                    logger.info(f"初始化系统模板到数据库: {template.id}")
+                    logger.info(f"初始化系统 Agent模板到数据库: {template.id}")
                 except Exception as e:
-                    logger.error(f"初始化系统模板到数据库失败: {e}")
+                    logger.error(f"初始化系统 Agent模板到数据库失败: {e}")
 
             self._templates[template.id] = template
+            added_count += 1
             logger.info(f"初始化系统内置 AgentTemplate: {template.id}")
 
-        self._cache_valid = True
+        logger.info(f"Agent模板初始化完成: 从数据库加载 {len(self._templates) - added_count} 个，新增 {added_count} 个，跳过 {skipped_count} 个")

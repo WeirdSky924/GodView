@@ -1065,3 +1065,285 @@ async def generate_character_personality(character_id: str):
     except Exception as e:
         logger.error(f"生成角色性格失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== 配角管理 API (v9) ====================
+
+@router.get("/supporting/lifecycle")
+async def get_supporting_character_lifecycle(
+    project_id: str,
+    stage: Optional[str] = Query(None, description="生命周期阶段：intro/active/developing/stable/exit"),
+):
+    """
+    获取配角生命周期状态
+
+    返回项目下所有配角的生命周期信息
+    """
+    from app.api.app import postgres_db
+
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+
+    try:
+        # 获取所有配角（非主角）
+        characters = await postgres_db.get_all_characters(project_id=project_id)
+
+        # 过滤配角
+        supporting_chars = [
+            c for c in characters
+            if c.get("importance_tier") in [
+                CharacterImportanceTier.SUPPORTING_CORE.value,
+                CharacterImportanceTier.SUPPORTING_RECURRING.value,
+                CharacterImportanceTier.SUPPORTING_EPISODIC.value,
+            ]
+        ]
+
+        # 获取生命周期数据
+        result = []
+        for char in supporting_chars:
+            lifecycle = await postgres_db.execute_query(
+                "SELECT * FROM character_lifecycles WHERE character_id = $1",
+                char["id"]
+            )
+
+            lifecycle_data = lifecycle[0] if lifecycle else {
+                "stage": "intro",
+                "total_appearances": 0,
+                "first_appearance_chapter": None,
+                "last_appearance_chapter": None,
+            }
+
+            if stage is None or lifecycle_data.get("stage") == stage:
+                result.append({
+                    "character_id": char["id"],
+                    "character_name": char.get("name"),
+                    "importance_tier": char.get("importance_tier"),
+                    "lifecycle": lifecycle_data,
+                })
+
+        return {
+            "supporting_characters": result,
+            "total": len(result),
+        }
+
+    except Exception as e:
+        logger.error(f"获取配角生命周期失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/supporting/{character_id}/lifecycle")
+async def update_supporting_lifecycle(
+    character_id: str,
+    stage: str = Query(..., description="生命周期阶段"),
+    chapter_number: Optional[int] = Query(None, description="相关章节"),
+    event: Optional[str] = Query(None, description="生命周期事件"),
+):
+    """
+    更新配角生命周期状态
+
+    更新配角的生命周期阶段和出场记录
+    """
+    from app.api.app import postgres_db
+
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+
+    valid_stages = ["intro", "active", "developing", "stable", "exit"]
+    if stage not in valid_stages:
+        raise HTTPException(status_code=400, detail=f"无效的阶段: {stage}")
+
+    try:
+        # 获取角色
+        character = await postgres_db.get_character(character_id)
+        if not character:
+            raise HTTPException(status_code=404, detail="角色不存在")
+
+        # 检查是否已有生命周期记录
+        existing = await postgres_db.execute_query(
+            "SELECT * FROM character_lifecycles WHERE character_id = $1",
+            character_id
+        )
+
+        now = datetime.now()
+
+        if existing:
+            # 更新
+            await postgres_db.execute_query(
+                """
+                UPDATE character_lifecycles
+                SET stage = $1, updated_at = $2,
+                    last_appearance_chapter = COALESCE($3, last_appearance_chapter),
+                    total_appearances = total_appearances + 1
+                WHERE character_id = $4
+                """,
+                stage, now, chapter_number, character_id
+            )
+        else:
+            # 创建
+            await postgres_db.execute_query(
+                """
+                INSERT INTO character_lifecycles
+                (id, project_id, character_id, stage, first_appearance_chapter,
+                 last_appearance_chapter, total_appearances, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $7)
+                """,
+                f"lifecycle_{character_id}", character.get("project_id"), character_id,
+                stage, chapter_number, chapter_number, now
+            )
+
+        return {
+            "success": True,
+            "character_id": character_id,
+            "stage": stage,
+            "chapter": chapter_number,
+            "event": event,
+        }
+
+    except Exception as e:
+        logger.error(f"更新配角生命周期失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/supporting/appearance-analysis")
+async def analyze_supporting_appearances(project_id: str):
+    """
+    分析配角出场情况
+
+    返回配角出场频率、缺席警告等信息
+    """
+    from app.api.app import postgres_db
+
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+
+    try:
+        # 获取项目章节总数
+        chapters = await postgres_db.get_chapters_by_project(project_id)
+        total_chapters = len(chapters) if chapters else 0
+
+        # 获取所有配角生命周期
+        lifecycles = await postgres_db.execute_query(
+            """
+            SELECT cl.*, c.name as character_name, c.importance_tier
+            FROM character_lifecycles cl
+            JOIN characters c ON cl.character_id = c.id
+            WHERE cl.project_id = $1
+            """,
+            project_id
+        )
+
+        warnings = []
+        analysis = []
+
+        for lc in lifecycles:
+            last_appearance = lc.get("last_appearance_chapter") or 0
+            absence_chapters = total_chapters - last_appearance
+
+            # 检查缺席警告
+            max_absence = 5  # 默认最大缺席章数
+            if lc.get("importance_tier") == CharacterImportanceTier.SUPPORTING_CORE.value:
+                max_absence = 3
+            elif lc.get("importance_tier") == CharacterImportanceTier.SUPPORTING_EPISODIC.value:
+                max_absence = 10
+
+            is_overdue = absence_chapters > max_absence
+
+            analysis.append({
+                "character_id": lc.get("character_id"),
+                "character_name": lc.get("character_name"),
+                "importance_tier": lc.get("importance_tier"),
+                "stage": lc.get("stage"),
+                "total_appearances": lc.get("total_appearances", 0),
+                "last_appearance_chapter": last_appearance,
+                "absence_chapters": absence_chapters,
+                "is_overdue": is_overdue,
+            })
+
+            if is_overdue:
+                warnings.append({
+                    "type": "absence_warning",
+                    "character_name": lc.get("character_name"),
+                    "absence_chapters": absence_chapters,
+                    "suggestion": f"角色 {lc.get('character_name')} 已缺席 {absence_chapters} 章，建议安排出场",
+                })
+
+        return {
+            "total_chapters": total_chapters,
+            "analysis": analysis,
+            "warnings": warnings,
+        }
+
+    except Exception as e:
+        logger.error(f"分析配角出场失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/supporting/{character_id}/design-exit")
+async def design_supporting_character_exit(
+    character_id: str,
+    exit_method: str = Query(..., description="退场方式：fade_out/death/leave/transform"),
+    exit_chapter: Optional[int] = Query(None, description="退场章节"),
+):
+    """
+    设计配角退场
+
+    为配角设计退场方案
+    """
+    from app.api.app import postgres_db
+    from app.services.skill_service import get_skill_service, ExecuteSkillDTO
+
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+
+    valid_exit_methods = ["fade_out", "death", "leave", "transform"]
+    if exit_method not in valid_exit_methods:
+        raise HTTPException(status_code=400, detail=f"无效的退场方式: {exit_method}")
+
+    try:
+        # 获取角色
+        character = await postgres_db.get_character(character_id)
+        if not character:
+            raise HTTPException(status_code=404, detail="角色不存在")
+
+        # 使用 Skill 设计退场
+        skill_service = get_skill_service()
+        result = await skill_service.execute_skill(ExecuteSkillDTO(
+            skill_id="skill_supporting_character_lifecycle",
+            project_id=character.get("project_id"),
+            parameters={
+                "task": "design_exit",
+                "character_name": character.get("name"),
+                "exit_method": exit_method,
+                "exit_chapter": exit_chapter,
+                "character_role": character.get("role"),
+            }
+        ))
+
+        if not result.success:
+            raise HTTPException(status_code=500, detail=result.error)
+
+        import json
+        exit_design = json.loads(result.output)
+
+        # 更新生命周期状态
+        await postgres_db.execute_query(
+            """
+            UPDATE character_lifecycles
+            SET stage = 'exit', exit_planned = TRUE, exit_method = $1,
+                exit_chapter = $2, updated_at = $3
+            WHERE character_id = $4
+            """,
+            exit_method, exit_chapter, datetime.now(), character_id
+        )
+
+        return {
+            "success": True,
+            "character_id": character_id,
+            "character_name": character.get("name"),
+            "exit_design": exit_design,
+        }
+
+    except Exception as e:
+        logger.error(f"设计配角退场失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))

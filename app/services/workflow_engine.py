@@ -695,7 +695,14 @@ class WorkflowEngine:
         initial_context: Dict[str, Any] = None,
         db=None,
     ) -> str:
-        """执行工作流"""
+        """执行工作流
+
+        Args:
+            workflow_id: 工作流ID
+            project_id: 项目ID
+            initial_context: 初始上下文，可选包含 target_chapters 参数
+            db: 数据库连接
+        """
         workflow = await self.get_workflow(workflow_id, db)
         if not workflow:
             raise ValueError(f"工作流不存在: {workflow_id}")
@@ -705,12 +712,48 @@ class WorkflowEngine:
         if not validation.valid:
             raise ValueError(f"工作流验证失败: {validation.errors}")
 
+        # 初始化上下文
+        context = initial_context or {}
+
+        # ========== 自动章节序号确定 ==========
+        chapter_number = context.get("chapter_num")
+        if chapter_number is None and db:
+            # 自动获取下一章节序号
+            try:
+                from app.services.plot_outline_service import get_plot_outline_service
+                plot_service = get_plot_outline_service()
+                chapter_number = await plot_service.get_next_chapter_number(project_id)
+                context["chapter_num"] = chapter_number
+                logger.info(f"自动确定章节序号: 第 {chapter_number} 章")
+            except Exception as e:
+                logger.warning(f"自动获取章节号失败: {e}，使用默认值 1")
+                context["chapter_num"] = 1
+
+        # ========== 自动加载章节大纲 ==========
+        if db:
+            try:
+                from app.services.plot_outline_service import get_plot_outline_service
+                plot_service = get_plot_outline_service()
+                outline = await plot_service.get_chapter_outline_for_workflow(
+                    project_id=project_id,
+                    chapter_number=context.get("chapter_num")
+                )
+                if outline:
+                    context["chapter_outline"] = outline
+                    context["chapter_title"] = outline.get("title", f"第{context.get('chapter_num')}章")
+                    context["chapter_summary"] = outline.get("summary", "")
+                    logger.info(f"自动加载第 {context.get('chapter_num')} 章大纲: {outline.get('title')}")
+                else:
+                    logger.warning(f"未找到第 {context.get('chapter_num')} 章大纲，将由大纲Agent生成")
+            except Exception as e:
+                logger.warning(f"加载章节大纲失败: {e}")
+
         # 创建执行实例
         execution = WorkflowExecution(
             workflow_id=workflow_id,
             project_id=project_id,
             status=WorkflowStatus.RUNNING,
-            context=initial_context or {},
+            context=context,
         )
 
         # 初始化节点状态
@@ -727,12 +770,13 @@ class WorkflowEngine:
         await self._broadcast_status(execution.id, "workflow_started", {
             "workflow_id": workflow_id,
             "execution_id": execution.id,
+            "chapter_number": context.get("chapter_num"),
         })
 
         # 异步执行工作流
         asyncio.create_task(self._run_workflow(execution.id, workflow, db))
 
-        logger.info(f"启动工作流执行: {execution.id}")
+        logger.info(f"启动工作流执行: {execution.id}, 章节: {context.get('chapter_num')}")
         return execution.id
 
     async def _run_workflow(
@@ -1811,7 +1855,7 @@ class WorkflowEngine:
                         logger.info(f"加载世界观设定（{agent_type}）: {world_info.get('name')} ({world_info.get('world_type')})")
 
             # ===== 需要角色的 Agent 类型 =====
-            character_requiring_agents = ["plotter", "master_plotter", "writer", "character", "evaluator", "hook_manager", "summarizer"]
+            character_requiring_agents = ["plotter", "master_plotter", "writer", "character", "evaluator", "hook_manager", "summarizer", "plot_outline"]
             if agent_type in character_requiring_agents:
                 if "characters" not in context or not context["characters"]:
                     chars = await db.get_all_characters(project_id)
@@ -2168,12 +2212,36 @@ class WorkflowEngine:
         else:
             logger.warning(f"Agent {node.agent_type} 不支持流式回调（缺少 _stream_callback 属性）")
 
-        # ========== 注入 Agent 记忆上下文 ==========
-        if hasattr(agent, 'get_memory_context') and agent._memory:
-            memory_context = agent.get_memory_context()
-            if memory_context:
-                context["agent_memory_context"] = memory_context
-                logger.info(f"Agent {node.agent_type} 注入了记忆上下文 ({agent._memory.total_memories} 条记忆)")
+        # ========== 注入 Agent 记忆上下文（使用增强记忆服务）==========
+        if hasattr(agent, '_memory') and agent._memory:
+            try:
+                # 确定任务类型（用于上下文感知记忆选择）
+                task_type = self._infer_task_type(node.agent_type, node.label)
+                query_text = self._build_memory_query(context, node.agent_type)
+
+                # 使用增强记忆上下文
+                if hasattr(agent, 'get_enhanced_memory_context'):
+                    memory_context = await agent.get_enhanced_memory_context(
+                        task_type=task_type,
+                        query_text=query_text,
+                        current_context={
+                            "chapter_number": context.get("chapter_num", context.get("chapter_number")),
+                            "characters": context.get("characters", []),
+                        },
+                        db=db,
+                    )
+                else:
+                    memory_context = agent.get_memory_context()
+
+                if memory_context:
+                    context["agent_memory_context"] = memory_context
+                    logger.info(f"Agent {node.agent_type} 注入了增强记忆上下文 ({agent._memory.total_memories} 条记忆, task_type={task_type})")
+            except Exception as e:
+                logger.warning(f"Agent {node.agent_type} 获取增强记忆上下文失败: {e}，使用基础记忆")
+                if hasattr(agent, 'get_memory_context'):
+                    memory_context = agent.get_memory_context()
+                    if memory_context:
+                        context["agent_memory_context"] = memory_context
 
         try:
             # 执行 Agent（添加超时保护）
@@ -2383,6 +2451,92 @@ class WorkflowEngine:
                 logger.warning(f"保存 Agent {node.agent_type} 记忆失败: {e}")
 
         return result.data if result.success else {"error": result.error}
+
+    def _infer_task_type(self, agent_type: str, node_label: str) -> str:
+        """
+        根据 Agent 类型和节点标签推断任务类型
+
+        Args:
+            agent_type: Agent 类型
+            node_label: 节点标签
+
+        Returns:
+            str: 任务类型（用于记忆选择配置）
+        """
+        # Agent 类型到任务类型的映射
+        task_type_map = {
+            "plot_outline": "outline_generation",
+            "master_plotter": "plot_planning",
+            "plotter": "plot_planning",
+            "writer": "chapter_writing",
+            "evaluator": "evaluation",
+            "character": "dialogue_generation",
+            "hook_manager": "hook_management",
+            "summarizer": "summarization",
+            "event_generator": "event_planning",
+        }
+
+        # 首先根据节点标签推断
+        label_lower = node_label.lower()
+        if "大纲" in label_lower or "outline" in label_lower:
+            return "outline_generation"
+        if "写作" in label_lower or "writing" in label_lower:
+            return "chapter_writing"
+        if "评估" in label_lower or "eval" in label_lower:
+            return "evaluation"
+        if "对话" in label_lower or "dialogue" in label_lower:
+            return "dialogue_generation"
+        if "伏笔" in label_lower or "hook" in label_lower:
+            return "hook_management"
+
+        # 然后根据 Agent 类型推断
+        return task_type_map.get(agent_type, "general")
+
+    def _build_memory_query(self, context: Dict[str, Any], agent_type: str) -> str:
+        """
+        构建记忆查询文本
+
+        从当前上下文中提取关键信息，用于语义记忆检索
+
+        Args:
+            context: 当前上下文
+            agent_type: Agent 类型
+
+        Returns:
+            str: 查询文本
+        """
+        query_parts = []
+
+        # 提取章节相关
+        chapter_num = context.get("chapter_num", context.get("chapter_number"))
+        if chapter_num:
+            query_parts.append(f"第{chapter_num}章")
+
+        # 提取角色相关
+        characters = context.get("characters", [])
+        if characters:
+            char_names = [c.get("name", "") for c in characters[:3] if c.get("name")]
+            if char_names:
+                query_parts.append(f"角色: {', '.join(char_names)}")
+
+        # 提取章节目标
+        chapter_goal = context.get("chapter_goal", context.get("goal"))
+        if chapter_goal:
+            query_parts.append(chapter_goal)
+
+        # 提取大纲要点
+        outline = context.get("chapter_outline", {})
+        if isinstance(outline, dict):
+            summary = outline.get("summary", outline.get("goal"))
+            if summary:
+                query_parts.append(summary[:100])
+
+        # 提取用户干预
+        user_guidance = context.get("user_guidance")
+        if user_guidance:
+            query_parts.append(user_guidance[:100])
+
+        return " ".join(query_parts) if query_parts else f"{agent_type} 任务"
 
     async def _save_chapter_from_writer(
         self,
@@ -5785,9 +5939,17 @@ class WorkflowEngine:
         return True
 
     async def resume_workflow(self, execution_id: str, db=None) -> bool:
-        """恢复工作流"""
+        """恢复工作流执行"""
         execution = self._executions.get(execution_id)
         if not execution:
+            # 尝试从数据库加载
+            if db:
+                execution = await self._load_execution_from_db(execution_id, db)
+                if execution:
+                    self._executions[execution_id] = execution
+
+        if not execution:
+            logger.warning(f"工作流执行不存在: {execution_id}")
             return False
 
         if execution.status != WorkflowStatus.PAUSED:
@@ -5800,6 +5962,12 @@ class WorkflowEngine:
 
         await self._broadcast_status(execution_id, "workflow_resumed", {})
         logger.info(f"恢复工作流: {execution_id}")
+
+        # 重新启动执行循环
+        workflow = await self.get_workflow(execution.workflow_id, db)
+        if workflow:
+            asyncio.create_task(self._run_workflow(execution_id, workflow, db))
+
         return True
 
     async def cancel_workflow(self, execution_id: str, db=None) -> bool:

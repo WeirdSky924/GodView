@@ -23,13 +23,14 @@ import {
 import { Search, Plus, Edit2, Trash2, Eye, X } from 'lucide-react'
 import { useTheme } from '@/contexts/ThemeContext'
 
+// 与后端 PromptCategory 枚举保持一致
 const CATEGORY_LABELS: Record<PromptCategory, string> = {
-  role_definition: '角色定义',
-  function: '功能职责',
-  constraint: '约束规则',
-  style: '风格指南',
-  context: '上下文',
-  output_format: '输出格式',
+  base: '基础定义',
+  role: '角色定义',
+  function: '功能规范',
+  value: '价值观/风格',
+  output: '输出格式',
+  constraint: '约束条件',
 }
 
 export default function Prompts() {

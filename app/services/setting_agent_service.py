@@ -152,8 +152,49 @@ class SettingAgentService:
 
     async def _get_existing_lores(self, project_id: str) -> List[LoreEntry]:
         """获取现有设定列表"""
-        # TODO: 从数据库加载
-        return []
+        try:
+            from app.api.app import postgres_db
+            if not postgres_db:
+                logger.warning("数据库未连接，无法加载设定")
+                return []
+
+            rows = await postgres_db.execute_query(
+                """SELECT id, project_id, title, category, priority, content, summary,
+                          keywords, tags, constraints, related_characters, related_locations,
+                          related_items, created_at, updated_at
+                   FROM lore_entries
+                   WHERE project_id = CAST(:project_id AS UUID)
+                   ORDER BY priority, created_at DESC""",
+                {"project_id": project_id}
+            )
+
+            lores = []
+            for row in rows:
+                lore = LoreEntry(
+                    id=row.get("id"),
+                    project_id=row.get("project_id"),
+                    title=row.get("title", ""),
+                    category=row.get("category", "custom"),
+                    priority=LorePriority(row.get("priority", "standard")),
+                    content=row.get("content", ""),
+                    summary=row.get("summary", ""),
+                    keywords=json.loads(row.get("keywords", "[]")) if isinstance(row.get("keywords"), str) else row.get("keywords", []),
+                    tags=json.loads(row.get("tags", "[]")) if isinstance(row.get("tags"), str) else row.get("tags", []),
+                    constraints=json.loads(row.get("constraints", "[]")) if isinstance(row.get("constraints"), str) else row.get("constraints", []),
+                    related_characters=json.loads(row.get("related_characters", "[]")) if isinstance(row.get("related_characters"), str) else row.get("related_characters", []),
+                    related_locations=json.loads(row.get("related_locations", "[]")) if isinstance(row.get("related_locations"), str) else row.get("related_locations", []),
+                    related_items=json.loads(row.get("related_items", "[]")) if isinstance(row.get("related_items"), str) else row.get("related_items", []),
+                    created_at=row.get("created_at"),
+                    updated_at=row.get("updated_at"),
+                )
+                lores.append(lore)
+
+            logger.info(f"加载 {len(lores)} 条设定用于冲突检测")
+            return lores
+
+        except Exception as e:
+            logger.error(f"加载设定失败: {e}")
+            return []
 
     async def _detect_conflicts(
         self,

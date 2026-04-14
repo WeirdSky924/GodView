@@ -75,6 +75,12 @@ class SkillStatus(str, Enum):
     DEPRECATED = "deprecated" # 已废弃
 
 
+class SkillLoadMode(str, Enum):
+    """Skill 加载模式"""
+    CORE = "core"           # 核心层：始终加载到上下文
+    ON_DEMAND = "on_demand" # 按需层：根据场景关键词动态加载
+
+
 class SkillPriority(int, Enum):
     """Skill 优先级"""
     CRITICAL = 100    # 核心必需
@@ -101,6 +107,34 @@ class SkillOutputSpec(BaseModel):
     type: str = Field(default="string", description="字段类型")
     description: str = Field(default="", description="字段描述")
     required: bool = Field(default=True, description="是否必需输出")
+
+
+class EvaluationThreshold(BaseModel):
+    """评估阈值配置"""
+    min_score: float = Field(default=0.7, ge=0, le=1, description="最低通过分数")
+    blocking: bool = Field(default=False, description="未达标时是否阻断流程")
+    auto_retry: bool = Field(default=True, description="未达标时是否自动重试")
+    max_retries: int = Field(default=2, ge=0, le=5, description="最大重试次数")
+    retry_strategy: str = Field(default="improve", description="重试策略: improve=改进输出, regenerate=重新生成")
+
+    # 评估维度
+    dimensions: List[str] = Field(
+        default_factory=lambda: ["quality", "consistency", "stance"],
+        description="评估维度列表"
+    )
+    dimension_weights: Dict[str, float] = Field(
+        default_factory=lambda: {"quality": 0.4, "consistency": 0.3, "stance": 0.3},
+        description="各维度权重"
+    )
+
+
+class SubSkillReference(BaseModel):
+    """子技能引用"""
+    skill_id: str = Field(..., description="子技能ID")
+    slot_name: str = Field(default="", description="插槽名称")
+    execution_order: int = Field(default=0, description="执行顺序")
+    pass_output_to: Optional[str] = Field(default=None, description="将输出传递给下一个子技能的参数名")
+    is_required: bool = Field(default=True, description="是否必需执行")
 
 
 class Skill(BaseModel):
@@ -151,6 +185,60 @@ class Skill(BaseModel):
         description="是否可组合（多个 Skill 可以在同一执行中一起使用）"
     )
 
+    # 加载模式
+    load_mode: SkillLoadMode = Field(
+        default=SkillLoadMode.ON_DEMAND,
+        description="加载模式：core=始终加载, on_demand=按需加载"
+    )
+    trigger_keywords: List[str] = Field(
+        default_factory=list,
+        description="触发关键词（按需加载时匹配场景关键词）"
+    )
+    trigger_scenes: List[str] = Field(
+        default_factory=list,
+        description="触发场景类型（如：战斗、对话、谈判）"
+    )
+
+    # 子技能（技能分解）
+    sub_skills: List[SubSkillReference] = Field(
+        default_factory=list,
+        description="子技能列表（用于复杂技能分解）"
+    )
+    parent_skill_id: Optional[str] = Field(
+        default=None,
+        description="父技能ID（如果是子技能）"
+    )
+
+    # 评估配置
+    evaluation_threshold: Optional[EvaluationThreshold] = Field(
+        default=None,
+        description="评估阈值配置（用于质量检查类技能）"
+    )
+    on_failure_action: str = Field(
+        default="continue",
+        description="失败时动作: continue=继续, retry=重试, abort=中止流程"
+    )
+
+    # 记忆集成
+    use_agent_memory: bool = Field(
+        default=False,
+        description="是否使用Agent长期记忆"
+    )
+    memory_types: List[str] = Field(
+        default_factory=list,
+        description="要加载的记忆类型: decision/observation/fact"
+    )
+
+    # 全局状态
+    reads_global_state: List[str] = Field(
+        default_factory=list,
+        description="需要读取的全局状态键"
+    )
+    writes_global_state: List[str] = Field(
+        default_factory=list,
+        description="要写入的全局状态键"
+    )
+
     # 创建来源
     creator_project_id: Optional[str] = Field(default=None, description="创建项目 ID")
     creator_agent_id: Optional[str] = Field(default=None, description="创建 Agent ID")
@@ -187,6 +275,16 @@ class SkillAssignment(BaseModel):
     execution_condition: Optional[str] = Field(default=None, description="执行条件表达式")
     is_enabled: bool = Field(default=True, description="是否启用")
     is_required: bool = Field(default=False, description="是否必需")
+
+    # 加载模式（可覆盖Skill的默认设置）
+    load_mode: Optional[SkillLoadMode] = Field(
+        default=None,
+        description="加载模式覆盖（None表示使用Skill的默认设置）"
+    )
+    trigger_keywords: List[str] = Field(
+        default_factory=list,
+        description="触发关键词覆盖"
+    )
 
     # 分配信息
     assigned_by: str = Field(default="user", description="分配者: user/system")
@@ -240,6 +338,27 @@ class CreateSkillDTO(BaseModel):
     is_composable: bool = True
     examples: List[Dict[str, Any]] = []
 
+    # 加载模式
+    load_mode: SkillLoadMode = SkillLoadMode.ON_DEMAND
+    trigger_keywords: List[str] = []
+    trigger_scenes: List[str] = []
+
+    # 子技能
+    sub_skills: List[SubSkillReference] = []
+    parent_skill_id: Optional[str] = None
+
+    # 评估配置
+    evaluation_threshold: Optional[EvaluationThreshold] = None
+    on_failure_action: str = "continue"
+
+    # 记忆集成
+    use_agent_memory: bool = False
+    memory_types: List[str] = []
+
+    # 全局状态
+    reads_global_state: List[str] = []
+    writes_global_state: List[str] = []
+
     creator_project_id: Optional[str] = None
     creator_agent_id: Optional[str] = None
     creator_user_id: Optional[str] = None
@@ -272,6 +391,27 @@ class UpdateSkillDTO(BaseModel):
     is_composable: Optional[bool] = None
     examples: Optional[List[Dict[str, Any]]] = None
 
+    # 加载模式
+    load_mode: Optional[SkillLoadMode] = None
+    trigger_keywords: Optional[List[str]] = None
+    trigger_scenes: Optional[List[str]] = None
+
+    # 子技能
+    sub_skills: Optional[List[SubSkillReference]] = None
+    parent_skill_id: Optional[str] = None
+
+    # 评估配置
+    evaluation_threshold: Optional[EvaluationThreshold] = None
+    on_failure_action: Optional[str] = None
+
+    # 记忆集成
+    use_agent_memory: Optional[bool] = None
+    memory_types: Optional[List[str]] = None
+
+    # 全局状态
+    reads_global_state: Optional[List[str]] = None
+    writes_global_state: Optional[List[str]] = None
+
 
 class AssignSkillDTO(BaseModel):
     """分配 Skill 到 Agent 模板 DTO"""
@@ -284,6 +424,10 @@ class AssignSkillDTO(BaseModel):
     execution_condition: Optional[str] = None
     is_enabled: bool = True
     is_required: bool = False
+
+    # 加载模式
+    load_mode: Optional[SkillLoadMode] = None
+    trigger_keywords: List[str] = []
 
 
 class ExecuteSkillDTO(BaseModel):

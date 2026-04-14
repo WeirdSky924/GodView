@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { NavLink, useNavigate } from 'react-router-dom'
 import {
-  LayoutDashboard, Users, Globe, BookOpen, BookMarked, Sliders, FileText, Settings, Flag, GitCompare, ShieldAlert, Eye, Network, Mic2, CheckCircle2, FolderOpen, ChevronDown, Plus, Layers, MessageSquare, Bot, PenTool, Sparkles, Sun, Moon, Database, Server, AlertCircle, CheckCircle, XCircle, Clapperboard, Play
+  LayoutDashboard, Users, Globe, BookOpen, BookMarked, Sliders, FileText, Settings, Flag, GitCompare, ShieldAlert, Eye, Network, Mic2, CheckCircle2, FolderOpen, ChevronDown, Plus, Layers, MessageSquare, Bot, PenTool, Sparkles, Sun, Moon, Database, Server, AlertCircle, CheckCircle, XCircle, Clapperboard, Play, ListTree
 } from 'lucide-react'
 import { useProject } from '@/contexts/ProjectContext'
 import { useTheme } from '@/contexts/ThemeContext'
@@ -22,6 +22,7 @@ const navItems: NavItem[] = [
   { path: '/worlds', icon: <Globe size={20} />, label: '世界管理' },
   { path: '/lore', icon: <BookMarked size={20} />, label: '设定库' },
   { path: '/plots', icon: <BookOpen size={20} />, label: '剧情管理' },
+  { path: '/outlines', icon: <ListTree size={20} />, label: '章节大纲' },
   { path: '/hooks', icon: <Flag size={20} />, label: '伏笔管理' },
   { path: '/interventions', icon: <ShieldAlert size={20} />, label: '干预日志' },
   { path: '/simulator', icon: <Eye size={20} />, label: '读者模拟' },

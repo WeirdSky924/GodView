@@ -163,7 +163,8 @@ async def create_agent_provider(director: DirectorSystem):
             return agent_instance
 
         # ProcGen Agent：世界生成 Agent（保留用于底层生成能力）
-        if agent_type_lower == "procgen":
+        # 支持 "procgen" 和 "proc_gen" 两种命名方式
+        if agent_type_lower in ["procgen", "proc_gen"]:
             from app.agents.procgen import ProcGenAgent
             from app.models.world import World
             model = director._model_factory() if director._model_factory else None
@@ -222,6 +223,23 @@ async def create_agent_provider(director: DirectorSystem):
             from app.agents.scene_coordinator import SceneCoordinatorAgent
             model = director._model_factory() if director._model_factory else None
             return SceneCoordinatorAgent(model=model, project_id=project_id)
+
+        # 检查是否是章节大纲 Agent（使用 master_plotter 作为基础）
+        if agent_type_lower == "plot_outline" or agent_type == "plot_outline":
+            # plot_outline 是 master_plotter 的一个变体，专门用于章节大纲规划
+            # 暂时使用 master_plotter，但可以后续创建专门的 PlotOutlineAgent
+            logger.info(f"获取 PlotOutline Agent (使用 master_plotter): project_id={project_id}")
+            return director.master_plotter
+
+        # 检查是否是副本生成 Agent
+        if agent_type_lower == "dungeon_generator" or agent_type == "dungeon_generator":
+            # dungeon_generator 使用 ProcGenAgent 的能力
+            logger.info(f"获取 DungeonGenerator Agent (使用 procgen): project_id={project_id}")
+            from app.agents.procgen import ProcGenAgent
+            from app.models.world import World
+            model = director._model_factory() if director._model_factory else None
+            world = World(id="dungeon_world", name="Dungeon World", world_type="奇幻")
+            return ProcGenAgent(world=world, model=model, project_id=project_id, agent_id="dungeon_generator")
 
         # 检查是否是批量角色获取（格式：characters:presence_type）
         if agent_type.startswith("characters:"):

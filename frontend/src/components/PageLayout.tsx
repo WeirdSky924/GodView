@@ -35,11 +35,11 @@ export default function PageLayout({
   const isDark = theme === 'dark'
 
   return (
-    <div className="h-full flex flex-col">
-      {/* 固定的顶部区域 */}
-      <div className={`sticky top-0 z-10 ${isDark ? 'bg-gray-900/95' : 'bg-white/95'} backdrop-blur-sm`}>
+    <div className="h-[calc(100vh-4rem)] flex flex-col relative">
+      {/* 固定的顶部区域 - 考虑侧边栏宽度 (ml-64 = 16rem = 256px) */}
+      <div className={`sticky top-0 z-50 ${isDark ? 'bg-gray-900/95' : 'bg-white/95'} backdrop-blur-sm border-b ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
         {/* 标题和操作按钮 */}
-        <div className={`p-4 border-b ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+        <div className="p-4">
           <div className="flex items-center justify-between">
             <div>
               <h1 className={`text-2xl font-bold ${isDark ? 'text-white' : 'text-gray-800'}`}>{title}</h1>
@@ -53,7 +53,7 @@ export default function PageLayout({
 
         {/* Tab 切换 */}
         {tabs && tabs.length > 0 && (
-          <div className={`px-4 py-2 border-b ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+          <div className="px-4 py-2">
             <div className="flex gap-2">
               {tabs.map((tab) => (
                 <button
@@ -77,7 +77,7 @@ export default function PageLayout({
 
         {/* 筛选器区域 */}
         {filters && (
-          <div className={`px-4 py-3 border-b ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+          <div className="px-4 py-3">
             {filters}
           </div>
         )}

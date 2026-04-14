@@ -6,46 +6,32 @@
 import { useState, useEffect, useCallback } from 'react'
 import { getWorkflowNodeTypes, type NodeTypeInfo, type WorkflowNodeTypes } from '@/api/nodeTypes'
 
-// 全局缓存
-let cachedNodeTypes: WorkflowNodeTypes | null = null
-let cachePromise: Promise<WorkflowNodeTypes> | null = null
-
 /**
  * 获取工作流节点类型的 Hook
  *
- * 自动缓存结果，避免重复请求
+ * 每次都从 API 获取最新数据，不使用全局缓存
  */
 export function useNodeTypes(projectId?: string) {
-  const [nodeTypes, setNodeTypes] = useState<WorkflowNodeTypes>(
-    cachedNodeTypes || {
-      agent_nodes: [],
-      interaction_nodes: [],
-      control_nodes: [],
-      character_nodes: [],
-    }
-  )
-  const [loading, setLoading] = useState(!cachedNodeTypes)
+  const [nodeTypes, setNodeTypes] = useState<WorkflowNodeTypes>({
+    agent_nodes: [],
+    interaction_nodes: [],
+    control_nodes: [],
+    character_nodes: [],
+  })
+  const [loading, setLoading] = useState(true)
   const [error, setError] = useState<Error | null>(null)
 
   useEffect(() => {
-    // 如果已有缓存且没有projectId，直接使用
-    if (cachedNodeTypes && !projectId) {
-      setNodeTypes(cachedNodeTypes)
-      setLoading(false)
-      return
-    }
-
-    // 发起请求
+    // 每次都重新获取数据
     setLoading(true)
     getWorkflowNodeTypes(projectId)
       .then((data) => {
+        console.log('[useNodeTypes] Loaded node types:', data.agent_nodes?.length, 'agent nodes, version:', data.version)
         setNodeTypes(data)
-        if (!projectId) {
-          cachedNodeTypes = data
-        }
         setError(null)
       })
       .catch((err) => {
+        console.error('[useNodeTypes] Failed to load node types:', err)
         setError(err)
       })
       .finally(() => {
@@ -122,8 +108,8 @@ export function useNodeTypes(projectId?: string) {
 
 /**
  * 清除缓存（用于测试或强制刷新）
+ * @deprecated 不再使用全局缓存
  */
 export function clearNodeTypesCache() {
-  cachedNodeTypes = null
-  cachePromise = null
+  // 不再需要，保留空函数以保持向后兼容
 }

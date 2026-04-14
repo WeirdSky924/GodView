@@ -26,12 +26,19 @@ const AGENT_ICONS: Record<string, React.ReactNode> = {
   setting: <Settings size={18} />,
   writer: <PenTool size={18} />,
   plotter: <GitBranch size={18} />,
+  master_plotter: <GitBranch size={18} />,  // 总编剧
   character: <Users size={18} />,
   summarizer: <BookOpen size={18} />,
   evaluator: <Search size={18} />,
   hook_manager: <GitBranch size={18} />,
   event_generator: <Dices size={18} />,
   world_map_manager: <Map size={18} />,
+  // v8 新增
+  proc_gen: <Dices size={18} />,  // 过程生成
+  dungeon_generator: <Map size={18} />,  // 副本生成
+  // v9 新增
+  plot_outline: <BookOpen size={18} />,  // 章节大纲
+  scene_coordinator: <GitBranch size={18} />,  // 场景协调
   // 控制节点
   start: <Play size={18} />,
   end: <Square size={18} />,
