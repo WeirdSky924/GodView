@@ -197,6 +197,12 @@ class SettingAgent:
         try:
             from openai import AsyncOpenAI
         except ImportError:
+            logger.error("[SettingAgent] openai 包未安装，请运行: pip install openai")
+            return self._fallback_response(messages)
+
+        # 检查 API Key 是否配置
+        if not self.llm_api_key:
+            logger.error("[SettingAgent] OpenAI API Key 未配置！请检查 .env 文件中的 LLM_OPENAI_API_KEY")
             return self._fallback_response(messages)
 
         client = AsyncOpenAI(
@@ -218,6 +224,12 @@ class SettingAgent:
         try:
             import anthropic
         except ImportError:
+            logger.error("[SettingAgent] anthropic 包未安装，请运行: pip install anthropic")
+            return self._fallback_response(messages)
+
+        # 检查 API Key 是否配置
+        if not self.llm_api_key:
+            logger.error("[SettingAgent] Anthropic API Key 未配置！请检查 .env 文件中的 LLM_ANTHROPIC_API_KEY")
             return self._fallback_response(messages)
 
         client = anthropic.AsyncAnthropic(

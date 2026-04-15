@@ -17,6 +17,7 @@ langchain-core>=0.3.19
 langchain-openai>=0.2.8
 langchain-anthropic>=0.3.0
 openai>=1.54.3
+anthropic>=0.40.0
 
 # Embedding (本地模式需要)
 sentence-transformers>=3.3.1

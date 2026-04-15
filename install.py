@@ -747,6 +747,707 @@ CREATE TABLE IF NOT EXISTS embedding_cache (
 
 CREATE INDEX idx_embedding_entity ON embedding_cache(entity_type, entity_id);
 
+-- ================== 世界表 ==================
+CREATE TABLE IF NOT EXISTS worlds (
+    id VARCHAR(64) PRIMARY KEY,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    world_type VARCHAR(50) DEFAULT 'fantasy',
+    tone VARCHAR(50) DEFAULT 'serious',
+    content_styles JSONB DEFAULT '[]',
+    protagonist_types JSONB DEFAULT '[]',
+    character_archetypes JSONB DEFAULT '[]',
+    power_types JSONB DEFAULT '[]',
+    rules JSONB DEFAULT '[]',
+    power_system TEXT,
+    technology_level TEXT,
+    history TEXT,
+    geography TEXT,
+    factions JSONB DEFAULT '[]',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_worlds_project ON worlds(project_id);
+
+-- ================== 区域表 ==================
+CREATE TABLE IF NOT EXISTS regions (
+    id VARCHAR(64) PRIMARY KEY,
+    world_id VARCHAR(64),
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    region_type VARCHAR(50) DEFAULT 'custom',
+    terrain_type VARCHAR(50) DEFAULT 'custom',
+    description TEXT,
+    atmosphere TEXT,
+    coordinates JSONB,
+    area_size FLOAT,
+    terrain_features JSONB DEFAULT '[]',
+    landmarks JSONB DEFAULT '[]',
+    encounters JSONB DEFAULT '[]',
+    connections JSONB DEFAULT '[]',
+    local_rules JSONB DEFAULT '[]',
+    is_generated BOOLEAN DEFAULT FALSE,
+    visit_count INTEGER DEFAULT 0,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_regions_world ON regions(world_id);
+CREATE INDEX idx_regions_project ON regions(project_id);
+
+-- ================== 章节大纲表 ==================
+CREATE TABLE IF NOT EXISTS chapter_outlines (
+    id VARCHAR(64) PRIMARY KEY,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    chapter_number INTEGER NOT NULL,
+    title VARCHAR(500) NOT NULL,
+    summary TEXT,
+    status VARCHAR(50) DEFAULT 'draft',
+    scenes JSONB DEFAULT '[]',
+    emotion_curve JSONB,
+    chapter_goals JSONB DEFAULT '[]',
+    plot_advancement TEXT,
+    character_arcs JSONB DEFAULT '{}',
+    hooks_planted JSONB DEFAULT '[]',
+    hooks_resolved JSONB DEFAULT '[]',
+    quality_metrics JSONB DEFAULT '{}',
+    target_word_count INTEGER DEFAULT 3000,
+    estimated_word_count INTEGER DEFAULT 0,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    approved_at TIMESTAMP WITH TIME ZONE,
+    approved_by VARCHAR(255),
+    previous_outline_id VARCHAR(64),
+    next_outline_id VARCHAR(64)
+);
+
+CREATE INDEX idx_chapter_outlines_project ON chapter_outlines(project_id);
+CREATE INDEX idx_chapter_outlines_chapter ON chapter_outlines(chapter_number);
+
+-- ================== 卷大纲表 ==================
+CREATE TABLE IF NOT EXISTS volume_outlines (
+    id VARCHAR(64) PRIMARY KEY,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    volume_number INTEGER NOT NULL,
+    title VARCHAR(500) NOT NULL,
+    summary TEXT,
+    chapter_range VARCHAR(50),
+    main_plot TEXT,
+    sub_plots JSONB DEFAULT '[]',
+    key_events JSONB DEFAULT '[]',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_volume_outlines_project ON volume_outlines(project_id);
+
+-- ================== 反派表 ==================
+CREATE TABLE IF NOT EXISTS villains (
+    id VARCHAR(64) PRIMARY KEY,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    character_id UUID REFERENCES characters(id) ON DELETE CASCADE,
+    villain_type VARCHAR(100),
+    threat_level INTEGER DEFAULT 5,
+    evil_deeds JSONB DEFAULT '[]',
+    weakness TEXT,
+    motivation TEXT,
+    defeat_condition TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_villains_project ON villains(project_id);
+CREATE INDEX idx_villains_character ON villains(character_id);
+
+-- ================== 伏笔表 ==================
+CREATE TABLE IF NOT EXISTS foreshadowings (
+    id VARCHAR(64) PRIMARY KEY,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    chapter_id UUID REFERENCES chapters(id) ON DELETE CASCADE,
+    hook_type VARCHAR(100),
+    description TEXT,
+    resolved BOOLEAN DEFAULT FALSE,
+    resolved_chapter_id UUID,
+    importance INTEGER DEFAULT 5,
+    foreshadow_type VARCHAR(50) DEFAULT 'suspense',
+    plant_chapter INTEGER,
+    resolve_chapter INTEGER,
+    status VARCHAR(50) DEFAULT 'planted',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_foreshadowings_project ON foreshadowings(project_id);
+CREATE INDEX idx_foreshadowings_chapter ON foreshadowings(chapter_id);
+
+-- ================== 冲突表 ==================
+CREATE TABLE IF NOT EXISTS conflicts (
+    id VARCHAR(64) PRIMARY KEY,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    chapter_id UUID REFERENCES chapters(id) ON DELETE SET NULL,
+    conflict_type VARCHAR(100),
+    description TEXT,
+    intensity INTEGER DEFAULT 5,
+    parties JSONB DEFAULT '[]',
+    resolution TEXT,
+    status VARCHAR(50) DEFAULT 'active',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    resolved_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE INDEX idx_conflicts_project ON conflicts(project_id);
+CREATE INDEX idx_conflicts_chapter ON conflicts(chapter_id);
+
+-- ================== 事件摘要表 ==================
+CREATE TABLE IF NOT EXISTS event_summaries (
+    id VARCHAR(64) PRIMARY KEY,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    chapter_id UUID REFERENCES chapters(id) ON DELETE CASCADE,
+    event_type VARCHAR(100),
+    summary TEXT,
+    key_characters JSONB DEFAULT '[]',
+    importance INTEGER DEFAULT 5,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_event_summaries_project ON event_summaries(project_id);
+CREATE INDEX idx_event_summaries_chapter ON event_summaries(chapter_id);
+
+-- ================== 角色生命周期表 ==================
+CREATE TABLE IF NOT EXISTS character_lifecycles (
+    id VARCHAR(64) PRIMARY KEY,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    character_id UUID REFERENCES characters(id) ON DELETE CASCADE,
+    lifecycle_stage VARCHAR(100),
+    stage_description TEXT,
+    start_chapter INTEGER,
+    end_chapter INTEGER,
+    key_events JSONB DEFAULT '[]',
+    growth_points JSONB DEFAULT '[]',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_character_lifecycles_project ON character_lifecycles(project_id);
+CREATE INDEX idx_character_lifecycles_character ON character_lifecycles(character_id);
+
+-- ================== 角色技能关联表 ==================
+CREATE TABLE IF NOT EXISTS character_skills (
+    id VARCHAR(64) PRIMARY KEY,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    character_id UUID REFERENCES characters(id) ON DELETE CASCADE,
+    skill_id UUID REFERENCES skills(id) ON DELETE CASCADE,
+    proficiency_level INTEGER DEFAULT 1,
+    acquired_chapter INTEGER,
+    usage_count INTEGER DEFAULT 0,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_character_skills_project ON character_skills(project_id);
+CREATE INDEX idx_character_skills_character ON character_skills(character_id);
+CREATE INDEX idx_character_skills_skill ON character_skills(skill_id);
+
+-- ================== 全局状态表 ==================
+CREATE TABLE IF NOT EXISTS global_state (
+    id VARCHAR(64) PRIMARY KEY,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE UNIQUE,
+    state_key VARCHAR(255) NOT NULL,
+    state_value JSONB DEFAULT '{}',
+    metadata JSONB DEFAULT '{}',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(project_id, state_key)
+);
+
+CREATE INDEX idx_global_state_project ON global_state(project_id);
+
+-- ================== 全局状态历史表 ==================
+CREATE TABLE IF NOT EXISTS global_state_history (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    state_key VARCHAR(255) NOT NULL,
+    old_value JSONB,
+    new_value JSONB,
+    change_reason TEXT,
+    chapter_id UUID,
+    changed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_global_state_history_project ON global_state_history(project_id);
+CREATE INDEX idx_global_state_history_key ON global_state_history(state_key);
+
+-- ================== 黄金三章规则表 ==================
+CREATE TABLE IF NOT EXISTS golden_three_rules (
+    id VARCHAR(64) PRIMARY KEY,
+    rule_type VARCHAR(50) NOT NULL,
+    rule_name VARCHAR(255) NOT NULL,
+    description TEXT,
+    check_points JSONB DEFAULT '[]',
+    examples JSONB DEFAULT '[]',
+    weight FLOAT DEFAULT 1.0,
+    severity VARCHAR(50) DEFAULT 'important',
+    applicable_genres JSONB DEFAULT '[]',
+    applicable_chapter INTEGER DEFAULT 1,
+    fix_suggestions JSONB DEFAULT '[]',
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_golden_three_rules_type ON golden_three_rules(rule_type);
+CREATE INDEX idx_golden_three_rules_chapter ON golden_three_rules(applicable_chapter);
+
+-- ================== 黄金三章检测结果表 ==================
+CREATE TABLE IF NOT EXISTS golden_three_checks (
+    id VARCHAR(64) PRIMARY KEY,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    chapter_results JSONB DEFAULT '{}',
+    total_score FLOAT DEFAULT 0.0,
+    hook_score FLOAT DEFAULT 0.0,
+    conflict_score FLOAT DEFAULT 0.0,
+    protagonist_score FLOAT DEFAULT 0.0,
+    critical_issues JSONB DEFAULT '[]',
+    warnings JSONB DEFAULT '[]',
+    suggestions JSONB DEFAULT '[]',
+    checked_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_golden_three_checks_project ON golden_three_checks(project_id);
+
+-- ================== 干预日志表 ==================
+CREATE TABLE IF NOT EXISTS intervention_logs (
+    id VARCHAR(64) PRIMARY KEY,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    workflow_execution_id VARCHAR(64),
+    node_id VARCHAR(64),
+    agent_type VARCHAR(100),
+    agent_name VARCHAR(255),
+    intervention_type VARCHAR(50) DEFAULT 'guidance',
+    user_message TEXT,
+    agent_response TEXT,
+    context_snapshot JSONB DEFAULT '{}',
+    timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    response_time_ms INTEGER
+);
+
+CREATE INDEX idx_intervention_logs_project ON intervention_logs(project_id);
+CREATE INDEX idx_intervention_logs_workflow ON intervention_logs(workflow_execution_id);
+
+-- ================== 世界快照表 ==================
+CREATE TABLE IF NOT EXISTS world_snapshots (
+    id VARCHAR(64) PRIMARY KEY,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    chapter_number INTEGER,
+    character_states JSONB DEFAULT '{}',
+    active_hooks JSONB DEFAULT '[]',
+    recent_events JSONB DEFAULT '[]',
+    world_state JSONB DEFAULT '{}',
+    key_memories JSONB DEFAULT '[]',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_world_snapshots_project ON world_snapshots(project_id);
+CREATE INDEX idx_world_snapshots_chapter ON world_snapshots(chapter_number);
+
+-- ================== 记忆条目表 ==================
+CREATE TABLE IF NOT EXISTS memory_entries (
+    id VARCHAR(64) PRIMARY KEY,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    memory_type VARCHAR(50) DEFAULT 'medium_term',
+    category VARCHAR(50) DEFAULT 'event',
+    content TEXT,
+    summary TEXT,
+    chapter_number INTEGER,
+    character_ids JSONB DEFAULT '[]',
+    event_ids JSONB DEFAULT '[]',
+    location_ids JSONB DEFAULT '[]',
+    embedding VECTOR(384),
+    importance_score FLOAT DEFAULT 0.5,
+    access_count INTEGER DEFAULT 0,
+    last_accessed_at TIMESTAMP WITH TIME ZONE,
+    expires_at TIMESTAMP WITH TIME ZONE,
+    source_type VARCHAR(50),
+    source_agent VARCHAR(100),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_memory_entries_project ON memory_entries(project_id);
+CREATE INDEX idx_memory_entries_type ON memory_entries(memory_type);
+CREATE INDEX idx_memory_entries_category ON memory_entries(category);
+
+-- ================== 记忆嵌入表 ==================
+CREATE TABLE IF NOT EXISTS memory_embeddings (
+    id VARCHAR(64) PRIMARY KEY,
+    memory_id VARCHAR(64) REFERENCES memory_entries(id) ON DELETE CASCADE,
+    embedding VECTOR(384),
+    embedding_model VARCHAR(100),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_memory_embeddings_memory ON memory_embeddings(memory_id);
+
+-- ================== 记忆衰减规则表 ==================
+CREATE TABLE IF NOT EXISTS memory_decay_rules (
+    id VARCHAR(64) PRIMARY KEY,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    memory_type VARCHAR(50),
+    decay_rate FLOAT DEFAULT 0.1,
+    retention_days INTEGER DEFAULT 30,
+    boost_on_access FLOAT DEFAULT 0.1,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_memory_decay_rules_project ON memory_decay_rules(project_id);
+
+-- ================== 记忆上下文配置表 ==================
+CREATE TABLE IF NOT EXISTS memory_context_configs (
+    id VARCHAR(64) PRIMARY KEY,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE UNIQUE,
+    max_short_term INTEGER DEFAULT 10,
+    max_medium_term INTEGER DEFAULT 50,
+    max_long_term INTEGER DEFAULT 200,
+    relevance_threshold FLOAT DEFAULT 0.7,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_memory_context_configs_project ON memory_context_configs(project_id);
+
+-- ================== 记忆使用日志表 ==================
+CREATE TABLE IF NOT EXISTS memory_usage_logs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    memory_id VARCHAR(64),
+    access_type VARCHAR(50),
+    context TEXT,
+    accessed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_memory_usage_logs_project ON memory_usage_logs(project_id);
+CREATE INDEX idx_memory_usage_logs_memory ON memory_usage_logs(memory_id);
+
+-- ================== Token使用表 ==================
+CREATE TABLE IF NOT EXISTS token_usage (
+    id VARCHAR(64) PRIMARY KEY,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    total_tokens INTEGER DEFAULT 0,
+    provider VARCHAR(100),
+    model VARCHAR(100),
+    category VARCHAR(50),
+    agent_name VARCHAR(255),
+    session_id VARCHAR(64),
+    chapter_id UUID,
+    character_id UUID,
+    estimated_cost FLOAT DEFAULT 0.0,
+    metadata JSONB DEFAULT '{}',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_token_usage_project ON token_usage(project_id);
+CREATE INDEX idx_token_usage_category ON token_usage(category);
+CREATE INDEX idx_token_usage_created ON token_usage(created_at);
+
+-- ================== Prompt模板表 ==================
+CREATE TABLE IF NOT EXISTS prompt_templates (
+    id VARCHAR(64) PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    category VARCHAR(50) NOT NULL,
+    tags JSONB DEFAULT '[]',
+    content TEXT NOT NULL,
+    variables JSONB DEFAULT '[]',
+    default_values JSONB DEFAULT '{}',
+    priority INTEGER DEFAULT 50,
+    is_system BOOLEAN DEFAULT FALSE,
+    version INTEGER DEFAULT 1,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_prompt_templates_category ON prompt_templates(category);
+CREATE INDEX idx_prompt_templates_tags ON prompt_templates USING GIN(tags);
+
+-- ================== 写作规则表 ==================
+CREATE TABLE IF NOT EXISTS writing_rules (
+    id VARCHAR(64) PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    category VARCHAR(50) NOT NULL,
+    severity VARCHAR(50) DEFAULT 'recommended',
+    tags JSONB DEFAULT '[]',
+    content TEXT NOT NULL,
+    examples JSONB DEFAULT '[]',
+    counter_examples JSONB DEFAULT '[]',
+    conditions JSONB DEFAULT '[]',
+    exceptions JSONB DEFAULT '[]',
+    is_system BOOLEAN DEFAULT FALSE,
+    version VARCHAR(20) DEFAULT '1.0.0',
+    author VARCHAR(255),
+    source VARCHAR(255),
+    usage_count INTEGER DEFAULT 0,
+    last_used_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_writing_rules_category ON writing_rules(category);
+CREATE INDEX idx_writing_rules_severity ON writing_rules(severity);
+
+-- ================== 写作规则集表 ==================
+CREATE TABLE IF NOT EXISTS writing_rule_sets (
+    id VARCHAR(64) PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    rule_ids JSONB DEFAULT '[]',
+    rule_overrides JSONB DEFAULT '{}',
+    category VARCHAR(50) NOT NULL,
+    tags JSONB DEFAULT '[]',
+    target_genres JSONB DEFAULT '[]',
+    is_system BOOLEAN DEFAULT FALSE,
+    version VARCHAR(20) DEFAULT '1.0.0',
+    author VARCHAR(255),
+    usage_count INTEGER DEFAULT 0,
+    last_used_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_writing_rule_sets_category ON writing_rule_sets(category);
+
+-- ================== 项目写作配置表 ==================
+CREATE TABLE IF NOT EXISTS project_writing_configs (
+    id VARCHAR(64) PRIMARY KEY,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE UNIQUE,
+    enabled_rule_ids JSONB DEFAULT '[]',
+    enabled_rule_set_ids JSONB DEFAULT '[]',
+    rule_overrides JSONB DEFAULT '{}',
+    rule_priorities JSONB DEFAULT '{}',
+    default_severity VARCHAR(50) DEFAULT 'recommended',
+    apply_to_chapters BOOLEAN DEFAULT TRUE,
+    apply_to_characters BOOLEAN DEFAULT TRUE,
+    apply_to_descriptions BOOLEAN DEFAULT TRUE,
+    apply_to_narration BOOLEAN DEFAULT TRUE,
+    is_active BOOLEAN DEFAULT TRUE,
+    version VARCHAR(20) DEFAULT '1.0.0',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_project_writing_configs_project ON project_writing_configs(project_id);
+
+-- ================== 满意度分析表 ==================
+CREATE TABLE IF NOT EXISTS satisfaction_analyses (
+    id VARCHAR(64) PRIMARY KEY,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    chapter_number INTEGER NOT NULL,
+    overall_score FLOAT DEFAULT 0.0,
+    satisfaction_index FLOAT DEFAULT 0.0,
+    detected_points JSONB DEFAULT '[]',
+    pibu_burst_structures JSONB DEFAULT '[]',
+    analysis_details JSONB DEFAULT '{}',
+    suggestions JSONB DEFAULT '[]',
+    warnings JSONB DEFAULT '[]',
+    analyzed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_satisfaction_analyses_project ON satisfaction_analyses(project_id);
+CREATE INDEX idx_satisfaction_analyses_chapter ON satisfaction_analyses(chapter_number);
+
+-- ================== Agent模板表 ==================
+CREATE TABLE IF NOT EXISTS agent_templates (
+    id VARCHAR(64) PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    agent_type VARCHAR(100) NOT NULL,
+    tags JSONB DEFAULT '[]',
+    prompt_slots JSONB DEFAULT '[]',
+    default_prompt_order JSONB DEFAULT '[]',
+    skill_slots JSONB DEFAULT '[]',
+    default_skill_order JSONB DEFAULT '[]',
+    default_model VARCHAR(100),
+    default_temperature FLOAT DEFAULT 0.7,
+    is_system BOOLEAN DEFAULT FALSE,
+    is_optional BOOLEAN DEFAULT FALSE,
+    is_enabled BOOLEAN DEFAULT TRUE,
+    version VARCHAR(20) DEFAULT '1.0.0',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_agent_templates_type ON agent_templates(agent_type);
+
+-- ================== Agent记忆表 ==================
+CREATE TABLE IF NOT EXISTS agent_memories (
+    id VARCHAR(64) PRIMARY KEY,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    agent_type VARCHAR(100) NOT NULL,
+    agent_id VARCHAR(64),
+    memories JSONB DEFAULT '[]',
+    knowledge JSONB DEFAULT '{}',
+    working_memory JSONB DEFAULT '{}',
+    total_memories INTEGER DEFAULT 0,
+    last_execution TIMESTAMP WITH TIME ZONE,
+    execution_count INTEGER DEFAULT 0,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_agent_memories_project ON agent_memories(project_id);
+CREATE INDEX idx_agent_memories_type ON agent_memories(agent_type);
+
+-- ================== Agent执行记录表 ==================
+CREATE TABLE IF NOT EXISTS agent_execution_records (
+    id VARCHAR(64) PRIMARY KEY,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    agent_type VARCHAR(100) NOT NULL,
+    agent_name VARCHAR(255),
+    execution_type VARCHAR(50),
+    input_data JSONB DEFAULT '{}',
+    output_data JSONB DEFAULT '{}',
+    success BOOLEAN DEFAULT TRUE,
+    error_message TEXT,
+    execution_time_ms INTEGER,
+    token_used INTEGER DEFAULT 0,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_agent_execution_records_project ON agent_execution_records(project_id);
+CREATE INDEX idx_agent_execution_records_type ON agent_execution_records(agent_type);
+
+-- ================== Agent执行日志表 ==================
+CREATE TABLE IF NOT EXISTS agent_execution_logs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    record_id VARCHAR(64) REFERENCES agent_execution_records(id) ON DELETE CASCADE,
+    log_level VARCHAR(20) DEFAULT 'info',
+    message TEXT,
+    details JSONB DEFAULT '{}',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_agent_execution_logs_record ON agent_execution_logs(record_id);
+
+-- ================== Agent Prompt绑定表 ==================
+CREATE TABLE IF NOT EXISTS agent_prompt_bindings (
+    id VARCHAR(64) PRIMARY KEY,
+    agent_template_id VARCHAR(64) REFERENCES agent_templates(id) ON DELETE CASCADE,
+    prompt_template_id VARCHAR(64) REFERENCES prompt_templates(id) ON DELETE CASCADE,
+    slot_name VARCHAR(100),
+    priority INTEGER DEFAULT 50,
+    is_enabled BOOLEAN DEFAULT TRUE,
+    variable_overrides JSONB DEFAULT '{}',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_agent_prompt_bindings_agent ON agent_prompt_bindings(agent_template_id);
+CREATE INDEX idx_agent_prompt_bindings_prompt ON agent_prompt_bindings(prompt_template_id);
+
+-- ================== Skill执行表 ==================
+CREATE TABLE IF NOT EXISTS skill_executions (
+    id VARCHAR(64) PRIMARY KEY,
+    skill_id VARCHAR(64) NOT NULL,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    agent_id VARCHAR(64),
+    input_params JSONB DEFAULT '{}',
+    output_result TEXT,
+    success BOOLEAN DEFAULT TRUE,
+    error_message TEXT,
+    execution_time_ms INTEGER,
+    token_usage JSONB DEFAULT '{}',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_skill_executions_skill ON skill_executions(skill_id);
+CREATE INDEX idx_skill_executions_project ON skill_executions(project_id);
+
+-- ================== Skill执行日志表 ==================
+CREATE TABLE IF NOT EXISTS skill_execution_logs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    skill_execution_id VARCHAR(64) REFERENCES skill_executions(id) ON DELETE CASCADE,
+    log_level VARCHAR(20) DEFAULT 'info',
+    message TEXT,
+    details JSONB DEFAULT '{}',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_skill_execution_logs_execution ON skill_execution_logs(skill_execution_id);
+
+-- ================== Skill分配表 ==================
+CREATE TABLE IF NOT EXISTS skill_assignments (
+    id VARCHAR(64) PRIMARY KEY,
+    skill_id VARCHAR(64) NOT NULL,
+    agent_type VARCHAR(100) NOT NULL,
+    slot_name VARCHAR(100),
+    custom_parameters JSONB,
+    variable_overrides JSONB DEFAULT '{}',
+    priority INTEGER DEFAULT 50,
+    execution_condition TEXT,
+    is_enabled BOOLEAN DEFAULT TRUE,
+    is_required BOOLEAN DEFAULT FALSE,
+    load_mode VARCHAR(50),
+    trigger_keywords JSONB DEFAULT '[]',
+    assigned_by VARCHAR(50) DEFAULT 'user',
+    assigned_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_skill_assignments_skill ON skill_assignments(skill_id);
+CREATE INDEX idx_skill_assignments_agent ON skill_assignments(agent_type);
+
+-- ================== Skill调用记录表 ==================
+CREATE TABLE IF NOT EXISTS skill_call_records (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    skill_id VARCHAR(64) NOT NULL,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    agent_id VARCHAR(64),
+    call_context JSONB DEFAULT '{}',
+    success BOOLEAN DEFAULT TRUE,
+    execution_time_ms INTEGER,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_skill_call_records_skill ON skill_call_records(skill_id);
+CREATE INDEX idx_skill_call_records_project ON skill_call_records(project_id);
+
+-- ================== 工作流定义表 ==================
+CREATE TABLE IF NOT EXISTS workflow_definitions (
+    id VARCHAR(64) PRIMARY KEY,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    nodes JSONB DEFAULT '[]',
+    edges JSONB DEFAULT '[]',
+    variables JSONB DEFAULT '{}',
+    is_template BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_workflow_definitions_project ON workflow_definitions(project_id);
+CREATE INDEX idx_workflow_definitions_template ON workflow_definitions(is_template);
+
+-- ================== 工作流执行表 ==================
+CREATE TABLE IF NOT EXISTS workflow_executions (
+    id VARCHAR(64) PRIMARY KEY,
+    workflow_id VARCHAR(64) REFERENCES workflow_definitions(id) ON DELETE CASCADE,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    status VARCHAR(50) DEFAULT 'pending',
+    current_node VARCHAR(64),
+    node_states JSONB DEFAULT '{}',
+    context JSONB DEFAULT '{}',
+    intervention_ids JSONB DEFAULT '[]',
+    started_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP WITH TIME ZONE,
+    total_duration_ms INTEGER,
+    error TEXT
+);
+
+CREATE INDEX idx_workflow_executions_workflow ON workflow_executions(workflow_id);
+CREATE INDEX idx_workflow_executions_project ON workflow_executions(project_id);
+CREATE INDEX idx_workflow_executions_status ON workflow_executions(status);
+
 -- ================== 更新时间触发器 ==================
 CREATE OR REPLACE FUNCTION update_updated_at()
 RETURNS TRIGGER AS $$
@@ -1461,6 +2162,351 @@ networks:
             print_error(f"备份失败: {e}")
             return False
 
+    def restore_from_backup(self, backup_path: str) -> bool:
+        """从备份恢复数据库数据
+
+        Args:
+            backup_path: 备份目录路径
+
+        Returns:
+            bool: 恢复是否成功
+        """
+        import shutil
+
+        backup_dir = Path(backup_path)
+        if not backup_dir.exists():
+            print_error(f"备份目录不存在: {backup_path}")
+            return False
+
+        print_step(f"从备份恢复数据: {backup_path}")
+
+        # 检查数据库是否运行
+        if not self.check_docker_running():
+            print_error("Docker 未运行，请先启动 Docker")
+            return False
+
+        # 检查容器状态
+        success, _ = run_command(['docker', 'ps', '--filter', 'name=godview-postgres'], capture=True)
+        if not success:
+            print_info("启动数据库容器...")
+            self.start_databases(include_nebula=True)
+            time.sleep(5)
+
+        # 1. 恢复 PostgreSQL 数据
+        postgres_backup_file = backup_dir / "postgres_backup_*.json"
+        postgres_sql_file = backup_dir / "postgres_backup.sql"
+
+        # 优先使用 JSON 格式备份
+        json_files = list(backup_dir.glob("postgres_backup_*.json"))
+        if json_files:
+            print_info("从 JSON 备份恢复 PostgreSQL...")
+            if self._restore_postgres_from_json(json_files[0]):
+                print_success("PostgreSQL JSON 数据恢复完成")
+            else:
+                print_warning("PostgreSQL JSON 恢复失败，尝试 SQL 恢复...")
+                if postgres_sql_file.exists():
+                    self._restore_postgres_from_sql(postgres_sql_file)
+        elif postgres_sql_file.exists():
+            print_info("从 SQL 备份恢复 PostgreSQL...")
+            self._restore_postgres_from_sql(postgres_sql_file)
+        else:
+            print_warning("未找到 PostgreSQL 备份文件")
+
+        # 2. 恢复 Qdrant 数据
+        qdrant_backup_file = backup_dir / "qdrant_backup_*.json"
+        qdrant_files = list(backup_dir.glob("qdrant_backup_*.json"))
+        if qdrant_files:
+            print_info("从 JSON 备份恢复 Qdrant...")
+            self._restore_qdrant_from_json(qdrant_files[0])
+        else:
+            print_warning("未找到 Qdrant 备份文件")
+
+        # 3. 恢复 NebulaGraph 数据
+        nebula_backup_file = backup_dir / "nebula_backup_*.json"
+        nebula_files = list(backup_dir.glob("nebula_backup_*.json"))
+        if nebula_files:
+            print_info("从 JSON 备份恢复 NebulaGraph...")
+            self._restore_nebula_from_json(nebula_files[0])
+        else:
+            print_warning("未找到 NebulaGraph 备份文件")
+
+        print_success("数据恢复完成")
+        return True
+
+    def _restore_postgres_from_json(self, json_file: Path) -> bool:
+        """从 JSON 文件恢复 PostgreSQL 数据"""
+        try:
+            with open(json_file, 'r', encoding='utf-8') as f:
+                backup_data = json.load(f)
+
+            if 'tables' not in backup_data:
+                print_error("备份文件格式错误：缺少 tables 字段")
+                return False
+
+            tables = backup_data['tables']
+            print_info(f"找到 {len(tables)} 个表的数据")
+
+            # 按依赖顺序排序表
+            table_order = [
+                'projects', 'worlds', 'characters', 'chapters', 'skills',
+                'world_settings', 'plot_lines', 'hooks', 'interventions',
+                'lore_entries', 'conversation_history', 'embedding_cache',
+                'regions', 'chapter_outlines', 'volume_outlines', 'villains',
+                'foreshadowings', 'conflicts', 'event_summaries', 'character_lifecycles',
+                'character_skills', 'global_state', 'global_state_history',
+                'golden_three_rules', 'golden_three_checks', 'intervention_logs',
+                'world_snapshots', 'memory_entries', 'memory_embeddings',
+                'memory_decay_rules', 'memory_context_configs', 'memory_usage_logs',
+                'token_usage', 'prompt_templates', 'writing_rules', 'writing_rule_sets',
+                'project_writing_configs', 'satisfaction_analyses', 'agent_templates',
+                'agent_memories', 'agent_execution_records', 'agent_execution_logs',
+                'agent_prompt_bindings', 'skill_executions', 'skill_execution_logs',
+                'skill_assignments', 'skill_call_records', 'workflow_definitions',
+                'workflow_executions'
+            ]
+
+            # 首先清空现有数据（按依赖顺序反向）
+            print_info("清空现有数据...")
+            for table in reversed(table_order):
+                if table in tables:
+                    run_command([
+                        'docker', 'exec', 'godview-postgres',
+                        'psql', '-U', 'postgres', '-d', 'godview', '-c',
+                        f'TRUNCATE TABLE {table} CASCADE;'
+                    ], capture=True)
+
+            # 插入备份数据
+            print_info("插入备份数据...")
+            for table in table_order:
+                if table not in tables:
+                    continue
+
+                rows = tables[table]
+                if not rows:
+                    continue
+
+                print_info(f"恢复表 {table} ({len(rows)} 行)...")
+
+                for row in rows:
+                    # 构建 INSERT 语句
+                    columns = list(row.keys())
+                    values = []
+                    for col in columns:
+                        val = row[col]
+                        if val is None:
+                            values.append('NULL')
+                        elif isinstance(val, bool):
+                            values.append('TRUE' if val else 'FALSE')
+                        elif isinstance(val, (int, float)):
+                            values.append(str(val))
+                        elif isinstance(val, (dict, list)):
+                            # JSON 类型
+                            import json as json_mod
+                            escaped = json_mod.dumps(val).replace("'", "''")
+                            values.append(f"'{escaped}'")
+                        else:
+                            # 字符串类型，需要转义
+                            escaped = str(val).replace("'", "''")
+                            values.append(f"'{escaped}'")
+
+                    columns_str = ', '.join(columns)
+                    values_str = ', '.join(values)
+
+                    insert_sql = f"INSERT INTO {table} ({columns_str}) VALUES ({values_str}) ON CONFLICT DO NOTHING;"
+
+                    success, output = run_command([
+                        'docker', 'exec', 'godview-postgres',
+                        'psql', '-U', 'postgres', '-d', 'godview', '-c', insert_sql
+                    ], capture=True)
+
+                    if not success and 'ERROR' in output:
+                        # 单条插入失败可能是数据问题，继续尝试其他数据
+                        pass
+
+            return True
+
+        except Exception as e:
+            print_error(f"PostgreSQL JSON 恢复失败: {e}")
+            return False
+
+    def _restore_postgres_from_sql(self, sql_file: Path) -> bool:
+        """从 SQL 文件恢复 PostgreSQL 数据"""
+        try:
+            # 读取 SQL 文件
+            with open(sql_file, 'r', encoding='utf-8') as f:
+                sql_content = f.read()
+
+            # 通过 docker exec 执行 SQL
+            success, output = run_command([
+                'docker', 'exec', '-i', 'godview-postgres',
+                'psql', '-U', 'postgres', '-d', 'godview'
+            ], capture=True, timeout=300)
+
+            # 使用管道传入 SQL 内容
+            import subprocess
+            process = subprocess.Popen(
+                ['docker', 'exec', '-i', 'godview-postgres', 'psql', '-U', 'postgres', '-d', 'godview'],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            stdout, stderr = process.communicate(input=sql_content, timeout=300)
+
+            if process.returncode == 0:
+                print_success("PostgreSQL SQL 数据恢复完成")
+                return True
+            else:
+                print_warning(f"部分恢复可能失败: {stderr[:500]}")
+                return False
+
+        except Exception as e:
+            print_error(f"PostgreSQL SQL 恢复失败: {e}")
+            return False
+
+    def _restore_qdrant_from_json(self, json_file: Path) -> bool:
+        """从 JSON 文件恢复 Qdrant 数据"""
+        try:
+            with open(json_file, 'r', encoding='utf-8') as f:
+                backup_data = json.load(f)
+
+            if 'collections' not in backup_data:
+                print_error("备份文件格式错误：缺少 collections 字段")
+                return False
+
+            collections = backup_data['collections']
+            base_url = "http://localhost:6333"
+
+            for collection_name, collection_data in collections.items():
+                print_info(f"恢复 Qdrant 集合: {collection_name}")
+
+                # 检查集合是否存在
+                try:
+                    req = urllib.request.Request(
+                        f"{base_url}/collections/{collection_name}",
+                        method='GET'
+                    )
+                    urllib.request.urlopen(req, timeout=5)
+                    collection_exists = True
+                except:
+                    collection_exists = False
+
+                # 创建集合（如果不存在）
+                if not collection_exists:
+                    vectors_config = collection_data.get('vectors_config', {"size": 384, "distance": "Cosine"})
+                    create_data = {"vectors": vectors_config}
+                    req = urllib.request.Request(
+                        f"{base_url}/collections/{collection_name}",
+                        data=json.dumps(create_data).encode('utf-8'),
+                        headers={'Content-Type': 'application/json'},
+                        method='PUT'
+                    )
+                    urllib.request.urlopen(req, timeout=10)
+
+                # 插入数据点
+                points = collection_data.get('points', [])
+                if points:
+                    # 分批上传（每批 100 条）
+                    batch_size = 100
+                    for i in range(0, len(points), batch_size):
+                        batch = points[i:i+batch_size]
+                        upload_data = {"points": batch}
+                        req = urllib.request.Request(
+                            f"{base_url}/collections/{collection_name}/points",
+                            data=json.dumps(upload_data).encode('utf-8'),
+                            headers={'Content-Type': 'application/json'},
+                            method='PUT'
+                        )
+                        urllib.request.urlopen(req, timeout=30)
+
+                    print_success(f"集合 {collection_name}: 恢复 {len(points)} 个数据点")
+
+            return True
+
+        except Exception as e:
+            print_error(f"Qdrant 恢复失败: {e}")
+            return False
+
+    def _restore_nebula_from_json(self, json_file: Path) -> bool:
+        """从 JSON 文件恢复 NebulaGraph 数据"""
+        try:
+            with open(json_file, 'r', encoding='utf-8') as f:
+                backup_data = json.load(f)
+
+            print_info("NebulaGraph 数据恢复需要 Python SDK...")
+
+            # 尝试使用 Python SDK
+            try:
+                from nebula3.gclient.net import ConnectionPool
+                from nebula3.Config import Config
+
+                config = Config()
+                config.max_connection_pool_size = 10
+                pool = ConnectionPool()
+                pool.init([('127.0.0.1', 9669)], config)
+                session = pool.get_session('root', 'nebula')
+
+                # 切换到 godview 图空间
+                session.execute('USE godview;')
+
+                # 恢复顶点
+                if 'vertices' in backup_data:
+                    for vertex in backup_data['vertices']:
+                        vid = vertex.get('vid')
+                        tag = vertex.get('tag')
+                        props = vertex.get('properties', {})
+
+                        # 构建 INSERT 语句
+                        prop_names = list(props.keys())
+                        prop_values = []
+                        for p in prop_names:
+                            val = props[p]
+                            if isinstance(val, str):
+                                prop_values.append(f'"{val}"')
+                            else:
+                                prop_values.append(str(val))
+
+                        prop_str = ', '.join([f'"{n}":{v}' for n, v in zip(prop_names, prop_values)])
+                        insert_stmt = f'INSERT VERTEX {tag}({", ".join(prop_names)}) VALUES "{vid}":({prop_str});'
+                        session.execute(insert_stmt)
+
+                    print_success(f"恢复 {len(backup_data['vertices'])} 个顶点")
+
+                # 恢复边
+                if 'edges' in backup_data:
+                    for edge in backup_data['edges']:
+                        edge_type = edge.get('type')
+                        src = edge.get('src')
+                        dst = edge.get('dst')
+                        props = edge.get('properties', {})
+
+                        prop_names = list(props.keys())
+                        prop_values = []
+                        for p in prop_names:
+                            val = props[p]
+                            if isinstance(val, str):
+                                prop_values.append(f'"{val}"')
+                            else:
+                                prop_values.append(str(val))
+
+                        insert_stmt = f'INSERT EDGE {edge_type}({", ".join(prop_names)}) VALUES "{src}"->"{dst}":({", ".join(prop_values)});'
+                        session.execute(insert_stmt)
+
+                    print_success(f"恢复 {len(backup_data['edges'])} 条边")
+
+                session.release()
+                pool.close()
+                return True
+
+            except ImportError:
+                print_warning("未安装 nebula3-python，跳过 NebulaGraph 恢复")
+                print_info("安装命令: pip install nebula3-python")
+                return False
+
+        except Exception as e:
+            print_error(f"NebulaGraph 恢复失败: {e}")
+            return False
+
 
 class GodViewInstaller:
     def __init__(self):
@@ -1555,6 +2601,7 @@ class GodViewInstaller:
                 "初始化 Qdrant 向量集合",
                 "初始化 NebulaGraph 图空间",
                 "备份数据库数据",
+                "从备份恢复数据",
                 "安装 Docker",
                 "返回主菜单",
             ]
@@ -1587,8 +2634,38 @@ class GodViewInstaller:
             elif idx == 8:
                 self.db_manager.backup_data()
             elif idx == 9:
-                self.db_manager.install_docker()
+                # 从备份恢复
+                print_info("可用的备份目录:")
+                backup_dir = self.project_dir / "backups"
+                if backup_dir.exists():
+                    backups = sorted(backup_dir.glob("backup_*"), reverse=True)
+                    if backups:
+                        for i, b in enumerate(backups[:10], 1):
+                            print(f"  {i}. {b.name}")
+                        print()
+                        choice = input("选择备份编号（或输入完整路径）: ").strip()
+                        try:
+                            idx_choice = int(choice) - 1
+                            if 0 <= idx_choice < len(backups):
+                                self.db_manager.restore_from_backup(str(backups[idx_choice]))
+                            else:
+                                self.db_manager.restore_from_backup(choice)
+                        except ValueError:
+                            if choice:
+                                self.db_manager.restore_from_backup(choice)
+                    else:
+                        print_warning("未找到备份目录")
+                        backup_path = input("请输入备份路径: ").strip()
+                        if backup_path:
+                            self.db_manager.restore_from_backup(backup_path)
+                else:
+                    print_warning("未找到 backups 目录")
+                    backup_path = input("请输入备份路径: ").strip()
+                    if backup_path:
+                        self.db_manager.restore_from_backup(backup_path)
             elif idx == 10:
+                self.db_manager.install_docker()
+            elif idx == 11:
                 break
 
     def install_docker_only(self):
@@ -1882,7 +2959,7 @@ class GodViewInstaller:
 
         success, output = run_command([
             'conda', 'create', '-n', self.conda_env_name, 'python=3.11', '-y'
-        ], capture=True)
+        ], capture=True, timeout=1800)
 
         if success or 'done' in output.lower():
             print_success(f"Conda 环境 '{self.conda_env_name}' 创建成功")
@@ -2138,8 +3215,15 @@ pause
             print_success("创建 start.bat")
 
         # Linux/Mac
+        conda_init_block = '''# 添加 conda 初始化（适用于非交互式 shell）
+CONDA_BASE=$(conda info --base 2>/dev/null || echo "$HOME/miniconda3")
+if [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
+    source "$CONDA_BASE/etc/profile.d/conda.sh"
+fi
+''' if self.use_conda else ''
+
         start_sh = f"""#!/bin/bash
-echo "Starting GodView..."
+{conda_init_block}echo "Starting GodView..."
 echo ""
 echo "Starting databases..."
 cd {self.project_dir}
@@ -2147,7 +3231,7 @@ docker compose up -d
 sleep 8
 echo ""
 echo "Starting backend..."
-{'source $(conda info --base)/etc/profile.d/conda.sh && conda activate ' + self.conda_env_name + ' && ' if self.use_conda else ''} \\
+{'conda activate ' + self.conda_env_name + ' && ' if self.use_conda else ''} \\
     python -m uvicorn app.api.app:app --host 0.0.0.0 --port 8000 --reload &
 BACKEND_PID=$!
 echo ""

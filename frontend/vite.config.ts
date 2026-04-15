@@ -16,6 +16,8 @@ export default defineConfig(({ mode }) => {
     },
     server: {
       port: 5173,
+      host: true,
+      allowedHosts: ['weirdsky.cn'],
       proxy: {
         '/api': {
           target: env.VITE_API_TARGET || 'http://localhost:8000',

@@ -1,18 +1,25 @@
 #!/bin/bash
+
+# 添加 conda 初始化（适用于非交互式 shell）
+CONDA_BASE=$(conda info --base 2>/dev/null || echo "$HOME/miniconda3")
+if [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
+    source "$CONDA_BASE/etc/profile.d/conda.sh"
+fi
+
 echo "Starting GodView..."
 echo ""
 echo "Starting databases..."
-cd E:\_Workspace\Godview
+cd /home/code_workspace/Godview
 docker compose up -d
 sleep 8
 echo ""
 echo "Starting backend..."
- \
+conda activate godview &&  \
     python -m uvicorn app.api.app:app --host 0.0.0.0 --port 8000 --reload &
 BACKEND_PID=$!
 echo ""
 echo "Starting frontend..."
-cd E:\_Workspace\Godview/frontend && npm run dev &
+cd /home/code_workspace/Godview/frontend && npm run dev &
 FRONTEND_PID=$!
 echo ""
 echo "========================================"
