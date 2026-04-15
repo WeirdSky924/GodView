@@ -1,782 +1,250 @@
-# GodView - 新手可直接照着做的启动说明
+# GodView - AI 驱动的小说生成系统
 
-这份说明按**从零开始**写，支持 4 种常见环境：
+GodView 是一个基于多 Agent 协作的智能小说生成平台，支持从大纲创建、章节生成到效果评估的完整创作流程。
 
-- Windows + venv
-- Windows + conda
-- Linux + venv
-- Linux + conda
+## 核心功能
 
-你不需要全部都做，只需要选择**一种**最适合你的方案。
+### 创作辅助
+- **小说编辑器** - 章节创建、编辑、保存与导出（TXT/Markdown）
+- **大纲管理** - 支持章节大纲、情绪曲线设计
+- **读者模拟** - 模拟真实读者反馈
 
-## 我该选哪一种？
+### AI 能力
+- **Director 上帝模式** - 全局创作指导和干预
+- **工作流引擎** - 可视化工作流编排与执行
+- **多 Agent 协作** - 设定 Agent、世界管理等智能体
 
-- **你是 Windows 用户，而且不熟悉 conda**：选 `Windows + venv`
-- **你是 Windows 用户，平时就用 conda**：选 `Windows + conda`
-- **你是 Linux 用户，而且不熟悉 conda**：选 `Linux + venv`
-- **你是 Linux 用户，平时就用 conda**：选 `Linux + conda`
+### 分析工具
+- **章节评估** - 内容质量与连贯性评估
+- **Diff 对比** - 章节版本差异可视化
+- **干预日志** - 记录并评估人工干预效果
 
-如果你完全不确定，默认推荐：
+## 技术架构
 
-- **Windows 用户**：`Windows + venv`
-- **Linux 用户**：`Linux + venv`
+### 数据库（31 个模型，200+ 数据表）
+- **PostgreSQL** - 关系数据库，存储项目、章节、角色、设定等结构化数据
+- **Qdrant** - 向量数据库，用于语义搜索和相似度匹配
+- **NebulaGraph** - 图数据库，存储角色关系、记忆关联、伏笔追踪
 
----
-
-## 快速导航
-
-- [0. 项目目前能做什么](#0-这个项目目前能做什么)
-- [1. 先安装这些软件](#1-先安装这些软件)
-- [2. 获取项目代码](#2-获取项目代码)
-- [3. 选择你的环境方案](#3-选择你的环境方案)
-  - [Windows + venv](#windows--venv)
-  - [Windows + conda](#windows--conda)
-  - [Linux + venv](#linux--venv)
-  - [Linux + conda](#linux--conda)
-- [4. 页面验证顺序](#4-页面验证顺序)
-- [5. 常见问题](#5-常见问题)
-- [6. 停止项目](#6-停止项目)
-
----
-
-## 0. 这个项目目前能做什么
-
-当前项目已经具备这些主要页面和能力：
-
-- 前端管理界面
-- Director 上帝模式页面
-- 小说章节编辑 / 保存 / 导出
-- 章节评估
-- 读者模拟
-- Diff 对比工具
-- 可视化工作台
-- 干预日志与效果评估
-
-推荐使用顺序：
-
-1. 启动数据库
-2. 启动后端
-3. 启动前端
-4. 打开页面验证
+### LLM 支持
+支持多种大语言模型提供商：
+- OpenAI（GPT-4o）
+- Anthropic（Claude）
+- 智谱 AI（GLM-4）
+- 通义千问（Qwen）
+- DeepSeek
+- Moonshot（Kimi）
+- 百川（Baichuan）
+- 零一万物（Yi）
+- MiniMax
+- OpenRouter
 
 ---
 
-## 1. 先安装这些软件
+## 一键部署
 
-请先安装下面这些软件。
+### 环境要求
 
-### 1.1 Python 3.11
+| 软件 | 版本 | 说明 |
+|------|------|------|
+| Python | 3.11+ | 后端运行环境 |
+| Node.js | 20+ | 前端运行环境 |
+| Docker | 最新版 | 数据库容器 |
+| Git | 任意 | 代码管理 |
 
-下载地址：
-
-- https://www.python.org/downloads/
-
-Windows 安装时请勾选：
-
-- `Add python.exe to PATH`
-
-安装完成后执行：
+### 快速安装
 
 ```bash
-python --version
-```
-
-Linux 如需可执行：
-
-```bash
-python3 --version
-```
-
----
-
-### 1.2 Git
-
-下载地址：
-
-- https://git-scm.com/downloads
-
-安装完成后执行：
-
-```bash
-git --version
-```
-
----
-
-### 1.3 Node.js 20+
-
-下载地址：
-
-- https://nodejs.org/
-
-安装完成后执行：
-
-```bash
-node --version
-npm --version
-```
-
----
-
-### 1.4 Docker Desktop / Docker Engine
-
-- Windows 推荐：Docker Desktop
-- Linux 推荐：Docker Engine + Docker Compose
-
-安装完成后执行：
-
-```bash
-docker --version
-docker compose version
-```
-
----
-
-### 1.5 可选：Conda
-
-如果你想用 conda 管理 Python 环境，请先安装：
-
-- Miniconda: https://docs.conda.io/en/latest/miniconda.html
-- 或 Anaconda: https://www.anaconda.com/download
-
-安装完成后执行：
-
-```bash
-conda --version
-```
-
----
-
-## 2. 获取项目代码
-
-如果你还没有代码，请执行：
-
-```bash
-git clone <你的仓库地址>
+# 1. 克隆项目
+git clone <仓库地址>
 cd Godview
+
+# 2. 运行安装脚本
+python install.py
 ```
 
-项目根目录应该能看到这些文件：
+安装脚本会引导你完成：
+1. 选择环境类型（Conda / venv）
+2. 自动安装 Docker（如未安装）
+3. 创建 Python 虚拟环境
+4. 安装前后端依赖
+5. 初始化数据库
+6. 生成启动脚本
 
-- `main.py`
-- `scripts.py`
-- `requirements.txt`
-- `docker-compose.yml`
-- `frontend/`
+### 启动项目
+
+**Linux/macOS:**
+```bash
+./start.sh
+```
+
+**Windows:**
+```bash
+start.bat
+```
+
+启动脚本会自动：
+- 启动 Docker 容器（PostgreSQL、Qdrant、NebulaGraph）
+- 激活 Conda 环境（如使用 Conda）
+- 启动后端服务（端口 8000）
+- 启动前端服务（端口 5173）
+
+### 访问地址
+
+| 服务 | 地址 |
+|------|------|
+| 前端界面 | http://localhost:5173 |
+| 后端 API | http://localhost:8000 |
+| API 文档 | http://localhost:8000/docs |
+| 健康检查 | http://localhost:8000/health |
 
 ---
 
-## 3. 选择你的环境方案
+## 配置说明
 
-下面 4 个方案只需要选 **一个**。
+### 环境变量
 
----
-
-## Windows + venv
-
-<details>
-<summary><strong>点击展开：Windows + venv 完整步骤</strong></summary>
-
-### A-1. 创建虚拟环境
-
-```bash
-python -m venv .venv
-```
-
-### A-2. 激活虚拟环境
-
-PowerShell：
-
-```bash
-.venv\Scripts\Activate.ps1
-```
-
-CMD：
-
-```bash
-.venv\Scripts\activate.bat
-```
-
-### A-3. 安装后端依赖
-
-```bash
-pip install -r requirements.txt
-```
-
-### A-4. 检查后端依赖
-
-```bash
-python scripts.py check
-```
-
-### A-5. 安装前端依赖
-
-```bash
-cd frontend
-npm install
-cd ..
-```
-
-### A-6. 复制环境变量
-
-```bash
-copy .env.example .env
-```
-
-然后打开 `.env`，至少确认这些值：
-
-```ini
-DATABASE_URL=postgresql+asyncpg://postgres:password@localhost:5432/godview
-QDRANT_URL=http://localhost:6333
-EMBEDDING_PROVIDER=sentence_transformers
-EMBEDDING_MODEL=all-MiniLM-L6-v2
-LLM_PROVIDER=openai
-LLM_API_KEY=your-api-key-here
-LLM_MODEL=gpt-4o
-```
-
-### A-7. 启动数据库
-
-先打开 Docker Desktop，再执行：
-
-```bash
-docker compose up -d postgres qdrant
-```
-
-检查状态：
-
-```bash
-docker compose ps
-```
-
-### A-8. 初始化数据库
-
-```bash
-python scripts.py init-db
-```
-
-### A-9. 启动后端
-
-```bash
-python scripts.py start --reload
-```
-
-### A-10. 启动前端
-
-新开一个终端窗口：
-
-```bash
-cd frontend
-npm run dev
-```
-
-### A-11. 打开页面
-
-- 前端：http://localhost:5173
-- 后端文档：http://localhost:8000/docs
-- 健康检查：http://localhost:8000/health
-
-</details>
-
----
-
-## Windows + conda
-
-<details>
-<summary><strong>点击展开：Windows + conda 完整步骤</strong></summary>
-
-### B-1. 创建 conda 环境
-
-```bash
-conda create -n godview python=3.11 -y
-```
-
-### B-2. 激活 conda 环境
-
-```bash
-conda activate godview
-```
-
-### B-3. 安装后端依赖
-
-```bash
-pip install -r requirements.txt
-```
-
-### B-4. 检查后端依赖
-
-```bash
-python scripts.py check
-```
-
-### B-5. 安装前端依赖
-
-```bash
-cd frontend
-npm install
-cd ..
-```
-
-### B-6. 复制环境变量
-
-```bash
-copy .env.example .env
-```
-
-然后打开 `.env`，至少确认这些值：
-
-```ini
-DATABASE_URL=postgresql+asyncpg://postgres:password@localhost:5432/godview
-QDRANT_URL=http://localhost:6333
-EMBEDDING_PROVIDER=sentence_transformers
-EMBEDDING_MODEL=all-MiniLM-L6-v2
-LLM_PROVIDER=openai
-LLM_API_KEY=your-api-key-here
-LLM_MODEL=gpt-4o
-```
-
-### B-7. 启动数据库
-
-先打开 Docker Desktop，再执行：
-
-```bash
-docker compose up -d postgres qdrant
-```
-
-### B-8. 初始化数据库
-
-```bash
-python scripts.py init-db
-```
-
-### B-9. 启动后端
-
-```bash
-python scripts.py start --reload
-```
-
-### B-10. 启动前端
-
-新开一个终端窗口：
-
-```bash
-cd frontend
-npm run dev
-```
-
-### B-11. 打开页面
-
-- 前端：http://localhost:5173
-- 后端文档：http://localhost:8000/docs
-- 健康检查：http://localhost:8000/health
-
-以后再次进入项目时，先执行：
-
-```bash
-conda activate godview
-```
-
-</details>
-
----
-
-## Linux + venv
-
-<details>
-<summary><strong>点击展开：Linux + venv 完整步骤</strong></summary>
-
-### C-1. 创建虚拟环境
-
-```bash
-python3 -m venv .venv
-```
-
-### C-2. 激活虚拟环境
-
-```bash
-source .venv/bin/activate
-```
-
-### C-3. 安装后端依赖
-
-```bash
-pip install -r requirements.txt
-```
-
-### C-4. 检查后端依赖
-
-```bash
-python3 scripts.py check
-```
-
-### C-5. 安装前端依赖
-
-```bash
-cd frontend
-npm install
-cd ..
-```
-
-### C-6. 复制环境变量
-
+复制并编辑配置文件：
 ```bash
 cp .env.example .env
 ```
 
-然后打开 `.env`，至少确认这些值：
+### 必要配置
 
 ```ini
+# 数据库
 DATABASE_URL=postgresql+asyncpg://postgres:password@localhost:5432/godview
 QDRANT_URL=http://localhost:6333
+NEBULA_HOST=127.0.0.1
+NEBULA_PORT=9669
+
+# LLM（至少配置一个）
+LLM_PROVIDER=openai
+LLM_OPENAI_API_KEY=your-api-key-here
+LLM_OPENAI_MODEL=gpt-4o
+
+# Embedding
 EMBEDDING_PROVIDER=sentence_transformers
-EMBEDDING_MODEL=all-MiniLM-L6-v2
-LLM_PROVIDER=openai
-LLM_API_KEY=your-api-key-here
-LLM_MODEL=gpt-4o
+EMBEDDING_ST_MODEL=all-MiniLM-L6-v2
 ```
 
-### C-7. 启动 Docker
-
-如果 Docker 服务未启动，可执行：
-
-```bash
-sudo systemctl start docker
-```
-
-### C-8. 启动数据库
-
-```bash
-docker compose up -d postgres qdrant
-```
-
-### C-9. 初始化数据库
-
-```bash
-python3 scripts.py init-db
-```
-
-### C-10. 启动后端
-
-```bash
-python3 scripts.py start --reload
-```
-
-### C-11. 启动前端
-
-新开一个终端窗口：
-
-```bash
-cd frontend
-npm run dev
-```
-
-### C-12. 打开页面
-
-- 前端：http://localhost:5173
-- 后端文档：http://localhost:8000/docs
-- 健康检查：http://localhost:8000/health
-
-</details>
-
----
-
-## Linux + conda
-
-<details>
-<summary><strong>点击展开：Linux + conda 完整步骤</strong></summary>
-
-### D-1. 创建 conda 环境
-
-```bash
-conda create -n godview python=3.11 -y
-```
-
-### D-2. 激活 conda 环境
-
-```bash
-conda activate godview
-```
-
-### D-3. 安装后端依赖
-
-```bash
-pip install -r requirements.txt
-```
-
-### D-4. 检查后端依赖
-
-```bash
-python scripts.py check
-```
-
-### D-5. 安装前端依赖
-
-```bash
-cd frontend
-npm install
-cd ..
-```
-
-### D-6. 复制环境变量
-
-```bash
-cp .env.example .env
-```
-
-然后打开 `.env`，至少确认这些值：
+### 多 LLM 配置示例
 
 ```ini
-DATABASE_URL=postgresql+asyncpg://postgres:password@localhost:5432/godview
-QDRANT_URL=http://localhost:6333
-EMBEDDING_PROVIDER=sentence_transformers
-EMBEDDING_MODEL=all-MiniLM-L6-v2
-LLM_PROVIDER=openai
-LLM_API_KEY=your-api-key-here
-LLM_MODEL=gpt-4o
-```
-
-### D-7. 启动 Docker
-
-如果 Docker 服务未启动，可执行：
-
-```bash
-sudo systemctl start docker
-```
-
-### D-8. 启动数据库
-
-```bash
-docker compose up -d postgres qdrant
-```
-
-### D-9. 初始化数据库
-
-```bash
-python scripts.py init-db
-```
-
-### D-10. 启动后端
-
-```bash
-python scripts.py start --reload
-```
-
-### D-11. 启动前端
-
-新开一个终端窗口：
-
-```bash
-cd frontend
-npm run dev
-```
-
-### D-12. 打开页面
-
-- 前端：http://localhost:5173
-- 后端文档：http://localhost:8000/docs
-- 健康检查：http://localhost:8000/health
-
-以后再次进入项目时，先执行：
-
-```bash
-conda activate godview
-```
-
-</details>
-
----
-
-## 4. 页面验证顺序
-
-启动完成后，建议按下面顺序检查。
-
-### 4.1 小说编辑页
-
-重点确认：
-
-- 能看到章节列表
-- 能新建章节
-- 能修改章节标题和正文
-- 能保存章节
-- 能导出 TXT / Markdown
-
-### 4.2 章节评估页
-
-重点确认：
-
-- 能读取章节
-- 能触发评估
-- 页面不会因为章节接口报错而空白
-
-### 4.3 读者模拟页
-
-重点确认：
-
-- 能读取章节列表
-- 能执行模拟
-
-### 4.4 Director 页面
-
-重点确认：
-
-- 页面能打开
-- 能建立会话
-- 工作流日志能显示
-- 运行时面板能刷新
-
-如果 `.env` 中的 `LLM_API_KEY` 没填真实值，生成类功能可能无法正常使用。
-
-### 4.5 Diff 工具页
-
-重点确认：
-
-- 页面能打开
-- 能选择对比模式
-- 快照对比接口能正常返回
-
-### 4.6 可视化工作台
-
-重点确认：
-
-- 页面能打开
-- 能选择世界
-- 能看到工作流 / 剧情树 / 版本树
-
-### 4.7 干预日志页
-
-重点确认：
-
-- 能加载干预记录
-- 能选择快照并创建干预
-- 能填写效果评分和备注并保存
-
----
-
-## 5. 常见问题
-
-### 5.1 `python` 命令不可用
-
-可能是：
-
-- Windows 没把 Python 加入 PATH
-- Linux 需要使用 `python3`
-
-### 5.2 `conda activate godview` 失败
-
-可先执行：
-
-```bash
-conda init
-```
-
-然后关闭终端重新打开，再执行：
-
-```bash
-conda activate godview
-```
-
-### 5.3 `docker compose` 失败
-
-通常是 Docker 没启动。
-
-Windows：
-
-- 先打开 Docker Desktop
-
-Linux：
-
-```bash
-sudo systemctl start docker
-```
-
-### 5.4 `python scripts.py init-db` 失败
-
-先执行：
-
-```bash
-docker compose ps
-```
-
-确认 PostgreSQL 已启动，再检查 `.env` 中的：
-
-```ini
-DATABASE_URL=postgresql+asyncpg://postgres:password@localhost:5432/godview
-```
-
-### 5.5 `npm run dev` 失败
-
-先确认你在 `frontend` 目录下，再执行：
-
-```bash
-npm install
-npm run dev
-```
-
-### 5.6 页面能打开，但生成能力不能用
-
-通常是：
-
-- `LLM_API_KEY` 没填真实值
-- 模型服务不可用
-
-请检查：
-
-```ini
-LLM_PROVIDER=openai
-LLM_API_KEY=你的真实Key
-LLM_MODEL=gpt-4o
+# 智谱 AI
+LLM_ZHIPU_API_KEY=your-zhipu-key
+LLM_ZHIPU_MODEL=glm-4-plus
+
+# 通义千问
+LLM_QWEN_API_KEY=your-qwen-key
+LLM_QWEN_MODEL=qwen-max
+
+# DeepSeek
+LLM_DEEPSEEK_API_KEY=your-deepseek-key
 ```
 
 ---
 
-## 6. 停止项目
+## 数据备份与恢复
 
-### 6.1 停止前端
-
-在前端终端按：
+### 备份数据库
 
 ```bash
-Ctrl + C
+python backup_database.py
 ```
 
-### 6.2 停止后端
+备份内容：
+- PostgreSQL 所有表数据
+- Qdrant 向量集合
+- NebulaGraph 图数据
+- 配置文件（敏感信息脱敏）
 
-在后端终端按：
+备份文件保存在 `./backups/backup_<时间戳>/` 目录。
 
-```bash
-Ctrl + C
-```
-
-### 6.3 退出 conda 环境（如果你在用 conda）
-
-```bash
-conda deactivate
-```
-
-### 6.4 停止 Docker 容器
+### 恢复数据
 
 ```bash
-docker compose down
+python restore_database.py ./backups/backup_<时间戳>
 ```
 
 ---
 
-## 7. 当前项目目录结构（简化版）
+## 项目结构
 
-```text
+```
 Godview/
-├── app/                  # 后端代码
-├── frontend/             # 前端代码
-├── main.py               # FastAPI 入口
-├── scripts.py            # 启动/检查/初始化命令
-├── docker-compose.yml    # Docker 数据库服务
-├── requirements.txt      # 后端依赖
-├── .env.example          # 环境变量模板
-└── README.md             # 当前说明文档
+├── app/                    # 后端代码
+│   ├── api/               # API 路由
+│   ├── models/            # 数据模型（31个）
+│   ├── services/          # 业务逻辑
+│   └── database/          # 数据库连接
+├── frontend/              # 前端代码（React + Vite）
+├── data/                  # 数据持久化目录
+│   ├── postgres/
+│   ├── qdrant/
+│   └── nebula/
+├── init/sql/              # 数据库初始化脚本
+├── backups/               # 备份文件目录
+├── main.py                # FastAPI 入口
+├── install.py             # 一键安装脚本
+├── start.sh               # Linux/Mac 启动脚本
+├── start.bat              # Windows 启动脚本
+├── backup_database.py     # 备份脚本
+├── docker-compose.yml     # Docker 配置
+├── requirements.txt       # Python 依赖
+└── .env.example           # 环境变量模板
 ```
 
 ---
 
-## 8. 许可证
+## 页面功能验证
+
+启动后建议按以下顺序检查：
+
+1. **前端管理界面** - http://localhost:5173
+2. **Director 上帝模式** - 创建会话、查看工作流日志
+3. **小说编辑页** - 创建/编辑/导出章节
+4. **章节评估页** - 触发 AI 评估
+5. **读者模拟页** - 执行模拟测试
+6. **Diff 工具页** - 版本对比
+7. **可视化工作台** - 查看工作流/剧情树
+8. **干预日志页** - 记录和评估干预效果
+
+---
+
+## 常见问题
+
+### Docker 启动失败
+
+**Windows:** 确保已启动 Docker Desktop
+
+**Linux:**
+```bash
+sudo systemctl start docker
+```
+
+### 数据库初始化失败
+
+检查 PostgreSQL 是否正常运行：
+```bash
+docker compose ps
+```
+
+### 前端启动失败
+
+确保在 `frontend` 目录下执行：
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+### AI 功能不可用
+
+检查 `.env` 中的 LLM API Key 是否正确配置。
+
+---
+
+## 许可证
 
 MIT License
