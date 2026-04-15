@@ -44,9 +44,33 @@ class ConnectionManager:
         self.active_connections.discard(websocket)
         self.client_data.pop(websocket, None)
         if client_id:
+            # 取消该客户端的工作流执行
+            execution_id = self.client_executions.get(client_id)
+            if execution_id:
+                # 异步取消工作流（在事件循环中执行）
+                import asyncio
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        asyncio.create_task(self._cancel_workflow_async(execution_id, client_id))
+                except Exception as e:
+                    logger.warning(f"取消工作流失败: {e}")
             self.director_sessions.pop(client_id, None)
             self.client_executions.pop(client_id, None)
         logger.info("客户端断开连接")
+
+    async def _cancel_workflow_async(self, execution_id: str, client_id: str):
+        """异步取消工作流"""
+        try:
+            from app.services.workflow_engine import get_workflow_engine
+            engine = get_workflow_engine()
+            success = await engine.cancel_workflow(execution_id)
+            if success:
+                logger.info(f"已取消客户端 {client_id} 的工作流执行: {execution_id}")
+            # 清理干预队列
+            await engine.clear_interventions(execution_id)
+        except Exception as e:
+            logger.warning(f"取消工作流异常: {e}")
 
     def set_execution(self, client_id: str, execution_id: str):
         """设置客户端当前的工作流执行ID"""
@@ -904,11 +928,35 @@ async def handle_rollback_snapshot(websocket: WebSocket, message: dict, client_i
 
 
 async def handle_stop_session(websocket: WebSocket, message: dict, client_id: str):
+    from app.services.workflow_engine import get_workflow_engine
+    from app.api.app import postgres_db
+
     director = get_or_create_director(client_id)
+
+    # 1. 停止自动模式（如果正在运行）
+    if director.is_auto_running():
+        director.stop_auto_mode()
+        await send_log(websocket, "⏹️ 正在停止自动运行模式...")
+
+    # 2. 取消当前工作流执行
+    execution_id = manager.get_execution(client_id)
+    if execution_id:
+        engine = get_workflow_engine()
+        success = await engine.cancel_workflow(execution_id, postgres_db)
+        if success:
+            await send_log(websocket, f"✅ 工作流已取消: {execution_id}")
+            # 清理干预队列
+            await engine.clear_interventions(execution_id)
+        manager.clear_execution(client_id)
+
+    # 3. 持久化状态
     await _persist_runtime_state(director)
     await _create_auto_snapshot(director, snapshot_type="manual", created_by="system")
+
+    # 4. 重置所有 Agent 状态
     for agent in ["Summarizer", "Master Plotter", "Hook Manager", "Writer", "Evaluator", "Character Agent", "ProcGen"]:
         await send_agent_update(websocket, agent, "idle", f"{agent} 已停止", 0)
+
     await websocket.send_json({"type": "session_stopped", "status": "success"})
     await send_log(websocket, "导演会话已停止")
 
@@ -1358,9 +1406,25 @@ async def handle_start_auto_mode(websocket: WebSocket, message: dict, client_id:
 
 async def handle_stop_auto_mode(websocket: WebSocket, message: dict, client_id: str):
     """停止自动运行模式"""
+    from app.services.workflow_engine import get_workflow_engine
+    from app.api.app import postgres_db
+
     director = get_or_create_director(client_id)
+
+    # 1. 停止自动模式标志
     director.stop_auto_mode()
-    await send_log(websocket, "⏹️ 正在停止自动模式...")
+
+    # 2. 取消当前工作流执行
+    execution_id = manager.get_execution(client_id)
+    if execution_id:
+        engine = get_workflow_engine()
+        success = await engine.cancel_workflow(execution_id, postgres_db)
+        if success:
+            await send_log(websocket, f"✅ 工作流已取消: {execution_id}")
+            await engine.clear_interventions(execution_id)
+        manager.clear_execution(client_id)
+
+    await send_log(websocket, "⏹️ 自动模式已停止")
 
 
 # ==================== v8 工作流 WebSocket 处理器 ====================

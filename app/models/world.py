@@ -87,6 +87,12 @@ class World(BaseModel):
     world_type: str = Field(default="fantasy", description="世界类型：fantasy/scifi/wuxia/etc")
     tone: str = Field(default="serious", description="故事基调：serious/humorous/dark/etc")
 
+    # 多维度标签
+    content_styles: List[str] = Field(default_factory=list, description="内容风格标签")
+    protagonist_types: List[str] = Field(default_factory=list, description="主角类型标签")
+    character_archetypes: List[str] = Field(default_factory=list, description="角色人设模板标签")
+    power_types: List[str] = Field(default_factory=list, description="战斗能力标签")
+
     # 核心法则
     rules: List[WorldRule] = Field(default_factory=list, description="世界规则列表")
     power_system: Optional[str] = Field(None, description="力量体系描述")
@@ -109,6 +115,9 @@ class World(BaseModel):
                 "description": "一个以武为尊的玄幻世界",
                 "world_type": "fantasy",
                 "tone": "serious",
+                "content_styles": ["hot_blooded"],
+                "protagonist_types": ["male_lead"],
+                "power_types": ["cultivation"],
                 "power_system": "修真体系：炼气→筑基→金丹→元婴→化神",
                 "technology_level": "古代冷兵器",
             }

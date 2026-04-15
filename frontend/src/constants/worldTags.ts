@@ -44,7 +44,7 @@ export const PROTAGONIST_TYPE_TAGS: TagOption[] = [
   { value: 'female_lead', label: '大女主', color: 'pink', description: '女性主角，主线围绕其成长' },
   { value: 'dual_lead', label: '双主角', color: 'purple', description: '双主角，两条主线交织' },
   { value: 'group', label: '群像剧', color: 'teal', description: '群像叙事，多角色并重' },
-  { value: 'non_human', label: '非人类', color: 'teal', description: '非人类主角，主线围绕其成长' },
+  { value: 'non_human', label: '非人类', color: 'red', description: '非人类主角，主线围绕其成长' },
 ]
 
 // 角色人设标签

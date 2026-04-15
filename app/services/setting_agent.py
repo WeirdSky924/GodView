@@ -240,7 +240,18 @@ class SettingAgent:
             max_tokens=self.llm_max_tokens,
         )
 
-        return response.content[0].text
+        # 提取文本内容（处理 ThinkingBlock 等不同类型）
+        text_content = ""
+        for block in response.content:
+            if hasattr(block, 'text'):
+                text_content += block.text
+            elif hasattr(block, 'thinking'):
+                # ThinkingBlock 跳过
+                pass
+            else:
+                text_content += str(block)
+
+        return text_content
 
     def _fallback_response(self, messages: List[Dict[str, Any]]) -> str:
         """回退响应（当没有 LLM 可用时）"""

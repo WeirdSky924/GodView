@@ -57,6 +57,49 @@ class SettingAgentService:
         # 协商会话
         self._negotiation_sessions: Dict[str, NegotiationSession] = {}
 
+        # ========== LLM 重试保护配置 ==========
+        self._max_retries = 3  # 最大重试次数
+        self._retry_base_delay = 1.0  # 基础重试延迟（秒）
+        self._retry_max_delay = 10.0  # 最大重试延迟（秒）
+        self._consecutive_failures = 0  # 连续失败计数
+        self._max_consecutive_failures = 5  # 最大连续失败次数，超过后暂停调用
+        self._failure_reset_time = 60  # 失败计数重置时间（秒）
+        self._last_failure_time = None  # 上次失败时间
+
+    def reset_failure_state(self):
+        """重置 LLM 失败状态（可由外部调用）"""
+        self._consecutive_failures = 0
+        self._last_failure_time = None
+        logger.info("[SettingAgent] LLM 失败状态已重置")
+
+    def is_llm_available(self) -> bool:
+        """检查 LLM 是否可用（未达到失败上限）"""
+        if self._consecutive_failures >= self._max_consecutive_failures:
+            if self._last_failure_time:
+                import time
+                elapsed = time.time() - self._last_failure_time
+                if elapsed < self._failure_reset_time:
+                    return False
+                else:
+                    # 时间已过，自动重置
+                    self.reset_failure_state()
+                    return True
+        return True
+
+    def get_failure_status(self) -> Dict[str, Any]:
+        """获取当前失败状态（用于诊断）"""
+        import time
+        remaining_time = 0
+        if self._last_failure_time and self._consecutive_failures >= self._max_consecutive_failures:
+            remaining_time = max(0, self._failure_reset_time - (time.time() - self._last_failure_time))
+
+        return {
+            "consecutive_failures": self._consecutive_failures,
+            "max_consecutive_failures": self._max_consecutive_failures,
+            "is_available": self.is_llm_available(),
+            "remaining_cooldown_seconds": int(remaining_time),
+        }
+
     # ==================== 会话管理 ====================
 
     async def get_or_create_session(
@@ -525,6 +568,19 @@ class SettingAgentService:
                 f"{msg['role']}: {msg['content']}"
                 for msg in session.conversation_history[-6:]
             ])
+
+            # 构建最终上下文：关键信息索引 + 完整原始上下文 + 最近对话
+            context_str = f"""【关键信息索引】
+{key_info_index}
+
+【项目完整信息】
+{full_context}
+
+【最近对话】
+""" + "\n".join([
+                f"{msg['role']}: {msg['content']}"
+                for msg in session.conversation_history[-6:]
+            ])
         else:
             # 从已加载的 sections 构建上下文
             context_parts = []
@@ -595,7 +651,7 @@ class SettingAgentService:
         assistant_response: str,
     ):
         """
-        同步对话到 AgentMemoryService
+        同步对话到 AgentMemoryService（只保存，不读取）
 
         确保工作流中的 SettingAgent 和 /lore 界面共享记忆
 
@@ -606,44 +662,79 @@ class SettingAgentService:
         """
         try:
             from app.api.app import postgres_db
-            from app.services.agent_memory_service import get_memory_service
-            from app.models.agent_memory import MemoryEntry, MemoryType, MemoryImportance
+            from datetime import datetime
+            import json
+            import hashlib
 
             if not postgres_db:
                 return
 
-            # 获取记忆服务（传入数据库连接）
-            memory_service = get_memory_service(postgres_db)
+            # 生成记忆 ID
+            key = f"{project_id}:setting:setting_agent"
+            memory_id = f"memory_{hashlib.md5(key.encode()).hexdigest()[:12]}"
 
-            # 获取或创建 Agent 记忆
-            memory = await memory_service.get_memory(
-                project_id=project_id,
-                agent_type="setting",
-                agent_id="setting_agent",
-            )
+            # 创建新的记忆条目（不读取现有记忆）
+            timestamp = datetime.now().isoformat()
+            new_memories = [
+                {
+                    "id": f"mem_{hashlib.md5(f'{timestamp}_user'.encode()).hexdigest()[:8]}",
+                    "type": "interaction",
+                    "importance": "medium",
+                    "content": f"用户: {user_message[:500]}",
+                    "tags": [],
+                    "context": {"source": "lore_interface", "role": "user"},
+                    "created_at": timestamp,
+                },
+                {
+                    "id": f"mem_{hashlib.md5(f'{timestamp}_assistant'.encode()).hexdigest()[:8]}",
+                    "type": "interaction",
+                    "importance": "medium",
+                    "content": f"设定助手: {assistant_response[:500]}",
+                    "tags": [],
+                    "context": {"source": "lore_interface", "role": "assistant"},
+                    "created_at": timestamp,
+                },
+            ]
 
-            # 用户消息 - 使用 add_memory 方法的正确签名
-            memory.add_memory(
-                content=f"用户: {user_message[:500]}",
-                memory_type=MemoryType.INTERACTION,
-                importance=MemoryImportance.MEDIUM,
-                context={"source": "lore_interface", "role": "user"},
-            )
+            memories_json = json.dumps(new_memories)
+            now = datetime.now()
 
-            # 助手响应
-            memory.add_memory(
-                content=f"设定助手: {assistant_response[:500]}",
-                memory_type=MemoryType.INTERACTION,
-                importance=MemoryImportance.MEDIUM,
-                context={"source": "lore_interface", "role": "assistant"},
-            )
+            # 直接使用 SQL 追加记忆（不读取现有记忆）
+            query = """
+                INSERT INTO agent_memories (id, project_id, agent_type, agent_id, memories, knowledge, working_memory, total_memories, created_at, updated_at)
+                VALUES (
+                    :id,
+                    CAST(:project_id AS UUID),
+                    :agent_type,
+                    :agent_id,
+                    CAST(:memories AS jsonb),
+                    CAST('{}' AS jsonb),
+                    CAST('{}' AS jsonb),
+                    :total_memories,
+                    :created_at,
+                    :updated_at
+                )
+                ON CONFLICT (id) DO UPDATE SET
+                    memories = agent_memories.memories || CAST(:memories AS jsonb),
+                    total_memories = agent_memories.total_memories + :total_memories,
+                    updated_at = :updated_at
+            """
 
-            # 保存到数据库
-            await memory_service.save_memory(memory)
+            await postgres_db.execute_write(query, {
+                "id": memory_id,
+                "project_id": project_id,
+                "agent_type": "setting",
+                "agent_id": "setting_agent",
+                "memories": memories_json,
+                "total_memories": 2,
+                "created_at": now,
+                "updated_at": now,
+            })
 
             logger.debug(f"同步 Setting Agent 对话到记忆系统: project_id={project_id}")
 
         except Exception as e:
+            logger.warning(f"同步 Setting Agent 记忆失败: {e}")
             logger.warning(f"同步 Setting Agent 记忆失败: {e}")
 
     async def _extract_lore_from_conversation(
@@ -1813,20 +1904,44 @@ class SettingAgentService:
         logger.info(f"[分段分析] 处理 {len(sorted_sections)} 个段落")
 
         # 第一轮：分段预处理，提取关键信息点
+        failed_segments = 0  # 连续失败段落计数
+        max_failed_segments = 3  # 允许的最大连续失败段落数
+
         for section_name, section_content in sorted_sections:
+            # ========== 检查是否应该提前终止 ==========
+            if self._consecutive_failures >= self._max_consecutive_failures:
+                logger.warning(f"[分段分析] LLM 连续失败次数过多，提前终止分段分析")
+                break
+
+            if failed_segments >= max_failed_segments:
+                logger.warning(f"[分段分析] 连续 {failed_segments} 个段落失败，提前终止")
+                break
+
             section_length = len(section_content)
 
             # 如果段落较短，直接分析
             if section_length <= SEGMENT_SIZE:
+                logger.info(f"[分段分析] 发送段落【{section_name}】({section_length}字符) 到 LLM")
+                logger.debug(f"[分段分析] 内容预览: {section_content[:200]}...")
                 key_points = await self._extract_key_points(
                     section_name, section_content, user_message, world_type_hint, project_id
                 )
-                all_key_points.extend(key_points)
+                if key_points:
+                    all_key_points.extend(key_points)
+                    failed_segments = 0  # 重置连续失败计数
+                else:
+                    failed_segments += 1
+                    logger.warning(f"[分段分析] 段落【{section_name}】提取失败 ({failed_segments}/{max_failed_segments})")
             else:
                 # 长段落需要分段处理，带有重叠
                 segment_start = 0
                 segment_num = 0
                 while segment_start < section_length:
+                    # 检查是否应该终止
+                    if self._consecutive_failures >= self._max_consecutive_failures:
+                        logger.warning(f"[分段分析] LLM 连续失败次数过多，跳过剩余段落")
+                        break
+
                     # 计算当前段的范围
                     if segment_start == 0:
                         segment_end = min(SEGMENT_SIZE, section_length)
@@ -1838,14 +1953,27 @@ class SettingAgentService:
                         segment_content = section_content[overlap_start:segment_end]
 
                     segment_num += 1
+                    segment_label = f"{section_name}(第{segment_num}段)"
+                    logger.info(f"[分段分析] 发送段落【{segment_label}】({len(segment_content)}字符) 到 LLM")
+                    logger.debug(f"[分段分析] 内容预览: {segment_content[:200]}...")
 
                     key_points = await self._extract_key_points(
-                        f"{section_name}(第{segment_num}段)", segment_content, user_message, world_type_hint, project_id
+                        segment_label, segment_content, user_message, world_type_hint, project_id
                     )
-                    all_key_points.extend(key_points)
+                    if key_points:
+                        all_key_points.extend(key_points)
+                        failed_segments = 0  # 重置连续失败计数
+                    else:
+                        failed_segments += 1
+                        logger.warning(f"[分段分析] 段落【{segment_label}】提取失败 ({failed_segments}/{max_failed_segments})")
 
                     segment_start = segment_end if segment_start == 0 else segment_start + SEGMENT_SIZE - OVERLAP_SIZE
                     if segment_start >= section_length:
+                        break
+
+                    # 检查连续失败
+                    if failed_segments >= max_failed_segments:
+                        logger.warning(f"[分段分析] 连续失败段落过多，跳过当前章节剩余内容")
                         break
 
         # 合并关键信息点（去重和整合）
@@ -1923,6 +2051,11 @@ class SettingAgentService:
 
         try:
             result = await self._call_llm_simple(prompt)
+
+            # 检查是否是错误响应
+            if not result or "抱歉" in result or "无法处理" in result or "请稍后" in result:
+                logger.warning(f"[分段分析] LLM 返回错误响应: {result[:100] if result else '空响应'}")
+                return []
 
             # 解析JSON
             if "```json" in result:
@@ -2026,7 +2159,24 @@ class SettingAgentService:
         project_id: Optional[str] = None,
         log_context: bool = True,
     ) -> str:
-        """调用 LLM 生成响应"""
+        """调用 LLM 生成响应（带重试保护）"""
+        import asyncio
+        import time
+
+        # ========== 检查连续失败状态 ==========
+        if self._consecutive_failures >= self._max_consecutive_failures:
+            # 检查是否过了重置时间
+            if self._last_failure_time:
+                elapsed = time.time() - self._last_failure_time
+                if elapsed < self._failure_reset_time:
+                    remaining = int(self._failure_reset_time - elapsed)
+                    logger.warning(f"[SettingAgent] LLM 连续失败次数已达上限 ({self._consecutive_failures}次)，暂停调用 {remaining}秒")
+                    return "抱歉，LLM 服务暂时不可用，请稍后再试。"
+                else:
+                    # 重置失败计数
+                    logger.info("[SettingAgent] 失败计数已重置")
+                    self._consecutive_failures = 0
+
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "system", "content": f"上下文信息：\n{context}"},
@@ -2039,22 +2189,44 @@ class SettingAgentService:
         # 计算输入 token（估算）
         input_tokens = sum(len(m.get("content", "")) // 4 for m in messages)
 
-        try:
-            if self.llm_provider == "openai":
-                response, usage = await self._call_openai_with_usage(messages)
-            elif self.llm_provider == "anthropic":
-                response, usage = await self._call_anthropic_with_usage(messages)
-            else:
-                response, usage = await self._call_openai_with_usage(messages)
+        last_error = None
+        for attempt in range(self._max_retries):
+            try:
+                if self.llm_provider == "openai":
+                    response, usage = await self._call_openai_with_usage(messages)
+                elif self.llm_provider == "anthropic":
+                    response, usage = await self._call_anthropic_with_usage(messages)
+                else:
+                    response, usage = await self._call_openai_with_usage(messages)
 
-            # 记录 token 使用
-            if project_id and usage:
-                await self._record_token_usage(project_id, usage, input_tokens)
+                # 记录 token 使用
+                if project_id and usage:
+                    await self._record_token_usage(project_id, usage, input_tokens)
 
-            return response
-        except Exception as e:
-            logger.error(f"LLM 调用失败：{e}")
-            return "抱歉，我现在无法处理你的请求。请稍后再试。"
+                # 成功，重置失败计数
+                self._consecutive_failures = 0
+                self._last_failure_time = None
+                return response
+
+            except Exception as e:
+                last_error = e
+                self._consecutive_failures += 1
+                self._last_failure_time = time.time()
+
+                if attempt < self._max_retries - 1:
+                    # 计算指数退避延迟
+                    delay = min(
+                        self._retry_base_delay * (2 ** attempt),
+                        self._retry_max_delay
+                    )
+                    logger.warning(f"[SettingAgent] LLM 调用失败 (尝试 {attempt + 1}/{self._max_retries}): {e}，{delay:.1f}秒后重试")
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(f"[SettingAgent] LLM 调用失败，已达最大重试次数 ({self._max_retries}次): {e}")
+
+        # 所有重试都失败
+        logger.error(f"[SettingAgent] LLM 调用最终失败: {last_error}")
+        return "抱歉，我现在无法处理你的请求。请稍后再试。"
 
     async def _record_token_usage(
         self,
@@ -2187,7 +2359,22 @@ class SettingAgentService:
                 "total_tokens": (response.usage.input_tokens or 0) + (response.usage.output_tokens or 0),
             }
 
-        return response.content[0].text, usage
+        # 提取文本内容（处理 ThinkingBlock 等不同类型）
+        text_content = ""
+        for block in response.content:
+            # 检查是否是 TextBlock（有 text 属性）
+            if hasattr(block, 'text'):
+                text_content += block.text
+            # 检查是否是 ThinkingBlock（跳过或记录）
+            elif hasattr(block, 'thinking'):
+                # ThinkingBlock 包含思考过程，可以记录但不需要返回
+                logger.debug(f"收到 ThinkingBlock，跳过思考内容")
+            else:
+                # 其他类型尝试转为字符串
+                logger.warning(f"未知的响应块类型: {type(block).__name__}")
+                text_content += str(block)
+
+        return text_content, usage
 
     def _fallback_response(self, messages: List[Dict[str, Any]]) -> str:
         """回退响应"""

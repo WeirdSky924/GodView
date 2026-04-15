@@ -190,10 +190,17 @@ export default function Worlds() {
     setSaving(true)
     try {
       const data = { ...formData, project_id: currentProject.id }
+      console.log('[Worlds] 保存数据:', data)
+      console.log('[Worlds] worldId:', worldId)
+
       if (worldId) {
-        await updateWorld(worldId, data as UpdateWorldDTO)
+        console.log('[Worlds] 调用 updateWorld')
+        const result = await updateWorld(worldId, data as UpdateWorldDTO)
+        console.log('[Worlds] updateWorld 结果:', result)
       } else {
+        console.log('[Worlds] 调用 createWorld')
         const newWorld = await createWorld(data as CreateWorldDTO)
+        console.log('[Worlds] createWorld 结果:', newWorld)
         setWorldId(newWorld.id || null)
       }
       alert('保存成功')

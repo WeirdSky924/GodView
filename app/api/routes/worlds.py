@@ -44,6 +44,8 @@ async def update_world(world_id: str, world: World):
     from app.api.app import postgres_db
     from datetime import datetime
 
+    logger.info(f"[Worlds] 收到更新请求: world_id={world_id}")
+
     if not postgres_db:
         raise HTTPException(status_code=503, detail="数据库未连接")
 
@@ -52,6 +54,7 @@ async def update_world(world_id: str, world: World):
         raise HTTPException(status_code=404, detail="世界不存在")
 
     world_data = world.model_dump(mode="json")
+    logger.info(f"[Worlds] 更新数据: content_styles={world_data.get('content_styles')}, protagonist_types={world_data.get('protagonist_types')}, power_types={world_data.get('power_types')}")
 
     # 确保使用正确的 ID 和时间戳
     world_data["id"] = world_id
@@ -63,6 +66,7 @@ async def update_world(world_id: str, world: World):
 
     try:
         await postgres_db.save_world(world_data)
+        logger.info(f"[Worlds] 世界 '{world.name}' 更新成功")
         return {"success": True, "id": world_id, "message": f"世界 '{world.name}' 更新成功"}
     except Exception as e:
         logger.error(f"更新世界失败：{e}")

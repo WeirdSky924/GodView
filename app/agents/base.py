@@ -396,7 +396,20 @@ class BaseAgent(ABC):
             messages = [SystemMessage(content=full_system_prompt)] + messages
 
         response = await self.model.ainvoke(messages)
-        content = response.content
+
+        # 处理不同模型的响应格式
+        raw_content = response.content
+        if isinstance(raw_content, str):
+            content = raw_content
+        elif isinstance(raw_content, list):
+            # Anthropic 格式：可能是 TextBlock/ThinkingBlock 列表
+            content = ""
+            for block in raw_content:
+                if hasattr(block, 'text'):
+                    content += block.text
+                # ThinkingBlock 跳过
+        else:
+            content = str(raw_content)
 
         # 尝试从响应中获取实际 token 使用量
         input_tokens = 0
@@ -484,7 +497,24 @@ class BaseAgent(ABC):
             async def stream_with_timeout():
                 nonlocal full_content, last_chunk, chunk_count
                 async for chunk in self.model.astream(messages):
-                    chunk_text = chunk.content if hasattr(chunk, 'content') else str(chunk)
+                    # 处理不同模型的响应格式
+                    chunk_text = ""
+                    if hasattr(chunk, 'content'):
+                        content = chunk.content
+                        # 如果是字符串，直接使用
+                        if isinstance(content, str):
+                            chunk_text = content
+                        # 如果是列表（Anthropic 格式，可能包含 TextBlock/ThinkingBlock）
+                        elif isinstance(content, list):
+                            for block in content:
+                                if hasattr(block, 'text'):
+                                    chunk_text += block.text
+                                # ThinkingBlock 跳过
+                        else:
+                            chunk_text = str(content)
+                    else:
+                        chunk_text = str(chunk)
+
                     full_content += chunk_text
                     last_chunk = chunk
                     chunk_count += 1
