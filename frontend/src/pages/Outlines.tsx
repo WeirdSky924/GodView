@@ -3,18 +3,18 @@
  * 与 Plot Outline Agent 协作管理章节大纲
  */
 
-import { useEffect, useState, useCallback } from 'react'
-import { Card, Button, Input, TextArea, Modal } from '@/components/ui'
+import { useEffect, useState } from 'react'
+import { Card, Button, Input } from '@/components/ui'
 import PageLayout from '@/components/PageLayout'
 import { useProject } from '@/contexts/ProjectContext'
 import { useTheme } from '@/contexts/ThemeContext'
 import {
   getOutlines,
   getOutline,
-  generateOutline,
   updateOutline,
   approveOutline,
   chatWithAgent,
+  deleteOutline,
   type ChapterOutline,
   type SceneOutline,
   type EmotionPoint,
@@ -22,8 +22,8 @@ import {
 } from '@/api/outlines'
 import {
   BookOpen, Plus, Edit2, Check, MessageSquare, Send, RefreshCw,
-  ChevronLeft, ChevronRight, Play, Eye, Sparkles, Target, Users,
-  MapPin, Clock, Zap, AlertTriangle, CheckCircle, X, Loader2
+  ChevronLeft, ChevronRight, Play, Sparkles, Target, Users,
+  MapPin, Clock, Zap, CheckCircle, X, Loader2, Trash2
 } from 'lucide-react'
 
 // 情绪类型映射
@@ -72,7 +72,6 @@ export default function Outlines() {
   const [selectedChapter, setSelectedChapter] = useState<number | null>(null)
   const [currentOutline, setCurrentOutline] = useState<ChapterOutline | null>(null)
   const [loading, setLoading] = useState(false)
-  const [generating, setGenerating] = useState(false)
 
   // 聊天状态
   const [showChat, setShowChat] = useState(false)
@@ -123,30 +122,6 @@ export default function Outlines() {
     }
   }
 
-  const handleGenerateOutline = async () => {
-    if (!currentProject?.id || !selectedChapter) return
-    setGenerating(true)
-    try {
-      const result = await generateOutline(currentProject.id, selectedChapter, {
-        project_id: currentProject.id,
-        chapter_number: selectedChapter,
-      })
-      setCurrentOutline(result.outline)
-      // 添加 Agent 建议到聊天
-      if (result.suggestions.length > 0) {
-        setChatMessages(prev => [
-          ...prev,
-          { role: 'assistant' as const, content: `大纲已生成！\n\n建议：\n${result.suggestions.map(s => `• ${s}`).join('\n')}` }
-        ])
-      }
-      loadOutlines()
-    } catch (error) {
-      console.error('Failed to generate outline:', error)
-    } finally {
-      setGenerating(false)
-    }
-  }
-
   const handleApprove = async () => {
     if (!currentProject?.id || !selectedChapter) return
     try {
@@ -158,17 +133,68 @@ export default function Outlines() {
     }
   }
 
-  const handleSendMessage = async () => {
-    if (!currentProject?.id || !selectedChapter || !chatInput.trim()) return
-    setSendingMessage(true)
-
-    const userMessage = chatInput.trim()
-    setChatMessages(prev => [...prev, { role: 'user' as const, content: userMessage }])
-    setChatInput('')
+  const handleDelete = async () => {
+    if (!currentProject?.id || !selectedChapter) return
+    if (!confirm(`确定要删除第${selectedChapter}章大纲吗？此操作不可撤销。`)) return
 
     try {
-      const response = await chatWithAgent(currentProject.id, selectedChapter, userMessage)
+      await deleteOutline(currentProject.id, selectedChapter)
+      // 清除当前选中
+      setCurrentOutline(null)
+      setSelectedChapter(null)
+      // 重新加载列表
+      loadOutlines()
+    } catch (error) {
+      console.error('Failed to delete outline:', error)
+      alert('删除失败，请稍后再试')
+    }
+  }
+
+  const handleStartFirstChapterChat = () => {
+    // 设置为第一章
+    setSelectedChapter(1)
+    // 打开聊天面板
+    setShowChat(true)
+    // 设置初始消息
+    const initialMessage = '请帮我生成第一章大纲'
+    setChatInput(initialMessage)
+    // 自动发送消息
+    sendChatMessage(initialMessage)
+  }
+
+  const sendChatMessage = async (message: string) => {
+    if (!currentProject?.id) return
+
+    const chapterNumber = selectedChapter || 1
+    setSendingMessage(true)
+
+    // 添加用户消息
+    setChatMessages(prev => [...prev, { role: 'user' as const, content: message }])
+
+    try {
+      const response = await chatWithAgent(currentProject.id, chapterNumber, message)
       setChatMessages(prev => [...prev, { role: 'assistant' as const, content: response.message }])
+
+      // 处理多章大纲保存
+      const savedOutlines = response.saved_outlines
+      if (savedOutlines && savedOutlines.length > 0) {
+        // 多章保存成功
+        setChatMessages(prev => [...prev, {
+          role: 'assistant' as const,
+          content: `✅ 已保存 ${savedOutlines.length} 章大纲草稿：${savedOutlines.map(o => `第${o.chapter_number}章`).join('、')}`
+        }])
+        // 刷新大纲列表
+        loadOutlines()
+        // 选中第一章
+        const firstSaved = savedOutlines[0]
+        setCurrentOutline(firstSaved)
+        setSelectedChapter(firstSaved.chapter_number)
+      } else if (response.saved_outline) {
+        // 单章保存
+        setCurrentOutline(response.saved_outline as ChapterOutline)
+        setSelectedChapter(response.saved_outline.chapter_number)
+        loadOutlines()
+      }
 
       // 如果有大纲更新，应用到当前大纲
       if (response.outline_updates && currentOutline) {
@@ -183,6 +209,13 @@ export default function Outlines() {
     } finally {
       setSendingMessage(false)
     }
+  }
+
+  const handleSendMessage = async () => {
+    if (!currentProject?.id || !selectedChapter || !chatInput.trim()) return
+    const message = chatInput.trim()
+    setChatInput('')
+    await sendChatMessage(message)
   }
 
   const handleQuickCommand = (command: string) => {
@@ -277,7 +310,7 @@ export default function Outlines() {
               <div className={`p-4 text-center ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
                 <BookOpen className="w-12 h-12 mx-auto mb-2 opacity-50" />
                 <p className="text-sm">暂无大纲</p>
-                <Button size="sm" className="mt-2" onClick={handleGenerateOutline}>
+                <Button size="sm" className="mt-2" onClick={handleStartFirstChapterChat}>
                   生成第一章
                 </Button>
               </div>
@@ -341,6 +374,10 @@ export default function Outlines() {
                           审批
                         </Button>
                       )}
+                      <Button size="sm" variant="secondary" onClick={handleDelete}>
+                        <Trash2 className="w-4 h-4 mr-1" />
+                        删除
+                      </Button>
                     </div>
                   </div>
                   <p className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>
@@ -564,12 +601,11 @@ export default function Outlines() {
                         <MessageSquare className="w-4 h-4 mr-1" />
                         与 Agent 讨论
                       </Button>
-                      <Button onClick={handleGenerateOutline} disabled={generating}>
-                        {generating ? (
-                          <Loader2 className="w-4 h-4 mr-1 animate-spin" />
-                        ) : (
-                          <RefreshCw className="w-4 h-4 mr-1" />
-                        )}
+                      <Button variant="secondary" onClick={() => {
+                        setShowChat(true)
+                        setChatInput('请帮我重新生成这一章的大纲')
+                      }}>
+                        <RefreshCw className="w-4 h-4 mr-1" />
                         重新生成
                       </Button>
                     </div>
@@ -590,12 +626,11 @@ export default function Outlines() {
                       <MessageSquare className="w-4 h-4 mr-1" />
                       与 Agent 讨论
                     </Button>
-                    <Button onClick={handleGenerateOutline} disabled={generating}>
-                      {generating ? (
-                        <Loader2 className="w-4 h-4 mr-1 animate-spin" />
-                      ) : (
-                        <Sparkles className="w-4 h-4 mr-1" />
-                      )}
+                    <Button onClick={() => {
+                      setShowChat(true)
+                      setChatInput(`请帮我生成第${selectedChapter}章的大纲`)
+                    }}>
+                      <Sparkles className="w-4 h-4 mr-1" />
                       生成大纲
                     </Button>
                   </div>

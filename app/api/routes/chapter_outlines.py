@@ -6,7 +6,7 @@ GodView v9: PlotOutlineAgent 专用接口
 import logging
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.models.chapter_outline import (
@@ -18,6 +18,8 @@ from app.models.chapter_outline import (
     GenerateOutlineResponse,
     ValidateOutlineRequest,
     ValidateOutlineResponse,
+    SceneOutline,
+    EmotionCurve,
 )
 from app.services.plot_outline_service import get_plot_outline_service, set_plot_outline_service
 
@@ -77,6 +79,20 @@ class ApproveOutlineRequest(BaseModel):
     approved_by: str
 
 
+class PendingOutline(BaseModel):
+    """待确认的大纲数据"""
+    chapter_number: int = Field(..., description="章节号")
+    title: str = Field(..., description="章节标题")
+    summary: str = Field(..., description="章节摘要")
+    scenes: Optional[List[Dict[str, Any]]] = Field(default_factory=list, description="场景列表")
+    emotion_curve: Optional[Dict[str, Any]] = Field(None, description="情绪曲线")
+    chapter_goals: Optional[List[str]] = Field(default_factory=list, description="章节目标")
+    hooks_planted: Optional[List[str]] = Field(default_factory=list, description="本章埋设的伏笔")
+    hooks_resolved: Optional[List[str]] = Field(default_factory=list, description="本章回收的伏笔")
+    target_word_count: Optional[int] = Field(default=3000, description="目标字数")
+    character_arcs: Optional[Dict[str, str]] = Field(default_factory=dict, description="角色发展")
+
+
 class ChatRequest(BaseModel):
     """与 Agent 聊天请求"""
     message: str
@@ -88,6 +104,21 @@ class ChatResponse(BaseModel):
     message: str
     outline_updates: Optional[Dict[str, Any]] = None
     suggestions: Optional[List[str]] = None
+    pending_outlines: Optional[List[PendingOutline]] = None
+    saved_outline: Optional[Dict[str, Any]] = None
+    saved_outlines: Optional[List[Dict[str, Any]]] = None  # 多章大纲保存
+
+
+class SavePendingOutlinesRequest(BaseModel):
+    """保存待确认大纲请求"""
+    outlines: List[PendingOutline]
+
+
+class SavePendingOutlinesResponse(BaseModel):
+    """保存待确认大纲响应"""
+    success: bool
+    saved_count: int
+    message: str
 
 
 # ==================== API 端点 ====================
@@ -288,10 +319,91 @@ async def chat_with_agent(project_id: str, chapter_number: int, request: ChatReq
         context=request.context,
     )
 
+    # 处理 pending_outlines
+    pending_outlines = None
+    if response.get("pending_outlines"):
+        pending_outlines = [PendingOutline(**o) for o in response["pending_outlines"]]
+
     return ChatResponse(
         message=response.get("message", ""),
         outline_updates=response.get("outline_updates"),
         suggestions=response.get("suggestions"),
+        pending_outlines=pending_outlines,
+        saved_outline=response.get("saved_outline"),
+        saved_outlines=response.get("saved_outlines"),
+    )
+
+
+@router.post("/save-outlines", response_model=SavePendingOutlinesResponse)
+async def save_pending_outlines(
+    project_id: str = Query(..., description="项目ID"),
+    request: SavePendingOutlinesRequest = None,
+):
+    """
+    保存待确认的大纲
+
+    将用户确认的大纲保存到数据库
+    """
+    from app.api.app import postgres_db
+
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+
+    if not request or not request.outlines:
+        return SavePendingOutlinesResponse(
+            success=True,
+            saved_count=0,
+            message="没有需要保存的大纲"
+        )
+
+    service = get_plot_outline_service()
+    saved_count = 0
+
+    for pending in request.outlines:
+        try:
+            # 检查是否已存在该章节大纲
+            existing = await service.get_outline(project_id, pending.chapter_number)
+
+            if existing:
+                # 更新现有大纲
+                update_data = {
+                    "title": pending.title,
+                    "summary": pending.summary,
+                    "scenes": [SceneOutline(**s) for s in pending.scenes] if pending.scenes else [],
+                    "emotion_curve": EmotionCurve(**pending.emotion_curve) if pending.emotion_curve else None,
+                    "chapter_goals": pending.chapter_goals or [],
+                    "hooks_planted": pending.hooks_planted or [],
+                    "hooks_resolved": pending.hooks_resolved or [],
+                    "target_word_count": pending.target_word_count or 3000,
+                    "character_arcs": pending.character_arcs or {},
+                    "status": ChapterOutlineStatus.DRAFT,
+                }
+                await service.update_outline(existing.id, UpdateChapterOutlineDTO(**update_data))
+            else:
+                # 创建新大纲
+                outline = ChapterOutline(
+                    project_id=project_id,
+                    chapter_number=pending.chapter_number,
+                    title=pending.title,
+                    summary=pending.summary,
+                    scenes=[SceneOutline(**s) for s in pending.scenes] if pending.scenes else [],
+                    emotion_curve=EmotionCurve(**pending.emotion_curve) if pending.emotion_curve else None,
+                    chapter_goals=pending.chapter_goals or [],
+                    hooks_planted=pending.hooks_planted or [],
+                    hooks_resolved=pending.hooks_resolved or [],
+                    target_word_count=pending.target_word_count or 3000,
+                    character_arcs=pending.character_arcs or {},
+                    status=ChapterOutlineStatus.DRAFT,
+                )
+                await service.create_outline(outline)
+            saved_count += 1
+        except Exception as e:
+            logger.error(f"保存大纲失败 (章节 {pending.chapter_number}): {e}")
+
+    return SavePendingOutlinesResponse(
+        success=True,
+        saved_count=saved_count,
+        message=f"成功保存 {saved_count} 个大纲" if saved_count > 0 else "没有保存任何大纲"
     )
 
 

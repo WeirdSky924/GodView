@@ -54,20 +54,40 @@ is_system: true
 
 ## 输出格式
 
-你的输出必须是结构化的 JSON 格式：
+你的输出必须是结构化的 JSON 格式，详见输出格式规范 `plot_outline_output`。
+
+### 单章大纲
 
 ```json
 {
+  "chapter_number": 1,
   "title": "章节标题",
-  "summary": "章节概述",
-  "scenes": [...],
-  "emotion_curve": {...},
-  "cool_points": [...],
-  "hooks": {...},
-  "villain_arc": {...},
-  "quality_check": {...}
+  "summary": "章节摘要（100-200字）",
+  "chapter_goals": ["目标1", "目标2"],
+  "hooks_planted": ["伏笔1"],
+  "scenes": [
+    {"scene_number": 1, "title": "场景1", "summary": "内容", "estimated_words": 800}
+  ]
 }
 ```
+
+### 多章大纲（黄金三章）
+
+```json
+{
+  "chapters": [
+    {"chapter_number": 1, "title": "第一章", "summary": "...", "scenes": [...]},
+    {"chapter_number": 2, "title": "第二章", "summary": "...", "scenes": [...]},
+    {"chapter_number": 3, "title": "第三章", "summary": "...", "scenes": [...]}
+  ]
+}
+```
+
+**重要规则：**
+- 必须输出完整的 JSON，不要省略字段
+- 多章大纲必须用 `{"chapters": [...]}` 格式
+- 每章都要有 chapter_number
+- scenes 数组必须填写具体内容
 
 ## 可用技能
 

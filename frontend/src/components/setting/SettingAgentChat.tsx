@@ -1,14 +1,16 @@
 import { useState, useRef, useEffect } from 'react'
-import { MessageCircle, Send, AlertTriangle, CheckCircle, X, Loader2, Save, Trash2 } from 'lucide-react'
+import { MessageCircle, Send, AlertTriangle, CheckCircle, X, Loader2, Save, Trash2, Lightbulb, Wrench } from 'lucide-react'
 import { Button, Card } from '@/components/ui'
 import {
   chatWithSettingAgent,
   negotiateConflict,
   savePendingLores,
   savePendingCharacters,
+  executeLoreModification,
   SettingConflict,
   PendingLore,
   PendingCharacter,
+  ImprovementSuggestion,
 } from '@/api/settingAgent'
 
 interface Message {
@@ -17,6 +19,7 @@ interface Message {
   content: string
   timestamp: Date
   conflict?: SettingConflict
+  suggestions?: ImprovementSuggestion[]
 }
 
 interface SettingAgentChatProps {
@@ -25,18 +28,28 @@ interface SettingAgentChatProps {
   onLoreChange?: () => void
 }
 
-const severityColors = {
+const severityColors: Record<string, string> = {
   low: 'bg-gray-100 text-gray-700 border-gray-200',
   medium: 'bg-yellow-100 text-yellow-700 border-yellow-200',
   high: 'bg-orange-100 text-orange-700 border-orange-200',
   critical: 'bg-red-100 text-red-700 border-red-200',
 }
 
-const severityLabels = {
+const severityLabels: Record<string, string> = {
   low: '轻微',
   medium: '中等',
   high: '严重',
   critical: '致命',
+}
+
+// 获取 severity 标签，带默认值
+const getSeverityLabel = (severity: string): string => {
+  return severityLabels[severity] || '未知'
+}
+
+// 获取 severity 颜色，带默认值
+const getSeverityColor = (severity: string): string => {
+  return severityColors[severity] || 'bg-gray-100 text-gray-700 border-gray-200'
 }
 
 export default function SettingAgentChat({
@@ -52,6 +65,11 @@ export default function SettingAgentChat({
   const [pendingCharacters, setPendingCharacters] = useState<PendingCharacter[]>([])
   const [showConfirmModal, setShowConfirmModal] = useState(false)
   const [showCharacterModal, setShowCharacterModal] = useState(false)
+  const [removedLoreIndices, setRemovedLoreIndices] = useState<Set<number>>(new Set())
+  const [removedCharacterIndices, setRemovedCharacterIndices] = useState<Set<number>>(new Set())
+  const [improvementSuggestions, setImprovementSuggestions] = useState<ImprovementSuggestion[]>([])
+  const [showImprovementModal, setShowImprovementModal] = useState(false)
+  const [executingSuggestion, setExecutingSuggestion] = useState<string | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
   // 初始欢迎消息
@@ -99,7 +117,9 @@ export default function SettingAgentChat({
 
       // 检查是否有待确认的设定
       if (response.pending_lores && response.pending_lores.length > 0) {
-        setPendingLores(response.pending_lores)
+        const lores = response.pending_lores
+        setPendingLores(lores)
+        setRemovedLoreIndices(new Set()) // 重置已删除列表
         setShowConfirmModal(true)
         // 添加提示消息
         setMessages((prev) => [
@@ -107,7 +127,7 @@ export default function SettingAgentChat({
           {
             id: `pending_${Date.now()}`,
             role: 'assistant',
-            content: `我检测到您确认了以下新设定，请确认是否保存到设定库：\n\n${response.pending_lores.map((l, i) => `${i + 1}. ${l.title} (${l.category})`).join('\n')}`,
+            content: `我检测到您确认了以下新设定，请确认是否保存到设定库：\n\n${lores.map((l, i) => `${i + 1}. ${l.title} (${l.category})`).join('\n')}`,
             timestamp: new Date(),
           },
         ])
@@ -115,7 +135,9 @@ export default function SettingAgentChat({
 
       // 检查是否有待确认的角色
       if (response.pending_characters && response.pending_characters.length > 0) {
-        setPendingCharacters(response.pending_characters)
+        const characters = response.pending_characters
+        setPendingCharacters(characters)
+        setRemovedCharacterIndices(new Set()) // 重置已删除列表
         setShowCharacterModal(true)
         // 添加提示消息
         setMessages((prev) => [
@@ -123,8 +145,26 @@ export default function SettingAgentChat({
           {
             id: `pending_char_${Date.now()}`,
             role: 'assistant',
-            content: `我检测到您确认了以下新角色，请确认是否保存到角色库：\n\n${response.pending_characters.map((c, i) => `${i + 1}. ${c.name} (${c.importance_tier})`).join('\n')}`,
+            content: `我检测到您确认了以下新角色，请确认是否保存到角色库：\n\n${characters.map((c, i) => `${i + 1}. ${c.name} (${c.importance_tier})`).join('\n')}`,
             timestamp: new Date(),
+          },
+        ])
+      }
+
+      // 检查是否有设定改进建议
+      if (response.improvement_suggestions && response.improvement_suggestions.length > 0) {
+        const suggestions = response.improvement_suggestions
+        setImprovementSuggestions(suggestions)
+        setShowImprovementModal(true)
+        // 添加提示消息
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `improvement_${Date.now()}`,
+            role: 'assistant',
+            content: `💡 我分析了现有设定，发现 ${suggestions.length} 个可能的改进点。点击查看详情。`,
+            timestamp: new Date(),
+            suggestions: suggestions,
           },
         ])
       }
@@ -146,11 +186,27 @@ export default function SettingAgentChat({
 
   // 保存用户确认的设定
   const handleConfirmSave = async () => {
-    if (pendingLores.length === 0) return
+    // 过滤掉已删除的设定
+    const loresToSave = pendingLores.filter((_, idx) => !removedLoreIndices.has(idx))
+    if (loresToSave.length === 0) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `no_lores_${Date.now()}`,
+          role: 'assistant',
+          content: '没有需要保存的设定。',
+          timestamp: new Date(),
+        },
+      ])
+      setPendingLores([])
+      setRemovedLoreIndices(new Set())
+      setShowConfirmModal(false)
+      return
+    }
 
     setLoading(true)
     try {
-      const result = await savePendingLores(projectId, pendingLores)
+      const result = await savePendingLores(projectId, loresToSave)
       if (result.success) {
         setMessages((prev) => [
           ...prev,
@@ -167,6 +223,7 @@ export default function SettingAgentChat({
       console.error('Save error:', error)
     } finally {
       setPendingLores([])
+      setRemovedLoreIndices(new Set())
       setShowConfirmModal(false)
       setLoading(false)
     }
@@ -184,16 +241,46 @@ export default function SettingAgentChat({
       },
     ])
     setPendingLores([])
+    setRemovedLoreIndices(new Set())
     setShowConfirmModal(false)
+  }
+
+  // 切换设定项的删除状态
+  const toggleLoreRemoval = (index: number) => {
+    setRemovedLoreIndices((prev) => {
+      const newSet = new Set(prev)
+      if (newSet.has(index)) {
+        newSet.delete(index)
+      } else {
+        newSet.add(index)
+      }
+      return newSet
+    })
   }
 
   // 保存用户确认的角色
   const handleConfirmSaveCharacters = async () => {
-    if (pendingCharacters.length === 0) return
+    // 过滤掉已删除的角色
+    const charactersToSave = pendingCharacters.filter((_, idx) => !removedCharacterIndices.has(idx))
+    if (charactersToSave.length === 0) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `no_chars_${Date.now()}`,
+          role: 'assistant',
+          content: '没有需要保存的角色。',
+          timestamp: new Date(),
+        },
+      ])
+      setPendingCharacters([])
+      setRemovedCharacterIndices(new Set())
+      setShowCharacterModal(false)
+      return
+    }
 
     setLoading(true)
     try {
-      const result = await savePendingCharacters(projectId, pendingCharacters)
+      const result = await savePendingCharacters(projectId, charactersToSave)
       if (result.success) {
         setMessages((prev) => [
           ...prev,
@@ -210,6 +297,7 @@ export default function SettingAgentChat({
       console.error('Save characters error:', error)
     } finally {
       setPendingCharacters([])
+      setRemovedCharacterIndices(new Set())
       setShowCharacterModal(false)
       setLoading(false)
     }
@@ -227,7 +315,92 @@ export default function SettingAgentChat({
       },
     ])
     setPendingCharacters([])
+    setRemovedCharacterIndices(new Set())
     setShowCharacterModal(false)
+  }
+
+  // 切换角色项的删除状态
+  const toggleCharacterRemoval = (index: number) => {
+    setRemovedCharacterIndices((prev) => {
+      const newSet = new Set(prev)
+      if (newSet.has(index)) {
+        newSet.delete(index)
+      } else {
+        newSet.add(index)
+      }
+      return newSet
+    })
+  }
+
+  // 执行设定改进建议
+  const handleExecuteImprovement = async (suggestion: ImprovementSuggestion) => {
+    setExecutingSuggestion(suggestion.id)
+    try {
+      const result = await executeLoreModification(projectId, suggestion)
+      if (result.success) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `executed_${Date.now()}`,
+            role: 'assistant',
+            content: `✅ ${result.message || '修改已执行'}`,
+            timestamp: new Date(),
+          },
+        ])
+        // 从列表中移除已执行的建议
+        setImprovementSuggestions((prev) => prev.filter((s) => s.id !== suggestion.id))
+        onLoreChange?.()
+      } else {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `error_${Date.now()}`,
+            role: 'assistant',
+            content: `❌ 执行失败: ${result.error || '未知错误'}`,
+            timestamp: new Date(),
+          },
+        ])
+      }
+    } catch (error) {
+      console.error('Execute improvement error:', error)
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `error_${Date.now()}`,
+          role: 'assistant',
+          content: '执行修改时发生错误，请重试。',
+          timestamp: new Date(),
+        },
+      ])
+    } finally {
+      setExecutingSuggestion(null)
+      // 如果没有更多建议，关闭弹窗
+      if (improvementSuggestions.length <= 1) {
+        setShowImprovementModal(false)
+      }
+    }
+  }
+
+  // 忽略改进建议
+  const handleIgnoreImprovement = (suggestionId: string) => {
+    setImprovementSuggestions((prev) => prev.filter((s) => s.id !== suggestionId))
+    if (improvementSuggestions.length <= 1) {
+      setShowImprovementModal(false)
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `ignored_${Date.now()}`,
+          role: 'assistant',
+          content: '已忽略所有改进建议。',
+          timestamp: new Date(),
+        },
+      ])
+    }
+  }
+
+  // 关闭改进建议弹窗
+  const handleCloseImprovementModal = () => {
+    setShowImprovementModal(false)
   }
 
   const handleSuggestionClick = async (suggestion: string, conflictId: string) => {
@@ -353,14 +526,14 @@ export default function SettingAgentChat({
                 <div className="mt-3 pt-3 border-t border-gray-200">
                   <div
                     className={`text-xs px-2 py-1 rounded inline-block mb-2 ${
-                      severityColors[msg.conflict.severity]
+                      getSeverityColor(msg.conflict.severity || 'medium')
                     }`}
                   >
-                    {severityLabels[msg.conflict.severity]}冲突
+                    {getSeverityLabel(msg.conflict.severity || 'medium')}冲突
                   </div>
                   <div className="space-y-2">
                     <p className="text-xs text-gray-600">解决方案：</p>
-                    {msg.conflict.resolution_suggestions.map((suggestion, idx) => (
+                    {(msg.conflict.resolution_suggestions || []).map((suggestion, idx) => (
                       <button
                         key={idx}
                         onClick={() => handleSuggestionClick(suggestion, msg.conflict!.id)}
@@ -403,7 +576,7 @@ export default function SettingAgentChat({
                   {currentConflict.description}
                 </p>
                 <p className="text-xs text-orange-600 mt-1">
-                  严重程度：{severityLabels[currentConflict.severity]}
+                  严重程度：{getSeverityLabel(currentConflict.severity || 'medium')}
                 </p>
               </div>
             </div>
@@ -435,50 +608,94 @@ export default function SettingAgentChat({
               </button>
             </div>
             <div className="p-4 max-h-96 overflow-y-auto space-y-4">
-              {pendingLores.map((lore, idx) => (
-                <div key={idx} className="border rounded-lg p-3 bg-gray-50">
-                  <div className="flex items-center justify-between mb-2">
-                    <span className="font-medium text-gray-800">{lore.title}</span>
-                    <span className="text-xs px-2 py-0.5 bg-blue-100 text-blue-700 rounded">
-                      {lore.category}
-                    </span>
-                  </div>
-                  {lore.summary && (
-                    <p className="text-sm text-gray-600 mb-2">{lore.summary}</p>
-                  )}
-                  <p className="text-xs text-gray-500 line-clamp-3">{lore.content}</p>
-                  {lore.keywords.length > 0 && (
-                    <div className="flex flex-wrap gap-1 mt-2">
-                      {lore.keywords.map((kw, i) => (
-                        <span key={i} className="text-xs px-2 py-0.5 bg-gray-200 text-gray-600 rounded">
-                          {kw}
+              {pendingLores.map((lore, idx) => {
+                const isRemoved = removedLoreIndices.has(idx)
+                return (
+                  <div
+                    key={idx}
+                    className={`border rounded-lg p-3 transition-all ${
+                      isRemoved
+                        ? 'bg-red-50 border-red-200 opacity-60'
+                        : 'bg-gray-50'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between mb-2">
+                      <span className={`font-medium ${isRemoved ? 'text-gray-400 line-through' : 'text-gray-800'}`}>
+                        {lore.title}
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <span className={`text-xs px-2 py-0.5 rounded ${
+                          isRemoved
+                            ? 'bg-gray-100 text-gray-400'
+                            : 'bg-blue-100 text-blue-700'
+                        }`}>
+                          {lore.category}
                         </span>
-                      ))}
+                        <button
+                          onClick={() => toggleLoreRemoval(idx)}
+                          className={`p-1 rounded transition-colors ${
+                            isRemoved
+                              ? 'text-green-600 hover:bg-green-100'
+                              : 'text-red-500 hover:bg-red-100'
+                          }`}
+                          title={isRemoved ? '恢复' : '移除'}
+                        >
+                          {isRemoved ? (
+                            <CheckCircle size={16} />
+                          ) : (
+                            <Trash2 size={16} />
+                          )}
+                        </button>
+                      </div>
                     </div>
-                  )}
-                </div>
-              ))}
+                    {!isRemoved && (
+                      <>
+                        {lore.summary && (
+                          <p className="text-sm text-gray-600 mb-2">{lore.summary}</p>
+                        )}
+                        <p className="text-xs text-gray-500 line-clamp-3">{lore.content}</p>
+                        {lore.keywords.length > 0 && (
+                          <div className="flex flex-wrap gap-1 mt-2">
+                            {lore.keywords.map((kw, i) => (
+                              <span key={i} className="text-xs px-2 py-0.5 bg-gray-200 text-gray-600 rounded">
+                                {kw}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </>
+                    )}
+                    {isRemoved && (
+                      <p className="text-xs text-red-500 italic">已标记移除，将不会保存</p>
+                    )}
+                  </div>
+                )
+              })}
             </div>
-            <div className="p-4 border-t bg-gray-50 flex justify-end gap-3">
-              <Button
-                variant="secondary"
-                onClick={handleRejectSave}
-                disabled={loading}
-              >
-                <Trash2 size={16} className="mr-1" />
-                取消
-              </Button>
-              <Button
-                onClick={handleConfirmSave}
-                disabled={loading}
-              >
-                {loading ? (
-                  <Loader2 size={16} className="animate-spin mr-1" />
-                ) : (
-                  <Save size={16} className="mr-1" />
-                )}
-                确认保存
-              </Button>
+            <div className="p-4 border-t bg-gray-50 flex justify-between items-center">
+              <span className="text-sm text-gray-500">
+                将保存 {pendingLores.length - removedLoreIndices.size} 个设定
+              </span>
+              <div className="flex gap-3">
+                <Button
+                  variant="secondary"
+                  onClick={handleRejectSave}
+                  disabled={loading}
+                >
+                  全部取消
+                </Button>
+                <Button
+                  onClick={handleConfirmSave}
+                  disabled={loading || removedLoreIndices.size === pendingLores.length}
+                >
+                  {loading ? (
+                    <Loader2 size={16} className="animate-spin mr-1" />
+                  ) : (
+                    <Save size={16} className="mr-1" />
+                  )}
+                  确认保存
+                </Button>
+              </div>
             </div>
           </div>
         </div>
@@ -498,54 +715,211 @@ export default function SettingAgentChat({
               </button>
             </div>
             <div className="p-4 max-h-96 overflow-y-auto space-y-4">
-              {pendingCharacters.map((char, idx) => (
-                <div key={idx} className="border rounded-lg p-3 bg-gray-50">
-                  <div className="flex items-center justify-between mb-2">
-                    <span className="font-medium text-gray-800">{char.name}</span>
-                    <span className="text-xs px-2 py-0.5 bg-green-100 text-green-700 rounded">
-                      {char.importance_tier}
-                    </span>
-                  </div>
-                  {char.description && (
-                    <p className="text-sm text-gray-600 mb-2">{char.description}</p>
-                  )}
-                  {char.appearance && (
-                    <p className="text-xs text-gray-500">外貌：{char.appearance}</p>
-                  )}
-                  {char.personality && (
-                    <p className="text-xs text-gray-500">性格：{char.personality}</p>
-                  )}
-                  {char.goals && char.goals.length > 0 && (
-                    <div className="flex flex-wrap gap-1 mt-2">
-                      {char.goals.map((goal, i) => (
-                        <span key={i} className="text-xs px-2 py-0.5 bg-gray-200 text-gray-600 rounded">
-                          {goal}
+              {pendingCharacters.map((char, idx) => {
+                const isRemoved = removedCharacterIndices.has(idx)
+                return (
+                  <div
+                    key={idx}
+                    className={`border rounded-lg p-3 transition-all ${
+                      isRemoved
+                        ? 'bg-red-50 border-red-200 opacity-60'
+                        : 'bg-gray-50'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between mb-2">
+                      <span className={`font-medium ${isRemoved ? 'text-gray-400 line-through' : 'text-gray-800'}`}>
+                        {char.name}
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <span className={`text-xs px-2 py-0.5 rounded ${
+                          isRemoved
+                            ? 'bg-gray-100 text-gray-400'
+                            : 'bg-green-100 text-green-700'
+                        }`}>
+                          {char.importance_tier}
                         </span>
-                      ))}
+                        <button
+                          onClick={() => toggleCharacterRemoval(idx)}
+                          className={`p-1 rounded transition-colors ${
+                            isRemoved
+                              ? 'text-green-600 hover:bg-green-100'
+                              : 'text-red-500 hover:bg-red-100'
+                          }`}
+                          title={isRemoved ? '恢复' : '移除'}
+                        >
+                          {isRemoved ? (
+                            <CheckCircle size={16} />
+                          ) : (
+                            <Trash2 size={16} />
+                          )}
+                        </button>
+                      </div>
                     </div>
-                  )}
-                </div>
-              ))}
+                    {!isRemoved && (
+                      <>
+                        {char.description && (
+                          <p className="text-sm text-gray-600 mb-2">{char.description}</p>
+                        )}
+                        {char.appearance && (
+                          <p className="text-xs text-gray-500">外貌：{char.appearance}</p>
+                        )}
+                        {char.personality && (
+                          <p className="text-xs text-gray-500">性格：{char.personality}</p>
+                        )}
+                        {char.goals && char.goals.length > 0 && (
+                          <div className="flex flex-wrap gap-1 mt-2">
+                            {char.goals.map((goal, i) => (
+                              <span key={i} className="text-xs px-2 py-0.5 bg-gray-200 text-gray-600 rounded">
+                                {goal}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </>
+                    )}
+                    {isRemoved && (
+                      <p className="text-xs text-red-500 italic">已标记移除，将不会保存</p>
+                    )}
+                  </div>
+                )
+              })}
             </div>
-            <div className="p-4 border-t bg-gray-50 flex justify-end gap-3">
-              <Button
-                variant="secondary"
-                onClick={handleRejectSaveCharacters}
-                disabled={loading}
-              >
-                <Trash2 size={16} className="mr-1" />
-                取消
-              </Button>
-              <Button
-                onClick={handleConfirmSaveCharacters}
-                disabled={loading}
-              >
-                {loading ? (
-                  <Loader2 size={16} className="animate-spin mr-1" />
-                ) : (
-                  <Save size={16} className="mr-1" />
-                )}
-                确认保存
+            <div className="p-4 border-t bg-gray-50 flex justify-between items-center">
+              <span className="text-sm text-gray-500">
+                将保存 {pendingCharacters.length - removedCharacterIndices.size} 个角色
+              </span>
+              <div className="flex gap-3">
+                <Button
+                  variant="secondary"
+                  onClick={handleRejectSaveCharacters}
+                  disabled={loading}
+                >
+                  全部取消
+                </Button>
+                <Button
+                  onClick={handleConfirmSaveCharacters}
+                  disabled={loading || removedCharacterIndices.size === pendingCharacters.length}
+                >
+                  {loading ? (
+                    <Loader2 size={16} className="animate-spin mr-1" />
+                  ) : (
+                    <Save size={16} className="mr-1" />
+                  )}
+                  确认保存
+                </Button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 设定改进建议弹窗 */}
+      {showImprovementModal && improvementSuggestions.length > 0 && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-lg shadow-xl max-w-2xl w-full mx-4 max-h-[80vh] overflow-hidden">
+            <div className="p-4 border-b bg-amber-50 flex items-center justify-between">
+              <h3 className="font-semibold text-lg text-gray-800 flex items-center gap-2">
+                <Lightbulb className="text-amber-600" size={20} />
+                设定改进建议
+              </h3>
+              <button onClick={handleCloseImprovementModal} className="text-gray-400 hover:text-gray-600">
+                <X size={20} />
+              </button>
+            </div>
+            <div className="p-4 max-h-96 overflow-y-auto space-y-4">
+              {improvementSuggestions.map((suggestion) => {
+                const typeLabels: Record<string, string> = {
+                  conflict: '冲突检测',
+                  missing: '缺失补充',
+                  priority: '优先级调整',
+                  optimize: '内容优化',
+                  relation: '关联增强',
+                }
+                const typeColors: Record<string, string> = {
+                  conflict: 'bg-red-100 text-red-700',
+                  missing: 'bg-blue-100 text-blue-700',
+                  priority: 'bg-purple-100 text-purple-700',
+                  optimize: 'bg-green-100 text-green-700',
+                  relation: 'bg-orange-100 text-orange-700',
+                }
+                const priorityColors: Record<string, string> = {
+                  low: 'text-gray-500',
+                  medium: 'text-amber-600',
+                  high: 'text-red-600',
+                }
+
+                return (
+                  <div key={suggestion.id} className="border rounded-lg p-4 bg-gray-50">
+                    <div className="flex items-start justify-between mb-3">
+                      <div className="flex items-center gap-2">
+                        <span className={`text-xs px-2 py-1 rounded ${typeColors[suggestion.type] || 'bg-gray-100'}`}>
+                          {typeLabels[suggestion.type] || suggestion.type}
+                        </span>
+                        {suggestion.target_lore_title && (
+                          <span className="text-sm text-gray-600">→ {suggestion.target_lore_title}</span>
+                        )}
+                      </div>
+                      <span className={`text-xs font-medium ${priorityColors[suggestion.priority]}`}>
+                        {suggestion.priority === 'high' ? '重要' : suggestion.priority === 'medium' ? '中等' : '建议'}
+                      </span>
+                    </div>
+
+                    <div className="space-y-2">
+                      <div>
+                        <span className="text-xs font-medium text-gray-500">问题：</span>
+                        <p className="text-sm text-gray-700">{suggestion.issue}</p>
+                      </div>
+                      <div>
+                        <span className="text-xs font-medium text-gray-500">建议：</span>
+                        <p className="text-sm text-gray-800">{suggestion.suggestion}</p>
+                      </div>
+                      {suggestion.suggested_content && (
+                        <div className="bg-white border rounded p-2">
+                          <span className="text-xs font-medium text-gray-500">建议内容：</span>
+                          <p className="text-sm text-gray-600 mt-1 whitespace-pre-wrap">
+                            {suggestion.suggested_content.length > 200
+                              ? suggestion.suggested_content.slice(0, 200) + '...'
+                              : suggestion.suggested_content}
+                          </p>
+                        </div>
+                      )}
+                      {suggestion.reason && (
+                        <p className="text-xs text-gray-500 italic">原因：{suggestion.reason}</p>
+                      )}
+                    </div>
+
+                    <div className="flex gap-2 mt-3 pt-3 border-t">
+                      <Button
+                        size="sm"
+                        onClick={() => handleExecuteImprovement(suggestion)}
+                        disabled={executingSuggestion === suggestion.id}
+                      >
+                        {executingSuggestion === suggestion.id ? (
+                          <Loader2 size={14} className="animate-spin mr-1" />
+                        ) : (
+                          <Wrench size={14} className="mr-1" />
+                        )}
+                        执行修改
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        onClick={() => handleIgnoreImprovement(suggestion.id)}
+                        disabled={executingSuggestion === suggestion.id}
+                      >
+                        忽略
+                      </Button>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+            <div className="p-4 border-t bg-gray-50 flex justify-between items-center">
+              <span className="text-sm text-gray-500">
+                还有 {improvementSuggestions.length} 个建议待处理
+              </span>
+              <Button variant="secondary" onClick={handleCloseImprovementModal}>
+                稍后处理
               </Button>
             </div>
           </div>

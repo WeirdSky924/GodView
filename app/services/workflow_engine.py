@@ -1956,6 +1956,17 @@ class WorkflowEngine:
                     context["intents"] = intents
                     logger.info(f"为 Writer 提取 {len(intents)} 条写作意图")
 
+                # ========== 提取写作指导（writing_guide）============
+                # 从章节大纲中提取写作指导，供Writer Agent遵循正确的节奏
+                writing_guide = None
+                if chapter_outline:
+                    current_chapter = chapter_outline.get(str(chapter_num), chapter_outline)
+                    if isinstance(current_chapter, dict):
+                        writing_guide = current_chapter.get("writing_guide")
+                if writing_guide:
+                    context["writing_guide"] = writing_guide
+                    logger.info(f"为 Writer 加载写作指导: {writing_guide.get('description', '')[:50]}...")
+
                 # 提取角色情绪状态（从多个来源合并）
                 characters_data = context.get("characters", [])
                 character_states = execution.context.get("character_states", {})

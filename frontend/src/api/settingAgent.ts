@@ -43,6 +43,19 @@ export interface ChatResponse {
   lore_saved?: boolean
   pending_lores?: PendingLore[]
   pending_characters?: PendingCharacter[]
+  improvement_suggestions?: ImprovementSuggestion[]
+}
+
+export interface ImprovementSuggestion {
+  id: string
+  type: 'conflict' | 'missing' | 'priority' | 'optimize' | 'relation'
+  target_lore_id?: string
+  target_lore_title: string
+  issue: string
+  suggestion: string
+  suggested_content?: string
+  priority: 'low' | 'medium' | 'high'
+  reason: string
 }
 
 export interface SettingConflict {
@@ -248,5 +261,18 @@ export async function savePendingCharacters(
   return await api.post(`${API_BASE}/save-characters`, {
     project_id: projectId,
     characters,
+  })
+}
+
+/**
+ * 执行设定修改
+ */
+export async function executeLoreModification(
+  projectId: string,
+  modification: ImprovementSuggestion
+): Promise<{ success: boolean; message?: string; error?: string }> {
+  return await api.post(`${API_BASE}/execute-modification`, {
+    project_id: projectId,
+    modification,
   })
 }

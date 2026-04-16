@@ -530,8 +530,8 @@ class SettingAgentService:
         # 构建系统提示（异步）
         system_prompt = await self._build_management_system_prompt(session)
 
-        # 获取分段上下文
-        sections = await self._get_context_sections(project_id)
+        # 获取分段上下文（传入用户消息用于智能检索）
+        sections = await self._get_context_sections(project_id, user_message=message)
         world_type = sections.pop("_world_type", None)
 
         # 计算上下文总长度（包括对话历史）
@@ -638,6 +638,28 @@ class SettingAgentService:
             if metadata_results.get("updated"):
                 logger.info(f"自动更新项目 {project_id} 元数据: {metadata_results}")
 
+        # 主动分析现有设定，识别改进点（每 3 次对话触发一次）
+        improvement_suggestions = []
+        if len(session.conversation_history) % 6 == 0:  # 每 3 次用户消息
+            try:
+                # 构建对话上下文
+                conversation_context = "\n".join([
+                    f"{msg['role']}: {msg['content']}"
+                    for msg in session.conversation_history[-6:]
+                ])
+                # 获取世界类型
+                world_type = sections.get("_world_type") if 'sections' in dir() else None
+
+                improvement_suggestions = await self.analyze_existing_lores(
+                    project_id=project_id,
+                    conversation_context=conversation_context,
+                    world_type=world_type,
+                )
+                if improvement_suggestions:
+                    logger.info(f"[SettingAgent] 发现 {len(improvement_suggestions)} 个设定改进建议")
+            except Exception as e:
+                logger.warning(f"[SettingAgent] 设定分析失败: {e}")
+
         result = {
             "response": response,
             "session_id": session.id,
@@ -649,6 +671,10 @@ class SettingAgentService:
             result["pending_lores"] = pending_lores
         if pending_characters:
             result["pending_characters"] = pending_characters
+
+        # 返回设定改进建议
+        if improvement_suggestions:
+            result["improvement_suggestions"] = improvement_suggestions
 
         return result
 
@@ -897,10 +923,260 @@ class SettingAgentService:
                 """, lore_entry)
                 saved_count += 1
                 logger.info(f"保存用户确认的设定: {lore_entry['title']}")
+
+                # 自动索引到向量库
+                try:
+                    from app.services.lore_index_service import get_lore_index_service
+                    lore_index = get_lore_index_service()
+                    await lore_index.index_lore(
+                        lore_id=lore_entry["id"],
+                        project_id=project_id,
+                        title=lore_entry["title"],
+                        content=lore_entry["content"],
+                        category=lore_entry["category"],
+                        priority=lore_entry["priority"],
+                        keywords=lore_data.get("keywords", []),
+                        related_characters=lore_data.get("related_characters", []),
+                        related_locations=lore_data.get("related_locations", []),
+                        related_items=lore_data.get("related_items", []),
+                    )
+                except Exception as idx_error:
+                    logger.warning(f"索引设定失败（不影响保存）: {idx_error}")
             except Exception as e:
                 logger.error(f"保存设定失败: {e}")
 
         return saved_count
+
+    async def analyze_existing_lores(
+        self,
+        project_id: str,
+        conversation_context: str,
+        world_type: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        分析现有设定，识别可能的改进点
+
+        Args:
+            project_id: 项目 ID
+            conversation_context: 对话上下文
+            world_type: 世界类型
+
+        Returns:
+            List[Dict]: 改进建议列表
+        """
+        try:
+            from app.api.app import postgres_db
+            if not postgres_db:
+                return []
+
+            # 获取现有设定
+            lores = await postgres_db.execute_query("""
+                SELECT id, title, category, priority, content, summary, keywords
+                FROM lore_entries
+                WHERE project_id = CAST(:project_id AS UUID)
+                ORDER BY priority DESC, updated_at DESC
+                LIMIT 20
+            """, {"project_id": project_id})
+
+            if not lores or len(lores) < 2:
+                # 设定太少，不需要分析
+                return []
+
+            # 构建设定摘要
+            lores_summary = "\n".join([
+                f"- [{l['priority']}] {l['title']} ({l['category']}): {(l.get('summary') or l.get('content', ''))[:100]}..."
+                for l in lores[:15]
+            ])
+
+            world_type_hint = self._get_world_type_hint(world_type) if world_type else ""
+
+            analysis_prompt = f"""你是一个专业的小说设定审核专家。请分析以下世界观设定，识别可能的改进点。
+
+## 世界类型
+{world_type_hint if world_type_hint else "未指定"}
+
+## 现有设定列表
+{lores_summary}
+
+## 最近对话上下文
+{conversation_context[:1500]}
+
+## 分析任务
+请识别以下类型的改进机会：
+1. **冲突检测**：设定之间是否存在矛盾或不一致？
+2. **缺失补充**：是否有重要设定缺失或不够完整？
+3. **优先级调整**：优先级是否合理？核心规则是否标记为 constitutional？
+4. **内容优化**：设定描述是否清晰、具体、可操作？
+5. **关联增强**：设定之间的关联是否需要补充？
+
+## 输出格式
+返回 JSON 数组，每个改进建议包含：
+```json
+[
+  {{
+    "type": "conflict|missing|priority|optimize|relation",
+    "target_lore_id": "目标设定ID（如适用）",
+    "target_lore_title": "目标设定标题",
+    "issue": "发现的问题描述",
+    "suggestion": "具体的改进建议",
+    "suggested_content": "建议的新内容或修改内容（如适用）",
+    "priority": "low|medium|high",
+    "reason": "为什么需要这个改进"
+  }}
+]
+```
+
+## 重要规则
+- 只返回真正有价值的改进建议，不要为了建议而建议
+- 如果没有明显的改进点，返回空数组 []
+- 建议要具体、可操作，不要泛泛而谈
+- 最多返回 3 个最关键的改进建议
+
+只输出 JSON 数组，不要其他内容。"""
+
+            response = await self._call_llm_simple(analysis_prompt)
+
+            # 解析 JSON
+            if "```json" in response:
+                response = response.split("```json")[1].split("```")[0]
+            elif "```" in response:
+                response = response.split("```")[1].split("```")[0]
+
+            response = response.strip()
+            if not response or response == "[]":
+                return []
+
+            suggestions = json.loads(response)
+            if not isinstance(suggestions, list):
+                return []
+
+            # 过滤并验证
+            valid_suggestions = []
+            for s in suggestions[:3]:  # 最多 3 个建议
+                if s.get("type") and s.get("issue") and s.get("suggestion"):
+                    valid_suggestions.append({
+                        "id": str(uuid.uuid4()),
+                        "type": s.get("type"),
+                        "target_lore_id": s.get("target_lore_id"),
+                        "target_lore_title": s.get("target_lore_title", ""),
+                        "issue": s.get("issue"),
+                        "suggestion": s.get("suggestion"),
+                        "suggested_content": s.get("suggested_content"),
+                        "priority": s.get("priority", "medium"),
+                        "reason": s.get("reason", ""),
+                    })
+
+            if valid_suggestions:
+                logger.info(f"[SettingAgent] 发现 {len(valid_suggestions)} 个设定改进建议")
+
+            return valid_suggestions
+
+        except json.JSONDecodeError as e:
+            logger.warning(f"[SettingAgent] 解析改进建议 JSON 失败: {e}")
+            return []
+        except Exception as e:
+            logger.error(f"[SettingAgent] 分析设定失败: {e}")
+            return []
+
+    async def execute_lore_modification(
+        self,
+        project_id: str,
+        modification: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        执行设定修改
+
+        Args:
+            project_id: 项目 ID
+            modification: 修改内容，包含 target_lore_id, type, suggested_content 等
+
+        Returns:
+            Dict: 执行结果
+        """
+        from app.api.app import postgres_db
+        if not postgres_db:
+            return {"success": False, "error": "数据库未连接"}
+
+        mod_type = modification.get("type")
+        target_id = modification.get("target_lore_id")
+        suggested_content = modification.get("suggested_content", "")
+
+        try:
+            if mod_type == "optimize" and target_id:
+                # 优化现有设定的内容
+                await postgres_db.execute_write("""
+                    UPDATE lore_entries
+                    SET content = :content, updated_at = :updated_at
+                    WHERE id = CAST(:id AS UUID) AND project_id = CAST(:project_id AS UUID)
+                """, {
+                    "id": target_id,
+                    "project_id": project_id,
+                    "content": suggested_content,
+                    "updated_at": datetime.now(),
+                })
+                return {"success": True, "message": f"已更新设定内容"}
+
+            elif mod_type == "priority" and target_id:
+                # 调整优先级
+                new_priority = modification.get("new_priority", "standard")
+                await postgres_db.execute_write("""
+                    UPDATE lore_entries
+                    SET priority = :priority, updated_at = :updated_at
+                    WHERE id = CAST(:id AS UUID) AND project_id = CAST(:project_id AS UUID)
+                """, {
+                    "id": target_id,
+                    "project_id": project_id,
+                    "priority": new_priority,
+                    "updated_at": datetime.now(),
+                })
+                return {"success": True, "message": f"已调整设定优先级为 {new_priority}"}
+
+            elif mod_type == "missing":
+                # 添加缺失的设定
+                lore_entry = {
+                    "id": str(uuid.uuid4()),
+                    "project_id": project_id,
+                    "title": modification.get("suggested_title", "新设定"),
+                    "category": modification.get("category", "custom"),
+                    "priority": modification.get("priority", "standard"),
+                    "content": suggested_content,
+                    "summary": modification.get("summary", ""),
+                    "keywords": json.dumps(modification.get("keywords", [])),
+                    "tags": json.dumps([]),
+                    "constraints": json.dumps([]),
+                    "related_characters": json.dumps([]),
+                    "related_locations": json.dumps([]),
+                    "related_items": json.dumps([]),
+                    "created_at": datetime.now(),
+                    "updated_at": datetime.now(),
+                }
+                await postgres_db.execute_write("""
+                    INSERT INTO lore_entries (id, project_id, title, category, priority, content, summary, keywords, tags, constraints, related_characters, related_locations, related_items, created_at, updated_at)
+                    VALUES (:id, CAST(:project_id AS UUID), :title, :category, :priority, :content, :summary, :keywords, :tags, :constraints, :related_characters, :related_locations, :related_items, :created_at, :updated_at)
+                """, lore_entry)
+                return {"success": True, "message": f"已添加新设定: {lore_entry['title']}"}
+
+            elif mod_type == "relation" and target_id:
+                # 更新关联关系
+                related = modification.get("related_entities", [])
+                await postgres_db.execute_write("""
+                    UPDATE lore_entries
+                    SET related_characters = :related, updated_at = :updated_at
+                    WHERE id = CAST(:id AS UUID) AND project_id = CAST(:project_id AS UUID)
+                """, {
+                    "id": target_id,
+                    "project_id": project_id,
+                    "related": json.dumps(related),
+                    "updated_at": datetime.now(),
+                })
+                return {"success": True, "message": "已更新设定关联"}
+
+            else:
+                return {"success": False, "error": f"未知的修改类型: {mod_type}"}
+
+        except Exception as e:
+            logger.error(f"[SettingAgent] 执行设定修改失败: {e}")
+            return {"success": False, "error": str(e)}
 
     async def _extract_characters_from_conversation(
         self,
@@ -1556,6 +1832,56 @@ class SettingAgentService:
 """
         return base_prompt
 
+    async def _extract_keywords_from_message(self, message: str) -> List[str]:
+        """
+        从用户消息中提取关键词
+
+        Args:
+            message: 用户消息
+
+        Returns:
+            List[str]: 关键词列表
+        """
+        import re
+
+        # 简单的关键词提取规则
+        keywords = []
+
+        # 1. 提取引号内的内容（用户明确提到的名词）
+        quoted = re.findall(r'[""「」『』]([^""「」『』]+)[""「」『』]', message)
+        keywords.extend(quoted)
+
+        # 2. 提取中文专有名词（2-6个字的词）
+        # 常见设定类型关键词
+        lore_patterns = [
+            r'([\u4e00-\u9fa5]{2,6}(?:设定|规则|体系|系统|能力|力量|技能|功法|境界|种族|门派|势力))',
+            r'(设定[：:]\s*([\u4e00-\u9fa5]{2,6}))',
+            r'(关于[《【]?([\u4e00-\u9fa5]{2,6})[》】]?)',
+        ]
+        for pattern in lore_patterns:
+            matches = re.findall(pattern, message)
+            for match in matches:
+                if isinstance(match, tuple):
+                    keywords.extend([m for m in match if m])
+                else:
+                    keywords.append(match)
+
+        # 3. 提取关键实体名词（常见的设定类别）
+        entity_keywords = [
+            "修真", "魔法", "功法", "境界", "灵根", "血脉", "天赋",
+            "种族", "势力", "门派", "宗门", "家族", "帝国",
+            "主角", "反派", "配角", "导师", "恋人",
+            "武器", "法宝", "神器", "丹药", "灵石",
+            "世界", "大陆", "区域", "城市", "秘境",
+        ]
+        for kw in entity_keywords:
+            if kw in message:
+                keywords.append(kw)
+
+        # 4. 去重并返回
+        unique_keywords = list(set(keywords))
+        return unique_keywords[:10]  # 最多返回 10 个
+
     def _get_world_type_hint(self, world_type: str) -> str:
         """根据世界类型返回对应的设定要点提示"""
         hints = {
@@ -1646,9 +1972,17 @@ class SettingAgentService:
         sections = await self._get_context_sections(project_id)
         return "\n\n".join([f"【{k}】\n{v}" for k, v in sections.items() if v])
 
-    async def _get_context_sections(self, project_id: str) -> Dict[str, str]:
+    async def _get_context_sections(
+        self,
+        project_id: str,
+        user_message: Optional[str] = None,
+    ) -> Dict[str, str]:
         """
-        获取项目上下文的分段信息（用于分段分析）
+        获取项目上下文的分段信息（智能检索版本）
+
+        Args:
+            project_id: 项目 ID
+            user_message: 用户消息（用于智能检索相关设定）
 
         Returns:
             Dict[str, str]: 分段的上下文信息
@@ -1667,7 +2001,7 @@ class SettingAgentService:
         sections = {}
 
         # 记录加载上下文
-        logger.info(f"[SettingAgent] 开始为项目 {project_id} 构建分段上下文")
+        logger.info(f"[SettingAgent] 开始为项目 {project_id} 构建智能上下文")
 
         try:
             # 1. 世界管理信息
@@ -1762,26 +2096,108 @@ class SettingAgentService:
                     sections["世界管理"] = "\n\n".join(world_info)
                     sections["_world_type"] = world_type or ""
 
-            # 2. 已有设定信息
+            # 2. 设定库 - 智能检索相关设定
             try:
-                lores = await conn.fetch("""
-                    SELECT title, category, priority, summary, content
+                # 2.1 始终加载宪法级规则（不可违反）
+                constitutional_lores = await conn.fetch("""
+                    SELECT id, title, category, priority, summary, content, keywords
                     FROM lore_entries
-                    WHERE project_id = $1
-                    ORDER BY priority DESC, created_at DESC
-                    LIMIT 15
+                    WHERE project_id = $1 AND priority = 'constitutional'
+                    ORDER BY created_at
                 """, project_id)
 
-                if lores:
-                    lore_info = []
-                    for lore in lores:
-                        info = f"- {lore['title']} [{lore['category']}]"
-                        if lore.get('summary'):
-                            info += f"：{lore['summary']}"
-                        lore_info.append(info)
-                    sections["已有设定"] = "\n".join(lore_info)
+                # 2.2 智能检索相关设定
+                relevant_lore_ids = set()
+                if user_message:
+                    # 从用户消息中提取关键词
+                    extracted_keywords = await self._extract_keywords_from_message(user_message)
+
+                    # 使用智能检索
+                    try:
+                        from app.services.lore_index_service import get_lore_index_service
+                        lore_index = get_lore_index_service()
+                        relevant_ids = await lore_index.smart_search(
+                            project_id=project_id,
+                            query=user_message,
+                            keywords=extracted_keywords,
+                            limit=20,
+                        )
+                        relevant_lore_ids.update(relevant_ids)
+                        logger.info(f"[SettingAgent] 智能检索到 {len(relevant_lore_ids)} 条相关设定")
+                    except Exception as e:
+                        logger.warning(f"[SettingAgent] 智能检索失败，回退到关键词匹配: {e}")
+                        # 回退：直接在数据库中搜索关键词
+                        if extracted_keywords:
+                            for kw in extracted_keywords[:5]:
+                                matching = await conn.fetch("""
+                                    SELECT id FROM lore_entries
+                                    WHERE project_id = $1
+                                    AND (keywords::text ILIKE $2 OR title ILIKE $2 OR content ILIKE $2)
+                                    LIMIT 5
+                                """, project_id, f"%{kw}%")
+                                for m in matching:
+                                    relevant_lore_ids.add(str(m['id']))
+
+                # 2.3 获取宪法级设定的 ID（排除重复）
+                constitutional_ids = {str(l['id']) for l in constitutional_lores}
+
+                # 2.4 获取相关设定的完整内容
+                relevant_lores = []
+                if relevant_lore_ids:
+                    # 排除已在宪法级中出现的
+                    ids_to_fetch = [lid for lid in relevant_lore_ids if lid not in constitutional_ids]
+                    if ids_to_fetch:
+                        # 构建查询
+                        placeholders = ",".join([f"'{lid}'" for lid in ids_to_fetch[:15]])
+                        relevant_lores = await conn.fetch(f"""
+                            SELECT id, title, category, priority, summary, content, keywords
+                            FROM lore_entries
+                            WHERE id::text IN ({placeholders})
+                        """)
+
+                # 2.5 构建设定库上下文
+                lore_info = []
+
+                # 宪法级设定（完整内容）
+                if constitutional_lores:
+                    lore_info.append("【宪法级设定 - 不可违反】")
+                    for lore in constitutional_lores:
+                        content = lore.get('content', '')
+                        if len(content) > 500:
+                            content = content[:500] + "..."
+                        lore_info.append(f"【{lore['title']}】")
+                        lore_info.append(f"类别: {lore['category']}")
+                        lore_info.append(f"内容: {content}")
+                        if lore.get('keywords'):
+                            try:
+                                kw = json.loads(lore['keywords']) if isinstance(lore['keywords'], str) else lore['keywords']
+                                if kw:
+                                    lore_info.append(f"关键词: {', '.join(kw[:5])}")
+                            except:
+                                pass
+                        lore_info.append("")
+                    logger.info(f"[SettingAgent] 宪法级设定: {len(constitutional_lores)} 条")
+
+                # 相关设定（根据用户问题智能检索）
+                if relevant_lores:
+                    lore_info.append(f"【相关设定（根据您的问题检索）】")
+                    for lore in relevant_lores[:15]:  # 最多 15 条
+                        content = lore.get('content', '')
+                        if len(content) > 400:
+                            content = content[:400] + "..."
+                        summary = lore.get('summary', '')
+                        info_line = f"- {lore['title']} [{lore['priority']}] ({lore['category']})"
+                        if summary:
+                            info_line += f"\n  摘要: {summary}"
+                        info_line += f"\n  内容: {content}"
+                        lore_info.append(info_line)
+                    logger.info(f"[SettingAgent] 相关设定: {len(relevant_lores)} 条")
+
+                if lore_info:
+                    sections["设定库"] = "\n".join(lore_info)
+
             except Exception as e:
-                logger.warning(f"获取 lore 失败: {e}")
+                logger.warning(f"获取设定失败: {e}")
 
             # 3. 角色信息
             try:
@@ -1899,7 +2315,7 @@ class SettingAgentService:
         all_key_points = []
 
         # 按段落类型逐个处理
-        section_order = ["世界管理", "已有设定", "角色列表", "伏笔列表", "章节大纲"]
+        section_order = ["世界管理", "设定库", "角色列表", "伏笔列表", "章节大纲"]
         sorted_sections = []
         for key in section_order:
             if key in sections and sections[key]:

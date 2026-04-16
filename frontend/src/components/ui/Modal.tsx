@@ -30,16 +30,17 @@ export function Modal({ isOpen, onClose, title, children, size = 'md', className
     <AnimatePresence>
       {isOpen && (
         <div className="fixed inset-0 z-[9999] overflow-y-auto">
-          <div className="flex min-h-screen items-center justify-center p-4">
-            {/* 背景遮罩 */}
-            <motion.div
-              className={`fixed inset-0 backdrop-blur-sm ${isDark ? 'bg-black/70' : 'bg-black/50'}`}
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              onClick={onClose}
-            />
+          {/* 背景遮罩 - 使用 z-[-1] 确保在内容下方 */}
+          <motion.div
+            className={`fixed inset-0 backdrop-blur-sm ${isDark ? 'bg-black/70' : 'bg-black/50'}`}
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={onClose}
+          />
 
+          {/* 模态框容器 */}
+          <div className="flex min-h-screen items-center justify-center p-4 relative z-10">
             {/* 模态框 */}
             <motion.div
               className={`relative rounded-xl shadow-2xl border w-full ${sizes[size]} ${className} ${

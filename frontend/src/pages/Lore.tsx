@@ -80,8 +80,8 @@ export default function Lore() {
   const [viewMode, setViewMode] = useState<'list' | 'tree'>('list')
   const [showAgentChat, setShowAgentChat] = useState(false)
 
-  const getPriorityColors = (priority: LorePriority): string => {
-    const colors: Record<LorePriority, { light: string; dark: string }> = {
+  const getPriorityColors = (priority?: LorePriority): string => {
+    const colors: Record<string, { light: string; dark: string }> = {
       constitutional: {
         light: 'bg-red-100 text-red-700 border-red-200',
         dark: 'bg-red-900/30 text-red-300 border-red-800'
@@ -99,7 +99,8 @@ export default function Lore() {
         dark: 'bg-gray-800 text-gray-300 border-gray-600'
       }
     }
-    return isDark ? colors[priority].dark : colors[priority].light
+    const validPriority = priority && colors[priority] ? priority : 'standard'
+    return isDark ? colors[validPriority].dark : colors[validPriority].light
   }
 
   const loadLore = useCallback(async () => {
@@ -192,6 +193,11 @@ export default function Lore() {
     try {
       if (editingLore) {
         await updateLore(editingLore.id, data)
+        // 更新选中的 lore
+        if (selectedLore?.id === editingLore.id) {
+          const updatedData = { ...selectedLore, ...data }
+          setSelectedLore(updatedData as LoreEntry)
+        }
       } else {
         await createLore(data)
       }
@@ -380,7 +386,7 @@ export default function Lore() {
                               <div className="flex-1 min-w-0">
                                 <h4 className={`font-medium truncate ${isDark ? 'text-white' : 'text-gray-800'}`}>{lore.title}</h4>
                                 <p className={`text-sm mt-1 line-clamp-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
-                                  {lore.summary || lore.content.slice(0, 100)}
+                                  {lore.summary || (lore.content ? lore.content.slice(0, 100) : '')}
                                 </p>
                                 <div className="flex items-center gap-2 mt-2">
                                   <span className={`text-xs px-2 py-0.5 rounded border ${getPriorityColors(lore.priority)}`}>

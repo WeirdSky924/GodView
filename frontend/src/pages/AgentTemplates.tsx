@@ -374,9 +374,9 @@ export default function AgentTemplates() {
                         {template.prompt_slots
                           .filter((s) => s.is_enabled)
                           .slice(0, 5)
-                          .map((slot) => (
+                          .map((slot, idx) => (
                             <span
-                              key={slot.slot_name}
+                              key={slot.prompt_template_id || `prompt-${idx}`}
                               className={`px-2 py-0.5 text-xs rounded ${
                                 slot.prompt_template_id ? 'bg-green-900 text-green-300' : isDark ? 'bg-gray-700 text-gray-400' : 'bg-gray-200 text-gray-500'
                               }`}
@@ -400,9 +400,9 @@ export default function AgentTemplates() {
                           {template.skill_slots
                             .filter((s) => s.is_enabled)
                             .slice(0, 5)
-                            .map((slot) => (
+                            .map((slot, idx) => (
                               <span
-                                key={slot.slot_name}
+                                key={slot.skill_id || `skill-${idx}`}
                                 className={`px-2 py-0.5 text-xs rounded ${
                                   slot.skill_id ? 'bg-purple-900 text-purple-300' : isDark ? 'bg-gray-700 text-gray-400' : 'bg-gray-200 text-gray-500'
                                 }`}

@@ -61,6 +61,12 @@ class SavePendingCharactersRequest(BaseModel):
     characters: List[Dict[str, Any]]
 
 
+class ExecuteLoreModificationRequest(BaseModel):
+    """执行设定修改请求"""
+    project_id: str
+    modification: Dict[str, Any]
+
+
 # ==================== API 端点 ====================
 
 @router.post("/chat")
@@ -277,5 +283,28 @@ async def create_or_get_session(project_id: str, mode: str = "management"):
         }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"Invalid mode: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/execute-modification")
+async def execute_lore_modification(request: ExecuteLoreModificationRequest):
+    """
+    执行设定修改
+
+    根据改进建议执行实际的修改操作：
+    - optimize: 优化设定内容
+    - priority: 调整优先级
+    - missing: 添加缺失设定
+    - relation: 更新关联关系
+    """
+    service = get_setting_agent_service()
+
+    try:
+        result = await service.execute_lore_modification(
+            project_id=request.project_id,
+            modification=request.modification,
+        )
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

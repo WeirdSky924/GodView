@@ -618,16 +618,17 @@ class SkillService:
             return []
 
         try:
+            # 使用 DISTINCT ON 去重，避免同一 skill 被多次分配到不同 slot 导致重复
             rows = await self._db.execute_query(
                 """
-                SELECT sa.*, s.*
+                SELECT DISTINCT ON (sa.skill_id) sa.*, s.*
                 FROM skill_assignments sa
                 JOIN skills s ON sa.skill_id = s.id
                 WHERE sa.agent_type = :agent_type
                   AND sa.is_enabled = true
                   AND s.status = 'active'
                   AND s.is_enabled = true
-                ORDER BY sa.priority DESC, s.priority DESC
+                ORDER BY sa.skill_id, sa.priority DESC, s.priority DESC
                 """,
                 {"agent_type": agent_type}
             )

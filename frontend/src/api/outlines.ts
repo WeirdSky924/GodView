@@ -129,10 +129,26 @@ export interface ChatRequest {
   context?: Record<string, any>
 }
 
+export interface PendingOutline {
+  chapter_number: number
+  title: string
+  summary: string
+  scenes?: Partial<SceneOutline>[]
+  emotion_curve?: EmotionCurve
+  chapter_goals?: string[]
+  hooks_planted?: string[]
+  hooks_resolved?: string[]
+  target_word_count?: number
+  character_arcs?: Record<string, string>
+}
+
 export interface ChatResponse {
   message: string
   outline_updates?: Partial<ChapterOutline>
   suggestions?: string[]
+  pending_outlines?: PendingOutline[]
+  saved_outline?: ChapterOutline
+  saved_outlines?: ChapterOutline[]  // 多章大纲保存
 }
 
 // ==================== API 函数 ====================
@@ -259,5 +275,17 @@ export async function batchGenerateOutlines(
     start_chapter: startChapter,
     end_chapter: endChapter,
     ...options,
+  })
+}
+
+/**
+ * 保存待确认的大纲
+ */
+export async function savePendingOutlines(
+  projectId: string,
+  outlines: PendingOutline[]
+): Promise<{ success: boolean; saved_count: number; message: string }> {
+  return await api.post(`${API_BASE}/save-outlines?project_id=${projectId}`, {
+    outlines,
   })
 }

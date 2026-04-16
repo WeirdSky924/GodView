@@ -269,6 +269,11 @@ async def update_lore(lore_id: str, lore_update: UpdateLoreDTO):
             if key in ["category", "priority"]:
                 update_fields.append(f"{key} = :{key}")
                 params[key] = value.value if hasattr(value, 'value') else value
+            elif key in ["keywords", "tags", "constraints"]:
+                # JSON/JSONB 字段需要转换为 JSON 字符串
+                import json
+                update_fields.append(f"{key} = :{key}")
+                params[key] = json.dumps(value)
             else:
                 update_fields.append(f"{key} = :{key}")
                 params[key] = value
