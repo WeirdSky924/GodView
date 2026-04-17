@@ -61,6 +61,12 @@ class SavePendingCharactersRequest(BaseModel):
     characters: List[Dict[str, Any]]
 
 
+class SavePendingHooksRequest(BaseModel):
+    """保存待确认伏笔请求"""
+    project_id: str
+    hooks: List[Dict[str, Any]]
+
+
 class ExecuteLoreModificationRequest(BaseModel):
     """执行设定修改请求"""
     project_id: str
@@ -140,6 +146,31 @@ async def save_pending_characters(request: SavePendingCharactersRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
+
+@router.post("/save-hooks")
+async def save_pending_hooks(request: SavePendingHooksRequest):
+    """
+    保存用户确认的伏笔
+
+    在设定助手的确认弹窗中，用户确认后调用此接口保存伏笔
+    """
+    service = get_setting_agent_service()
+
+    try:
+        saved_count = await service.save_pending_hooks(
+            project_id=request.project_id,
+            hooks=request.hooks,
+        )
+        return {
+            "success": True,
+            "saved_count": saved_count,
+            "message": f"成功保存 {saved_count} 个伏笔" if saved_count > 0 else "没有需要保存的伏笔"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/change")
 async def request_setting_change(request: SettingChangeRequest):
     """
@@ -171,6 +202,7 @@ async def request_setting_change(request: SettingChangeRequest):
         raise HTTPException(status_code=400, detail=f"Invalid change_type: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @router.post("/negotiate")

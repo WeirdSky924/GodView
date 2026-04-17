@@ -77,8 +77,8 @@ class LoreIndexService:
                 logger.warning("Qdrant 未连接，跳过向量索引")
                 return False
 
-            # 构建用于向量化的文本（标题 + 内容摘要）
-            text_for_embedding = f"{title}\n{content[:1000]}"
+            # 构建用于向量化的文本（标题 + 全量内容）
+            text_for_embedding = f"{title}\n{content}"
 
             # 添加到向量库
             await qdrant.add_lore_entry(

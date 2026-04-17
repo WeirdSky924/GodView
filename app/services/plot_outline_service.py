@@ -7,8 +7,9 @@ GodView v9: PlotOutlineAgent 专用
 
 import json
 import logging
+import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from app.models.chapter_outline import (
@@ -50,7 +51,13 @@ class PlotOutlineService:
 
         # 内存缓存
         self._outlines_cache: Dict[str, ChapterOutline] = {}
-        self._cache_valid: bool = False
+        self._loaded_outline_projects: set[str] = set()
+
+        self._context_cache: Dict[str, Dict[str, Any]] = {}
+        self._formatted_context_cache: Dict[str, Dict[str, Any]] = {}
+        self._system_prompt_cache: Dict[str, Dict[str, Any]] = {}
+        self._output_format_cache: Dict[str, Dict[str, Any]] = {}
+        self._cache_ttl = timedelta(minutes=5)
 
         # 获取 LLM 配置
         from app.config import settings
@@ -64,25 +71,646 @@ class PlotOutlineService:
 
         logger.info(f"[PlotOutlineService] LLM 配置 - Provider: {self._llm_provider}, Model: {self._llm_model}, Base: {self._llm_base_url}")
 
+
+    def _is_cache_entry_valid(self, entry: Optional[Dict[str, Any]]) -> bool:
+        if not entry:
+            return False
+
+        expires_at = entry.get("expires_at")
+        return isinstance(expires_at, datetime) and expires_at > datetime.now()
+
+    def _cache_entry(self, cache: Dict[str, Dict[str, Any]], key: str, value: Any):
+        cache[key] = {
+            "value": value,
+            "expires_at": datetime.now() + self._cache_ttl,
+        }
+        return value
+
+    def _get_cached_value(self, cache: Dict[str, Dict[str, Any]], key: str):
+        entry = cache.get(key)
+        if not self._is_cache_entry_valid(entry):
+            if key in cache:
+                del cache[key]
+            return None
+        return entry["value"]
+
+    def _invalidate_project_caches(self, project_id: str, chapter_number: Optional[int] = None):
+        context_prefix = f"{project_id}:"
+        for cache in (self._context_cache, self._formatted_context_cache, self._system_prompt_cache):
+            stale_keys = [key for key in cache if key.startswith(context_prefix)]
+            for key in stale_keys:
+                del cache[key]
+
+    def _merge_outline_into_list(self, outline: ChapterOutline):
+        self._outlines_cache[outline.id] = outline
+        self._loaded_outline_projects.add(outline.project_id)
+
+    def _build_outline_list_cache(self, outlines: List[ChapterOutline]):
+        self._outlines_cache = {outline.id: outline for outline in outlines}
+        self._loaded_outline_projects = {outline.project_id for outline in outlines}
+
+    def _get_context_cache_key(self, project_id: str, chapter_number: int) -> str:
+        return f"{project_id}:context:{chapter_number}"
+
+    def _get_formatted_context_cache_key(self, project_id: str, chapter_number: int) -> str:
+        return f"{project_id}:formatted-context:{chapter_number}"
+
+    def _get_system_prompt_cache_key(self, project_id: str, chapter_number: int) -> str:
+        return f"{project_id}:system-prompt:{chapter_number}"
+
+    def _log_timing(self, stage: str, started_at: float):
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
+        logger.info(f"[PlotOutline][Timing] {stage}: {elapsed_ms:.1f}ms")
+
     async def _ensure_cache(self, project_id: str):
-        """确保缓存有效"""
-        cache_key = f"project_{project_id}"
-        if self._cache_valid and cache_key in self._outlines_cache:
+        if project_id in self._loaded_outline_projects:
             return
 
-        if self._db:
+        if not self._db:
+            return
+
+        try:
+            rows = await self._db.execute_query(
+                "SELECT * FROM chapter_outlines WHERE project_id = :project_id ORDER BY chapter_number",
+                {"project_id": project_id}
+            )
+
+            self._outlines_cache = {
+                outline_id: outline
+                for outline_id, outline in self._outlines_cache.items()
+                if outline.project_id != project_id
+            }
+
+            for row in rows:
+                outline = self._row_to_outline(row)
+                self._outlines_cache[outline.id] = outline
+
+            self._loaded_outline_projects.add(project_id)
+            logger.info(f"从数据库加载项目 {project_id} 的 {len(rows)} 个章节大纲")
+        except Exception as e:
+            logger.warning(f"从数据库加载章节大纲失败: {e}")
+
+    async def _get_cached_project_context(self, project_id: str, chapter_number: int) -> Dict[str, Any]:
+        cache_key = self._get_context_cache_key(project_id, chapter_number)
+        cached = self._get_cached_value(self._context_cache, cache_key)
+        if cached is not None:
+            return cached
+
+        started_at = time.perf_counter()
+        context = await self.get_full_project_context(project_id, chapter_number)
+        self._log_timing("fetch_project_context", started_at)
+        return self._cache_entry(self._context_cache, cache_key, context)
+
+    def _get_cached_formatted_context(self, project_id: str, chapter_number: int, full_context: Dict[str, Any]) -> str:
+        cache_key = self._get_formatted_context_cache_key(project_id, chapter_number)
+        cached = self._get_cached_value(self._formatted_context_cache, cache_key)
+        if cached is not None:
+            return cached
+
+        started_at = time.perf_counter()
+        formatted = self.format_context_for_prompt(full_context)
+        self._log_timing("format_project_context", started_at)
+        return self._cache_entry(self._formatted_context_cache, cache_key, formatted)
+
+    async def _get_cached_system_prompt(
+        self,
+        project_id: str,
+        chapter_number: int,
+        full_context: Dict[str, Any],
+    ) -> str:
+        cache_key = self._get_system_prompt_cache_key(project_id, chapter_number)
+        cached = self._get_cached_value(self._system_prompt_cache, cache_key)
+        if cached is not None:
+            return cached
+
+        started_at = time.perf_counter()
+        try:
+            from app.services.agent_prompt_service import get_agent_prompt_service
+            prompt_service = get_agent_prompt_service()
+            base_prompt = await prompt_service.build_agent_prompt(
+                agent_type="plot_outline",
+                project_id=project_id,
+                include_skills=True,
+            )
+        except Exception as e:
+            logger.warning(f"加载 plot_outline prompt 模板失败: {e}，使用默认 prompt")
+            base_prompt = self._build_fallback_prompt()
+
+        context_hints = self._build_context_hints(full_context)
+        output_format = await self._get_cached_output_format_prompt()
+        system_prompt = f"{base_prompt}\n\n{context_hints}\n\n{output_format}".strip()
+        self._log_timing("build_system_prompt", started_at)
+        return self._cache_entry(self._system_prompt_cache, cache_key, system_prompt)
+
+    def _build_outline_runtime_context(self, existing_outline: Optional[ChapterOutline]) -> str:
+        if not existing_outline:
+            return "当前章节暂无大纲，需要创建新的大纲。"
+
+        return f"""
+当前章节大纲状态：
+- 标题: {existing_outline.title}
+- 摘要: {existing_outline.summary if existing_outline.summary else ''}
+- 状态: {existing_outline.status.value}
+- 场景数: {len(existing_outline.scenes)}
+- 目标字数: {existing_outline.target_word_count}
+""".strip()
+
+    def _build_context_hints(self, full_context: Optional[Dict[str, Any]]) -> str:
+        if not full_context:
+            return ""
+
+        char_count = len(full_context.get("characters", []))
+        constitutional_count = len(full_context.get("constitutional_rules", []))
+        core_count = len(full_context.get("core_settings", []))
+        relevant_count = len(full_context.get("relevant_settings", []))
+        hooks_pending = len(full_context.get("hooks", {}).get("pending", []))
+        hooks_to_resolve = len(full_context.get("hooks", {}).get("to_resolve", []))
+
+        return f"""
+【已获取的项目上下文】
+- 角色信息：{char_count} 个角色可用
+- 宪法级设定：{constitutional_count} 条（不可违反）
+- 核心设定：{core_count} 条
+- 相关设定：{relevant_count} 条
+- 待处理伏笔：{hooks_pending} 个
+- 建议回收伏笔：{hooks_to_resolve} 个
+
+生成或修改大纲时，必须优先服从宪法级设定与核心设定，其优先级高于输出格式偏好。
+""".strip()
+
+    async def _get_cached_output_format_prompt(self) -> str:
+        cache_key = "plot_outline_output"
+        cached = self._get_cached_value(self._output_format_cache, cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            from app.services.md_file_service import get_md_file_service
+            md_service = get_md_file_service()
+            prompt = md_service.get_prompt("plot_outline_output")
+            if prompt:
+                content = prompt.get("content") or prompt.get("raw_content") or ""
+                if content:
+                    return self._cache_entry(self._output_format_cache, cache_key, content.strip())
+        except Exception as e:
+            logger.warning(f"加载 plot_outline_output prompt 失败: {e}")
+
+        return self._cache_entry(self._output_format_cache, cache_key, self._get_simple_output_format())
+
+    def _build_combined_context(self, context_str: str, user_context: str) -> str:
+        if not context_str:
+            return user_context
+        if not user_context:
+            return context_str
+        return f"{context_str}\n\n{user_context}"
+
+    def _truncate_text(self, value: Optional[str], limit: int) -> str:
+        if not value:
+            return ""
+        return value
+
+    def _build_lore_context_entry(self, lore: Dict[str, Any], summary_limit: int) -> Dict[str, Any]:
+        summary = lore.get("summary") or lore.get("content") or ""
+        return {
+            "title": lore.get("title", ""),
+            "category": lore.get("category", "custom"),
+            "priority": lore.get("priority", "standard"),
+            "summary": summary,
+        }
+
+    def _split_world_settings(self, world_settings: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        constitutional_rules = [item for item in world_settings if item.get("priority") == "constitutional"]
+        core_settings = [item for item in world_settings if item.get("priority") == "core"]
+        relevant_settings = [
+            item for item in world_settings
+            if item.get("priority") not in {"constitutional", "core"}
+        ]
+        return constitutional_rules, core_settings, relevant_settings
+
+    def _format_lore_section(self, title: str, items: List[Dict[str, Any]], summary_limit: int, max_items: Optional[int] = None) -> List[str]:
+        if not items:
+            return []
+
+        lines = [title]
+        for lore in items:
+            lines.append(f"- [{lore.get('priority', 'standard')}] {lore.get('title', '')}")
+            summary = self._truncate_text(lore.get("summary"), summary_limit)
+            if summary:
+                lines.append(f"  {summary}")
+        lines.append("")
+        return lines
+
+    def _format_consistency_check_text(self, outline_updates: Dict[str, Any]) -> str:
+        if "chapters" in outline_updates:
+            blocks = []
+            for chapter in outline_updates.get("chapters", []):
+                chapter_no = chapter.get("chapter_number", "?")
+                title = chapter.get("title", "")
+                summary = chapter.get("summary", "")
+                blocks.append(f"第{chapter_no}章 {title}\n摘要：{summary}")
+                for scene in chapter.get("scenes", []):
+                    blocks.append(f"- 场景{scene.get('scene_number', '?')} {scene.get('title', '')}: {scene.get('summary', '')}")
+            return "\n".join(blocks)
+
+        title = outline_updates.get("title", "")
+        summary = outline_updates.get("summary", "")
+        lines = [f"第{outline_updates.get('chapter_number', '?')}章 {title}", f"摘要：{summary}"]
+        for scene in outline_updates.get("scenes", []):
+            lines.append(f"- 场景{scene.get('scene_number', '?')} {scene.get('title', '')}: {scene.get('summary', '')}")
+        return "\n".join(lines)
+
+    async def _check_outline_setting_consistency(
+        self,
+        project_id: str,
+        outline_updates: Dict[str, Any],
+        full_context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not self._skill_service or not outline_updates:
+            return {"conflicts": [], "setting_gaps": [], "risk_areas": [], "consistency_score": 100}
+
+        try:
+            from app.services.skill_service import ExecuteSkillDTO
+
+            world_sections: List[str] = []
+            world_sections.extend(self._format_lore_section("【宪法级设定 - 不可违反】", full_context.get("constitutional_rules", []), 1200))
+            world_sections.extend(self._format_lore_section("【核心设定】", full_context.get("core_settings", []), 800))
+            world_sections.extend(self._format_lore_section("【相关设定】", full_context.get("relevant_settings", []), 500))
+
+            character_lines = []
+            for char in full_context.get("characters", []):
+                parts = [char.get("name", "")]
+                if char.get("role"):
+                    parts.append(f"角色定位: {char['role']}")
+                if char.get("personality"):
+                    parts.append(f"性格: {char['personality']}")
+                if char.get("background"):
+                    parts.append(f"背景: {char['background']}")
+                character_lines.append(" | ".join(parts))
+
+            result = await self._skill_service.execute_skill(ExecuteSkillDTO(
+                skill_id="skill_setting_conflict_detection",
+                project_id=project_id,
+                parameters={
+                    "chapter_content": self._format_consistency_check_text(outline_updates),
+                    "world_settings": "\n".join(world_sections),
+                    "character_settings": "\n".join(character_lines),
+                    "ability_settings": "",
+                }
+            ))
+
+            if not result.success:
+                logger.warning(f"[PlotOutline] 设定一致性检测失败: {result.error}")
+                return {"conflicts": [], "setting_gaps": [], "risk_areas": [], "consistency_score": 100}
+
+            parsed = self._parse_consistency_result(result.output)
+            return {
+                "conflicts": parsed.get("conflicts", []),
+                "setting_gaps": parsed.get("setting_gaps", []),
+                "risk_areas": parsed.get("risk_areas", []),
+                "consistency_score": parsed.get("consistency_score", 100),
+            }
+        except Exception as e:
+            logger.warning(f"[PlotOutline] 执行设定一致性检测失败: {e}")
+            return {"conflicts": [], "setting_gaps": [], "risk_areas": [], "consistency_score": 100}
+
+    async def _repair_outline_with_consistency_feedback(
+        self,
+        project_id: str,
+        chapter_number: int,
+        message: str,
+        full_context: Dict[str, Any],
+        system_prompt: str,
+        combined_context: str,
+        llm_config: Dict[str, Any],
+        consistency: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        conflicts = consistency.get("conflicts", [])
+        risk_areas = consistency.get("risk_areas", [])
+        setting_gaps = consistency.get("setting_gaps", [])
+
+        if not conflicts and not risk_areas:
+            return None
+
+        repair_feedback = [
+            "你刚生成的大纲存在设定一致性风险，请基于原任务立即修正后重新输出完整 JSON。",
+            "修正时必须优先服从宪法级设定和核心设定，不要输出解释，不要省略字段。",
+        ]
+        if conflicts:
+            repair_feedback.append("冲突列表：")
+            repair_feedback.extend([f"- {item}" for item in conflicts])
+        if risk_areas:
+            repair_feedback.append("风险区域：")
+            repair_feedback.extend([f"- {item}" for item in risk_areas])
+        if setting_gaps:
+            repair_feedback.append("设定缺口：")
+            repair_feedback.extend([f"- {item}" for item in setting_gaps])
+
+        repaired_response = await self._call_llm_for_chat(
+            system_prompt=system_prompt,
+            user_message=f"{message}\n\n" + "\n".join(repair_feedback),
+            context=combined_context,
+            llm_config=llm_config,
+        )
+        repaired_updates = self._try_parse_outline_updates(repaired_response)
+        if repaired_updates:
+            logger.info("[PlotOutline] 已根据设定一致性反馈执行一次自动修正")
+        return repaired_updates
+
+    def _extract_json_candidates(self, text: str) -> List[str]:
+        import re
+
+        candidates: List[str] = []
+
+        json_blocks = re.findall(r'```json\s*([\s\S]*?)\s*```', text)
+        candidates.extend([block.strip() for block in json_blocks if block.strip()])
+
+        stack: List[str] = []
+        start_index: Optional[int] = None
+        in_string = False
+        escape = False
+
+        for index, char in enumerate(text):
+            if escape:
+                escape = False
+                continue
+            if char == "\\":
+                escape = True
+                continue
+            if char == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if char == '{':
+                if not stack:
+                    start_index = index
+                stack.append(char)
+            elif char == '}':
+                if stack:
+                    stack.pop()
+                    if not stack and start_index is not None:
+                        candidate = text[start_index:index + 1].strip()
+                        if candidate:
+                            candidates.append(candidate)
+                        start_index = None
+
+        return candidates
+
+    def _extract_json_object(self, text: str) -> Optional[Dict[str, Any]]:
+        for candidate in self._extract_json_candidates(text):
             try:
-                rows = await self._db.execute_query(
-                    "SELECT * FROM chapter_outlines WHERE project_id = :project_id ORDER BY chapter_number",
-                    {"project_id": project_id}
+                data = json.loads(candidate)
+                if isinstance(data, dict):
+                    return data
+            except json.JSONDecodeError:
+                continue
+        return None
+
+    def _has_outline_shape(self, data: Dict[str, Any]) -> bool:
+        return any(key in data for key in ["title", "summary", "scenes", "chapters", "chapter_goals", "writing_guide"])
+
+    def _has_meaningful_outline_content(self, outline_data: Dict[str, Any]) -> bool:
+        if not outline_data:
+            return False
+        if outline_data.get("summary"):
+            return True
+        if outline_data.get("scenes"):
+            return True
+        if outline_data.get("chapter_goals"):
+            return True
+        hooks = outline_data.get("hooks_planted") or outline_data.get("hooks_resolved")
+        if hooks:
+            return True
+        return False
+
+    def _parse_consistency_result(self, output: str) -> Dict[str, Any]:
+        data = self._extract_json_object(output)
+        if not data:
+            raise json.JSONDecodeError("No JSON object found", output, 0)
+
+        conflicts = data.get("conflicts", [])
+        critical_conflicts = data.get("critical_conflicts", [])
+        suggestions = data.get("suggestions", [])
+        checked_settings = data.get("checked_settings", [])
+        overall_compliance = data.get("overall_compliance")
+        consistency_score = data.get("consistency_score", overall_compliance if overall_compliance is not None else 100)
+
+        risk_areas: List[str] = []
+        for item in conflicts:
+            if isinstance(item, dict):
+                description = item.get("conflict") or item.get("description") or str(item)
+                severity = item.get("severity")
+                if severity:
+                    risk_areas.append(f"{severity}: {description}")
+                else:
+                    risk_areas.append(description)
+            else:
+                risk_areas.append(str(item))
+
+        setting_gaps = [str(item) for item in suggestions]
+        if checked_settings and not setting_gaps:
+            setting_gaps = [str(item) for item in checked_settings]
+
+        return {
+            "conflicts": conflicts,
+            "setting_gaps": setting_gaps,
+            "risk_areas": risk_areas + [str(item) for item in critical_conflicts if not isinstance(item, dict)],
+            "consistency_score": consistency_score,
+        }
+
+    def _compact_outline_payload(self, outline: ChapterOutline) -> Dict[str, Any]:
+        return {
+            "id": outline.id,
+            "project_id": outline.project_id,
+            "chapter_number": outline.chapter_number,
+            "title": outline.title,
+            "summary": outline.summary,
+            "status": outline.status.value,
+            "scenes": self._to_plain_data(outline.scenes),
+            "emotion_curve": self._to_plain_data(outline.emotion_curve),
+            "chapter_goals": outline.chapter_goals,
+            "plot_advancement": outline.plot_advancement,
+            "character_arcs": outline.character_arcs,
+            "hooks_planted": outline.hooks_planted,
+            "hooks_resolved": outline.hooks_resolved,
+            "quality_metrics": outline.quality_metrics,
+            "target_word_count": outline.target_word_count,
+            "estimated_word_count": outline.estimated_word_count,
+            "created_at": outline.created_at,
+            "updated_at": outline.updated_at,
+            "approved_at": outline.approved_at,
+            "approved_by": outline.approved_by,
+            "previous_outline_id": outline.previous_outline_id,
+            "next_outline_id": outline.next_outline_id,
+        }
+
+    def _to_plain_data(self, value: Any) -> Any:
+        if value is None:
+            return None
+        if hasattr(value, "model_dump"):
+            return value.model_dump()
+        if isinstance(value, list):
+            return [self._to_plain_data(item) for item in value]
+        if isinstance(value, dict):
+            return {key: self._to_plain_data(item) for key, item in value.items()}
+        return value
+
+    def _outline_saved_response(self, outline: Optional[ChapterOutline]) -> Optional[Dict[str, Any]]:
+        if not outline:
+            return None
+        return self._compact_outline_payload(outline)
+
+    def _outlines_saved_response(self, outlines: List[ChapterOutline]) -> List[Dict[str, Any]]:
+        return [self._compact_outline_payload(outline) for outline in outlines]
+
+    def _normalize_outline_updates(self, outline_updates: Dict[str, Any]) -> Dict[str, Any]:
+        normalized = dict(outline_updates)
+
+        if "hooks_planted" not in normalized and "hooks_to_plant" in normalized:
+            normalized["hooks_planted"] = normalized.get("hooks_to_plant") or []
+        if "hooks_resolved" not in normalized and "hooks_to_resolve" in normalized:
+            normalized["hooks_resolved"] = normalized.get("hooks_to_resolve") or []
+
+        if "chapters" in normalized:
+            normalized_chapters = []
+            for chapter in normalized.get("chapters") or []:
+                chapter_data = dict(chapter)
+                if "hooks_planted" not in chapter_data and "hooks_to_plant" in chapter_data:
+                    chapter_data["hooks_planted"] = chapter_data.get("hooks_to_plant") or []
+                if "hooks_resolved" not in chapter_data and "hooks_to_resolve" in chapter_data:
+                    chapter_data["hooks_resolved"] = chapter_data.get("hooks_to_resolve") or []
+                normalized_chapters.append(chapter_data)
+            normalized["chapters"] = normalized_chapters
+
+        return normalized
+
+    def _has_consistency_risk(self, consistency: Dict[str, Any]) -> bool:
+        return bool(consistency.get("conflicts") or consistency.get("risk_areas"))
+
+    def _select_outline_payload(self, data: Dict[str, Any], chapter_number: int) -> Dict[str, Any]:
+        if "chapters" not in data:
+            return data
+
+        chapters = data.get("chapters") or []
+        if not chapters:
+            return {}
+
+        for chapter in chapters:
+            if chapter.get("chapter_number") == chapter_number:
+                return chapter
+        return chapters[0]
+
+    def _summarize_consistency_warnings(self, consistency: Dict[str, Any]) -> List[str]:
+        warnings: List[str] = []
+        for item in consistency.get("conflicts", []):
+            warnings.append(f"设定冲突风险：{item}")
+        for item in consistency.get("risk_areas", []):
+            warnings.append(f"设定风险：{item}")
+        return warnings
+
+    async def _save_outline_updates(
+        self,
+        project_id: str,
+        default_chapter_number: int,
+        outline_updates: Dict[str, Any],
+    ) -> tuple[Optional[ChapterOutline], List[ChapterOutline]]:
+        saved_outline: Optional[ChapterOutline] = None
+        saved_outlines: List[ChapterOutline] = []
+        outline_updates = self._normalize_outline_updates(outline_updates)
+
+        if "chapters" in outline_updates:
+            for chapter_data in outline_updates["chapters"]:
+                ch_num = chapter_data.get("chapter_number") or default_chapter_number
+                scenes = self._convert_scenes_data(chapter_data.get("scenes", []))
+                existing = await self.get_outline(project_id, ch_num)
+
+                if existing:
+                    update_dto = UpdateChapterOutlineDTO(
+                        title=chapter_data.get("title", existing.title),
+                        summary=chapter_data.get("summary", existing.summary),
+                        chapter_goals=chapter_data.get("chapter_goals", existing.chapter_goals),
+                        hooks_planted=chapter_data.get("hooks_planted", existing.hooks_planted),
+                        hooks_resolved=chapter_data.get("hooks_resolved", existing.hooks_resolved),
+                        target_word_count=chapter_data.get("target_word_count", existing.target_word_count),
+                    )
+                    if scenes:
+                        update_dto.scenes = scenes
+                    updated = await self.update_outline(existing.id, update_dto)
+                    if updated:
+                        saved_outlines.append(updated)
+                        logger.info(f"更新草稿大纲: 第{ch_num}章")
+                else:
+                    created = await self.create_outline(CreateChapterOutlineDTO(
+                        project_id=project_id,
+                        chapter_number=ch_num,
+                        title=chapter_data.get("title", f"第{ch_num}章"),
+                        summary=chapter_data.get("summary", ""),
+                        scenes=scenes,
+                        chapter_goals=chapter_data.get("chapter_goals", []),
+                        hooks_planted=chapter_data.get("hooks_planted", []),
+                        hooks_resolved=chapter_data.get("hooks_resolved", []),
+                        target_word_count=chapter_data.get("target_word_count", 3000),
+                    ))
+                    if created:
+                        saved_outlines.append(created)
+                        logger.info(f"创建草稿大纲: 第{ch_num}章")
+
+            if saved_outlines:
+                self._mark_outline_project_dirty(project_id)
+                saved_outline = saved_outlines[-1]
+                logger.info(f"批量保存了 {len(saved_outlines)} 章大纲")
+            return saved_outline, saved_outlines
+
+        if (
+            self._has_meaningful_outline_content(outline_updates)
+            or ("chapters" in outline_updates and bool(outline_updates.get("chapters")))
+        ):
+            existing = await self.get_outline(project_id, default_chapter_number)
+            scenes = self._convert_scenes_data(outline_updates.get("scenes", []))
+
+            if existing:
+                update_dto = UpdateChapterOutlineDTO(
+                    title=outline_updates.get("title", existing.title),
+                    summary=outline_updates.get("summary", existing.summary),
+                    chapter_goals=outline_updates.get("chapter_goals", existing.chapter_goals),
+                    hooks_planted=outline_updates.get("hooks_planted", existing.hooks_planted),
+                    hooks_resolved=outline_updates.get("hooks_resolved", existing.hooks_resolved),
+                    target_word_count=outline_updates.get("target_word_count", existing.target_word_count),
                 )
-                for row in rows:
-                    outline = self._row_to_outline(row)
-                    self._outlines_cache[outline.id] = outline
-                self._cache_valid = True
-                logger.info(f"从数据库加载 {len(rows)} 个章节大纲")
-            except Exception as e:
-                logger.warning(f"从数据库加载章节大纲失败: {e}")
+                if scenes:
+                    update_dto.scenes = scenes
+                saved_outline = await self.update_outline(existing.id, update_dto)
+                if saved_outline:
+                    saved_outlines.append(saved_outline)
+                    logger.info(f"更新草稿大纲: 第{default_chapter_number}章")
+            else:
+                saved_outline = await self.create_outline(CreateChapterOutlineDTO(
+                    project_id=project_id,
+                    chapter_number=default_chapter_number,
+                    title=outline_updates.get("title", f"第{default_chapter_number}章"),
+                    summary=outline_updates.get("summary", ""),
+                    scenes=scenes,
+                    chapter_goals=outline_updates.get("chapter_goals", []),
+                    hooks_planted=outline_updates.get("hooks_planted", []),
+                    hooks_resolved=outline_updates.get("hooks_resolved", []),
+                    target_word_count=outline_updates.get("target_word_count", 3000),
+                ))
+                if saved_outline:
+                    saved_outlines.append(saved_outline)
+                    logger.info(f"创建草稿大纲: 第{default_chapter_number}章")
+
+            if saved_outline:
+                self._mark_outline_project_dirty(project_id, default_chapter_number)
+
+        return saved_outline, saved_outlines
+
+    def _mark_outline_project_dirty(self, project_id: str, chapter_number: Optional[int] = None):
+        self._loaded_outline_projects.discard(project_id)
+        self._invalidate_project_caches(project_id, chapter_number)
+
+    def invalidate_project_context(self, project_id: str):
+        """清理指定项目的 Plot Outline 上下文缓存"""
+        self._invalidate_project_caches(project_id)
 
     def _row_to_outline(self, row: Dict) -> ChapterOutline:
         """将数据库行转换为章节大纲对象"""
@@ -162,7 +790,7 @@ class PlotOutlineService:
                         "chapter_number": outline.chapter_number,
                         "title": outline.title,
                         "summary": outline.summary,
-                        "scenes": json.dumps([s.model_dump() for s in outline.scenes]) if outline.scenes else "[]",
+                        "scenes": json.dumps(self._to_plain_data(outline.scenes)) if outline.scenes else "[]",
                         "chapter_goals": json.dumps(outline.chapter_goals),
                         "hooks_planted": json.dumps(outline.hooks_planted),
                         "hooks_resolved": json.dumps(outline.hooks_resolved),
@@ -176,7 +804,8 @@ class PlotOutlineService:
             except Exception as e:
                 logger.error(f"保存章节大纲失败: {e}")
 
-        self._outlines_cache[outline.id] = outline
+        self._merge_outline_into_list(outline)
+        self._mark_outline_project_dirty(outline.project_id, outline.chapter_number)
         return outline
 
     async def get_outline(self, project_id: str, chapter_number: int) -> Optional[ChapterOutline]:
@@ -231,8 +860,8 @@ class PlotOutlineService:
         if not outline:
             return None
 
-        update_data = dto.model_dump(exclude_unset=True)
-        for key, value in update_data.items():
+        for key in dto.model_fields_set:
+            value = getattr(dto, key)
             if value is not None:
                 setattr(outline, key, value)
 
@@ -252,8 +881,8 @@ class PlotOutlineService:
                     {
                         "title": outline.title,
                         "summary": outline.summary,
-                        "scenes": json.dumps([s.model_dump() for s in outline.scenes]),
-                        "emotion_curve": outline.emotion_curve.model_dump_json() if outline.emotion_curve else None,
+                        "scenes": json.dumps(self._to_plain_data(outline.scenes)),
+                        "emotion_curve": json.dumps(self._to_plain_data(outline.emotion_curve)) if outline.emotion_curve else None,
                         "chapter_goals": json.dumps(outline.chapter_goals),
                         "status": outline.status.value,
                         "hooks_planted": json.dumps(outline.hooks_planted),
@@ -267,6 +896,7 @@ class PlotOutlineService:
             except Exception as e:
                 logger.error(f"更新章节大纲失败: {e}")
 
+        self._mark_outline_project_dirty(outline.project_id, outline.chapter_number)
         return outline
 
     async def generate_outline(
@@ -343,11 +973,14 @@ class PlotOutlineService:
                 ))
                 if result.success:
                     data = json.loads(result.output)
-                    outline = self._parse_generated_outline(project_id, chapter_number, data)
+                    outline = self._parse_generated_outline(project_id, chapter_number, self._select_outline_payload(data, chapter_number))
+                    consistency = await self._check_outline_setting_consistency(project_id, data, full_context)
+                    warnings = list(data.get("warnings", []))
+                    warnings.extend(self._summarize_consistency_warnings(consistency))
                     return GenerateOutlineResponse(
                         outline=outline,
                         suggestions=data.get("suggestions", []),
-                        warnings=data.get("warnings", []),
+                        warnings=warnings,
                     )
             except Exception as e:
                 logger.warning(f"使用 Skill 生成大纲失败，fallback 到直接生成: {e}")
@@ -357,6 +990,7 @@ class PlotOutlineService:
             project_id=project_id,
             chapter_number=chapter_number,
             prompt=prompt,
+            full_context=full_context,
         )
 
         return GenerateOutlineResponse(
@@ -393,18 +1027,34 @@ class PlotOutlineService:
             prompt_parts.append(f"类型: {world_info.get('world_type', '奇幻')}")
             if world_info.get('description'):
                 desc = world_info.get('description') or ''
-                prompt_parts.append(f"描述: {desc[:500]}")
-            # 添加设定列表
+                prompt_parts.append(f"描述: {desc}")
             if world_info.get('settings'):
-                prompt_parts.append("\n关键设定：")
-                for setting in world_info['settings'][:10]:
-                    summary = setting.get('summary') or ''
-                    prompt_parts.append(f"- {setting.get('title', '')}: {summary[:100]}")
+                constitutional_settings = [s for s in world_info['settings'] if s.get('priority') == 'constitutional']
+                core_settings = [s for s in world_info['settings'] if s.get('priority') == 'core']
+                other_settings = [s for s in world_info['settings'] if s.get('priority') not in {'constitutional', 'core'}]
+
+                if constitutional_settings:
+                    prompt_parts.append("\n【宪法级设定 - 不可违反】")
+                    for setting in constitutional_settings:
+                        summary = setting.get('summary') or ''
+                        prompt_parts.append(f"- {setting.get('title', '')}: {summary}")
+
+                if core_settings:
+                    prompt_parts.append("\n【核心设定】")
+                    for setting in core_settings:
+                        summary = setting.get('summary') or ''
+                        prompt_parts.append(f"- {setting.get('title', '')}: {summary}")
+
+                if other_settings:
+                    prompt_parts.append("\n【相关设定】")
+                    for setting in other_settings:
+                        summary = setting.get('summary') or ''
+                        prompt_parts.append(f"- {setting.get('title', '')}: {summary}")
             prompt_parts.append("")
 
         if characters:
             prompt_parts.append("【主要角色】")
-            for char in characters[:10]:  # 最多显示10个
+            for char in characters:
                 name = char.get('name', '未知')
                 role = char.get('role', '')
                 prompt_parts.append(f"- {name} ({role})" if role else f"- {name}")
@@ -412,20 +1062,20 @@ class PlotOutlineService:
 
         if previous_events:
             prompt_parts.append("【前文事件概要】")
-            prompt_parts.append(previous_events[:1000])
+            prompt_parts.append(previous_events)
             prompt_parts.append("")
 
         if existing_hooks:
             prompt_parts.append("【待回收伏笔】")
-            for hook in existing_hooks[:5]:
+            for hook in existing_hooks:
                 title = hook.get('title', '未知伏笔')
                 desc = hook.get('description') or ''
-                prompt_parts.append(f"- {title}: {desc[:100]}")
+                prompt_parts.append(f"- {title}: {desc}")
             prompt_parts.append("")
 
         if context:
             prompt_parts.append("【额外上下文】")
-            prompt_parts.append(context[:500])
+            prompt_parts.append(context)
             prompt_parts.append("")
 
         prompt_parts.append("""
@@ -529,6 +1179,7 @@ class PlotOutlineService:
         project_id: str,
         chapter_number: int,
         prompt: str,
+        full_context: Optional[Dict[str, Any]] = None,
     ) -> ChapterOutline:
         """直接调用 LLM 生成大纲（Skill 失败时的 fallback）"""
         from app.config import settings
@@ -555,24 +1206,31 @@ class PlotOutlineService:
                 llm_config=llm_config,
             )
 
-            # 尝试解析 JSON
-            import re
-            json_match = re.search(r'```json\s*([\s\S]*?)\s*```', response)
-            if json_match:
-                data = json.loads(json_match.group(1))
-            else:
-                data = json.loads(response)
+            outline_updates = self._try_parse_outline_updates(response)
+            if not outline_updates:
+                raise ValueError("未能从 LLM 响应中解析出大纲 JSON")
 
-            return ChapterOutline(
-                id=f"outline_{uuid.uuid4().hex[:8]}",
-                project_id=project_id,
-                chapter_number=chapter_number,
-                title=data.get("title", f"第{chapter_number}章"),
-                summary=data.get("summary", ""),
-                scenes=[],
-                chapter_goals=data.get("chapter_goals", []),
-                hooks_planted=data.get("hooks_planted", []),
-                target_word_count=data.get("target_word_count", 3000),
+            outline_updates = self._normalize_outline_updates(outline_updates)
+            if full_context:
+                consistency = await self._check_outline_setting_consistency(project_id, outline_updates, full_context)
+                if self._has_consistency_risk(consistency):
+                    repaired_updates = await self._repair_outline_with_consistency_feedback(
+                        project_id=project_id,
+                        chapter_number=chapter_number,
+                        message=prompt,
+                        full_context=full_context,
+                        system_prompt=system_prompt,
+                        combined_context="",
+                        llm_config=llm_config,
+                        consistency=consistency,
+                    )
+                    if repaired_updates:
+                        outline_updates = self._normalize_outline_updates(repaired_updates)
+
+            return self._parse_generated_outline(
+                project_id,
+                chapter_number,
+                self._select_outline_payload(outline_updates, chapter_number),
             )
         except Exception as e:
             logger.error(f"直接生成大纲失败: {e}")
@@ -684,7 +1342,7 @@ class PlotOutlineService:
                     skill_id="skill_chapter_outline_validation",
                     project_id=project_id,
                     parameters={
-                        "outline": outline.model_dump(),
+                        "outline": self._to_plain_data(outline),
                     }
                 ))
                 if result.success:
@@ -713,8 +1371,7 @@ class PlotOutlineService:
         Returns:
             bool: 是否成功
         """
-        if outline_id in self._outlines_cache:
-            del self._outlines_cache[outline_id]
+        outline = self._outlines_cache.get(outline_id)
 
         if self._db:
             try:
@@ -723,10 +1380,15 @@ class PlotOutlineService:
                     {"id": outline_id}
                 )
                 logger.info(f"删除章节大纲: {outline_id}")
-                return True
             except Exception as e:
                 logger.error(f"删除章节大纲失败: {e}")
                 return False
+
+        if outline_id in self._outlines_cache:
+            del self._outlines_cache[outline_id]
+
+        if outline:
+            self._mark_outline_project_dirty(outline.project_id, outline.chapter_number)
 
         return True
 
@@ -771,6 +1433,7 @@ class PlotOutlineService:
             except Exception as e:
                 logger.error(f"审批章节大纲失败: {e}")
 
+        self._mark_outline_project_dirty(outline.project_id, outline.chapter_number)
         return outline
 
     async def get_outline_statistics(self, project_id: str) -> Dict[str, Any]:
@@ -820,6 +1483,9 @@ class PlotOutlineService:
         context = {
             "project": {},
             "characters": [],
+            "constitutional_rules": [],
+            "core_settings": [],
+            "relevant_settings": [],
             "world_settings": [],
             "hooks": {"to_plant": [], "to_resolve": [], "pending": []},
             "previous_outlines": [],
@@ -837,7 +1503,7 @@ class PlotOutlineService:
                 description = project.get("description") or ""
                 context["project"] = {
                     "title": project.get("title", ""),
-                    "description": description[:500] if description else "",
+                    "description": description,
                     "world_type": metadata.get("world_type", ""),
                     "tone": metadata.get("tone", ""),
                 }
@@ -865,7 +1531,6 @@ class PlotOutlineService:
                         ELSE 100
                     END,
                     name
-                LIMIT 20
                 """,
                 {"project_id": project_id}
             )
@@ -875,8 +1540,8 @@ class PlotOutlineService:
                 context["characters"].append({
                     "name": char.get("name", ""),
                     "role": char.get("role", "supporting"),
-                    "personality": personality[:200] if personality else "",
-                    "background": background[:200] if background else "",
+                    "personality": personality,
+                    "background": background,
                     "importance": char.get("importance_tier", "npc"),
                     "status": char.get("status", ""),
                 })
@@ -895,18 +1560,21 @@ class PlotOutlineService:
                         ELSE 4
                     END,
                     created_at DESC
-                LIMIT 30
                 """,
                 {"project_id": project_id}
             )
             for lore in lores:
-                summary = lore.get("summary") or lore.get("content") or ""
-                context["world_settings"].append({
-                    "title": lore.get("title", ""),
-                    "category": lore.get("category", "custom"),
-                    "priority": lore.get("priority", "standard"),
-                    "summary": summary[:300] if summary else "",
-                })
+                context["world_settings"].append(
+                    self._build_lore_context_entry(
+                        lore,
+                        summary_limit=1200 if lore.get("priority") == "constitutional" else 800 if lore.get("priority") == "core" else 500,
+                    )
+                )
+
+            constitutional_rules, core_settings, relevant_settings = self._split_world_settings(context["world_settings"])
+            context["constitutional_rules"] = constitutional_rules
+            context["core_settings"] = core_settings
+            context["relevant_settings"] = relevant_settings
 
             # 4. 获取伏笔状态
             hooks = await self._db.execute_query(
@@ -915,7 +1583,6 @@ class PlotOutlineService:
                 FROM hooks
                 WHERE project_id = CAST(:project_id AS UUID)
                 ORDER BY plant_chapter DESC
-                LIMIT 30
                 """,
                 {"project_id": project_id}
             )
@@ -925,7 +1592,7 @@ class PlotOutlineService:
                 hook_info = {
                     "id": hook.get("id", ""),
                     "title": hook.get("title", ""),
-                    "description": hook_desc[:100] if hook_desc else "",
+                    "description": hook_desc,
                     "planted_chapter": hook.get("plant_chapter"),
                 }
                 if hook_status == "planted":
@@ -941,11 +1608,10 @@ class PlotOutlineService:
                         context["previous_outlines"].append({
                             "chapter_number": outline.chapter_number,
                             "title": outline.title,
-                            "summary": outline.summary[:200] if outline.summary else "",
+                            "summary": outline.summary,
                             "status": outline.status.value,
                         })
-                # 只保留最近3章
-                context["previous_outlines"] = context["previous_outlines"][-3:]
+                # 保留所有前文大纲
 
             logger.info(f"获取项目 {project_id} 上下文: {len(context['characters'])} 角色, "
                        f"{len(context['world_settings'])} 设定, {len(hooks)} 伏笔")
@@ -1069,7 +1735,7 @@ class PlotOutlineService:
         # 项目信息
         if context.get("project"):
             proj = context["project"]
-            parts.append(f"【作品信息】")
+            parts.append("【作品信息】")
             if proj.get("title"):
                 parts.append(f"作品名称：{proj['title']}")
             if proj.get("world_type"):
@@ -1077,29 +1743,26 @@ class PlotOutlineService:
             if proj.get("tone"):
                 parts.append(f"叙事基调：{proj['tone']}")
             if proj.get("description"):
-                parts.append(f"作品简介：{proj['description'][:300]}")
+                parts.append(f"作品简介：{proj['description']}")
             parts.append("")
 
         # 角色信息
         if context.get("characters"):
             parts.append("【主要角色】")
-            for char in context["characters"][:10]:
+            for char in context["characters"]:
                 role_label = {"main": "主角", "antagonist": "反派", "supporting": "配角"}.get(char.get("role", ""), "角色")
                 parts.append(f"- {char['name']} ({role_label})")
                 if char.get("personality"):
-                    parts.append(f"  性格：{char['personality'][:100]}")
+                    parts.append(f"  性格：{char['personality']}")
+                if char.get("background"):
+                    parts.append(f"  背景：{char['background']}")
                 if char.get("status"):
                     parts.append(f"  当前状态：{char['status']}")
             parts.append("")
 
-        # 世界设定
-        if context.get("world_settings"):
-            parts.append("【世界设定】")
-            for lore in context["world_settings"][:15]:
-                parts.append(f"- [{lore.get('priority', 'standard')}] {lore['title']}")
-                if lore.get("summary"):
-                    parts.append(f"  {lore['summary'][:150]}")
-            parts.append("")
+        parts.extend(self._format_lore_section("【宪法级设定 - 不可违反】", context.get("constitutional_rules", []), 1200))
+        parts.extend(self._format_lore_section("【核心设定】", context.get("core_settings", []), 800))
+        parts.extend(self._format_lore_section("【相关设定】", context.get("relevant_settings", []), 500))
 
         # 伏笔状态
         hooks = context.get("hooks", {})
@@ -1107,13 +1770,14 @@ class PlotOutlineService:
             parts.append("【伏笔状态】")
             if hooks.get("pending"):
                 parts.append("待处理伏笔：")
-                for h in hooks["pending"][:5]:
+                for h in hooks["pending"]:
                     parts.append(f"- [{h.get('plant_chapter', '?')}章] {h['title']}")
+                    if h.get("description"):
+                        parts.append(f"  {h['description']}")
             if hooks.get("to_resolve"):
                 parts.append("建议回收的伏笔：")
-                for h in hooks["to_resolve"][:3]:
-                    desc = h.get('description') or ''
-                    parts.append(f"- {h['title']}: {desc[:50]}")
+                for h in hooks["to_resolve"]:
+                    parts.append(f"- {h['title']}: {h.get('description') or ''}")
             parts.append("")
 
         # 前文大纲
@@ -1122,7 +1786,7 @@ class PlotOutlineService:
             for outline in context["previous_outlines"]:
                 parts.append(f"第{outline['chapter_number']}章：{outline['title']}")
                 if outline.get("summary"):
-                    parts.append(f"  {outline['summary'][:150]}")
+                    parts.append(f"  {outline['summary']}")
             parts.append("")
 
         return "\n".join(parts)
@@ -1152,25 +1816,18 @@ class PlotOutlineService:
         """
         from app.config import settings
 
-        # 获取项目完整上下文
-        full_context = await self.get_full_project_context(project_id, chapter_number)
-        context_str = self.format_context_for_prompt(full_context)
-
-        # 构建系统提示（从数据库模板加载）
-        system_prompt = await self._build_chat_system_prompt(
-            project_id, chapter_number, existing_outline, full_context
-        )
-
-        # 构建用户消息上下文
-        user_context = await self._build_chat_user_context(
-            project_id, chapter_number, existing_outline, context
-        )
-
-        # 合并上下文
-        combined_context = f"{context_str}\n\n{user_context}"
-
-        # 调用 LLM
         try:
+            full_context = await self._get_cached_project_context(project_id, chapter_number)
+            context_str = self._get_cached_formatted_context(project_id, chapter_number, full_context)
+            base_system_prompt = await self._get_cached_system_prompt(project_id, chapter_number, full_context)
+            outline_runtime_context = self._build_outline_runtime_context(existing_outline)
+            system_prompt = f"{base_system_prompt}\n\n{outline_runtime_context}".strip()
+
+            user_context = await self._build_chat_user_context(
+                project_id, chapter_number, existing_outline, context
+            )
+            combined_context = self._build_combined_context(context_str, user_context)
+
             llm_config = settings.get_llm_config(settings.llm_provider)
             response = await self._call_llm_for_chat(
                 system_prompt=system_prompt,
@@ -1179,122 +1836,59 @@ class PlotOutlineService:
                 llm_config=llm_config,
             )
 
-            # 调试日志：记录原始响应
             logger.info(f"[PlotOutline] LLM 响应长度: {len(response)} 字符")
-            logger.debug(f"[PlotOutline] LLM 响应内容: {response[:500]}...")
+            logger.debug(f"[PlotOutline] LLM 响应内容: {response}")
 
-            # 尝试解析大纲更新
             outline_updates = self._try_parse_outline_updates(response)
+            if outline_updates:
+                outline_updates = self._normalize_outline_updates(outline_updates)
             logger.info(f"[PlotOutline] 解析结果: {outline_updates}")
 
-            # 如果有大纲内容，自动保存为草稿
             saved_outline = None
-            saved_outlines = []  # 支持多章保存
+            saved_outlines = []
+            consistency_warnings: List[str] = []
 
             if outline_updates:
                 try:
-                    # 检查是否为多章大纲
-                    if "chapters" in outline_updates:
-                        # 保存多章大纲
-                        for chapter_data in outline_updates["chapters"]:
-                            ch_num = chapter_data.get("chapter_number", 1)
-                            existing = await self.get_outline(project_id, ch_num)
+                    consistency = await self._check_outline_setting_consistency(project_id, outline_updates, full_context)
+                    if self._has_consistency_risk(consistency):
+                        repaired_updates = await self._repair_outline_with_consistency_feedback(
+                            project_id=project_id,
+                            chapter_number=chapter_number,
+                            message=message,
+                            full_context=full_context,
+                            system_prompt=system_prompt,
+                            combined_context=combined_context,
+                            llm_config=llm_config,
+                            consistency=consistency,
+                        )
+                        if repaired_updates:
+                            outline_updates = self._normalize_outline_updates(repaired_updates)
+                            consistency = await self._check_outline_setting_consistency(project_id, outline_updates, full_context)
 
-                            # 转换场景数据
-                            scenes = self._convert_scenes_data(chapter_data.get("scenes", []))
+                    consistency_warnings = self._summarize_consistency_warnings(consistency)
 
-                            if existing:
-                                # 更新现有草稿
-                                update_dto = UpdateChapterOutlineDTO(
-                                    title=chapter_data.get("title", existing.title),
-                                    summary=chapter_data.get("summary", existing.summary),
-                                    chapter_goals=chapter_data.get("chapter_goals", existing.chapter_goals),
-                                    hooks_planted=chapter_data.get("hooks_planted", existing.hooks_planted),
-                                    hooks_resolved=chapter_data.get("hooks_resolved", existing.hooks_resolved),
-                                    target_word_count=chapter_data.get("target_word_count", existing.target_word_count),
-                                )
-                                # 如果有场景数据，也更新
-                                if scenes:
-                                    update_dto.scenes = scenes
-                                updated = await self.update_outline(existing.id, update_dto)
-                                if updated:
-                                    saved_outlines.append(updated)
-                                logger.info(f"更新草稿大纲: 第{ch_num}章")
-                            else:
-                                # 创建新草稿
-                                created = await self.create_outline(CreateChapterOutlineDTO(
-                                    project_id=project_id,
-                                    chapter_number=ch_num,
-                                    title=chapter_data.get("title", f"第{ch_num}章"),
-                                    summary=chapter_data.get("summary", ""),
-                                    scenes=scenes,
-                                    chapter_goals=chapter_data.get("chapter_goals", []),
-                                    hooks_planted=chapter_data.get("hooks_planted", []),
-                                    hooks_resolved=chapter_data.get("hooks_resolved", []),
-                                    target_word_count=chapter_data.get("target_word_count", 3000),
-                                ))
-                                if created:
-                                    saved_outlines.append(created)
-                                logger.info(f"创建草稿大纲: 第{ch_num}章")
-
-                        # 使缓存失效
-                        self._cache_valid = False
-                        saved_outline = saved_outlines[-1] if saved_outlines else None
-                        logger.info(f"批量保存了 {len(saved_outlines)} 章大纲")
-
-                    elif "title" in outline_updates:
-                        # 单章大纲
-                        existing = await self.get_outline(project_id, chapter_number)
-
-                        # 转换场景数据
-                        scenes = self._convert_scenes_data(outline_updates.get("scenes", []))
-
-                        if existing:
-                            # 更新现有草稿
-                            update_dto = UpdateChapterOutlineDTO(
-                                title=outline_updates.get("title", existing.title),
-                                summary=outline_updates.get("summary", existing.summary),
-                                chapter_goals=outline_updates.get("chapter_goals", existing.chapter_goals),
-                                hooks_planted=outline_updates.get("hooks_planted", existing.hooks_planted),
-                                hooks_resolved=outline_updates.get("hooks_resolved", existing.hooks_resolved),
-                                target_word_count=outline_updates.get("target_word_count", existing.target_word_count),
-                            )
-                            # 如果有场景数据，也更新
-                            if scenes:
-                                update_dto.scenes = scenes
-                            saved_outline = await self.update_outline(existing.id, update_dto)
-                            logger.info(f"更新草稿大纲: 第{chapter_number}章")
-                        else:
-                            # 创建新草稿
-                            saved_outline = await self.create_outline(CreateChapterOutlineDTO(
-                                project_id=project_id,
-                                chapter_number=chapter_number,
-                                title=outline_updates.get("title", f"第{chapter_number}章"),
-                                summary=outline_updates.get("summary", ""),
-                                scenes=scenes,
-                                chapter_goals=outline_updates.get("chapter_goals", []),
-                                hooks_planted=outline_updates.get("hooks_planted", []),
-                                hooks_resolved=outline_updates.get("hooks_resolved", []),
-                                target_word_count=outline_updates.get("target_word_count", 3000),
-                            ))
-                            logger.info(f"创建草稿大纲: 第{chapter_number}章")
-
-                        # 使缓存失效
-                        self._cache_valid = False
+                    save_started_at = time.perf_counter()
+                    saved_outline, saved_outlines = await self._save_outline_updates(
+                        project_id=project_id,
+                        default_chapter_number=chapter_number,
+                        outline_updates=outline_updates,
+                    )
+                    self._log_timing("auto_save_outline", save_started_at)
 
                 except Exception as e:
                     logger.error(f"自动保存草稿失败: {e}")
 
-            # 返回结果
             result = {
                 "message": response,
                 "outline_updates": outline_updates,
                 "suggestions": self._extract_suggestions(response),
-                "saved_outline": saved_outline.model_dump() if saved_outline else None,
+                "saved_outline": self._outline_saved_response(saved_outline),
             }
-            # 如果保存了多章，添加到返回结果
+            if consistency_warnings:
+                result["warnings"] = consistency_warnings
             if saved_outlines:
-                result["saved_outlines"] = [o.model_dump() for o in saved_outlines]
+                result["saved_outlines"] = self._outlines_saved_response(saved_outlines)
 
             return result
         except Exception as e:
@@ -1306,84 +1900,6 @@ class PlotOutlineService:
                 "saved_outline": None,
             }
 
-    async def _build_chat_system_prompt(
-        self,
-        project_id: str,
-        chapter_number: int,
-        existing_outline: Optional[ChapterOutline],
-        full_context: Optional[Dict[str, Any]] = None,
-    ) -> str:
-        """构建聊天系统提示（从数据库加载模板）"""
-        # 从 AgentPromptService 加载基础 prompt
-        try:
-            from app.services.agent_prompt_service import get_agent_prompt_service
-            prompt_service = get_agent_prompt_service()
-            base_prompt = await prompt_service.build_agent_prompt(
-                agent_type="plot_outline",
-                project_id=project_id,
-                include_skills=True,
-            )
-        except Exception as e:
-            logger.warning(f"加载 plot_outline prompt 模板失败: {e}，使用默认 prompt")
-            base_prompt = self._build_fallback_prompt()
-
-        # 构建动态上下文
-        outline_context = ""
-        if existing_outline:
-            outline_context = f"""
-当前章节大纲状态：
-- 标题: {existing_outline.title}
-- 摘要: {existing_outline.summary}
-- 状态: {existing_outline.status.value}
-- 场景数: {len(existing_outline.scenes)}
-- 目标字数: {existing_outline.target_word_count}
-"""
-        else:
-            outline_context = "当前章节暂无大纲，需要创建新的大纲。"
-
-        # 根据上下文生成提示
-        context_hints = ""
-        if full_context:
-            char_count = len(full_context.get("characters", []))
-            lore_count = len(full_context.get("world_settings", []))
-            hooks_pending = len(full_context.get("hooks", {}).get("pending", []))
-            hooks_to_resolve = len(full_context.get("hooks", {}).get("to_resolve", []))
-
-            context_hints = f"""
-【已获取的项目上下文】
-- 角色信息：{char_count} 个角色可用
-- 世界设定：{lore_count} 条设定可用
-- 待处理伏笔：{hooks_pending} 个
-- 建议回收伏笔：{hooks_to_resolve} 个
-
-请根据上下文信息，确保大纲与现有设定保持一致。
-"""
-
-        # 从 prompt 库加载输出格式规范
-        output_format = await self._load_output_format_prompt()
-
-        # 组合基础 prompt 和动态上下文
-        return f"{base_prompt}\n\n{outline_context}\n\n{context_hints}\n\n{output_format}".strip()
-
-    async def _load_output_format_prompt(self) -> str:
-        """从 prompt 库加载输出格式规范"""
-        try:
-            # 尝试从 MD 文件服务加载
-            from app.services.md_file_service import get_md_file_service
-            md_service = get_md_file_service()
-            prompt = md_service.get_prompt("plot_outline_output")
-            if prompt:
-                # 提取内容（去掉 YAML frontmatter）
-                import re
-                content = prompt.content
-                # 去掉 frontmatter
-                content = re.sub(r'^---\n[\s\S]*?\n---\n', '', content)
-                return content.strip()
-        except Exception as e:
-            logger.warning(f"加载 plot_outline_output prompt 失败: {e}")
-
-        # 返回简化版本
-        return self._get_simple_output_format()
 
     def _get_simple_output_format(self) -> str:
         """获取简化的输出格式（当 prompt 库加载失败时使用）"""
@@ -1434,7 +1950,7 @@ class PlotOutlineService:
         # 添加上下文信息
         if extra_context:
             if extra_context.get("previous_events"):
-                parts.append(f"前文事件: {extra_context['previous_events'][:500]}")
+                parts.append(f"前文事件: {extra_context['previous_events']}")
             if extra_context.get("special_requirements"):
                 parts.append(f"特殊要求: {', '.join(extra_context['special_requirements'])}")
 
@@ -1461,7 +1977,9 @@ class PlotOutlineService:
         api_key = self._llm_api_key
 
         # 记录调用信息用于调试
-        logger.info(f"[PlotOutline] LLM调用: provider={provider}, base_url={base_url}, model={model}")
+        logger.info(
+            f"[PlotOutline] LLM调用: provider={provider}, base_url={base_url}, model={model}"
+        )
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -1496,6 +2014,7 @@ class PlotOutlineService:
                     claude_messages.append({"role": m["role"], "content": m["content"]})
 
             system_message = "\n\n".join(system_parts)
+            started_at = time.perf_counter()
 
             try:
                 response = await client.messages.create(
@@ -1505,16 +2024,18 @@ class PlotOutlineService:
                     system=system_message,
                     messages=claude_messages,
                 )
+                self._log_timing("provider_call", started_at)
+
                 # 处理响应内容（可能有 ThinkingBlock）
                 text_content = ""
                 for block in response.content:
                     if hasattr(block, 'text'):
                         text_content += block.text
                     elif hasattr(block, 'thinking'):
-                        # ThinkingBlock 跳过
-                        logger.debug(f"收到 ThinkingBlock")
+                        logger.debug("收到 ThinkingBlock")
                 return text_content
             except Exception as e:
+                self._log_timing("provider_call_failed", started_at)
                 logger.error(f"[PlotOutline] LLM 调用失败: {e}")
                 return f"处理请求时出错: {str(e)}"
         else:
@@ -1528,6 +2049,7 @@ class PlotOutlineService:
                 api_key=api_key,
                 base_url=base_url if base_url else "https://api.openai.com/v1",
             )
+            started_at = time.perf_counter()
 
             try:
                 response = await client.chat.completions.create(
@@ -1536,8 +2058,10 @@ class PlotOutlineService:
                     temperature=self._llm_temperature,
                     max_tokens=self._llm_max_tokens,
                 )
+                self._log_timing("provider_call", started_at)
                 return response.choices[0].message.content
             except Exception as e:
+                self._log_timing("provider_call_failed", started_at)
                 logger.error(f"[PlotOutline] LLM 调用失败: {e}")
                 return f"处理请求时出错: {str(e)}"
 
@@ -1550,39 +2074,20 @@ class PlotOutlineService:
         2. 多章大纲：{"chapters": [{"chapter_number": 1, ...}, {"chapter_number": 2, ...}, ...]}
         """
         try:
-            import re
+            parsed_json = self._extract_json_object(response)
+            if parsed_json and self._has_outline_shape(parsed_json):
+                return parsed_json
 
-            # 首先尝试从文本中提取多章大纲（优先级最高，因为JSON可能被截断）
             chapters = self._extract_chapters_from_text(response)
-            if chapters and len(chapters) > 1:
-                logger.info(f"从文本中提取了 {len(chapters)} 章大纲")
-                return {"chapters": chapters}
-            elif chapters and len(chapters) == 1:
-                # 单章大纲
-                return chapters[0]
+            valid_chapters = [chapter for chapter in chapters if self._has_meaningful_outline_content(chapter)]
+            if valid_chapters and len(valid_chapters) > 1:
+                logger.info(f"从文本中提取了 {len(valid_chapters)} 章大纲")
+                return {"chapters": valid_chapters}
+            elif valid_chapters and len(valid_chapters) == 1:
+                return valid_chapters[0]
 
-            # 方法2：查找完整的 JSON 代码块
-            json_blocks = re.findall(r'```json\s*([\s\S]*?)\s*```', response)
-            if json_blocks:
-                for json_str in json_blocks:
-                    try:
-                        data = json.loads(json_str)
-                        if "title" in data or "scenes" in data:
-                            return data
-                    except json.JSONDecodeError:
-                        continue
-
-            # 方法3：尝试直接解析整个响应为 JSON
-            try:
-                data = json.loads(response)
-                if "title" in data or "scenes" in data or "chapters" in data:
-                    return data
-            except json.JSONDecodeError:
-                pass
-
-            # 方法4：从文本中提取单章大纲信息
             outline_data = self._extract_single_outline_from_text(response)
-            if outline_data.get("title") or outline_data.get("summary"):
+            if self._has_meaningful_outline_content(outline_data):
                 logger.info(f"从文本中提取大纲信息: {outline_data}")
                 return outline_data
 
@@ -1753,9 +2258,9 @@ class PlotOutlineService:
             chapters.append({
                 "chapter_number": chapter_num,
                 "title": title,
-                "summary": summary[:500] if summary else "",
-                "chapter_goals": goals[:5] if goals else [],
-                "hooks_planted": hooks_planted[:3] if hooks_planted else [],
+                "summary": summary if summary else "",
+                "chapter_goals": goals if goals else [],
+                "hooks_planted": hooks_planted if hooks_planted else [],
                 "scenes": scenes,
             })
 
@@ -1773,6 +2278,16 @@ class PlotOutlineService:
         title_match = re.search(r'(?:章节标题|标题|第\d+章[：:]?\s*)([^\n「」【】\|]+)', response)
         if title_match:
             outline_data["title"] = title_match.group(1).strip()
+
+        parsed_json = self._extract_json_object(response)
+        if parsed_json and isinstance(parsed_json, dict):
+            for key in [
+                "summary", "chapter_goals", "scenes", "hooks_planted", "hooks_resolved",
+                "target_word_count", "emotion_curve", "writing_guide", "quality_check",
+                "quality_metrics", "notes", "foreshadowing", "villain_arc", "cool_points",
+            ]:
+                if key in parsed_json:
+                    outline_data[key] = parsed_json[key]
 
         # 提取摘要
         summary_match = re.search(r'(?:章节摘要|摘要|内容概要|summary)[：:]\s*([^\n]+(?:\n[^\n#]*)*)', response, re.IGNORECASE)
@@ -1804,7 +2319,7 @@ class PlotOutlineService:
                 key_events = [(f"事件{i+1}", line.strip()) for i, line in enumerate(re.findall(r'[-•]\s*([^\n]+)', scene_content))]
 
             summary = ""
-            for event_title, event_content in key_events[:2]:
+            for event_title, event_content in key_events:
                 summary += event_content + "。"
             if not summary:
                 lines = re.findall(r'[-•]\s*([^\n]+)', scene_content)
@@ -1813,9 +2328,9 @@ class PlotOutlineService:
             scenes.append({
                 "scene_number": scene_num,
                 "title": scene_title,
-                "summary": summary[:200],
+                "summary": summary,
                 "estimated_words": estimated_words,
-                "key_events": [e[1] if isinstance(e, tuple) else e for e in key_events[:3]]
+                "key_events": [e[1] if isinstance(e, tuple) else e for e in key_events]
             })
 
         # 如果找到了场景，添加到大纲数据
@@ -1888,7 +2403,7 @@ class PlotOutlineService:
             line = line.strip()
             if line.startswith("建议") or line.startswith("- 建议"):
                 suggestions.append(line.lstrip("- ").lstrip("建议：").lstrip("建议:"))
-        return suggestions[:5]  # 最多返回5条建议
+        return suggestions
 
 
 # 全局实例

@@ -135,7 +135,7 @@ export default function TagSelector({
       {filteredCategories.map(category => {
         const selectedCount = getSelectedCount(category.key)
         const isExpanded = expandedGroups.has(category.key)
-        const isMaxReached = category.maxSelect && selectedCount >= category.maxSelect
+        const isMaxReached = category.maxSelect !== undefined && selectedCount >= category.maxSelect
         const currentSelected = selectedTags[category.key] || []
 
         return (

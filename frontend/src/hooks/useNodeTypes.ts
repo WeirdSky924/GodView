@@ -26,7 +26,7 @@ export function useNodeTypes(projectId?: string) {
     setLoading(true)
     getWorkflowNodeTypes(projectId)
       .then((data) => {
-        console.log('[useNodeTypes] Loaded node types:', data.agent_nodes?.length, 'agent nodes, version:', data.version)
+        console.log('[useNodeTypes] Loaded node types:', data.agent_nodes?.length, 'agent nodes')
         setNodeTypes(data)
         setError(null)
       })

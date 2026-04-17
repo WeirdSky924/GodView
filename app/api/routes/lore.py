@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from app.models.lore import (
     LoreCategory,
@@ -17,7 +17,10 @@ from app.models.lore import (
     LorePriority,
     LoreSearchResult,
     LoreValidationResult,
+    normalize_lore_category,
+    normalize_lore_priority,
 )
+from app.services.plot_outline_service import get_plot_outline_service
 
 
 class UpdateLoreDTO(BaseModel):
@@ -36,10 +39,59 @@ class UpdateLoreDTO(BaseModel):
     forbidden_actions: Optional[List[str]] = None
     source: Optional[str] = None
 
+    @field_validator("category", mode="before")
+    @classmethod
+    def normalize_category(cls, value: Any) -> Optional[LoreCategory]:
+        if value is None:
+            return None
+        return normalize_lore_category(value)
+
+    @field_validator("priority", mode="before")
+    @classmethod
+    def normalize_priority(cls, value: Any) -> Optional[LorePriority]:
+        if value is None:
+            return None
+        return normalize_lore_priority(value)
+
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+_lore_entry_columns_cache: Optional[set[str]] = None
+
+
+async def _get_lore_entry_columns(postgres_db, force_refresh: bool = False) -> set[str]:
+    global _lore_entry_columns_cache
+    if _lore_entry_columns_cache is not None and not force_refresh:
+        return _lore_entry_columns_cache
+
+    rows = await postgres_db.execute_query(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'lore_entries'
+        """
+    )
+    _lore_entry_columns_cache = {row.get("column_name") for row in rows if row.get("column_name")}
+    return _lore_entry_columns_cache
+
+
+def _serialize_lore_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    serialized = dict(row)
+    serialized["category"] = normalize_lore_category(row.get("category", "custom")).value
+    serialized["priority"] = normalize_lore_priority(row.get("priority", "standard")).value
+    serialized.setdefault("forbidden_actions", [])
+    return serialized
+
+
+def _invalidate_plot_outline_context(project_id: Optional[str]):
+    if not project_id:
+        return
+    try:
+        get_plot_outline_service().invalidate_project_context(project_id)
+    except Exception as e:
+        logger.warning(f"Plot Outline 缓存失效失败: {e}")
 
 
 # ==================== 静态路由（必须在动态路由之前） ====================
@@ -143,7 +195,7 @@ async def list_lore(
     """
 
     results = await postgres_db.execute_query(query, params)
-    return results
+    return [_serialize_lore_row(row) for row in results]
 
 
 @router.post("", response_model=Dict[str, Any])
@@ -182,6 +234,8 @@ async def create_lore(lore: LoreEntry):
         "related_characters": json.dumps(lore.related_characters) if lore.related_characters else "[]",
         "related_locations": json.dumps(lore.related_locations) if lore.related_locations else "[]",
         "related_items": json.dumps(lore.related_items) if lore.related_items else "[]",
+        "forbidden_actions": json.dumps(lore.forbidden_actions) if lore.forbidden_actions else "[]",
+        "source": lore.source or "",
         "created_at": now,
         "updated_at": now,
     }
@@ -191,14 +245,15 @@ async def create_lore(lore: LoreEntry):
             INSERT INTO lore_entries (
                 id, project_id, title, category, priority, content, summary,
                 keywords, tags, constraints, related_characters, related_locations, related_items,
-                created_at, updated_at
+                forbidden_actions, source, created_at, updated_at
             ) VALUES (
                 CAST(:id AS UUID), CAST(:project_id AS UUID), :title, :category, :priority, :content, :summary,
                 :keywords, :tags, :constraints, :related_characters, :related_locations, :related_items,
-                :created_at, :updated_at
+                :forbidden_actions, :source, :created_at, :updated_at
             )
         """, params)
 
+        _invalidate_plot_outline_context(lore.project_id)
         return {
             "success": True,
             "id": lore_id,
@@ -231,7 +286,7 @@ async def get_lore(lore_id: str):
     if not results:
         raise HTTPException(status_code=404, detail="设定不存在")
 
-    return results[0]
+    return _serialize_lore_row(results[0])
 
 
 @router.put("/{lore_id}", response_model=Dict[str, Any])
@@ -259,17 +314,43 @@ async def update_lore(lore_id: str, lore_update: UpdateLoreDTO):
     if not existing:
         raise HTTPException(status_code=404, detail="设定不存在")
 
+    project_id_result = await postgres_db.execute_query(
+        "SELECT project_id FROM lore_entries WHERE id = CAST(:id AS UUID)",
+        {"id": lore_id}
+    )
+    if not project_id_result:
+        raise HTTPException(status_code=404, detail="设定不存在")
+    project_id = project_id_result[0].get("project_id")
+
+    available_columns = await _get_lore_entry_columns(postgres_db)
+
+    # 如果运行时刚执行过迁移，旧缓存可能仍缺少新列，这里主动刷新一次
+    update_data = lore_update.model_dump(exclude_unset=True)
+    missing_requested_columns = [key for key in update_data if key not in available_columns]
+    if missing_requested_columns:
+        available_columns = await _get_lore_entry_columns(postgres_db, force_refresh=True)
+
     # 构建更新语句
     update_fields = []
     params: Dict[str, Any] = {"id": lore_id}
 
-    update_data = lore_update.model_dump(exclude_unset=True)
     for key, value in update_data.items():
+        if key not in available_columns:
+            logger.warning(f"Lore 更新跳过不存在的列: {key}")
+            continue
         if value is not None:
             if key in ["category", "priority"]:
                 update_fields.append(f"{key} = :{key}")
                 params[key] = value.value if hasattr(value, 'value') else value
-            elif key in ["keywords", "tags", "constraints"]:
+            elif key in [
+                "keywords",
+                "tags",
+                "constraints",
+                "related_characters",
+                "related_locations",
+                "related_items",
+                "forbidden_actions",
+            ]:
                 # JSON/JSONB 字段需要转换为 JSON 字符串
                 import json
                 update_fields.append(f"{key} = :{key}")
@@ -285,6 +366,7 @@ async def update_lore(lore_id: str, lore_update: UpdateLoreDTO):
 
     query = f"UPDATE lore_entries SET {', '.join(update_fields)} WHERE id = CAST(:id AS UUID)"
     await postgres_db.execute_write(query, params)
+    _invalidate_plot_outline_context(project_id)
 
     return {
         "success": True,
@@ -309,10 +391,18 @@ async def delete_lore(lore_id: str):
     if not postgres_db:
         raise HTTPException(status_code=503, detail="数据库未连接")
 
+    project_row = await postgres_db.execute_query(
+        "SELECT project_id FROM lore_entries WHERE id = CAST(:id AS UUID)",
+        {"id": lore_id}
+    )
+    if not project_row:
+        raise HTTPException(status_code=404, detail="设定不存在")
+
     await postgres_db.execute_write(
         "DELETE FROM lore_entries WHERE id = CAST(:id AS UUID)",
         {"id": lore_id}
     )
+    _invalidate_plot_outline_context(project_row[0].get("project_id"))
 
     return {
         "success": True,
@@ -369,8 +459,8 @@ async def search_lore(
         LoreSearchResult(
             id=row.get("id", ""),
             title=row.get("title", ""),
-            category=row.get("category", "custom"),
-            priority=row.get("priority", "standard"),
+            category=normalize_lore_category(row.get("category", "custom")),
+            priority=normalize_lore_priority(row.get("priority", "standard")),
             summary=row.get("summary"),
             score=0.8,  # 简单的固定分数
             keywords=row.get("keywords", []),

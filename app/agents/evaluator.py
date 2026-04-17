@@ -111,7 +111,7 @@ class EvaluatorAgent(BaseAgent):
 - 事件列表：{events}
 - 埋设的伏笔：{hooks_planted}
 - 字数：{word_count}
-- 章节内容：{chapter_content[:2000] if chapter_content else '无'}
+- 章节内容：{chapter_content if chapter_content else '无'}
 
 请输出 JSON 格式：
 {{
@@ -188,7 +188,7 @@ class EvaluatorAgent(BaseAgent):
 标题：{chapter_title}
 
 【章节内容】
-{chapter_content[:5000]}
+{chapter_content}
 
 【评分维度】（1-10 分）
 1. 开篇吸引力 - 开头是否抓人
@@ -274,7 +274,7 @@ class EvaluatorAgent(BaseAgent):
         if forbidden_words:
             forbidden_check = f"- 禁用语：{', '.join(forbidden_words)}"
 
-        samples_text = "\n".join([f"- {s}" for s in voice_samples[:5]])
+        samples_text = "\n".join([f"- {s}" for s in voice_samples])
 
         prompt = f"""你是角色一致性审查员。请检查生成的台词是否符合角色设定。
 

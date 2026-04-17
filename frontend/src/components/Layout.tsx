@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { NavLink, useNavigate } from 'react-router-dom'
+import { NavLink, useNavigate, useLocation } from 'react-router-dom'
 import {
   LayoutDashboard, Users, Globe, BookOpen, BookMarked, Sliders, FileText, Settings, Flag, GitCompare, ShieldAlert, Eye, Network, Mic2, CheckCircle2, FolderOpen, ChevronDown, Plus, Layers, MessageSquare, Bot, PenTool, Sparkles, Sun, Moon, Database, Server, AlertCircle, CheckCircle, XCircle, Clapperboard, Play, ListTree
 } from 'lucide-react'
@@ -41,14 +41,21 @@ export default function Layout({ children }: { children: React.ReactNode }) {
   const { currentProject, projects, setCurrentProject, loading } = useProject()
   const { theme, toggleTheme } = useTheme()
   const navigate = useNavigate()
+  const location = useLocation()
   const [showProjectMenu, setShowProjectMenu] = useState(false)
   const [dbStatus, setDbStatus] = useState<DatabaseStatusResponse | null>(null)
   const [showDbPopover, setShowDbPopover] = useState(false)
 
   const isDark = theme === 'dark'
 
-  // 定期获取数据库状态
+  // 仅在设置页或状态浮窗打开时获取数据库状态
   useEffect(() => {
+    const shouldFetchDbStatus = location.pathname === '/settings' || showDbPopover
+
+    if (!shouldFetchDbStatus) {
+      return
+    }
+
     const fetchDbStatus = async () => {
       try {
         const status = await getDatabaseStatus()
@@ -57,10 +64,11 @@ export default function Layout({ children }: { children: React.ReactNode }) {
         console.error('Failed to fetch database status:', e)
       }
     }
+
     fetchDbStatus()
-    const interval = setInterval(fetchDbStatus, 30000) // 每30秒更新
+    const interval = setInterval(fetchDbStatus, 60000)
     return () => clearInterval(interval)
-  }, [])
+  }, [location.pathname, showDbPopover])
 
   return (
     <div className={`min-h-screen flex ${isDark ? 'bg-gradient-to-br from-gray-900 via-gray-900 to-slate-900' : 'bg-gradient-to-br from-slate-50 via-white to-blue-50'}`}>

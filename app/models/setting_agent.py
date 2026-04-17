@@ -108,6 +108,15 @@ class SettingAgentSession(BaseModel):
     current_request: Optional[SettingChangeRequest] = None
     pending_conflicts: List[SettingConflict] = Field(default_factory=list)
 
+    # 缓存上一轮提取的 pending 数据（用于"保存"指令跳过LLM）
+    cached_pending_lores: List[Dict[str, Any]] = Field(default_factory=list)
+    cached_pending_characters: List[Dict[str, Any]] = Field(default_factory=list)
+    cached_pending_hooks: List[Dict[str, Any]] = Field(default_factory=list)
+
+    # 增量上下文：记录是否已加载过全量项目上下文
+    full_context_loaded: bool = False
+    cached_context_sections: Dict[str, str] = Field(default_factory=dict)
+
     # 状态
     is_active: bool = True
 

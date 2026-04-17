@@ -83,6 +83,15 @@ class Settings(BaseSettings):
         description="LLM 提供商",
     )
 
+    llm_request_timeout: float = Field(
+        default=float(os.getenv("LLM_REQUEST_TIMEOUT", "45")),
+        description="LLM 请求超时时间（秒）",
+    )
+    llm_max_retries: int = Field(
+        default=int(os.getenv("LLM_MAX_RETRIES", "0")),
+        description="LLM 请求最大重试次数",
+    )
+
     # ===== LLM 分 Provider 配置 =====
     # OpenAI
     llm_openai_model: str = Field(
@@ -381,6 +390,8 @@ class Settings(BaseSettings):
             "base_url": getattr(self, f"{prefix}base_url", ""),
             "temperature": getattr(self, f"{prefix}temperature", 0.7),
             "max_tokens": getattr(self, f"{prefix}max_tokens", 4096),
+            "timeout": self.llm_request_timeout,
+            "max_retries": self.llm_max_retries,
         }
 
     def set_llm_config(self, provider: str, **kwargs):

@@ -88,8 +88,8 @@ class RAGOrchestrator:
         if include_constitutional:
             constitutional = await self.lore_service.get_constitutional_rules(project_id)
             full_context["constitutional_rules"] = [
-                {"title": r.title, "content": r.content[:500]}
-                for r in constitutional[:5]
+                {"title": r.title, "content": r.content}
+                for r in constitutional
             ]
 
         return full_context
@@ -167,7 +167,7 @@ class RAGOrchestrator:
         # 搜索相关剧情
         relevant_narratives = await self.narrative_service.search_narrative(
             project_id=project_id,
-            query=content[:200],  # 使用内容前200字符作为查询
+            query=content,
             limit=5,
         )
 
@@ -197,11 +197,11 @@ class RAGOrchestrator:
         # 最近事件
         if context.recent_events:
             parts.append("## 最近发生的事件\n")
-            for i, event in enumerate(context.recent_events[:5], 1):
+            for i, event in enumerate(context.recent_events, 1):
                 parts.append(f"{i}. {event.title}")
                 parts.append(f"   类型: {event.entry_type.value}")
                 if event.summary:
-                    parts.append(f"   摘要: {event.summary[:100]}...")
+                    parts.append(f"   摘要: {event.summary}")
                 parts.append("")
 
         # 角色状态
@@ -348,7 +348,7 @@ class RAGOrchestrator:
             ],
             "character_lore": [
                 {"title": l.title, "summary": l.summary}
-                for l in character_lore[:10]
+                for l in character_lore
             ],
             "chapter_events": [
                 {"title": e.title, "summary": e.summary}

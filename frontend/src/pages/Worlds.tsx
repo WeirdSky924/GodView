@@ -23,6 +23,8 @@ import {
 import { useProject } from '@/contexts/ProjectContext'
 import { useTheme } from '@/contexts/ThemeContext'
 
+type WorldTagField = 'world_type' | 'tone' | 'content_styles' | 'protagonist_types' | 'power_types' | 'character_archetypes'
+
 // 模块定义
 interface ModuleConfig {
   key: string
@@ -275,18 +277,18 @@ ${formData.description}
   }
 
   // 标签变化
-  const handleTagsChange = (tags: Record<string, string[]>) => {
+  const handleTagsChange = (tags: Partial<Record<WorldTagField, string[]>>) => {
     setFormData(prev => {
       const newData = { ...prev }
 
-      // 处理每个标签字段
       Object.entries(tags).forEach(([key, value]) => {
-        // world_type 和 tone 是字符串类型，取数组第一个元素
-        if (key === 'world_type' || key === 'tone') {
-          newData[key] = value.length > 0 ? value[0] : ''
+        if (!value) return
+
+        const typedKey = key as WorldTagField
+        if (typedKey === 'world_type' || typedKey === 'tone') {
+          newData[typedKey] = value.length > 0 ? value[0] : ''
         } else {
-          // 其他字段是数组类型
-          newData[key] = value
+          newData[typedKey] = value
         }
       })
 

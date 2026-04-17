@@ -500,13 +500,13 @@ class WriterAgent(BaseAgent):
 - 分段数: {segment_count} 段
 
 【环境设定】
-{environment[:300] if environment else "无特定环境"}
+{environment if environment else "无特定环境"}
 
 【需要表达的意图】
-{chr(10).join(intents[:5]) if intents else "自由发挥"}
+{chr(10).join(intents) if intents else "自由发挥"}
 
 【角色状态】
-{chr(10).join([f"- {k}: {v}" for k, v in list(character_moods.items())[:5]]) if character_moods else "无特定状态"}
+{chr(10).join([f"- {k}: {v}" for k, v in character_moods.items()]) if character_moods else "无特定状态"}
 
 【规划要求】
 1. 每段应该有明确的叙事焦点
@@ -577,10 +577,10 @@ class WriterAgent(BaseAgent):
             parts.append(f"\n【世界观参考】\n名称：{world_info.get('name', '未知')}\n类型：{world_info.get('world_type', '奇幻')}")
 
         if previous_content:
-            parts.append(f"\n【前一段落结尾】\n...{previous_content[-300:]}")
+            parts.append(f"\n【前一段落结尾】\n{previous_content}")
 
         if previous_style and segment_num == 1:
-            parts.append(f"\n【前文风格样本】\n{previous_style[:300]}\n请保持与上述风格一致。")
+            parts.append(f"\n【前文风格样本】\n{previous_style}\n请保持与上述风格一致。")
 
         parts.append(f"""
 【写作要求】
@@ -609,8 +609,8 @@ class WriterAgent(BaseAgent):
         """构建补充内容提示"""
         return f"""请为以下章节内容进行补充，增加约 {shortage} 字。
 
-【已有内容（最后 400 字）】
-...{existing_content[-400:]}
+【已有内容】
+{existing_content}
 
 【长篇创作意识】
 - 当前是第 {chapter_num} 章，全书共 {total_chapters} 章
@@ -643,8 +643,8 @@ class WriterAgent(BaseAgent):
         """构建续写提示"""
         return f"""请继续写作，补充约 {shortage} 字的内容。
 
-【已有内容（最后 500 字）】
-{existing_content[-500:]}
+【已有内容】
+{existing_content}
 
 【长篇创作意识】
 - 当前是第 {chapter_num} 章，全书共 {total_chapters} 章
@@ -781,22 +781,22 @@ class WriterAgent(BaseAgent):
 名称：{world_info.get('name', '未知世界')}
 类型：{world_info.get('world_type', '奇幻')}
 基调：{world_info.get('tone', '正剧')}
-背景：{world_info.get('background', world_info.get('description', ''))[:300]}"""
+背景：{world_info.get('background', world_info.get('description', ''))}"""
             rules = world_info.get('rules', {})
             if rules:
                 if isinstance(rules, dict):
-                    rules_text = '\n'.join([f'- {k}: {v}' for k, v in list(rules.items())[:5]])
+                    rules_text = '\n'.join([f'- {k}: {v}' for k, v in rules.items()])
                 else:
-                    rules_text = str(rules)[:200]
+                    rules_text = str(rules)
                 world_section += f"\n\n【世界规则】\n{rules_text}"
             themes = world_info.get('themes', [])
             if themes:
-                world_section += f"\n\n【核心主题】\n{', '.join(themes[:5])}"
+                world_section += f"\n\n【核心主题】\n{', '.join(themes)}"
             message_parts.append(world_section)
 
         # 团队讨论共识（如果有）
         if discussion_summary:
-            message_parts.append(f"【团队讨论共识】\n{discussion_summary[:600]}\n请在写作中体现以上讨论达成的共识。")
+            message_parts.append(f"【团队讨论共识】\n{discussion_summary}\n请在写作中体现以上讨论达成的共识。")
 
         # 环境描写
         if environment:
@@ -822,7 +822,7 @@ class WriterAgent(BaseAgent):
 
         # 前文风格样本
         if previous_style:
-            message_parts.append(f"【前文风格样本】\n{previous_style[:500]}")
+            message_parts.append(f"【前文风格样本】\n{previous_style}")
             message_parts.append("请保持与上述样本风格一致。")
 
         message_parts.append(
@@ -855,10 +855,10 @@ class WriterAgent(BaseAgent):
         prompt = f"""请检查以下两段文本的风格一致性：
 
 【前文样本】
-{previous_style[:1000]}
+{previous_style}
 
 【新生成文本】
-{generated_text[:1000]}
+{generated_text}
 
 请从以下维度评估：
 1. 叙述视角是否一致

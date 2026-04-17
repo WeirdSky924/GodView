@@ -207,7 +207,7 @@ class BaseAgent(ABC):
 
         for entry in recent:
             context_parts.append(
-                f"- [{entry.type.value}] {entry.content[:100]}"
+                f"- [{entry.type.value}] {entry.content}"
             )
 
         # 获取重要记忆
@@ -216,7 +216,7 @@ class BaseAgent(ABC):
             context_parts.append("\n【关键记忆】")
             for entry in important:
                 context_parts.append(
-                    f"- [{entry.importance.value}] {entry.content[:100]}"
+                    f"- [{entry.importance.value}] {entry.content}"
                 )
 
         return "\n".join(context_parts)
@@ -286,7 +286,7 @@ class BaseAgent(ABC):
                     importance_marker = "⭐ "
 
                 context_parts.append(
-                    f"- {importance_marker}[{entry.type.value}] {entry.content[:150]}"
+                    f"- {importance_marker}[{entry.type.value}] {entry.content}"
                 )
 
             return "\n".join(context_parts)

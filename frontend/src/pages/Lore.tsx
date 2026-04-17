@@ -16,6 +16,7 @@ import type {
   LoreCategory,
   LorePriority,
   CreateLoreDTO,
+  UpdateLoreDTO,
   LoreSearchResult,
 } from '@/api/lore'
 import {
@@ -48,6 +49,40 @@ const priorityLabels: Record<LorePriority, string> = {
   flexible: '灵活',
 }
 
+const normalizeStringArray = (value: unknown): string[] => {
+  if (Array.isArray(value)) {
+    return value.filter((item): item is string => typeof item === 'string')
+  }
+
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value)
+      return Array.isArray(parsed)
+        ? parsed.filter((item): item is string => typeof item === 'string')
+        : []
+    } catch {
+      return value
+        .split(/[，,\n]/)
+        .map(item => item.trim())
+        .filter(Boolean)
+    }
+  }
+
+  return []
+}
+
+const normalizeLorePriority = (value: unknown): LorePriority => {
+  if (value === 'constitutional' || value === 'core' || value === 'standard' || value === 'flexible') {
+    return value
+  }
+
+  if (value === 'low') return 'flexible'
+  if (value === 'medium') return 'standard'
+  if (value === 'high') return 'core'
+
+  return 'standard'
+}
+
 export default function Lore() {
   const { currentProject } = useProject()
   const { theme } = useTheme()
@@ -75,6 +110,11 @@ export default function Lore() {
     keywords: [],
     tags: [],
     constraints: [],
+    related_characters: [],
+    related_locations: [],
+    related_items: [],
+    forbidden_actions: [],
+    source: '',
   })
   const [keywordsInput, setKeywordsInput] = useState('')
   const [viewMode, setViewMode] = useState<'list' | 'tree'>('list')
@@ -159,53 +199,111 @@ export default function Lore() {
       keywords: [],
       tags: [],
       constraints: [],
+      related_characters: [],
+      related_locations: [],
+      related_items: [],
+      forbidden_actions: [],
+      source: '',
     })
     setKeywordsInput('')
     setShowModal(true)
   }
 
   const openEditModal = (lore: LoreEntry) => {
+    const keywords = normalizeStringArray(lore.keywords)
+
     setEditingLore(lore)
     setFormData({
       id: lore.id,
       project_id: lore.project_id,
       title: lore.title,
       category: lore.category,
-      priority: lore.priority,
+      priority: normalizeLorePriority(lore.priority),
       content: lore.content,
       summary: lore.summary || '',
-      keywords: lore.keywords,
-      tags: lore.tags,
-      constraints: lore.constraints,
+      keywords,
+      tags: normalizeStringArray(lore.tags),
+      constraints: normalizeStringArray(lore.constraints),
+      related_characters: normalizeStringArray(lore.related_characters),
+      related_locations: normalizeStringArray(lore.related_locations),
+      related_items: normalizeStringArray(lore.related_items),
+      forbidden_actions: normalizeStringArray(lore.forbidden_actions),
+      source: lore.source || '',
     })
-    setKeywordsInput(lore.keywords.join('，'))
+    setKeywordsInput(keywords.join('，'))
     setShowModal(true)
   }
 
   const saveLore = async () => {
     if (!formData.title || !formData.content) return
 
-    const data = {
-      ...formData,
-      keywords: keywordsInput.split(/[，,\n]/).map(k => k.trim()).filter(Boolean),
-    }
+    const keywords = keywordsInput.split(/[，,\n]/).map(k => k.trim()).filter(Boolean)
+    const tags = normalizeStringArray(formData.tags)
+    const constraints = normalizeStringArray(formData.constraints)
+    const relatedCharacters = normalizeStringArray(formData.related_characters)
+    const relatedLocations = normalizeStringArray(formData.related_locations)
+    const relatedItems = normalizeStringArray(formData.related_items)
+    const forbiddenActions = normalizeStringArray(formData.forbidden_actions)
 
     try {
       if (editingLore) {
+        const data: UpdateLoreDTO = {
+          title: formData.title,
+          category: formData.category,
+          priority: normalizeLorePriority(formData.priority),
+          content: formData.content,
+          summary: formData.summary,
+          keywords,
+          tags,
+          constraints,
+          related_characters: relatedCharacters,
+          related_locations: relatedLocations,
+          related_items: relatedItems,
+          forbidden_actions: forbiddenActions,
+          source: formData.source,
+        }
         await updateLore(editingLore.id, data)
-        // 更新选中的 lore
         if (selectedLore?.id === editingLore.id) {
-          const updatedData = { ...selectedLore, ...data }
-          setSelectedLore(updatedData as LoreEntry)
+          setSelectedLore({
+            ...selectedLore,
+            ...data,
+            priority: normalizeLorePriority(data.priority ?? selectedLore.priority),
+            keywords,
+            tags,
+            constraints,
+            related_characters: relatedCharacters,
+            related_locations: relatedLocations,
+            related_items: relatedItems,
+            forbidden_actions: forbiddenActions,
+          })
         }
       } else {
+        const data: CreateLoreDTO = {
+          ...formData,
+          keywords,
+          tags,
+          constraints,
+          related_characters: relatedCharacters,
+          related_locations: relatedLocations,
+          related_items: relatedItems,
+          forbidden_actions: forbiddenActions,
+        }
         await createLore(data)
       }
       await loadLore()
       setShowModal(false)
-    } catch (error) {
+    } catch (error: any) {
+      const responseData = error?.response?.data
+      const validationDetail = responseData?.detail
+      const serializedResponseData = responseData ? JSON.stringify(responseData, null, 2) : null
+      const serializedValidationDetail = validationDetail ? JSON.stringify(validationDetail, null, 2) : null
+
       console.error('Failed to save lore:', error)
-      alert('保存失败，请重试')
+      console.error('Lore save response data:', responseData)
+      console.error('Lore save response data JSON:', serializedResponseData)
+      console.error('Lore save validation detail:', validationDetail)
+      console.error('Lore save validation detail JSON:', serializedValidationDetail)
+      alert(serializedValidationDetail || '保存失败，请重试')
     }
   }
 

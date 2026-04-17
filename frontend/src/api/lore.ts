@@ -69,6 +69,9 @@ export interface CreateLoreDTO {
   constraints?: string[]
   related_characters?: string[]
   related_locations?: string[]
+  related_items?: string[]
+  forbidden_actions?: string[]
+  source?: string
 }
 
 export interface UpdateLoreDTO {
@@ -80,6 +83,11 @@ export interface UpdateLoreDTO {
   keywords?: string[]
   tags?: string[]
   constraints?: string[]
+  related_characters?: string[]
+  related_locations?: string[]
+  related_items?: string[]
+  forbidden_actions?: string[]
+  source?: string
 }
 
 export async function getLoreList(

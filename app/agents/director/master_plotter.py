@@ -230,7 +230,7 @@ class MasterPlotterAgent(BaseAgent):
                 if isinstance(char, dict):
                     name = char.get("name", "未知角色")
                     role = char.get("role", char.get("character_type", ""))
-                    desc = char.get("description", char.get("personality", ""))[:200]
+                    desc = char.get("description", char.get("personality", ""))
                     characters_section += f"- {name}"
                     if role:
                         characters_section += f"（{role}）"
@@ -247,7 +247,7 @@ class MasterPlotterAgent(BaseAgent):
         if existing_hooks:
             hooks_section = f"""
 【已有伏笔】
-{chr(10).join([f"- {h.get('title', h.get('id', '未知'))}: {h.get('description', '')[:100]}" for h in existing_hooks[:10]])}
+{chr(10).join([f"- {h.get('title', h.get('id', '未知'))}: {h.get('description', '')}" for h in existing_hooks])}
 """
 
         # 构建讨论历史部分
@@ -258,15 +258,15 @@ class MasterPlotterAgent(BaseAgent):
                 topic = d.get("topic", f"讨论{i+1}")
                 messages = d.get("messages", [])
                 if messages:
-                    summary_text = messages[-1].get("content", "")[:300] if messages else ""
-                    discussion_summaries.append(f"- {topic}: {summary_text}...")
+                    summary_text = messages[-1].get("content", "") if messages else ""
+                    discussion_summaries.append(f"- {topic}: {summary_text}")
             if discussion_summaries:
                 discussion_section = f"""
 【团队讨论记录】
 {chr(10).join(discussion_summaries)}
 
 【最新讨论共识】
-{last_discussion_summary[:500] if last_discussion_summary else '暂无'}
+{last_discussion_summary if last_discussion_summary else '暂无'}
 """
 
         prompt = f"""你是一位资深网文编剧，现在需要根据以下信息规划一部小说的整体剧情大纲。
@@ -438,10 +438,10 @@ class MasterPlotterAgent(BaseAgent):
         prompt = f"""基于以下情境，生成一个合理的外部事件来强制推进剧情：
 
 【最近事件】
-{chr(10).join(recent_events[-3:]) if recent_events else '无'}
+{chr(10).join(recent_events) if recent_events else '无'}
 
 【待回收伏笔】
-{chr(10).join([h.get('title', '') for h in pending_hooks[:3]]) if pending_hooks else '无'}
+{chr(10).join([h.get('title', '') for h in pending_hooks]) if pending_hooks else '无'}
 
 要求：
 1. 事件应该是外部的、突然的（如：刺客袭击、天灾、意外来客）

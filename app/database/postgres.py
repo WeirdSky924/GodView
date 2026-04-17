@@ -188,10 +188,11 @@ class PostgresDatabase:
                 'characters', 'relationships', 'regions', 'hooks',
                 'coordinates', 'terrain_features', 'landmarks', 'encounters', 'connections', 'local_rules',
                 'completed_events', 'character_locations',
+                'keywords', 'tags', 'constraints', 'related_characters', 'related_locations', 'related_items', 'forbidden_actions',
                 # project_writing_configs 表的 JSONB 字段
                 'enabled_rule_ids', 'enabled_rule_set_ids', 'rule_overrides', 'rule_priorities',
                 # writing_rules 表的 JSONB 字段
-                'tags', 'examples', 'counter_examples', 'conditions', 'exceptions',
+                'examples', 'counter_examples', 'conditions', 'exceptions',
                 # writing_rule_sets 表的 JSONB 字段
                 'rule_ids', 'rule_overrides', 'target_genres',
             ]
@@ -415,6 +416,28 @@ class PostgresDatabase:
         """
         query = "SELECT * FROM characters WHERE id = :id"
         results = await self.execute_query(query, {"id": character_id})
+        return results[0] if results else None
+
+    async def get_character_by_project_and_name(
+        self,
+        project_id: str,
+        name: str,
+    ) -> Optional[Dict[str, Any]]:
+        """按项目和名称查找角色"""
+        if not project_id or not name.strip():
+            return None
+
+        query = """
+        SELECT * FROM characters
+        WHERE project_id = CAST(:project_id AS UUID)
+          AND LOWER(name) = LOWER(:name)
+        ORDER BY updated_at DESC NULLS LAST, created_at DESC
+        LIMIT 1
+        """
+        results = await self.execute_query(query, {
+            "project_id": project_id,
+            "name": name.strip(),
+        })
         return results[0] if results else None
 
     async def get_all_characters(
@@ -904,7 +927,7 @@ class PostgresDatabase:
 
         Args:
             project_id: 项目 ID 过滤
-            status: 状态过滤 (resolved: True/False)
+            status: 按状态过滤
             limit: 返回数量限制
 
         Returns:
@@ -917,14 +940,11 @@ class PostgresDatabase:
             conditions.append("project_id = CAST(:project_id AS UUID)")
             params["project_id"] = project_id
         if status:
-            # Map status to resolved column
-            if status == "resolved":
-                conditions.append("resolved = TRUE")
-            elif status in ["planted", "triggered"]:
-                conditions.append("resolved = FALSE")
+            conditions.append("status = :status")
+            params["status"] = status
 
         where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        query = f"SELECT * FROM hooks {where_clause} ORDER BY importance DESC, created_at DESC LIMIT :limit"
+        query = f"SELECT * FROM hooks {where_clause} ORDER BY priority DESC, created_at DESC LIMIT :limit"
 
         return await self.execute_query(query, params)
 

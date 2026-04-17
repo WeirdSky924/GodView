@@ -83,6 +83,33 @@ export default function Outlines() {
   const [editingScene, setEditingScene] = useState<SceneOutline | null>(null)
   const [showSceneEditor, setShowSceneEditor] = useState(false)
 
+  const mergeOutlines = (current: ChapterOutline[], incoming: ChapterOutline[]) => {
+    const outlineMap = new Map(current.map(outline => [outline.chapter_number, outline]))
+
+    for (const outline of incoming) {
+      outlineMap.set(outline.chapter_number, outline)
+    }
+
+    return Array.from(outlineMap.values()).sort((a, b) => a.chapter_number - b.chapter_number)
+  }
+
+  const upsertOutline = (outline: ChapterOutline) => {
+    setOutlines(prev => mergeOutlines(prev, [outline]))
+  }
+
+  const upsertOutlines = (incoming: ChapterOutline[]) => {
+    setOutlines(prev => mergeOutlines(prev, incoming))
+  }
+
+  const removeOutlineFromState = (chapterNumber: number) => {
+    const remaining = outlines.filter(outline => outline.chapter_number !== chapterNumber)
+    const fallbackOutline = remaining[0] ?? null
+
+    setOutlines(remaining)
+    setSelectedChapter(fallbackOutline?.chapter_number ?? null)
+    setCurrentOutline(fallbackOutline)
+  }
+
   // 加载大纲列表
   useEffect(() => {
     if (currentProject?.id) {
@@ -127,7 +154,7 @@ export default function Outlines() {
     try {
       const updated = await approveOutline(currentProject.id, selectedChapter, 'user')
       setCurrentOutline(updated)
-      loadOutlines()
+      upsertOutline(updated)
     } catch (error) {
       console.error('Failed to approve outline:', error)
     }
@@ -139,11 +166,7 @@ export default function Outlines() {
 
     try {
       await deleteOutline(currentProject.id, selectedChapter)
-      // 清除当前选中
-      setCurrentOutline(null)
-      setSelectedChapter(null)
-      // 重新加载列表
-      loadOutlines()
+      removeOutlineFromState(selectedChapter)
     } catch (error) {
       console.error('Failed to delete outline:', error)
       alert('删除失败，请稍后再试')
@@ -178,27 +201,20 @@ export default function Outlines() {
       // 处理多章大纲保存
       const savedOutlines = response.saved_outlines
       if (savedOutlines && savedOutlines.length > 0) {
-        // 多章保存成功
         setChatMessages(prev => [...prev, {
           role: 'assistant' as const,
           content: `✅ 已保存 ${savedOutlines.length} 章大纲草稿：${savedOutlines.map(o => `第${o.chapter_number}章`).join('、')}`
         }])
-        // 刷新大纲列表
-        loadOutlines()
-        // 选中第一章
+        upsertOutlines(savedOutlines)
         const firstSaved = savedOutlines[0]
         setCurrentOutline(firstSaved)
         setSelectedChapter(firstSaved.chapter_number)
       } else if (response.saved_outline) {
-        // 单章保存
-        setCurrentOutline(response.saved_outline as ChapterOutline)
+        setCurrentOutline(response.saved_outline)
         setSelectedChapter(response.saved_outline.chapter_number)
-        loadOutlines()
-      }
-
-      // 如果有大纲更新，应用到当前大纲
-      if (response.outline_updates && currentOutline) {
-        setCurrentOutline({ ...currentOutline, ...response.outline_updates })
+        upsertOutline(response.saved_outline)
+      } else if (response.outline_updates) {
+        setCurrentOutline(prev => prev ? { ...prev, ...response.outline_updates } : prev)
       }
     } catch (error) {
       console.error('Chat error:', error)

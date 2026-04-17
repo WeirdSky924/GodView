@@ -24,6 +24,7 @@ export interface PendingLore {
 }
 
 export interface PendingCharacter {
+  id?: string
   name: string
   importance_tier: string
   description: string
@@ -34,6 +35,33 @@ export interface PendingCharacter {
   age: number | null
   gender: string
   goals: string[]
+  relationships?: string[]
+  key_relationships?: Record<string, string>
+  lexicon?: string[]
+  forbidden_words?: string[]
+  voice_samples?: string[]
+  attributes?: Record<string, unknown>
+  inventory?: string[]
+  narrative_weight?: string
+  story_arc_role?: string
+  plot_priority?: number
+  has_agent?: boolean
+  agent_enabled?: boolean
+  agent_goals?: string[]
+  agent_memory?: string[]
+}
+
+export interface PendingHook {
+  title: string
+  description: string
+  hook_type: 'mystery' | 'object' | 'character' | 'event' | 'location' | 'relationship' | 'custom'
+  status: 'planted' | 'triggered' | 'resolved' | 'dropped'
+  related_characters: string[]
+  related_locations: string[]
+  related_objects: string[]
+  plant_context: string
+  resolution_hint: string
+  priority: number
 }
 
 export interface ChatResponse {
@@ -43,6 +71,7 @@ export interface ChatResponse {
   lore_saved?: boolean
   pending_lores?: PendingLore[]
   pending_characters?: PendingCharacter[]
+  pending_hooks?: PendingHook[]
   improvement_suggestions?: ImprovementSuggestion[]
 }
 
@@ -261,6 +290,19 @@ export async function savePendingCharacters(
   return await api.post(`${API_BASE}/save-characters`, {
     project_id: projectId,
     characters,
+  })
+}
+
+/**
+ * 保存用户确认的伏笔
+ */
+export async function savePendingHooks(
+  projectId: string,
+  hooks: PendingHook[]
+): Promise<{ success: boolean; saved_count: number; message: string }> {
+  return await api.post(`${API_BASE}/save-hooks`, {
+    project_id: projectId,
+    hooks,
   })
 }
 

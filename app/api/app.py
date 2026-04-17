@@ -6,7 +6,9 @@ import logging
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
@@ -212,6 +214,26 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(request: Request, exc: RequestValidationError):
+        try:
+            request_body = await request.body()
+            request_body_text = request_body.decode("utf-8", errors="ignore")
+        except Exception:
+            request_body_text = "<unavailable>"
+
+        if len(request_body_text) > 2000:
+            request_body_text = request_body_text[:2000] + "...<truncated>"
+
+        logger.error(
+            "请求校验失败: %s %s detail=%s body=%s",
+            request.method,
+            request.url.path,
+            exc.errors(),
+            request_body_text,
+        )
+        return await request_validation_exception_handler(request, exc)
 
     # 注册路由
     from app.api.routes import characters, worlds, plots, websocket, config, time, simulation, projects, bootstrap, lore, setting_agent, skills, token_usage, writing_rules, prompts, agent_templates, agent_configs, workflows, interventions, quality_checks, chapter_outlines, villains, memories, volumes, genre_templates, character_depth, golden_three_rules, world_expansion

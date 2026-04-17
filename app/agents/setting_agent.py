@@ -175,7 +175,7 @@ class SettingAgent(BaseAgent):
                 from app.models.agent_memory import MemoryEntry, MemoryType
                 memory_entry = MemoryEntry(
                     type=MemoryType.OBSERVATION,
-                    content=f"设定管理任务: {task[:100]}..." if len(task) > 100 else f"设定管理任务: {task}",
+                    content=f"设定管理任务: {task}",
                     importance=2,
                     metadata={
                         "task_type": task,
@@ -216,7 +216,7 @@ class SettingAgent(BaseAgent):
         prompt = f"""请检查以下章节内容与世界设定的一致性。
 
 【章节内容】
-{chapter_content[:3000]}...
+{chapter_content}
 
 请检查：
 1. 力量体系使用是否一致（等级、境界、能力名称）

@@ -153,13 +153,13 @@ class SummarizerAgent(BaseAgent):
 世界名称：{world_info.get('name', '未知')}
 世界类型：{world_info.get('world_type', '奇幻')}
 叙事基调：{world_info.get('tone', '正剧')}
-背景设定：{world_info.get('background', '无')[:500]}
+背景设定：{world_info.get('background', '无')}
 核心规则：{world_info.get('rules', {})}"""
 
         if lore_entries:
             lore_text = "\n".join([
-                f"- {l.get('title', '无标题')}（{l.get('category', 'general')}）：{l.get('content', '')[:200]}"
-                for l in lore_entries[:10]
+                f"- {l.get('title', '无标题')}（{l.get('category', 'general')}）：{l.get('content', '')}"
+                for l in lore_entries
             ])
             setting_info += f"\n\n【设定条目】\n{lore_text}"
 
@@ -202,7 +202,7 @@ class SummarizerAgent(BaseAgent):
 {setting_info}
 
 【章节内容】
-{chapter_content[:3000]}
+{chapter_content}
 
 请检查：
 1. 角色能力使用是否符合设定

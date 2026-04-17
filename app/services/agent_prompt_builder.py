@@ -147,19 +147,19 @@ class AgentPromptBuilder:
 
         if decisions:
             parts.append("\n### 重要决策")
-            for d in decisions[:5]:
+            for d in decisions:
                 parts.append(f"- {d.content}")
                 if d.summary:
                     parts.append(f"  理由: {d.summary}")
 
         if facts:
             parts.append("\n### 已知事实")
-            for f in facts[:5]:
+            for f in facts:
                 parts.append(f"- {f.content}")
 
         if observations:
             parts.append("\n### 关键观察")
-            for o in observations[:3]:
+            for o in observations:
                 parts.append(f"- {o.content}")
 
         return "\n".join(parts)
@@ -230,7 +230,7 @@ class AgentPromptBuilder:
             chars = context["characters"]
             if chars:
                 parts.append("\n### 出场角色")
-                for char in chars[:10]:
+                for char in chars:
                     name = char.get("name", "未知")
                     role_type = char.get("role_type", "未知")
                     stance = char.get("stance", "未知")
@@ -241,9 +241,9 @@ class AgentPromptBuilder:
             settings = context["world_settings"]
             if settings:
                 parts.append("\n### 相关设定")
-                for setting in settings[:5]:
+                for setting in settings:
                     name = setting.get("name", "未知")
-                    desc = setting.get("description", "")[:100]
+                    desc = setting.get("description", "")
                     parts.append(f"- {name}: {desc}")
 
         # 伏笔状态
@@ -251,7 +251,7 @@ class AgentPromptBuilder:
             hooks = context["active_hooks"]
             if hooks:
                 parts.append("\n### 待处理伏笔")
-                for hook in hooks[:5]:
+                for hook in hooks:
                     title = hook.get("title", "未知")
                     status = hook.get("status", "pending")
                     parts.append(f"- [{status}] {title}")
@@ -444,7 +444,6 @@ class AgentContextBuilder:
                 SELECT id, name, category, description
                 FROM world_settings
                 WHERE project_id = CAST(:project_id AS UUID)
-                LIMIT 20
             """
             results = await self._db.execute_query(query, {"project_id": project_id})
             return results or []
@@ -464,7 +463,6 @@ class AgentContextBuilder:
                 WHERE project_id = CAST(:project_id AS UUID)
                   AND status IN ('pending', 'triggered', 'ready_for_resolution')
                 ORDER BY priority DESC
-                LIMIT 15
             """
             results = await self._db.execute_query(query, {"project_id": project_id})
             return results or []

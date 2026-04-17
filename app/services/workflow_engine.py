@@ -4,6 +4,7 @@ v8 Agent协作可视化工作台
 """
 
 import asyncio
+import json
 import logging
 import random
 from collections import defaultdict, deque
@@ -1651,11 +1652,10 @@ class WorkflowEngine:
             # ========== 4. 加载前文章节 ==========
             chapters = await db.get_chapters_by_project(project_id) if hasattr(db, 'get_chapters_by_project') else []
             if chapters:
-                # 提取最近的章节作为参考
-                recent_chapters = chapters[-5:] if len(chapters) > 5 else chapters
-                output["previous_chapters"] = recent_chapters
+                # 提取章节作为参考
+                output["previous_chapters"] = chapters
                 output["all_chapters"] = chapters
-                execution.context["previous_chapters"] = recent_chapters
+                execution.context["previous_chapters"] = chapters
                 execution.context["all_chapters"] = chapters
 
                 # 提取章节概要
@@ -1667,17 +1667,17 @@ class WorkflowEngine:
                 execution.context["chapter_summaries"] = chapter_summaries
 
                 # 最近章节的风格参考
-                if recent_chapters:
-                    last_chapter = recent_chapters[-1]
-                    output["previous_style"] = last_chapter.get("content", "")[:1000]
+                if chapters:
+                    last_chapter = chapters[-1]
+                    output["previous_style"] = last_chapter.get("content", "")
                     execution.context["previous_style"] = output["previous_style"]
 
-                logger.info(f"加载 {len(chapters)} 个章节（最近 {len(recent_chapters)} 章）")
+                logger.info(f"加载 {len(chapters)} 个章节")
 
             # ========== 5. 加载设定条目 ==========
             try:
                 lores = await db.execute_query(
-                    "SELECT * FROM lore_entries WHERE project_id = CAST(:project_id AS UUID) ORDER BY priority, created_at DESC LIMIT 30",
+                    "SELECT * FROM lore_entries WHERE project_id = CAST(:project_id AS UUID) ORDER BY priority, created_at DESC",
                     {"project_id": project_id}
                 ) if hasattr(db, 'execute_query') else []
                 if lores:
@@ -1716,7 +1716,7 @@ class WorkflowEngine:
                 output["is_retry"] = execution.context.get("is_retry", False)
                 output["retry_count"] = execution.context.get("retry_count", 0)
                 output["user_feedback_timestamp"] = execution.context.get("user_feedback_timestamp")
-                logger.info(f"检测到用户反馈（重试 {output.get('retry_count', 0)} 次）: {user_feedback[:100]}...")
+                logger.info(f"检测到用户反馈（重试 {output.get('retry_count', 0)} 次）: {user_feedback}")
 
             # 记录加载完成
             loaded_items = [k for k in output.keys() if k != "status"]
@@ -1881,15 +1881,14 @@ class WorkflowEngine:
                 if "previous_chapters" not in context:
                     chapters = await db.get_chapters_by_project(project_id) if hasattr(db, 'get_chapters_by_project') else []
                     if chapters:
-                        # 获取最近几章的内容作为参考
-                        recent_chapters = chapters[-3:] if len(chapters) > 3 else chapters
-                        context["previous_chapters"] = recent_chapters
-                        execution.context["previous_chapters"] = recent_chapters
+                        context["previous_chapters"] = chapters
+                        context["all_chapters"] = chapters
+                        execution.context["previous_chapters"] = chapters
+                        execution.context["all_chapters"] = chapters
                         # 提取最近章节作为风格参考
-                        if recent_chapters:
-                            last_chapter = recent_chapters[-1]
-                            context["previous_style"] = last_chapter.get("content", "")[:1000]
-                            execution.context["previous_style"] = context["previous_style"]
+                        last_chapter = chapters[-1]
+                        context["previous_style"] = last_chapter.get("content", "")
+                        execution.context["previous_style"] = context["previous_style"]
                         logger.info(f"加载 {len(chapters)} 个章节历史到上下文（writer）")
 
                 # 已有伏笔（需要处理的伏笔）- 转换为 Writer 需要的格式
@@ -1947,8 +1946,8 @@ class WorkflowEngine:
                             intents.extend(goal["events"])
 
                 if not intents and plot_outline:
-                    # 从剧情大纲中提取最近的意图
-                    for node in plot_outline[-3:]:
+                    # 从剧情大纲中提取意图
+                    for node in plot_outline:
                         if node.get("event"):
                             intents.append(node["event"])
 
@@ -1965,7 +1964,7 @@ class WorkflowEngine:
                         writing_guide = current_chapter.get("writing_guide")
                 if writing_guide:
                     context["writing_guide"] = writing_guide
-                    logger.info(f"为 Writer 加载写作指导: {writing_guide.get('description', '')[:50]}...")
+                    logger.info(f"为 Writer 加载写作指导: {writing_guide.get('description', '')}")
 
                 # 提取角色情绪状态（从多个来源合并）
                 characters_data = context.get("characters", [])
@@ -2116,15 +2115,12 @@ class WorkflowEngine:
                 # 讨论历史：从执行上下文获取之前的讨论记录
                 discussion_history = execution.context.get("discussion_history", [])
                 if discussion_history:
-                    # 提取最近的讨论摘要供编剧参考
-                    recent_discussions = discussion_history[-3:] if len(discussion_history) > 3 else discussion_history
-                    context["recent_discussions"] = recent_discussions
+                    context["recent_discussions"] = discussion_history
                     # 提取最后一次讨论的总结
-                    if recent_discussions:
-                        last_discussion = recent_discussions[-1]
-                        last_summary = last_discussion.get("messages", [{}])[-1].get("content", "") if last_discussion.get("messages") else ""
-                        context["last_discussion_summary"] = last_summary
-                        logger.info(f"加载 {len(recent_discussions)} 条讨论记录到编剧上下文（plotter）")
+                    last_discussion = discussion_history[-1]
+                    last_summary = last_discussion.get("messages", [{}])[-1].get("content", "") if last_discussion.get("messages") else ""
+                    context["last_discussion_summary"] = last_summary
+                    logger.info(f"加载 {len(discussion_history)} 条讨论记录到编剧上下文（plotter）")
 
             # ===== ProcGen/World Agent：需要已有区域 =====
             if agent_type in ["procgen", "world_map_manager", "event_generator"]:
@@ -2161,7 +2157,7 @@ class WorkflowEngine:
                     else:
                         context["exploration_direction"] = "随机探索"
 
-                    logger.info(f"为 ProcGen Agent 设置探索方向: {context['exploration_direction'][:100]}")
+                    logger.info(f"为 ProcGen Agent 设置探索方向: {context['exploration_direction']}")
 
                 # generation_type: 根据上下文确定生成类型
                 if "generation_type" not in context:
@@ -2178,10 +2174,10 @@ class WorkflowEngine:
                 # 根据 agent 类型添加特定的任务提示
                 if agent_type == "world_map_manager":
                     context["exploration_direction"] = f"[地图管理任务] {context.get('exploration_direction', '生成新地图区域')}"
-                    logger.info(f"World Map Manager 上下文准备完成: exploration_direction={context.get('exploration_direction', 'N/A')[:100]}, generation_type={context.get('generation_type', 'N/A')}")
+                    logger.info(f"World Map Manager 上下文准备完成: exploration_direction={context.get('exploration_direction', 'N/A')}, generation_type={context.get('generation_type', 'N/A')}")
                 elif agent_type == "event_generator":
                     context["exploration_direction"] = f"[事件生成任务] {context.get('exploration_direction', '生成世界事件')}"
-                    logger.info(f"Event Generator 上下文准备完成: exploration_direction={context.get('exploration_direction', 'N/A')[:100]}, generation_type={context.get('generation_type', 'N/A')}")
+                    logger.info(f"Event Generator 上下文准备完成: exploration_direction={context.get('exploration_direction', 'N/A')}, generation_type={context.get('generation_type', 'N/A')}")
 
         except Exception as e:
             logger.error(f"加载Agent上下文数据失败: {e}")
@@ -2526,7 +2522,7 @@ class WorkflowEngine:
         # 提取角色相关
         characters = context.get("characters", [])
         if characters:
-            char_names = [c.get("name", "") for c in characters[:3] if c.get("name")]
+            char_names = [c.get("name", "") for c in characters if c.get("name")]
             if char_names:
                 query_parts.append(f"角色: {', '.join(char_names)}")
 
@@ -2540,12 +2536,12 @@ class WorkflowEngine:
         if isinstance(outline, dict):
             summary = outline.get("summary", outline.get("goal"))
             if summary:
-                query_parts.append(summary[:100])
+                query_parts.append(summary)
 
         # 提取用户干预
         user_guidance = context.get("user_guidance")
         if user_guidance:
-            query_parts.append(user_guidance[:100])
+            query_parts.append(user_guidance)
 
         return " ".join(query_parts) if query_parts else f"{agent_type} 任务"
 
@@ -2831,13 +2827,15 @@ class WorkflowEngine:
                     "category": category.value if hasattr(category, 'value') else str(category),
                     "priority": priority.value if hasattr(priority, 'value') else str(priority),
                     "content": lore_data.get("content", ""),
-                    "summary": lore_data.get("summary", "")[:500] if lore_data.get("summary") else "",
+                    "summary": lore_data.get("summary", "") if lore_data.get("summary") else "",
                     "keywords": json.dumps(lore_data.get("keywords", [])),
                     "tags": json.dumps(lore_data.get("tags", [])),
                     "constraints": json.dumps(lore_data.get("constraints", [])),
                     "related_characters": json.dumps(lore_data.get("related_characters", [])),
                     "related_locations": json.dumps(lore_data.get("related_locations", [])),
                     "related_items": json.dumps(lore_data.get("related_items", [])),
+                    "forbidden_actions": json.dumps(lore_data.get("forbidden_actions", [])),
+                    "source": lore_data.get("source", ""),
                     "created_at": datetime.now(),
                     "updated_at": datetime.now(),
                 }
@@ -2846,11 +2844,11 @@ class WorkflowEngine:
                     INSERT INTO lore_entries (
                         id, project_id, title, category, priority, content, summary,
                         keywords, tags, constraints, related_characters, related_locations, related_items,
-                        created_at, updated_at
+                        forbidden_actions, source, created_at, updated_at
                     ) VALUES (
                         CAST(:id AS UUID), CAST(:project_id AS UUID), :title, :category, :priority, :content, :summary,
                         :keywords, :tags, :constraints, :related_characters, :related_locations, :related_items,
-                        :created_at, :updated_at
+                        :forbidden_actions, :source, :created_at, :updated_at
                     )
                 """, params)
 
@@ -2866,10 +2864,32 @@ class WorkflowEngine:
                 update_fields = []
                 params = {"id": lore_id}
 
-                for field in ["title", "content", "summary"]:
+                json_fields = [
+                    "keywords",
+                    "tags",
+                    "constraints",
+                    "related_characters",
+                    "related_locations",
+                    "related_items",
+                    "forbidden_actions",
+                ]
+
+                for field in [
+                    "title",
+                    "category",
+                    "priority",
+                    "content",
+                    "summary",
+                    "source",
+                ]:
                     if field in lore_data:
                         update_fields.append(f"{field} = :{field}")
                         params[field] = lore_data[field]
+
+                for field in json_fields:
+                    if field in lore_data:
+                        update_fields.append(f"{field} = :{field}")
+                        params[field] = json.dumps(lore_data.get(field, []))
 
                 if update_fields:
                     update_fields.append("updated_at = NOW()")
@@ -2894,7 +2914,7 @@ class WorkflowEngine:
                 # 重新加载设定列表
                 try:
                     results = await db.execute_query(
-                        "SELECT * FROM lore_entries WHERE project_id = CAST(:project_id AS UUID) ORDER BY priority, created_at DESC LIMIT 30",
+                        "SELECT * FROM lore_entries WHERE project_id = CAST(:project_id AS UUID) ORDER BY priority, created_at DESC",
                         {"project_id": execution.project_id}
                     )
                     if results:
@@ -3009,7 +3029,7 @@ class WorkflowEngine:
 
             if summary:
                 execution.context["current_plot_summary"] = summary
-                logger.info(f"更新剧情摘要: {summary[:100]}...")
+                logger.info(f"更新剧情摘要: {summary}")
 
             if key_events:
                 execution.context.setdefault("all_key_events", []).extend(key_events)
@@ -4068,7 +4088,7 @@ class WorkflowEngine:
             if issues_raw:
                 issues_formatted = '\n'.join([
                     '- ' + (str(i) if isinstance(i, str) else i.get('issue', i.get('description', str(i))))
-                    for i in issues_raw[:5]
+                    for i in issues_raw
                 ])
                 issues_section = f"\n问题点：\n{issues_formatted}"
             else:
@@ -4085,11 +4105,11 @@ class WorkflowEngine:
 【当前章节】{chapter_title}
 
 【已写内容】
-{written_content[:1500] if written_content else "暂无"}
+{written_content if written_content else "暂无"}
 
 【剧情规划进度】
 {len(plot_outline)} 个情节点已规划
-{f"当前进度：{plot_outline[-3:]}" if plot_outline else "暂无详细规划"}
+{f"当前进度：{plot_outline}" if plot_outline else "暂无详细规划"}
 
 【评估反馈】
 评分: {evaluation_result.get('score', 'N/A')}/10
@@ -4169,7 +4189,7 @@ class WorkflowEngine:
 
 【讨论内容】
 章节：{chapter_title}
-已写内容：{written_content[:1000] if written_content else "暂无"}...
+已写内容：{written_content if written_content else "暂无"}
 
 【评估结果】
 评分: {evaluation_result.get('score', 'N/A')}/10
@@ -4227,8 +4247,8 @@ class WorkflowEngine:
             messages_summary = []
             for msg in discussion_messages:
                 agent_name = msg.get("agent", "Unknown")
-                content = msg.get("content", "")[:200]
-                messages_summary.append(f"【{agent_name}】{content}...")
+                content = msg.get("content", "")
+                messages_summary.append(f"【{agent_name}】{content}")
 
             prompt = f"""你是总编剧（讨论领头人），现在需要汇总讨论结果并请求用户确认。
 
@@ -4565,7 +4585,7 @@ class WorkflowEngine:
             if issues_raw:
                 issues_formatted = ', '.join([
                     str(i) if isinstance(i, str) else i.get('issue', i.get('description', str(i)))
-                    for i in issues_raw[:5]
+                    for i in issues_raw
                 ])
             else:
                 issues_formatted = '无明显问题'
@@ -4574,7 +4594,7 @@ class WorkflowEngine:
             if characters:
                 char_names = [
                     str(c) if isinstance(c, str) else c.get('name', '未知角色')
-                    for c in characters[:5]
+                    for c in characters
                 ]
                 characters_formatted = ', '.join(char_names)
             else:
@@ -4584,7 +4604,7 @@ class WorkflowEngine:
             prompt = prompt_template.format(
                 score=evaluation_result.get('score', 'N/A'),
                 issues=issues_formatted,
-                suggestions=evaluation_result.get('summary', '继续保持')[:200] if evaluation_result.get('summary') else '继续保持',
+                suggestions=evaluation_result.get('summary', '继续保持') if evaluation_result.get('summary') else '继续保持',
                 hooks_count=len(context.get('existing_hooks', [])),
                 word_count_info=context.get('word_count_check', {}).get('actual', '已统计') if context.get('word_count_check') else '字数已达标',
                 characters=characters_formatted,
@@ -4592,7 +4612,7 @@ class WorkflowEngine:
 
             # 添加章节内容（重要：让Agent有具体的分析对象）
             if written_content:
-                prompt += f"\n\n【章节内容（用于分析）】\n{written_content[:2000]}"
+                prompt += f"\n\n【章节内容（用于分析）】\n{written_content}"
 
             # 添加世界观设定
             world_info = context.get("world_info", {})
@@ -4602,15 +4622,15 @@ class WorkflowEngine:
             # 添加已有的伏笔信息
             existing_hooks = context.get('existing_hooks', [])
             if existing_hooks:
-                hooks_info = [f"- {h.get('title', h.get('id', '未知'))}: {h.get('status', 'pending')}" for h in existing_hooks[:5]]
+                hooks_info = [f"- {h.get('title', h.get('id', '未知'))}: {h.get('status', 'pending')}" for h in existing_hooks]
                 prompt += f"\n\n【当前伏笔状态】\n{chr(10).join(hooks_info)}"
 
             # 添加前文讨论摘要（让后续发言能回应前面的问题）
             if previous_messages:
                 recent_messages = []
-                for m in previous_messages[-3:]:
+                for m in previous_messages:
                     speaker = m.get('agent', '某Agent')
-                    content_preview = m.get('content', '')[:300]
+                    content_preview = m.get('content', '')
                     recent_messages.append(f"【{speaker}】\n{content_preview}")
                 if recent_messages:
                     prompt += f"\n\n【之前的讨论要点】\n{chr(10).join(recent_messages)}"
@@ -4779,7 +4799,7 @@ class WorkflowEngine:
 
             # 构建角色列表（包含重要性层级）
             char_info = []
-            for c in characters[:8]:  # 最多8个主要角色
+            for c in characters:
                 if isinstance(c, dict):
                     name = c.get("name", "未知")
                     tier = c.get("importance_tier", 3)
@@ -4799,18 +4819,18 @@ class WorkflowEngine:
 【世界观设定】
 名称：{world_info.get('name', '未知世界')}
 类型：{world_info.get('world_type', '奇幻')}
-背景：{world_info.get('background', world_info.get('description', ''))[:500]}
+背景：{world_info.get('background', world_info.get('description', ''))}
 基调：{world_info.get('tone', '正剧')}
-规则：{str(world_info.get('rules', {}))[:300]}
+规则：{str(world_info.get('rules', {}))}
 
 【当前章节目标】
-{chapter_goal[:600] if chapter_goal else '推进主线剧情'}
+{chapter_goal if chapter_goal else '推进主线剧情'}
 
 【参与角色（含重要性层级）】
 {chr(10).join([f"- {c['name']}（层级{c['tier']}，{c['type']}{'，主角' if c['is_protagonist'] else ''}{'，反派' if c['is_antagonist'] else ''}）" for c in char_info])}
 
 【剧情大纲（最近）】
-{str(plot_outline[-3:]) if plot_outline else '暂无'}
+{str(plot_outline) if plot_outline else '暂无'}
 
 【重要原则】
 1. 角色信息隔离：不要让角色知道不该知道的信息
@@ -4944,11 +4964,11 @@ class WorkflowEngine:
             history_context = ""
             if is_interactive and conversation_history:
                 # 过滤对话历史，只保留在同一场合能听到的内容
-                recent_history = conversation_history[-5:]
+                recent_history = conversation_history
                 history_lines = []
                 for h in recent_history:
                     speaker = h.get("agent", "某角色")
-                    content = h.get("content", "")[:150]
+                    content = h.get("content", "")
                     history_lines.append(f"{speaker}: {content}")
                 history_context = f"\n【当前场景中你能听到/看到的对话】\n" + "\n".join(history_lines)
 
@@ -4982,10 +5002,10 @@ class WorkflowEngine:
 名字：{char_name}
 类型：{character_type}
 重要性层级：{importance_tier}（1=核心，2=重要，3=普通，4=配角，5=路人）
-性格：{personality[:300] if personality else '根据剧情需要表现'}
-背景：{background[:400] if background else '普通背景'}
+性格：{personality if personality else '根据剧情需要表现'}
+背景：{background if background else '普通背景'}
 说话风格：{speech_pattern if speech_pattern else '自然随意'}
-特质：{', '.join(traits[:5]) if traits else '无特殊特质'}
+特质：{', '.join(traits) if traits else '无特殊特质'}
 
 ═══════════════════════════════════════════════════════
 【角色已知信息】（你只知道这些！）
@@ -5171,8 +5191,8 @@ class WorkflowEngine:
                     related_dialogues.append(dialogue)
 
             distributed_info["previous_context"] = {
-                "related_dialogues": related_dialogues[-3:],  # 最近3条相关对话
-                "recent_events": previous_node_output.get("events", [])[-2:],
+                "related_dialogues": related_dialogues,
+                "recent_events": previous_node_output.get("events", []),
             }
 
         return distributed_info
@@ -5366,7 +5386,7 @@ class WorkflowEngine:
             if rules and importance_tier <= 2:
                 # 重要角色可能知道更多规则
                 if isinstance(rules, dict):
-                    rule_items = list(rules.items())[:3]
+                    rule_items = list(rules.items())
                     known_parts.append("已知世界规则：")
                     for k, v in rule_items:
                         known_parts.append(f"  - {k}: {v}")
@@ -5374,13 +5394,13 @@ class WorkflowEngine:
         # 角色自己的经历和知识
         background = char_data.get("background", "")
         if background:
-            known_parts.append(f"你的经历：{background[:200]}")
+            known_parts.append(f"你的经历：{background}")
 
         # 角色与其他角色的关系（只知道自己这边的关系）
         relationships = char_data.get("relationships", [])
         if relationships:
             known_parts.append("你认识的人：")
-            for rel in relationships[:3]:
+            for rel in relationships:
                 target = rel.get("target", rel.get("name", "某人"))
                 rel_type = rel.get("type", rel.get("relationship", "认识"))
                 known_parts.append(f"  - {target}（{rel_type}）")
@@ -5420,7 +5440,7 @@ class WorkflowEngine:
             performances = []
             for msg in performance_messages:
                 agent = msg.get("agent", "未知")
-                content = msg.get("content", "")[:500]
+                content = msg.get("content", "")
                 performances.append(f"【{agent}】\n{content}")
 
             prompt = f"""作为总结员，请对刚才的角色演绎进行详细总结。
@@ -5914,12 +5934,12 @@ class WorkflowEngine:
 
         if issues:
             msg_parts.append(f"需要改进的问题:")
-            for i, issue in enumerate(issues[:5], 1):  # 最多显示5个问题
+            for i, issue in enumerate(issues, 1):
                 msg_parts.append(f"  {i}. {issue}")
 
         if suggestions:
             msg_parts.append(f"改进建议:")
-            for i, suggestion in enumerate(suggestions[:5], 1):  # 最多显示5条建议
+            for i, suggestion in enumerate(suggestions, 1):
                 msg_parts.append(f"  {i}. {suggestion}")
 
         return "\n".join(msg_parts)
@@ -6110,7 +6130,7 @@ class WorkflowEngine:
                 return {"success": False, "error": "不同意讨论结果时必须提供反馈意见"}
 
             logger.info(f"用户不同意讨论结果，将重新执行工作流: {execution_id}")
-            logger.info(f"用户反馈: {feedback[:200]}...")
+            logger.info(f"用户反馈: {feedback}")
 
             workflow = await self.get_workflow(execution.workflow_id, db)
             if not workflow:

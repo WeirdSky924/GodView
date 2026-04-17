@@ -6,10 +6,12 @@ import {
   negotiateConflict,
   savePendingLores,
   savePendingCharacters,
+  savePendingHooks,
   executeLoreModification,
   SettingConflict,
   PendingLore,
   PendingCharacter,
+  PendingHook,
   ImprovementSuggestion,
 } from '@/api/settingAgent'
 
@@ -63,10 +65,13 @@ export default function SettingAgentChat({
   const [currentConflict, setCurrentConflict] = useState<SettingConflict | null>(null)
   const [pendingLores, setPendingLores] = useState<PendingLore[]>([])
   const [pendingCharacters, setPendingCharacters] = useState<PendingCharacter[]>([])
+  const [pendingHooks, setPendingHooks] = useState<PendingHook[]>([])
   const [showConfirmModal, setShowConfirmModal] = useState(false)
   const [showCharacterModal, setShowCharacterModal] = useState(false)
+  const [showHookModal, setShowHookModal] = useState(false)
   const [removedLoreIndices, setRemovedLoreIndices] = useState<Set<number>>(new Set())
   const [removedCharacterIndices, setRemovedCharacterIndices] = useState<Set<number>>(new Set())
+  const [removedHookIndices, setRemovedHookIndices] = useState<Set<number>>(new Set())
   const [improvementSuggestions, setImprovementSuggestions] = useState<ImprovementSuggestion[]>([])
   const [showImprovementModal, setShowImprovementModal] = useState(false)
   const [executingSuggestion, setExecutingSuggestion] = useState<string | null>(null)
@@ -137,21 +142,36 @@ export default function SettingAgentChat({
       if (response.pending_characters && response.pending_characters.length > 0) {
         const characters = response.pending_characters
         setPendingCharacters(characters)
-        setRemovedCharacterIndices(new Set()) // 重置已删除列表
+        setRemovedCharacterIndices(new Set())
         setShowCharacterModal(true)
-        // 添加提示消息
         setMessages((prev) => [
           ...prev,
           {
-            id: `pending_char_${Date.now()}`,
+            id: `pending_character_${Date.now()}`,
             role: 'assistant',
-            content: `我检测到您确认了以下新角色，请确认是否保存到角色库：\n\n${characters.map((c, i) => `${i + 1}. ${c.name} (${c.importance_tier})`).join('\n')}`,
+            content: `我检测到以下可保存的角色，请确认是否保存到角色库：\n\n${characters.map((c, i) => `${i + 1}. ${c.name} (${c.importance_tier})`).join('\n')}`,
             timestamp: new Date(),
           },
         ])
       }
 
-      // 检查是否有设定改进建议
+      // 检查是否有待确认的伏笔
+      if (response.pending_hooks && response.pending_hooks.length > 0) {
+        const hooks = response.pending_hooks
+        setPendingHooks(hooks)
+        setRemovedHookIndices(new Set())
+        setShowHookModal(true)
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `pending_hook_${Date.now()}`,
+            role: 'assistant',
+            content: `我检测到以下可单独管理的伏笔，请确认是否保存到伏笔库：\n\n${hooks.map((h, i) => `${i + 1}. ${h.title} (${h.hook_type})`).join('\n')}`,
+            timestamp: new Date(),
+          },
+        ])
+      }
+
       if (response.improvement_suggestions && response.improvement_suggestions.length > 0) {
         const suggestions = response.improvement_suggestions
         setImprovementSuggestions(suggestions)
@@ -322,6 +342,79 @@ export default function SettingAgentChat({
   // 切换角色项的删除状态
   const toggleCharacterRemoval = (index: number) => {
     setRemovedCharacterIndices((prev) => {
+      const newSet = new Set(prev)
+      if (newSet.has(index)) {
+        newSet.delete(index)
+      } else {
+        newSet.add(index)
+      }
+      return newSet
+    })
+  }
+
+  // 保存用户确认的伏笔
+  const handleConfirmSaveHooks = async () => {
+    const hooksToSave = pendingHooks.filter((_, idx) => !removedHookIndices.has(idx))
+    if (hooksToSave.length === 0) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `no_hooks_${Date.now()}`,
+          role: 'assistant',
+          content: '没有需要保存的伏笔。',
+          timestamp: new Date(),
+        },
+      ])
+      setPendingHooks([])
+      setRemovedHookIndices(new Set())
+      setShowHookModal(false)
+      return
+    }
+
+    setLoading(true)
+    try {
+      const result = await savePendingHooks(projectId, hooksToSave)
+      if (result.success) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `saved_hook_${Date.now()}`,
+            role: 'assistant',
+            content: result.message,
+            timestamp: new Date(),
+          },
+        ])
+        onLoreChange?.()
+      }
+    } catch (error) {
+      console.error('Save hooks error:', error)
+    } finally {
+      setPendingHooks([])
+      setRemovedHookIndices(new Set())
+      setShowHookModal(false)
+      setLoading(false)
+    }
+  }
+
+  // 拒绝保存伏笔
+  const handleRejectSaveHooks = () => {
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: `rejected_hook_${Date.now()}`,
+        role: 'assistant',
+        content: '已取消保存伏笔。',
+        timestamp: new Date(),
+      },
+    ])
+    setPendingHooks([])
+    setRemovedHookIndices(new Set())
+    setShowHookModal(false)
+  }
+
+  // 切换伏笔项的删除状态
+  const toggleHookRemoval = (index: number) => {
+    setRemovedHookIndices((prev) => {
       const newSet = new Set(prev)
       if (newSet.has(index)) {
         newSet.delete(index)
@@ -799,6 +892,132 @@ export default function SettingAgentChat({
                 <Button
                   onClick={handleConfirmSaveCharacters}
                   disabled={loading || removedCharacterIndices.size === pendingCharacters.length}
+                >
+                  {loading ? (
+                    <Loader2 size={16} className="animate-spin mr-1" />
+                  ) : (
+                    <Save size={16} className="mr-1" />
+                  )}
+                  确认保存
+                </Button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 伏笔确认弹窗 */}
+      {showHookModal && pendingHooks.length > 0 && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-lg shadow-xl max-w-lg w-full mx-4 max-h-[80vh] overflow-hidden">
+            <div className="p-4 border-b bg-purple-50 flex items-center justify-between">
+              <h3 className="font-semibold text-lg text-gray-800 flex items-center gap-2">
+                <CheckCircle className="text-purple-600" size={20} />
+                确认保存伏笔
+              </h3>
+              <button onClick={handleRejectSaveHooks} className="text-gray-400 hover:text-gray-600">
+                <X size={20} />
+              </button>
+            </div>
+            <div className="p-4 max-h-96 overflow-y-auto space-y-4">
+              {pendingHooks.map((hook, idx) => {
+                const isRemoved = removedHookIndices.has(idx)
+                return (
+                  <div
+                    key={idx}
+                    className={`border rounded-lg p-3 transition-all ${
+                      isRemoved
+                        ? 'bg-red-50 border-red-200 opacity-60'
+                        : 'bg-gray-50'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between mb-2 gap-2">
+                      <span className={`font-medium ${isRemoved ? 'text-gray-400 line-through' : 'text-gray-800'}`}>
+                        {hook.title}
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <span className={`text-xs px-2 py-0.5 rounded ${
+                          isRemoved
+                            ? 'bg-gray-100 text-gray-400'
+                            : 'bg-purple-100 text-purple-700'
+                        }`}>
+                          {hook.hook_type}
+                        </span>
+                        <button
+                          onClick={() => toggleHookRemoval(idx)}
+                          className={`p-1 rounded transition-colors ${
+                            isRemoved
+                              ? 'text-green-600 hover:bg-green-100'
+                              : 'text-red-500 hover:bg-red-100'
+                          }`}
+                          title={isRemoved ? '恢复' : '移除'}
+                        >
+                          {isRemoved ? (
+                            <CheckCircle size={16} />
+                          ) : (
+                            <Trash2 size={16} />
+                          )}
+                        </button>
+                      </div>
+                    </div>
+                    {!isRemoved && (
+                      <>
+                        {hook.description && (
+                          <p className="text-sm text-gray-600 mb-2">{hook.description}</p>
+                        )}
+                        {hook.plant_context && (
+                          <p className="text-xs text-gray-500 mb-1">埋设情境：{hook.plant_context}</p>
+                        )}
+                        {hook.resolution_hint && (
+                          <p className="text-xs text-gray-500 mb-1">回收提示：{hook.resolution_hint}</p>
+                        )}
+                        <div className="flex flex-wrap gap-1 mt-2">
+                          <span className="text-xs px-2 py-0.5 bg-gray-200 text-gray-600 rounded">
+                            状态：{hook.status}
+                          </span>
+                          <span className="text-xs px-2 py-0.5 bg-gray-200 text-gray-600 rounded">
+                            优先级：{hook.priority}
+                          </span>
+                          {hook.related_characters.map((item, i) => (
+                            <span key={`char-${i}`} className="text-xs px-2 py-0.5 bg-blue-100 text-blue-700 rounded">
+                              角色：{item}
+                            </span>
+                          ))}
+                          {hook.related_locations.map((item, i) => (
+                            <span key={`loc-${i}`} className="text-xs px-2 py-0.5 bg-green-100 text-green-700 rounded">
+                              地点：{item}
+                            </span>
+                          ))}
+                          {hook.related_objects.map((item, i) => (
+                            <span key={`obj-${i}`} className="text-xs px-2 py-0.5 bg-amber-100 text-amber-700 rounded">
+                              物件：{item}
+                            </span>
+                          ))}
+                        </div>
+                      </>
+                    )}
+                    {isRemoved && (
+                      <p className="text-xs text-red-500 italic">已标记移除，将不会保存</p>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+            <div className="p-4 border-t bg-gray-50 flex justify-between items-center">
+              <span className="text-sm text-gray-500">
+                将保存 {pendingHooks.length - removedHookIndices.size} 个伏笔
+              </span>
+              <div className="flex gap-3">
+                <Button
+                  variant="secondary"
+                  onClick={handleRejectSaveHooks}
+                  disabled={loading}
+                >
+                  全部取消
+                </Button>
+                <Button
+                  onClick={handleConfirmSaveHooks}
+                  disabled={loading || removedHookIndices.size === pendingHooks.length}
                 >
                   {loading ? (
                     <Loader2 size={16} className="animate-spin mr-1" />

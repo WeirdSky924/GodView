@@ -7,7 +7,67 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+LEGACY_LORE_PRIORITY_MAP = {
+    "low": "flexible",
+    "medium": "standard",
+    "high": "core",
+}
+
+LEGACY_LORE_CATEGORY_MAP = {
+    "world": "world_rule",
+    "worldview": "world_rule",
+    "rule": "world_rule",
+    "rules": "world_rule",
+    "location": "geography",
+    "place": "geography",
+    "organization": "faction",
+    "organisation": "faction",
+    "group": "faction",
+    "job": "profession",
+    "class": "profession",
+    "artifact": "item",
+    "equipment": "item",
+    "ability": "skill",
+    "power": "skill",
+}
+
+
+def normalize_lore_category(value: Any) -> "LoreCategory":
+    """将输入值归一化为当前 LoreCategory。"""
+    if isinstance(value, LoreCategory):
+        return value
+
+    if isinstance(value, str):
+        normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+        normalized = LEGACY_LORE_CATEGORY_MAP.get(normalized, normalized)
+
+        try:
+            return LoreCategory(normalized)
+        except ValueError:
+            pass
+
+    return LoreCategory.CUSTOM
+
+
+def normalize_lore_priority(value: Any) -> "LorePriority":
+    """将 legacy priority 值归一化为当前 LorePriority。"""
+    if isinstance(value, LorePriority):
+        return value
+
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in LEGACY_LORE_PRIORITY_MAP:
+            normalized = LEGACY_LORE_PRIORITY_MAP[normalized]
+
+        try:
+            return LorePriority(normalized)
+        except ValueError:
+            pass
+
+    return LorePriority.STANDARD
 
 
 class LoreCategory(str, Enum):
@@ -70,6 +130,16 @@ class LoreEntry(BaseModel):
 
     # 向量嵌入 ID（用于 RAG 检索）
     embedding_id: Optional[str] = Field(None, description="Qdrant 向量 ID")
+
+    @field_validator("category", mode="before")
+    @classmethod
+    def normalize_category(cls, value: Any) -> LoreCategory:
+        return normalize_lore_category(value)
+
+    @field_validator("priority", mode="before")
+    @classmethod
+    def normalize_priority(cls, value: Any) -> LorePriority:
+        return normalize_lore_priority(value)
 
     class Config:
         json_schema_extra = {

@@ -24,7 +24,8 @@ from app.models.setting_agent import (
     NegotiationSession,
     NegotiationMessage,
 )
-from app.models.lore import LoreEntry, LorePriority
+from app.models.lore import LoreEntry, LorePriority, normalize_lore_category, normalize_lore_priority
+from app.models.plot import HookStatus, HookType
 from app.models.skill import ExecuteSkillDTO
 from app.models.token_usage import UsageCategory
 from app.services.conflict_detector import ConflictDetector, get_conflict_detector
@@ -227,7 +228,7 @@ class SettingAgentService:
                     project_id=row.get("project_id"),
                     title=row.get("title", ""),
                     category=row.get("category", "custom"),
-                    priority=LorePriority(row.get("priority", "standard")),
+                    priority=normalize_lore_priority(row.get("priority", "standard")),
                     content=row.get("content", ""),
                     summary=row.get("summary", ""),
                     keywords=json.loads(row.get("keywords", "[]")) if isinstance(row.get("keywords"), str) else row.get("keywords", []),
@@ -334,6 +335,49 @@ class SettingAgentService:
             "conflict": conflict.model_dump(),
             "can_proceed": all_resolved,
         }
+
+    def _is_save_intent(self, message: str) -> bool:
+        """检测用户消息是否为保存/确认意图（不需要调用LLM）"""
+        message_lower = message.strip().lower()
+        save_keywords = [
+            "保存", "确认", "确定", "好的", "可以", "没问题",
+            "就这样", "行", "ok", "yes", "save", "确认保存",
+            "保存吧", "存一下", "存下来", "保存下来",
+        ]
+        # 消息较短且包含保存关键词时才判定为保存意图
+        if len(message_lower) > 50:
+            return False
+        return any(keyword in message_lower for keyword in save_keywords)
+
+    def _clear_cached_pending_lores(self, project_id: str):
+        """清除指定项目 session 中缓存的 pending_lores"""
+        for session in self._management_sessions.values():
+            if session.project_id == project_id and session.is_active:
+                session.cached_pending_lores = []
+                break
+
+    def _clear_cached_pending_characters(self, project_id: str):
+        """清除指定项目 session 中缓存的 pending_characters"""
+        for session in self._management_sessions.values():
+            if session.project_id == project_id and session.is_active:
+                session.cached_pending_characters = []
+                break
+
+    def _clear_cached_pending_hooks(self, project_id: str):
+        """清除指定项目 session 中缓存的 pending_hooks"""
+        for session in self._management_sessions.values():
+            if session.project_id == project_id and session.is_active:
+                session.cached_pending_hooks = []
+                break
+
+    def invalidate_context_cache(self, project_id: str):
+        """使指定项目的上下文缓存失效（当设定/角色变更后调用）"""
+        for session in self._management_sessions.values():
+            if session.project_id == project_id and session.is_active:
+                session.full_context_loaded = False
+                session.cached_context_sections = {}
+                logger.info(f"[SettingAgent] 已清除项目 {project_id} 的上下文缓存")
+                break
 
     async def _analyze_user_intent(self, user_response: str) -> str:
         """分析用户意图"""
@@ -520,6 +564,55 @@ class SettingAgentService:
         """
         session = await self.get_or_create_session(project_id)
 
+        # ========== 优化1：保存指令跳过LLM调用 ==========
+        # 检测用户是否发送"保存"等确认性指令
+        if self._is_save_intent(message) and (session.cached_pending_lores or session.cached_pending_characters or session.cached_pending_hooks):
+            logger.info(f"[SettingAgent] 检测到保存意图，直接返回缓存的 pending 数据（跳过LLM调用）")
+
+            # 添加用户消息到历史
+            session.conversation_history.append({
+                "role": "user",
+                "content": message,
+                "timestamp": datetime.now().isoformat(),
+            })
+
+            # 构建保存确认回复
+            save_summary_parts = []
+            if session.cached_pending_lores:
+                lore_titles = [l.get("title", "未命名") for l in session.cached_pending_lores]
+                save_summary_parts.append(f"{len(session.cached_pending_lores)} 条设定（{', '.join(lore_titles)}）")
+            if session.cached_pending_characters:
+                char_names = [c.get("name", "未命名") for c in session.cached_pending_characters]
+                save_summary_parts.append(f"{len(session.cached_pending_characters)} 个角色（{', '.join(char_names)}）")
+            if session.cached_pending_hooks:
+                hook_titles = [h.get("title", "未命名") for h in session.cached_pending_hooks]
+                save_summary_parts.append(f"{len(session.cached_pending_hooks)} 个伏笔（{', '.join(hook_titles)}）")
+
+            response = f"好的，已为您准备保存以下内容：{'、'.join(save_summary_parts)}。请在弹窗中确认保存。"
+
+            # 添加助手回复到历史
+            session.conversation_history.append({
+                "role": "assistant",
+                "content": response,
+                "timestamp": datetime.now().isoformat(),
+            })
+
+            session.last_activity_at = datetime.now()
+
+            result = {
+                "response": response,
+                "session_id": session.id,
+                "mode": session.mode.value,
+            }
+            if session.cached_pending_lores:
+                result["pending_lores"] = session.cached_pending_lores
+            if session.cached_pending_characters:
+                result["pending_characters"] = session.cached_pending_characters
+            if session.cached_pending_hooks:
+                result["pending_hooks"] = session.cached_pending_hooks
+
+            return result
+
         # 添加用户消息到历史
         session.conversation_history.append({
             "role": "user",
@@ -530,9 +623,26 @@ class SettingAgentService:
         # 构建系统提示（异步）
         system_prompt = await self._build_management_system_prompt(session)
 
-        # 获取分段上下文（传入用户消息用于智能检索）
-        sections = await self._get_context_sections(project_id, user_message=message)
-        world_type = sections.pop("_world_type", None)
+        # ========== 优化2：增量上下文加载 ==========
+        # 第一次消息加载完整项目上下文并缓存；后续消息复用缓存
+        if not session.full_context_loaded:
+            # 首次：加载完整项目上下文
+            sections = await self._get_context_sections(project_id, user_message=message)
+            world_type = sections.pop("_world_type", None)
+
+            # 缓存 sections 到 session
+            session.cached_context_sections = sections
+            if world_type:
+                session.cached_context_sections["_world_type"] = world_type
+            session.full_context_loaded = True
+
+            logger.info(f"[SettingAgent] 首次加载完整上下文: {sum(len(v) for v in sections.values() if isinstance(v, str))} 字符")
+        else:
+            # 后续：复用缓存的上下文，不再重新查询数据库
+            sections = dict(session.cached_context_sections)
+            world_type = sections.pop("_world_type", None)
+
+            logger.info(f"[SettingAgent] 复用缓存上下文（增量模式）: {sum(len(v) for v in sections.values() if isinstance(v, str))} 字符")
 
         # 计算上下文总长度（包括对话历史）
         sections_length = sum(len(v) for v in sections.values() if isinstance(v, str))
@@ -622,9 +732,18 @@ class SettingAgentService:
 
         session.last_activity_at = datetime.now()
 
-        # 从对话中提取待确认的设定和角色
+        # 从对话中提取待确认的设定、伏笔和角色
         pending_lores = await self._extract_lore_from_conversation(project_id, session)
+        pending_hooks = await self._extract_hooks_from_conversation(project_id, session)
         pending_characters = await self._extract_characters_from_conversation(project_id, session)
+
+        # 缓存 pending 数据到 session（供下次"保存"指令跳过LLM使用）
+        if pending_lores:
+            session.cached_pending_lores = pending_lores
+        if pending_hooks:
+            session.cached_pending_hooks = pending_hooks
+        if pending_characters:
+            session.cached_pending_characters = pending_characters
 
         # 同步对话到 AgentMemoryService（与工作流 Agent 共享记忆）
         await self._sync_to_agent_memory(project_id, message, response)
@@ -666,9 +785,11 @@ class SettingAgentService:
             "mode": session.mode.value,
         }
 
-        # 返回待确认的设定和角色，由前端显示确认弹窗
+        # 返回待确认的设定、伏笔和角色，由前端显示确认弹窗
         if pending_lores:
             result["pending_lores"] = pending_lores
+        if pending_hooks:
+            result["pending_hooks"] = pending_hooks
         if pending_characters:
             result["pending_characters"] = pending_characters
 
@@ -714,7 +835,7 @@ class SettingAgentService:
                     "id": f"mem_{hashlib.md5(f'{timestamp}_user'.encode()).hexdigest()[:8]}",
                     "type": "interaction",
                     "importance": "medium",
-                    "content": f"用户: {user_message[:500]}",
+                    "content": f"用户: {user_message}",
                     "tags": [],
                     "context": {"source": "lore_interface", "role": "user"},
                     "created_at": timestamp,
@@ -723,7 +844,7 @@ class SettingAgentService:
                     "id": f"mem_{hashlib.md5(f'{timestamp}_assistant'.encode()).hexdigest()[:8]}",
                     "type": "interaction",
                     "importance": "medium",
-                    "content": f"设定助手: {assistant_response[:500]}",
+                    "content": f"设定助手: {assistant_response}",
                     "tags": [],
                     "context": {"source": "lore_interface", "role": "assistant"},
                     "created_at": timestamp,
@@ -850,8 +971,8 @@ class SettingAgentService:
                     continue
                 valid_lores.append({
                     "title": lore_data.get("title", ""),
-                    "category": lore_data.get("category", "custom"),
-                    "priority": lore_data.get("priority", "standard"),
+                    "category": normalize_lore_category(lore_data.get("category", "custom")).value,
+                    "priority": normalize_lore_priority(lore_data.get("priority", "standard")).value,
                     "content": lore_data.get("content", ""),
                     "summary": lore_data.get("summary", ""),
                     "keywords": lore_data.get("keywords", []),
@@ -872,6 +993,139 @@ class SettingAgentService:
             return []
         except Exception as e:
             logger.error(f"提取设定失败: {e}")
+            return []
+
+
+    def _normalize_hook_type(self, hook_type: Any) -> str:
+        """规范化 hook 类型到现有枚举值"""
+        raw = str(hook_type or "").strip().lower()
+        valid_types = {item.value for item in HookType}
+        if raw in valid_types:
+            return raw
+
+        alias_map = {
+            "foreshadow": HookType.CUSTOM.value,
+            "foreshadowing": HookType.CUSTOM.value,
+            "suspense": HookType.MYSTERY.value,
+            "item": HookType.OBJECT.value,
+            "artifact": HookType.OBJECT.value,
+            "prop": HookType.OBJECT.value,
+            "person": HookType.CHARACTER.value,
+            "place": HookType.LOCATION.value,
+            "relation": HookType.RELATIONSHIP.value,
+        }
+        return alias_map.get(raw, HookType.CUSTOM.value)
+
+    def _normalize_hook_status(self, status: Any) -> str:
+        """规范化 hook 状态到现有枚举值"""
+        raw = str(status or "").strip().lower()
+        valid_statuses = {item.value for item in HookStatus}
+        if raw in valid_statuses:
+            return raw
+        return HookStatus.PLANTED.value
+
+    def _normalize_hook_priority(self, priority: Any) -> int:
+        """规范化 hook 优先级到 1-5"""
+        try:
+            value = int(priority)
+        except (TypeError, ValueError):
+            value = 3
+        return max(1, min(5, value))
+
+    async def _extract_hooks_from_conversation(
+        self,
+        project_id: str,
+        session: SettingAgentSession,
+    ) -> List[Dict[str, Any]]:
+        """从对话中提取值得单独管理的伏笔信息（需要用户确认）"""
+        recent_messages = session.conversation_history[-6:]
+        if len(recent_messages) < 2:
+            return []
+
+        history_text = "\n".join([
+            f"{msg['role']}: {msg['content']}"
+            for msg in recent_messages
+        ])
+
+        extraction_prompt = f"""分析以下对话，判断用户是否明确确认了值得记录为“伏笔（hook）”的内容。
+
+重要规则：
+- 只有当用户明确表示要保存、确认、加入设定库，或者 assistant 已经形成明确可保存设定时，才提取
+- 只有那些适合后续统一追踪、回收、管理的伏笔才提取
+- 普通背景设定、泛泛讨论、尚未确认的猜想不要提取
+- 如果没有明确可保存的伏笔，返回 []
+
+请输出 JSON 数组，每个对象字段必须为：
+```json
+[
+  {{
+    "title": "伏笔标题",
+    "description": "伏笔描述",
+    "hook_type": "mystery|object|character|event|location|relationship|custom",
+    "status": "planted",
+    "related_characters": ["角色名或ID"],
+    "related_locations": ["地点名或ID"],
+    "related_objects": ["物品名或ID"],
+    "plant_context": "这个伏笔在设定中的埋设情境",
+    "resolution_hint": "后续可如何回收或揭示",
+    "priority": 3
+  }}
+]
+```
+
+约束：
+- hook_type 必须使用给定枚举之一
+- status 固定为 planted
+- priority 为 1-5 的整数
+- 只输出 JSON 数组，不要输出解释文字
+
+对话内容：
+{history_text}
+"""
+
+        try:
+            response = await self._call_llm_simple(extraction_prompt)
+
+            if "```json" in response:
+                response = response.split("```json")[1].split("```")[0]
+            elif "```" in response:
+                response = response.split("```")[1].split("```")[0]
+
+            response = response.strip()
+            if not response or response == "[]":
+                return []
+
+            hooks = json.loads(response)
+            if not isinstance(hooks, list) or len(hooks) == 0:
+                return []
+
+            valid_hooks = []
+            for hook_data in hooks:
+                if not hook_data.get("title"):
+                    continue
+                valid_hooks.append({
+                    "title": hook_data.get("title", ""),
+                    "description": hook_data.get("description", ""),
+                    "hook_type": self._normalize_hook_type(hook_data.get("hook_type")),
+                    "status": self._normalize_hook_status(hook_data.get("status")),
+                    "related_characters": hook_data.get("related_characters", []) or [],
+                    "related_locations": hook_data.get("related_locations", []) or [],
+                    "related_objects": hook_data.get("related_objects", []) or [],
+                    "plant_context": hook_data.get("plant_context", ""),
+                    "resolution_hint": hook_data.get("resolution_hint", ""),
+                    "priority": self._normalize_hook_priority(hook_data.get("priority")),
+                })
+
+            if valid_hooks:
+                logger.info(f"从对话中提取 {len(valid_hooks)} 个待确认伏笔")
+
+            return valid_hooks
+
+        except json.JSONDecodeError:
+            logger.warning("解析伏笔 JSON 失败")
+            return []
+        except Exception as e:
+            logger.error(f"提取伏笔失败: {e}")
             return []
 
     async def save_pending_lores(
@@ -902,8 +1156,8 @@ class SettingAgentService:
                 "id": str(uuid.uuid4()),
                 "project_id": project_id,
                 "title": lore_data.get("title", ""),
-                "category": lore_data.get("category", "custom"),
-                "priority": lore_data.get("priority", "standard"),
+                "category": normalize_lore_category(lore_data.get("category", "custom")).value,
+                "priority": normalize_lore_priority(lore_data.get("priority", "standard")).value,
                 "content": lore_data.get("content", ""),
                 "summary": lore_data.get("summary", ""),
                 "keywords": json.dumps(lore_data.get("keywords", [])),
@@ -912,14 +1166,16 @@ class SettingAgentService:
                 "related_characters": json.dumps(lore_data.get("related_characters", [])),
                 "related_locations": json.dumps(lore_data.get("related_locations", [])),
                 "related_items": json.dumps(lore_data.get("related_items", [])),
+                "forbidden_actions": json.dumps(lore_data.get("forbidden_actions", [])),
+                "source": lore_data.get("source", ""),
                 "created_at": datetime.now(),
                 "updated_at": datetime.now(),
             }
 
             try:
                 await postgres_db.execute_write("""
-                    INSERT INTO lore_entries (id, project_id, title, category, priority, content, summary, keywords, tags, constraints, related_characters, related_locations, related_items, created_at, updated_at)
-                    VALUES (:id, CAST(:project_id AS UUID), :title, :category, :priority, :content, :summary, :keywords, :tags, :constraints, :related_characters, :related_locations, :related_items, :created_at, :updated_at)
+                    INSERT INTO lore_entries (id, project_id, title, category, priority, content, summary, keywords, tags, constraints, related_characters, related_locations, related_items, forbidden_actions, source, created_at, updated_at)
+                    VALUES (:id, CAST(:project_id AS UUID), :title, :category, :priority, :content, :summary, :keywords, :tags, :constraints, :related_characters, :related_locations, :related_items, :forbidden_actions, :source, :created_at, :updated_at)
                 """, lore_entry)
                 saved_count += 1
                 logger.info(f"保存用户确认的设定: {lore_entry['title']}")
@@ -944,6 +1200,60 @@ class SettingAgentService:
                     logger.warning(f"索引设定失败（不影响保存）: {idx_error}")
             except Exception as e:
                 logger.error(f"保存设定失败: {e}")
+
+        # 保存成功后清除缓存，避免重复保存，并刷新上下文缓存
+        if saved_count > 0:
+            self._clear_cached_pending_lores(project_id)
+            self.invalidate_context_cache(project_id)
+
+        return saved_count
+
+    async def save_pending_hooks(
+        self,
+        project_id: str,
+        hooks: List[Dict[str, Any]],
+    ) -> int:
+        """保存用户确认的伏笔到数据库"""
+        from app.api.app import postgres_db
+        if not postgres_db:
+            return 0
+
+        saved_count = 0
+        for hook_data in hooks:
+            if not hook_data.get("title"):
+                continue
+
+            hook_entry = {
+                "id": str(uuid.uuid4()),
+                "project_id": project_id,
+                "title": hook_data.get("title", ""),
+                "description": hook_data.get("description", ""),
+                "world_id": None,
+                "hook_type": self._normalize_hook_type(hook_data.get("hook_type")),
+                "status": self._normalize_hook_status(hook_data.get("status")),
+                "related_characters": hook_data.get("related_characters", []) or [],
+                "related_locations": hook_data.get("related_locations", []) or [],
+                "related_objects": hook_data.get("related_objects", []) or [],
+                "plant_context": hook_data.get("plant_context", ""),
+                "plant_chapter": None,
+                "resolution_hint": hook_data.get("resolution_hint", ""),
+                "resolution_context": None,
+                "resolution_chapter": None,
+                "priority": self._normalize_hook_priority(hook_data.get("priority")),
+                "created_at": datetime.now(),
+                "resolved_at": None,
+            }
+
+            try:
+                await postgres_db.save_hook(hook_entry)
+                saved_count += 1
+                logger.info(f"保存用户确认的伏笔: {hook_entry['title']}")
+            except Exception as e:
+                logger.error(f"保存伏笔失败: {e}")
+
+        if saved_count > 0:
+            self._clear_cached_pending_hooks(project_id)
+            self.invalidate_context_cache(project_id)
 
         return saved_count
 
@@ -975,7 +1285,6 @@ class SettingAgentService:
                 FROM lore_entries
                 WHERE project_id = CAST(:project_id AS UUID)
                 ORDER BY priority DESC, updated_at DESC
-                LIMIT 20
             """, {"project_id": project_id})
 
             if not lores or len(lores) < 2:
@@ -984,8 +1293,8 @@ class SettingAgentService:
 
             # 构建设定摘要
             lores_summary = "\n".join([
-                f"- [{l['priority']}] {l['title']} ({l['category']}): {(l.get('summary') or l.get('content', ''))[:100]}..."
-                for l in lores[:15]
+                f"- [{l['priority']}] {l['title']} ({l['category']}): {l.get('summary') or l.get('content', '')}"
+                for l in lores
             ])
 
             world_type_hint = self._get_world_type_hint(world_type) if world_type else ""
@@ -999,7 +1308,7 @@ class SettingAgentService:
 {lores_summary}
 
 ## 最近对话上下文
-{conversation_context[:1500]}
+{conversation_context}
 
 ## 分析任务
 请识别以下类型的改进机会：
@@ -1052,7 +1361,7 @@ class SettingAgentService:
 
             # 过滤并验证
             valid_suggestions = []
-            for s in suggestions[:3]:  # 最多 3 个建议
+            for s in suggestions:
                 if s.get("type") and s.get("issue") and s.get("suggestion"):
                     valid_suggestions.append({
                         "id": str(uuid.uuid4()),
@@ -1118,7 +1427,7 @@ class SettingAgentService:
 
             elif mod_type == "priority" and target_id:
                 # 调整优先级
-                new_priority = modification.get("new_priority", "standard")
+                new_priority = normalize_lore_priority(modification.get("new_priority", "standard")).value
                 await postgres_db.execute_write("""
                     UPDATE lore_entries
                     SET priority = :priority, updated_at = :updated_at
@@ -1137,22 +1446,24 @@ class SettingAgentService:
                     "id": str(uuid.uuid4()),
                     "project_id": project_id,
                     "title": modification.get("suggested_title", "新设定"),
-                    "category": modification.get("category", "custom"),
-                    "priority": modification.get("priority", "standard"),
+                    "category": normalize_lore_category(modification.get("category", "custom")).value,
+                    "priority": normalize_lore_priority(modification.get("priority", "standard")).value,
                     "content": suggested_content,
                     "summary": modification.get("summary", ""),
                     "keywords": json.dumps(modification.get("keywords", [])),
-                    "tags": json.dumps([]),
-                    "constraints": json.dumps([]),
-                    "related_characters": json.dumps([]),
-                    "related_locations": json.dumps([]),
-                    "related_items": json.dumps([]),
+                    "tags": json.dumps(modification.get("tags", [])),
+                    "constraints": json.dumps(modification.get("constraints", [])),
+                    "related_characters": json.dumps(modification.get("related_characters", [])),
+                    "related_locations": json.dumps(modification.get("related_locations", [])),
+                    "related_items": json.dumps(modification.get("related_items", [])),
+                    "forbidden_actions": json.dumps(modification.get("forbidden_actions", [])),
+                    "source": modification.get("source", ""),
                     "created_at": datetime.now(),
                     "updated_at": datetime.now(),
                 }
                 await postgres_db.execute_write("""
-                    INSERT INTO lore_entries (id, project_id, title, category, priority, content, summary, keywords, tags, constraints, related_characters, related_locations, related_items, created_at, updated_at)
-                    VALUES (:id, CAST(:project_id AS UUID), :title, :category, :priority, :content, :summary, :keywords, :tags, :constraints, :related_characters, :related_locations, :related_items, :created_at, :updated_at)
+                    INSERT INTO lore_entries (id, project_id, title, category, priority, content, summary, keywords, tags, constraints, related_characters, related_locations, related_items, forbidden_actions, source, created_at, updated_at)
+                    VALUES (:id, CAST(:project_id AS UUID), :title, :category, :priority, :content, :summary, :keywords, :tags, :constraints, :related_characters, :related_locations, :related_items, :forbidden_actions, :source, :created_at, :updated_at)
                 """, lore_entry)
                 return {"success": True, "message": f"已添加新设定: {lore_entry['title']}"}
 
@@ -1177,6 +1488,103 @@ class SettingAgentService:
         except Exception as e:
             logger.error(f"[SettingAgent] 执行设定修改失败: {e}")
             return {"success": False, "error": str(e)}
+
+    def _parse_character_list_value(self, value: Any) -> List[Any]:
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except Exception:
+                return []
+        return value if isinstance(value, list) else []
+
+    def _parse_character_dict_value(self, value: Any) -> Dict[str, Any]:
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except Exception:
+                return {}
+        return value if isinstance(value, dict) else {}
+
+    def _has_meaningful_character_value(self, value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return bool(value.strip())
+        if isinstance(value, (list, dict)):
+            return len(value) > 0
+        return True
+
+    def _merge_character_payload(
+        self,
+        existing_character: Optional[Dict[str, Any]],
+        incoming_character: Dict[str, Any],
+        project_id: str,
+    ) -> Dict[str, Any]:
+        merged = dict(existing_character or {})
+        merged["project_id"] = project_id
+
+        list_fields = [
+            "goals",
+            "relationships",
+            "lexicon",
+            "forbidden_words",
+            "voice_samples",
+            "inventory",
+            "agent_goals",
+            "agent_memory",
+        ]
+        dict_fields = ["attributes", "key_relationships"]
+        scalar_fields = [
+            "id",
+            "name",
+            "importance_tier",
+            "description",
+            "appearance",
+            "personality",
+            "background_story",
+            "speech_pattern",
+            "age",
+            "gender",
+            "narrative_weight",
+            "story_arc_role",
+            "plot_priority",
+            "has_agent",
+            "agent_enabled",
+            "current_location",
+        ]
+
+        for field in scalar_fields:
+            if field in incoming_character and self._has_meaningful_character_value(incoming_character.get(field)):
+                merged[field] = incoming_character[field]
+
+        for field in list_fields:
+            if field in incoming_character:
+                parsed_value = self._parse_character_list_value(incoming_character.get(field))
+                if self._has_meaningful_character_value(parsed_value):
+                    merged[field] = parsed_value
+                elif field not in merged:
+                    merged[field] = []
+            elif field in merged:
+                merged[field] = self._parse_character_list_value(merged.get(field))
+            else:
+                merged[field] = []
+
+        for field in dict_fields:
+            if field in incoming_character:
+                parsed_value = self._parse_character_dict_value(incoming_character.get(field))
+                if self._has_meaningful_character_value(parsed_value):
+                    merged[field] = parsed_value
+                elif field not in merged:
+                    merged[field] = {}
+            elif field in merged:
+                merged[field] = self._parse_character_dict_value(merged.get(field))
+            else:
+                merged[field] = {}
+
+        if "age" in incoming_character and incoming_character.get("age") is None and "age" not in merged:
+            merged["age"] = None
+
+        return merged
 
     async def _extract_characters_from_conversation(
         self,
@@ -1224,7 +1632,21 @@ class SettingAgentService:
     "speech_pattern": "说话风格",
     "age": 年龄数字或null,
     "gender": "性别",
-    "goals": ["目标1", "目标2"]
+    "goals": ["目标1", "目标2"],
+    "relationships": ["与其他角色的关系概述"],
+    "key_relationships": {{"角色名": "关系说明"}},
+    "lexicon": ["标志性用词"],
+    "forbidden_words": ["不会说的词"],
+    "voice_samples": ["代表性台词"],
+    "attributes": {{"身份": "值"}},
+    "inventory": ["随身物品"],
+    "narrative_weight": "full_focus|major_focus|moderate|minimal|background",
+    "story_arc_role": "hero|guide|helper|protector|mentor_role|villain|obstacle|betrayer|corruptor|neutral|wild_card|double_agent|sacrifice|redeemed|tragic|herald",
+    "plot_priority": 0,
+    "has_agent": true,
+    "agent_enabled": true,
+    "agent_goals": ["角色Agent目标"],
+    "agent_memory": ["角色关键记忆"]
   }}
 ]
 ```
@@ -1277,7 +1699,21 @@ class SettingAgentService:
                     "speech_pattern": char_data.get("speech_pattern", ""),
                     "age": char_data.get("age"),
                     "gender": char_data.get("gender", ""),
-                    "goals": char_data.get("goals", []),
+                    "goals": self._parse_character_list_value(char_data.get("goals")),
+                    "relationships": self._parse_character_list_value(char_data.get("relationships")),
+                    "key_relationships": self._parse_character_dict_value(char_data.get("key_relationships")),
+                    "lexicon": self._parse_character_list_value(char_data.get("lexicon")),
+                    "forbidden_words": self._parse_character_list_value(char_data.get("forbidden_words")),
+                    "voice_samples": self._parse_character_list_value(char_data.get("voice_samples")),
+                    "attributes": self._parse_character_dict_value(char_data.get("attributes")),
+                    "inventory": self._parse_character_list_value(char_data.get("inventory")),
+                    "narrative_weight": char_data.get("narrative_weight"),
+                    "story_arc_role": char_data.get("story_arc_role"),
+                    "plot_priority": char_data.get("plot_priority"),
+                    "has_agent": char_data.get("has_agent"),
+                    "agent_enabled": char_data.get("agent_enabled"),
+                    "agent_goals": self._parse_character_list_value(char_data.get("agent_goals")),
+                    "agent_memory": self._parse_character_list_value(char_data.get("agent_memory")),
                 })
 
             if valid_characters:
@@ -1308,41 +1744,55 @@ class SettingAgentService:
             int: 保存的数量
         """
         from app.api.app import postgres_db
+        from app.api.routes.characters import _auto_configure_character_agent, _derive_role_from_tier
+
         if not postgres_db:
             return 0
 
         saved_count = 0
         for char_data in characters:
-            if not char_data.get("name"):
+            name = (char_data.get("name") or "").strip()
+            if not name:
                 continue
 
-            char_entry = {
-                "id": str(uuid.uuid4()),
-                "project_id": project_id,
-                "name": char_data.get("name", ""),
-                "importance_tier": char_data.get("importance_tier", "npc"),
-                "description": char_data.get("description", ""),
-                "appearance": char_data.get("appearance", ""),
-                "personality": char_data.get("personality", ""),
-                "background_story": char_data.get("background_story", ""),
-                "speech_pattern": char_data.get("speech_pattern", ""),
-                "age": char_data.get("age"),
-                "gender": char_data.get("gender", ""),
-                "goals": json.dumps(char_data.get("goals", [])),
-                "status": "active",
-                "created_at": datetime.now(),
-                "updated_at": datetime.now(),
-            }
-
             try:
-                await postgres_db.execute_write("""
-                    INSERT INTO characters (id, project_id, name, importance_tier, description, appearance, personality, background_story, speech_pattern, age, gender, goals, status, created_at, updated_at)
-                    VALUES (:id, CAST(:project_id AS UUID), :name, :importance_tier, :description, :appearance, :personality, :background_story, :speech_pattern, :age, :gender, :goals, :status, :created_at, :updated_at)
-                """, char_entry)
+                existing_character = None
+                existing_id = char_data.get("id")
+                if existing_id:
+                    existing_character = await postgres_db.get_character(existing_id)
+
+                if not existing_character:
+                    existing_character = await postgres_db.get_character_by_project_and_name(project_id, name)
+
+                merged_character = self._merge_character_payload(existing_character, char_data, project_id)
+                merged_character["name"] = name
+                merged_character["status"] = merged_character.get("status") or "active"
+
+                if existing_character:
+                    merged_character["id"] = existing_character.get("id")
+                    if existing_character.get("created_at"):
+                        merged_character["created_at"] = existing_character.get("created_at")
+                else:
+                    merged_character["id"] = merged_character.get("id") or str(uuid.uuid4())
+                    merged_character["created_at"] = datetime.now()
+
+                importance_tier = merged_character.get("importance_tier") or "npc"
+                merged_character["importance_tier"] = importance_tier
+                merged_character["role"] = _derive_role_from_tier(importance_tier)
+                merged_character["updated_at"] = datetime.now()
+
+                merged_character = await _auto_configure_character_agent(merged_character)
+                await postgres_db.save_character(merged_character)
+
                 saved_count += 1
-                logger.info(f"保存用户确认的角色: {char_entry['name']}")
+                logger.info(f"保存用户确认的角色: {name}")
             except Exception as e:
                 logger.error(f"保存角色失败: {e}")
+
+        # 保存成功后清除缓存，避免重复保存，并刷新上下文缓存
+        if saved_count > 0:
+            self._clear_cached_pending_characters(project_id)
+            self.invalidate_context_cache(project_id)
 
         return saved_count
 
@@ -1586,7 +2036,11 @@ class SettingAgentService:
 
             personality_data = json.loads(response.strip())
 
-            logger.info(f"为角色 '{character_data.get('name')}' 生成性格: {personality_data.get('personality', '')[:50]}...")
+            logger.info(
+                "为角色 '%s' 生成性格: %s",
+                character_data.get('name'),
+                personality_data.get('personality', ''),
+            )
 
             return {
                 "success": True,
@@ -1660,7 +2114,7 @@ class SettingAgentService:
                     # 添加世界规则
                     rules = world.get("rules", [])
                     if rules:
-                        rules_str = ", ".join([r.get("name", "") for r in rules[:5] if isinstance(r, dict)])
+                        rules_str = ", ".join([r.get("name", "") for r in rules if isinstance(r, dict)])
                         if rules_str:
                             context_parts.append(f"【核心规则】{rules_str}")
             except Exception as e:
@@ -1669,12 +2123,18 @@ class SettingAgentService:
             # 获取关键设定
             try:
                 lores = await postgres_db.execute_query(
-                    "SELECT title FROM lore_entries WHERE project_id = CAST(:project_id AS UUID) ORDER BY priority, created_at DESC LIMIT 5",
+                    "SELECT title, category, priority, summary, content FROM lore_entries WHERE project_id = CAST(:project_id AS UUID) ORDER BY priority, created_at DESC",
                     {"project_id": project_id}
                 )
                 if lores:
-                    lore_titles = [l.get("title", "") for l in lores]
-                    context_parts.append(f"\n关键设定：{', '.join(lore_titles)}")
+                    lore_lines = []
+                    for lore in lores:
+                        lore_lines.append(f"- [{lore.get('priority', 'standard')}] {lore.get('title', '')} ({lore.get('category', 'custom')})")
+                        if lore.get("summary"):
+                            lore_lines.append(f"  摘要：{lore['summary']}")
+                        if lore.get("content"):
+                            lore_lines.append(f"  内容：{lore['content']}")
+                    context_parts.append("\n关键设定：\n" + "\n".join(lore_lines))
             except Exception:
                 pass  # lore_entries 表可能不存在
 
@@ -1709,7 +2169,7 @@ class SettingAgentService:
         existing_personalities = ""
         if existing_characters:
             personalities = []
-            for char in existing_characters[:5]:
+            for char in existing_characters:
                 if char.get("personality"):
                     personalities.append(f"- {char.get('name')}: {char.get('personality')}")
             if personalities:
@@ -1879,8 +2339,8 @@ class SettingAgentService:
                 keywords.append(kw)
 
         # 4. 去重并返回
-        unique_keywords = list(set(keywords))
-        return unique_keywords[:10]  # 最多返回 10 个
+        unique_keywords = list(dict.fromkeys(keywords))
+        return unique_keywords
 
     def _get_world_type_hint(self, world_type: str) -> str:
         """根据世界类型返回对应的设定要点提示"""
@@ -2028,7 +2488,7 @@ class SettingAgentService:
                             except:
                                 content_styles = []
                         if isinstance(content_styles, list) and len(content_styles) > 0:
-                            info += f"\n  内容风格：{', '.join(content_styles[:5])}"
+                            info += f"\n  内容风格：{', '.join(content_styles)}"
                     # 新增：主角类型标签
                     protagonist_types = w.get('protagonist_types')
                     if protagonist_types:
@@ -2038,7 +2498,7 @@ class SettingAgentService:
                             except:
                                 protagonist_types = []
                         if isinstance(protagonist_types, list) and len(protagonist_types) > 0:
-                            info += f"\n  主角类型：{', '.join(protagonist_types[:3])}"
+                            info += f"\n  主角类型：{', '.join(protagonist_types)}"
                     # 新增：角色人设标签
                     character_archetypes = w.get('character_archetypes')
                     if character_archetypes:
@@ -2048,7 +2508,7 @@ class SettingAgentService:
                             except:
                                 character_archetypes = []
                         if isinstance(character_archetypes, list) and len(character_archetypes) > 0:
-                            info += f"\n  角色人设模板：{', '.join(character_archetypes[:5])}"
+                            info += f"\n  角色人设模板：{', '.join(character_archetypes)}"
                     # 新增：战斗能力标签
                     power_types = w.get('power_types')
                     if power_types:
@@ -2058,7 +2518,7 @@ class SettingAgentService:
                             except:
                                 power_types = []
                         if isinstance(power_types, list) and len(power_types) > 0:
-                            info += f"\n  战斗能力：{', '.join(power_types[:5])}"
+                            info += f"\n  战斗能力：{', '.join(power_types)}"
                     if w.get('power_system'):
                         info += f"\n  力量体系：{w['power_system']}"
                     if w.get('technology_level'):
@@ -2078,7 +2538,7 @@ class SettingAgentService:
                         if isinstance(factions, list) and len(factions) > 0:
                             faction_names = [f.get('name', '') for f in factions if isinstance(f, dict) and f.get('name')]
                             if faction_names:
-                                info += f"\n  主要势力：{', '.join(faction_names[:5])}"
+                                info += f"\n  主要势力：{', '.join(faction_names)}"
                     # 加载世界规则
                     rules = w.get('rules')
                     if rules:
@@ -2090,7 +2550,7 @@ class SettingAgentService:
                         if isinstance(rules, list) and len(rules) > 0:
                             rule_names = [r.get('name', '') for r in rules if isinstance(r, dict) and r.get('name')]
                             if rule_names:
-                                info += f"\n  世界规则：{', '.join(rule_names[:5])}"
+                                info += f"\n  世界规则：{', '.join(rule_names)}"
                     world_info.append(info)
                 if world_info:
                     sections["世界管理"] = "\n\n".join(world_info)
@@ -2128,12 +2588,11 @@ class SettingAgentService:
                         logger.warning(f"[SettingAgent] 智能检索失败，回退到关键词匹配: {e}")
                         # 回退：直接在数据库中搜索关键词
                         if extracted_keywords:
-                            for kw in extracted_keywords[:5]:
+                            for kw in extracted_keywords:
                                 matching = await conn.fetch("""
                                     SELECT id FROM lore_entries
                                     WHERE project_id = $1
                                     AND (keywords::text ILIKE $2 OR title ILIKE $2 OR content ILIKE $2)
-                                    LIMIT 5
                                 """, project_id, f"%{kw}%")
                                 for m in matching:
                                     relevant_lore_ids.add(str(m['id']))
@@ -2148,7 +2607,7 @@ class SettingAgentService:
                     ids_to_fetch = [lid for lid in relevant_lore_ids if lid not in constitutional_ids]
                     if ids_to_fetch:
                         # 构建查询
-                        placeholders = ",".join([f"'{lid}'" for lid in ids_to_fetch[:15]])
+                        placeholders = ",".join([f"'{lid}'" for lid in ids_to_fetch])
                         relevant_lores = await conn.fetch(f"""
                             SELECT id, title, category, priority, summary, content, keywords
                             FROM lore_entries
@@ -2162,9 +2621,7 @@ class SettingAgentService:
                 if constitutional_lores:
                     lore_info.append("【宪法级设定 - 不可违反】")
                     for lore in constitutional_lores:
-                        content = lore.get('content', '')
-                        if len(content) > 500:
-                            content = content[:500] + "..."
+                        content = lore.get('content') or lore.get('summary') or ''
                         lore_info.append(f"【{lore['title']}】")
                         lore_info.append(f"类别: {lore['category']}")
                         lore_info.append(f"内容: {content}")
@@ -2172,7 +2629,7 @@ class SettingAgentService:
                             try:
                                 kw = json.loads(lore['keywords']) if isinstance(lore['keywords'], str) else lore['keywords']
                                 if kw:
-                                    lore_info.append(f"关键词: {', '.join(kw[:5])}")
+                                    lore_info.append(f"关键词: {', '.join(str(item) for item in kw)}")
                             except:
                                 pass
                         lore_info.append("")
@@ -2181,10 +2638,8 @@ class SettingAgentService:
                 # 相关设定（根据用户问题智能检索）
                 if relevant_lores:
                     lore_info.append(f"【相关设定（根据您的问题检索）】")
-                    for lore in relevant_lores[:15]:  # 最多 15 条
+                    for lore in relevant_lores:
                         content = lore.get('content', '')
-                        if len(content) > 400:
-                            content = content[:400] + "..."
                         summary = lore.get('summary', '')
                         info_line = f"- {lore['title']} [{lore['priority']}] ({lore['category']})"
                         if summary:
@@ -2206,7 +2661,6 @@ class SettingAgentService:
                     FROM characters
                     WHERE project_id = $1
                     ORDER BY created_at DESC
-                    LIMIT 15
                 """, project_id)
 
                 if characters:
@@ -2227,7 +2681,6 @@ class SettingAgentService:
                     FROM hooks
                     WHERE project_id = $1
                     ORDER BY created_at DESC
-                    LIMIT 15
                 """, project_id)
 
                 if hooks:
@@ -2249,7 +2702,6 @@ class SettingAgentService:
                     WHERE project_id = $1
                     AND status IN ('draft', 'approved')
                     ORDER BY chapter_number
-                    LIMIT 15
                 """, project_id)
 
                 if outlines:
@@ -2346,7 +2798,7 @@ class SettingAgentService:
             # 如果段落较短，直接分析
             if section_length <= SEGMENT_SIZE:
                 logger.info(f"[分段分析] 发送段落【{section_name}】({section_length}字符) 到 LLM")
-                logger.debug(f"[分段分析] 内容预览: {section_content[:200]}...")
+                logger.debug(f"[分段分析] 内容全文: {section_content}")
                 key_points = await self._extract_key_points(
                     section_name, section_content, user_message, world_type_hint, project_id
                 )
@@ -2379,7 +2831,7 @@ class SettingAgentService:
                     segment_num += 1
                     segment_label = f"{section_name}(第{segment_num}段)"
                     logger.info(f"[分段分析] 发送段落【{segment_label}】({len(segment_content)}字符) 到 LLM")
-                    logger.debug(f"[分段分析] 内容预览: {segment_content[:200]}...")
+                    logger.debug(f"[分段分析] 内容全文: {segment_content}")
 
                     key_points = await self._extract_key_points(
                         segment_label, segment_content, user_message, world_type_hint, project_id
@@ -2478,7 +2930,7 @@ class SettingAgentService:
 
             # 检查是否是错误响应
             if not result or "抱歉" in result or "无法处理" in result or "请稍后" in result:
-                logger.warning(f"[分段分析] LLM 返回错误响应: {result[:100] if result else '空响应'}")
+                logger.warning(f"[分段分析] LLM 返回错误响应: {result if result else '空响应'}")
                 return []
 
             # 解析JSON
@@ -2527,13 +2979,13 @@ class SettingAgentService:
         seen = set()
         unique_points = []
         for point in sorted_points:
-            key = (point.get("entity", ""), point.get("key_fact", "")[:50])  # 用前50字符判断重复
+            key = (point.get("entity", ""), point.get("key_fact", ""))  # 用完整 key_fact 判断重复
             if key not in seen:
                 seen.add(key)
                 unique_points.append(point)
 
         # 限制数量，避免索引过长
-        return unique_points[:50]
+        return unique_points
 
     def _format_key_points_index(self, key_points: List[Dict[str, Any]]) -> str:
         """

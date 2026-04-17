@@ -15,6 +15,8 @@ from app.models.lore import (
     LorePriority,
     LoreSearchResult,
     LoreValidationResult,
+    normalize_lore_category,
+    normalize_lore_priority,
 )
 
 logger = logging.getLogger(__name__)
@@ -101,8 +103,8 @@ class LoreRAGService:
             LoreSearchResult(
                 id=r["id"],
                 title=r["payload"].get("title", ""),
-                category=LoreCategory(r["payload"].get("category", "custom")),
-                priority=LorePriority(r["payload"].get("priority", "standard")),
+                category=normalize_lore_category(r["payload"].get("category", "custom")),
+                priority=normalize_lore_priority(r["payload"].get("priority", "standard")),
                 summary=r["payload"].get("summary"),
                 score=r["score"],
                 keywords=r["payload"].get("keywords", []),
@@ -148,7 +150,7 @@ class LoreRAGService:
                 id=r["id"],
                 project_id=r["payload"].get("project_id", project_id),
                 title=r["payload"].get("title", ""),
-                category=LoreCategory(r["payload"].get("category", "custom")),
+                category=normalize_lore_category(r["payload"].get("category", "custom")),
                 priority=LorePriority.CONSTITUTIONAL,
                 content=r["payload"].get("content", ""),
                 keywords=r["payload"].get("keywords", []),
@@ -246,8 +248,8 @@ class LoreRAGService:
         constitutional = await self.get_constitutional_rules(project_id)
         if constitutional:
             context_parts.append("## 核心规则（不可违反）\n")
-            for rule in constitutional[:3]:
-                context_parts.append(f"- {rule.title}: {rule.content[:200]}...")
+            for rule in constitutional:
+                context_parts.append(f"- {rule.title}: {rule.content}")
 
         return "\n".join(context_parts)
 
@@ -326,7 +328,7 @@ class LoreRAGService:
                 project_id=r["payload"].get("project_id", project_id),
                 title=r["payload"].get("title", ""),
                 category=category,
-                priority=LorePriority(r["payload"].get("priority", "standard")),
+                priority=normalize_lore_priority(r["payload"].get("priority", "standard")),
                 content=r["payload"].get("content", ""),
                 keywords=r["payload"].get("keywords", []),
             )
