@@ -13,25 +13,11 @@ from app.models.agent_config import (
     AgentConfigCreate,
     AgentConfigUpdate,
 )
+from app.services.agent_config_service import get_agent_config_service
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-
-# 模拟服务实例
-_agent_config_service = None
-
-
-def get_agent_config_service():
-    """获取 Agent 配置服务实例"""
-    global _agent_config_service
-    if _agent_config_service is None:
-        from app.services.agent_config_service import AgentConfigService
-        from app.services.agent_template_service import AgentTemplateService
-        template_service = AgentTemplateService()
-        _agent_config_service = AgentConfigService(agent_template_service=template_service)
-    return _agent_config_service
-
 
 # ==================== Agent 配置 API ====================
 

@@ -109,6 +109,13 @@ models/
 # Docker volumes (如果使用本地目录)
 .docker/
 
+# 项目脚本（本地运行）
+start.sh
+stop.sh
+install.sh
+start.bat
+stop.bat
+
 # ======================== 临时文件 ========================
 *.tmp
 *.temp

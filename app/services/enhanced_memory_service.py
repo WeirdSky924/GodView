@@ -63,6 +63,9 @@ class EnhancedMemoryService:
         except ImportError:
             return None
 
+    def _agent_id_filter_sql(self) -> str:
+        return "AND (agent_id = :agent_id OR (agent_id IS NULL AND :agent_id IS NULL))"
+
     # ==================== 语义记忆检索 ====================
 
     async def get_semantic_memories(
@@ -72,6 +75,7 @@ class EnhancedMemoryService:
         query_text: str,
         limit: int = 10,
         min_similarity: float = 0.5,
+        agent_id: Optional[str] = None,
     ) -> List[Tuple[MemoryEntry, float]]:
         """
         语义记忆检索 - 使用向量嵌入进行相似度搜索
@@ -82,6 +86,7 @@ class EnhancedMemoryService:
             query_text: 查询文本
             limit: 返回数量限制
             min_similarity: 最小相似度阈值
+            agent_id: Agent 实例 ID
 
         Returns:
             List[Tuple[MemoryEntry, float]]: (记忆条目, 相似度分数) 列表
@@ -92,7 +97,7 @@ class EnhancedMemoryService:
         if not embedding_service or not self._db:
             # 降级为关键词匹配
             return await self._fallback_keyword_search(
-                project_id, agent_type, query_text, limit
+                project_id, agent_type, query_text, limit, agent_id=agent_id
             )
 
         try:
@@ -101,7 +106,7 @@ class EnhancedMemoryService:
 
             # 2. 从数据库检索相似记忆
             memories = await self._search_similar_embeddings(
-                project_id, agent_type, query_embedding, limit * 2
+                project_id, agent_type, query_embedding, limit * 2, agent_id=agent_id
             )
 
             # 3. 过滤低相似度结果
@@ -113,6 +118,7 @@ class EnhancedMemoryService:
                     memory_id=memory.id,
                     project_id=project_id,
                     agent_type=agent_type,
+                    agent_id=agent_id,
                     usage_context="semantic_search",
                     relevance_score=score,
                 )
@@ -122,7 +128,7 @@ class EnhancedMemoryService:
         except Exception as e:
             logger.error(f"语义记忆检索失败: {e}")
             return await self._fallback_keyword_search(
-                project_id, agent_type, query_text, limit
+                project_id, agent_type, query_text, limit, agent_id=agent_id
             )
 
     async def _search_similar_embeddings(
@@ -131,6 +137,7 @@ class EnhancedMemoryService:
         agent_type: str,
         query_embedding: List[float],
         limit: int,
+        agent_id: Optional[str] = None,
     ) -> List[Tuple[MemoryEntry, float]]:
         """从数据库搜索相似嵌入"""
         if not self._db:
@@ -142,12 +149,13 @@ class EnhancedMemoryService:
 
             if use_pgvector:
                 # 使用 pgvector 的余弦相似度搜索
-                query = """
+                query = f"""
                     SELECT memory_id, content, memory_type, importance, tags,
                            1 - (embedding_vec <=> :embedding::vector) as similarity
                     FROM memory_embeddings
                     WHERE project_id = CAST(:project_id AS UUID)
                       AND agent_type = :agent_type
+                      {self._agent_id_filter_sql()}
                       AND decay_factor > 0.1
                       AND embedding_vec IS NOT NULL
                     ORDER BY embedding_vec <=> :embedding::vector
@@ -157,7 +165,7 @@ class EnhancedMemoryService:
                 # 降级到关键词搜索（JSONB 模式不支持向量搜索）
                 logger.info("pgvector 不可用，降级到关键词搜索")
                 return await self._fallback_keyword_search(
-                    project_id, agent_type, "", limit
+                    project_id, agent_type, "", limit, agent_id=agent_id
                 )
 
             results = await self._db.execute_query(
@@ -165,6 +173,7 @@ class EnhancedMemoryService:
                 {
                     "project_id": project_id,
                     "agent_type": agent_type,
+                    "agent_id": agent_id,
                     "embedding": str(query_embedding),
                     "limit": limit,
                 },
@@ -223,9 +232,10 @@ class EnhancedMemoryService:
         agent_type: str,
         query_text: str,
         limit: int,
+        agent_id: Optional[str] = None,
     ) -> List[Tuple[MemoryEntry, float]]:
         """降级为关键词搜索"""
-        memory = await self.base_service.get_memory(project_id, agent_type)
+        memory = await self.base_service.get_memory(project_id, agent_type, agent_id)
         query_words = set(query_text.lower().split())
 
         scored = []
@@ -262,6 +272,7 @@ class EnhancedMemoryService:
         task_type: str,
         current_context: Optional[Dict[str, Any]] = None,
         query_text: Optional[str] = None,
+        agent_id: Optional[str] = None,
     ) -> List[MemoryEntry]:
         """
         上下文感知记忆选择
@@ -274,6 +285,7 @@ class EnhancedMemoryService:
             task_type: 任务类型（如 "outline_generation", "chapter_writing"）
             current_context: 当前上下文（章节号、角色等）
             query_text: 可选的查询文本
+            agent_id: Agent 实例 ID
 
         Returns:
             List[MemoryEntry]: 选中的记忆列表
@@ -283,7 +295,7 @@ class EnhancedMemoryService:
 
         if not config:
             # 无配置，使用默认策略
-            return await self._default_memory_selection(project_id, agent_type)
+            return await self._default_memory_selection(project_id, agent_type, agent_id=agent_id)
 
         strategy = config.get("selection_strategy", MemorySelectionStrategy.HYBRID)
         max_memories = config.get("max_memories", 10)
@@ -292,7 +304,7 @@ class EnhancedMemoryService:
         excluded_tags = config.get("excluded_tags", [])
 
         # 2. 获取基础记忆
-        memory = await self.base_service.get_memory(project_id, agent_type)
+        memory = await self.base_service.get_memory(project_id, agent_type, agent_id)
 
         # 3. 根据策略选择记忆
         if strategy == MemorySelectionStrategy.RECENT:
@@ -303,7 +315,7 @@ class EnhancedMemoryService:
 
         elif strategy == MemorySelectionStrategy.RELEVANT and query_text:
             results = await self.get_semantic_memories(
-                project_id, agent_type, query_text, max_memories
+                project_id, agent_type, query_text, max_memories, agent_id=agent_id
             )
             selected = [entry for entry, _ in results]
 
@@ -323,13 +335,14 @@ class EnhancedMemoryService:
                 memory_id=entry.id,
                 project_id=project_id,
                 agent_type=agent_type,
+                agent_id=agent_id,
                 usage_context=task_type,
                 chapter_number=current_context.get("chapter_number") if current_context else None,
             )
 
         logger.info(
             f"上下文感知记忆选择: task={task_type}, agent={agent_type}, "
-            f"strategy={strategy}, selected={len(selected)}"
+            f"agent_id={agent_id or 'default'}, strategy={strategy}, selected={len(selected)}"
         )
 
         return selected
@@ -427,9 +440,10 @@ class EnhancedMemoryService:
         self,
         project_id: str,
         agent_type: str,
+        agent_id: Optional[str] = None,
     ) -> List[MemoryEntry]:
         """默认记忆选择"""
-        memory = await self.base_service.get_memory(project_id, agent_type)
+        memory = await self.base_service.get_memory(project_id, agent_type, agent_id)
 
         # 默认：最近5条 + 重要3条
         recent = memory.get_recent_memories(5)
@@ -477,6 +491,7 @@ class EnhancedMemoryService:
         chapter_number: Optional[int] = None,
         workflow_execution_id: Optional[str] = None,
         workflow_node_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
     ):
         """记录记忆使用"""
         if not self._db:
@@ -486,11 +501,11 @@ class EnhancedMemoryService:
             # 更新访问计数
             query = """
                 INSERT INTO memory_usage_logs (
-                    memory_id, project_id, agent_type,
+                    memory_id, project_id, agent_type, agent_id,
                     usage_context, relevance_score, chapter_number,
                     workflow_execution_id, workflow_node_id
                 ) VALUES (
-                    :memory_id, CAST(:project_id AS UUID), :agent_type,
+                    :memory_id, CAST(:project_id AS UUID), :agent_type, :agent_id,
                     :usage_context, :relevance_score, :chapter_number,
                     :workflow_execution_id, :workflow_node_id
                 )
@@ -501,6 +516,7 @@ class EnhancedMemoryService:
                     "memory_id": memory_id,
                     "project_id": project_id,
                     "agent_type": agent_type,
+                    "agent_id": agent_id,
                     "usage_context": usage_context,
                     "relevance_score": relevance_score,
                     "chapter_number": chapter_number,
@@ -510,18 +526,24 @@ class EnhancedMemoryService:
             )
 
             # 更新嵌入表的访问计数
-            update_query = """
+            update_query = f"""
                 UPDATE memory_embeddings
                 SET access_count = access_count + 1,
                     last_accessed_at = NOW(),
                     last_used_context = :context,
                     last_used_in_chapter = COALESCE(:chapter, last_used_in_chapter)
                 WHERE memory_id = :memory_id
+                  AND project_id = CAST(:project_id AS UUID)
+                  AND agent_type = :agent_type
+                  {self._agent_id_filter_sql()}
             """
             await self._db.execute_write(
                 update_query,
                 {
                     "memory_id": memory_id,
+                    "project_id": project_id,
+                    "agent_type": agent_type,
+                    "agent_id": agent_id,
                     "context": usage_context,
                     "chapter": chapter_number,
                 },
@@ -535,13 +557,16 @@ class EnhancedMemoryService:
         project_id: str,
         agent_type: Optional[str] = None,
         days: int = 30,
+        agent_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """获取记忆使用统计"""
         if not self._db:
             return {}
 
         try:
-            query = """
+            agent_filter = "AND agent_type = :agent_type" if agent_type else ""
+            agent_id_filter = self._agent_id_filter_sql() if agent_type else ""
+            query = f"""
                 SELECT
                     usage_context,
                     COUNT(*) as usage_count,
@@ -549,16 +574,14 @@ class EnhancedMemoryService:
                     COUNT(DISTINCT memory_id) as unique_memories
                 FROM memory_usage_logs
                 WHERE project_id = CAST(:project_id AS UUID)
-                  AND created_at > NOW() - INTERVAL ':days days'
+                  AND created_at > NOW() - (:days * INTERVAL '1 day')
                   {agent_filter}
+                  {agent_id_filter}
                 GROUP BY usage_context
                 ORDER BY usage_count DESC
             """
 
-            agent_filter = "AND agent_type = :agent_type" if agent_type else ""
-            query = query.format(agent_filter=agent_filter)
-
-            params = {"project_id": project_id, "days": days}
+            params = {"project_id": project_id, "days": days, "agent_id": agent_id}
             if agent_type:
                 params["agent_type"] = agent_type
 
@@ -587,6 +610,7 @@ class EnhancedMemoryService:
         self,
         project_id: str,
         agent_type: str,
+        agent_id: Optional[str] = None,
     ) -> int:
         """
         应用记忆衰减
@@ -604,7 +628,7 @@ class EnhancedMemoryService:
             rules = await self._get_decay_rules()
 
             # 获取记忆
-            memory = await self.base_service.get_memory(project_id, agent_type)
+            memory = await self.base_service.get_memory(project_id, agent_type, agent_id)
 
             updated_count = 0
             now = datetime.now()
@@ -624,7 +648,9 @@ class EnhancedMemoryService:
 
             if updated_count > 0:
                 await self.base_service.save_memory(memory)
-                logger.info(f"记忆衰减完成: {agent_type}, 更新 {updated_count} 条")
+                logger.info(
+                    f"记忆衰减完成: {agent_type}, agent_id={agent_id or 'default'}, 更新 {updated_count} 条"
+                )
 
             return updated_count
 
@@ -695,6 +721,7 @@ class EnhancedMemoryService:
         entry: MemoryEntry,
         project_id: str,
         agent_type: str,
+        agent_id: Optional[str] = None,
     ):
         """存储记忆的向量嵌入"""
         # 尝试获取嵌入服务
@@ -717,15 +744,15 @@ class EnhancedMemoryService:
                 # 使用 pgvector 存储
                 query = """
                     INSERT INTO memory_embeddings (
-                        memory_id, project_id, agent_type,
+                        memory_id, project_id, agent_type, agent_id,
                         content, content_hash, embedding, embedding_vec,
                         memory_type, importance, tags
                     ) VALUES (
-                        :memory_id, CAST(:project_id AS UUID), :agent_type,
+                        :memory_id, CAST(:project_id AS UUID), :agent_type, :agent_id,
                         :content, :content_hash, :embedding::jsonb, :embedding_vec::vector,
                         :memory_type, :importance, :tags::jsonb
                     )
-                    ON CONFLICT (memory_id, project_id, agent_type) DO UPDATE SET
+                    ON CONFLICT (memory_id, project_id, agent_type, agent_id) DO UPDATE SET
                         content = EXCLUDED.content,
                         content_hash = EXCLUDED.content_hash,
                         embedding = EXCLUDED.embedding,
@@ -736,6 +763,7 @@ class EnhancedMemoryService:
                     "memory_id": entry.id,
                     "project_id": project_id,
                     "agent_type": agent_type,
+                    "agent_id": agent_id,
                     "content": entry.content,
                     "content_hash": content_hash,
                     "embedding": json.dumps(embedding),
@@ -748,15 +776,15 @@ class EnhancedMemoryService:
                 # 使用 JSONB 存储（无向量搜索能力）
                 query = """
                     INSERT INTO memory_embeddings (
-                        memory_id, project_id, agent_type,
+                        memory_id, project_id, agent_type, agent_id,
                         content, content_hash, embedding,
                         memory_type, importance, tags
                     ) VALUES (
-                        :memory_id, CAST(:project_id AS UUID), :agent_type,
+                        :memory_id, CAST(:project_id AS UUID), :agent_type, :agent_id,
                         :content, :content_hash, :embedding::jsonb,
                         :memory_type, :importance, :tags::jsonb
                     )
-                    ON CONFLICT (memory_id, project_id, agent_type) DO UPDATE SET
+                    ON CONFLICT (memory_id, project_id, agent_type, agent_id) DO UPDATE SET
                         content = EXCLUDED.content,
                         content_hash = EXCLUDED.content_hash,
                         embedding = EXCLUDED.embedding,
@@ -766,6 +794,7 @@ class EnhancedMemoryService:
                     "memory_id": entry.id,
                     "project_id": project_id,
                     "agent_type": agent_type,
+                    "agent_id": agent_id,
                     "content": entry.content,
                     "content_hash": content_hash,
                     "embedding": json.dumps(embedding),
@@ -783,16 +812,17 @@ class EnhancedMemoryService:
         self,
         project_id: str,
         agent_type: str,
+        agent_id: Optional[str] = None,
     ):
         """同步记忆嵌入（批量）"""
-        memory = await self.base_service.get_memory(project_id, agent_type)
+        memory = await self.base_service.get_memory(project_id, agent_type, agent_id)
 
         synced = 0
         for entry in memory.memories:
-            await self.store_memory_embedding(entry, project_id, agent_type)
+            await self.store_memory_embedding(entry, project_id, agent_type, agent_id=agent_id)
             synced += 1
 
-        logger.info(f"同步记忆嵌入: {agent_type}, {synced} 条")
+        logger.info(f"同步记忆嵌入: {agent_type}, agent_id={agent_id or 'default'}, {synced} 条")
         return synced
 
 

@@ -175,8 +175,15 @@ export async function getAgentTemplateByType(agentType: AgentType): Promise<Agen
 /**
  * 切换可选 Agent 模板的启用状态
  */
-export async function toggleAgentTemplate(templateId: string, enabled: boolean): Promise<{ success: boolean; message: string; template: AgentTemplate }> {
-  return await api.post(`${API_BASE}/${templateId}/toggle?enabled=${enabled}`)
+export async function toggleAgentTemplate(
+  templateId: string,
+  enabled: boolean,
+  projectId?: string,
+): Promise<{ success: boolean; message: string; template: AgentTemplate; project_config?: unknown }> {
+  const params = new URLSearchParams()
+  params.append('enabled', String(enabled))
+  if (projectId) params.append('project_id', projectId)
+  return await api.post(`${API_BASE}/${templateId}/toggle?${params.toString()}`)
 }
 
 /**

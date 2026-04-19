@@ -8,25 +8,7 @@ import { useTheme } from '@/contexts/ThemeContext'
 import type { WorkflowNode } from '@/api/workflows'
 import { X, Settings, Save, GitBranch, Plus, Trash2, ArrowDownCircle, ArrowUpCircle, BookOpen, Layers, RefreshCw } from 'lucide-react'
 import { getAgentTypeSkills, type Skill } from '@/api/skills'
-
-// Agent 类型选项
-const AGENT_TYPE_OPTIONS = [
-  { value: 'setting', label: '设定 Agent' },
-  { value: 'writer', label: '作家 Agent' },
-  { value: 'plotter', label: '编剧 Agent' },
-  { value: 'master_plotter', label: '总编剧 Agent' },
-  { value: 'character', label: '角色 Agent' },
-  { value: 'summarizer', label: '摘要 Agent' },
-  { value: 'evaluator', label: '评估 Agent' },
-  { value: 'hook_manager', label: '伏笔 Agent' },
-  { value: 'event_generator', label: '事件 Agent' },
-  { value: 'world_map_manager', label: '地图 Agent' },
-  { value: 'proc_gen', label: '过程生成 Agent' },
-  { value: 'dungeon_generator', label: '副本生成 Agent' },
-  // v9 新增
-  { value: 'plot_outline', label: '章节大纲 Agent' },
-  { value: 'scene_coordinator', label: '场景协调 Agent' },
-]
+import { getAgentTypeOptions, getWorkflowNodeTypes, type WorkflowNodeTypes } from '@/api/nodeTypes'
 
 // 数据输入来源选项
 const INPUT_SOURCE_OPTIONS = [
@@ -91,6 +73,7 @@ interface EdgeData {
 }
 
 interface PropertyPanelProps {
+  projectId?: string
   node: WorkflowNode | null
   edge: EdgeData | null
   onClose?: () => void
@@ -98,7 +81,7 @@ interface PropertyPanelProps {
   onUpdateEdge?: (edgeId: string, updates: any) => void
 }
 
-export default function PropertyPanel({ node, edge, onClose, onUpdateNode, onUpdateEdge }: PropertyPanelProps) {
+export default function PropertyPanel({ projectId, node, edge, onClose, onUpdateNode, onUpdateEdge }: PropertyPanelProps) {
   const { theme } = useTheme()
   const isDark = theme === 'dark'
 
@@ -112,6 +95,26 @@ export default function PropertyPanel({ node, edge, onClose, onUpdateNode, onUpd
   // Skills 状态
   const [agentSkills, setAgentSkills] = useState<Skill[]>([])
   const [loadingSkills, setLoadingSkills] = useState(false)
+  const [nodeTypes, setNodeTypes] = useState<WorkflowNodeTypes | null>(null)
+  const agentTypeOptions = getAgentTypeOptions(nodeTypes)
+
+  useEffect(() => {
+    let cancelled = false
+
+    getWorkflowNodeTypes(projectId)
+      .then((data) => {
+        if (!cancelled) {
+          setNodeTypes(data)
+        }
+      })
+      .catch((error) => {
+        console.error('Failed to load workflow node types:', error)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [projectId])
 
   // 加载 Agent 类型的 Skills
   const loadAgentSkills = async (agentType: string) => {
@@ -697,7 +700,7 @@ export default function PropertyPanel({ node, edge, onClose, onUpdateNode, onUpd
               `}
             >
               <option value="">选择 Agent 类型...</option>
-              {AGENT_TYPE_OPTIONS.map((opt) => (
+              {agentTypeOptions.map((opt) => (
                 <option key={opt.value} value={opt.value}>
                   {opt.label}
                 </option>

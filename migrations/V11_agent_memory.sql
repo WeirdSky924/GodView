@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS agent_memories (
 
     -- 约束
     CONSTRAINT fk_project FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
-    CONSTRAINT unique_agent_in_project UNIQUE (project_id, agent_type, agent_id)
+    CONSTRAINT unique_agent_in_project UNIQUE NULLS NOT DISTINCT (project_id, agent_type, agent_id)
 );
 
 -- 创建索引

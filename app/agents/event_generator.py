@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 class EventGeneratorAgent(BaseAgent):
     """事件生成 Agent - 独立的世界事件管理器"""
 
-    AGENT_TYPE = AgentType.PROC_GEN  # 复用枚举，但实际是独立 Agent
+    AGENT_TYPE = AgentType.EVENT_GENERATOR
 
     def __init__(
         self,
@@ -38,7 +38,7 @@ class EventGeneratorAgent(BaseAgent):
         system_prompt: Optional[str] = None,
         agent_id: Optional[str] = None,
     ):
-        if not system_prompt:
+        if not system_prompt and not project_id:
             system_prompt = self._build_system_prompt()
 
         super().__init__(
@@ -164,23 +164,51 @@ class EventGeneratorAgent(BaseAgent):
         world_info: Dict[str, Any],
     ) -> str:
         """构建事件生成提示"""
-        world_name = world_info.get("name", "未知世界")
-        world_type = world_info.get("world_type", "奇幻")
+        world_name = world_info.get("name") or "未命名世界"
+        world_type = world_info.get("world_type") or world_info.get("description") or "未提供世界类型"
+        character_names = [
+            c if isinstance(c, str) else c.get("name", "未知角色")
+            for c in (characters or [])
+            if c
+        ]
 
-        prompt = f"""请生成一个事件。
+        chapter_outline = context.get("chapter_outline") or context.get("main_scene") or context.get("plot_focus") or "无章节大纲"
+        chapter_goals = context.get("chapter_goals") or []
+        lore_entries = context.get("lore_entries") or []
+        lore_titles = []
+        for entry in lore_entries[:20]:
+            if isinstance(entry, dict):
+                title = entry.get("title") or entry.get("name") or entry.get("summary")
+                if title:
+                    lore_titles.append(title)
+            elif isinstance(entry, str):
+                lore_titles.append(entry)
+
+        prompt = f"""请基于当前项目上下文生成一个事件。
 
 【世界观】
-- 世界：{world_name} ({world_type})
+- 世界：{world_name}
+- 类型/风格：{world_type}
 
-【事件类型】
-{event_type}
+【章节目标】
+{chapter_goals if chapter_goals else '未提供'}
+
+【当前剧情焦点】
+{chapter_outline}
 
 【相关角色】
-{', '.join(characters) if characters else '无特定角色'}
+{', '.join(character_names) if character_names else '无特定角色'}
 
-【上下文】
+【相关设定关键词】
+{', '.join(lore_titles) if lore_titles else '未提供'}
+
+【补充上下文】
 {context.get('situation', '无特定情境')}
 
-请生成一个符合世界观和剧情需要的事件。输出 JSON 格式。"""
+要求：
+1. 事件必须严格贴合当前世界观与章节目标，禁止套用默认奇幻冒险套路。
+2. 如果上下文体现了明确题材（如赛博朋克、科幻、都市、武侠等），事件必须使用对应题材语言和要素。
+3. 参与者、触发条件、后果要尽量引用已有角色、设定和剧情目标。
+4. 输出 JSON 格式。"""
 
         return prompt

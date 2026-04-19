@@ -5,7 +5,7 @@ import { useDynamicWebSocket } from '@/hooks/useWebSocket'
 import { getDirectorState, getSnapshotTree } from '@/api/director'
 import { getCharacters } from '@/api/characters'
 import { getWorkflows, type WorkflowDefinition } from '@/api/workflows'
-import { useWorkflowAgents, type AgentStatus } from '@/hooks/useWorkflowAgents'
+import { useWorkflowAgents, type AgentStatus, getAgentDisplayName } from '@/hooks/useWorkflowAgents'
 import {
   Play, Pause, RotateCcw, Target, BookOpen, MessageSquare, GitBranch, Settings,
   Sparkles, FileText, Network, FolderOpen, UserPlus, UserMinus, Users, ChevronDown,
@@ -24,6 +24,8 @@ import VolumePlanner from '@/components/VolumePlanner'
 
 // ==================== Types ====================
 
+type WorkflowOrigin = 'project' | 'global_template'
+
 interface SnapshotNode {
   id: string
   name?: string
@@ -34,165 +36,153 @@ interface SnapshotNode {
 
 // ==================== Sub Components ====================
 
-// Agent 状态配置
-const AGENT_CONFIG: Record<string, { icon: string; color: string; description: string }> = {
-  'Summarizer': { icon: '📝', color: 'blue', description: '剧情总结员' },
-  'Master Plotter': { icon: '🎬', color: 'purple', description: '总编剧' },
-  'Plotter': { icon: '📋', color: 'violet', description: '编剧' },
-  'Hook Manager': { icon: '🎯', color: 'orange', description: '伏笔管理员' },
-  'Writer': { icon: '✍️', color: 'green', description: '内容执行官' },
-  'Evaluator': { icon: '🔍', color: 'red', description: '剧情评估员' },
-  'Character Agent': { icon: '🎭', color: 'pink', description: '角色演绎' },
-  'Setting': { icon: '⚙️', color: 'indigo', description: '设定 Agent' },
-  'Event Generator': { icon: '🎲', color: 'pink', description: '事件生成' },
-  'World Map': { icon: '🗺️', color: 'teal', description: '地图管理' },
-  'ProcGen': { icon: '⚡', color: 'yellow', description: '过程生成' },
-  'Dungeon Generator': { icon: '🏰', color: 'emerald', description: '副本生成' },
-  'Plot Outline': { icon: '📑', color: 'rose', description: '章节大纲' },
-  'Scene Coordinator': { icon: '🎪', color: 'sky', description: '场景协调' },
-}
-
-// Agent 名称到 agent_type 的映射（用于工作流）
-const AGENT_TYPE_MAP: Record<string, string> = {
-  'Summarizer': 'summarizer',
+const LEGACY_AGENT_KEY_MAP: Record<string, string> = {
+  Summarizer: 'summarizer',
   'Master Plotter': 'master_plotter',
-  'Plotter': 'plotter',
+  Plotter: 'plotter',
   'Hook Manager': 'hook_manager',
-  'Writer': 'writer',
-  'Evaluator': 'evaluator',
+  Writer: 'writer',
+  Evaluator: 'evaluator',
   'Character Agent': 'character',
-  'Setting': 'setting',
+  Setting: 'setting',
+  'Setting Agent': 'setting',
   'Event Generator': 'event_generator',
+  'Event Agent': 'event_generator',
   'World Map': 'world_map_manager',
-  'ProcGen': 'proc_gen',
+  'Map Agent': 'world_map_manager',
+  ProcGen: 'proc_gen',
+  'ProcGen Agent': 'proc_gen',
   'Dungeon Generator': 'dungeon_generator',
+  'Dungeon Generator Agent': 'dungeon_generator',
+  'Dungeon Agent': 'dungeon_generator',
   'Plot Outline': 'plot_outline',
+  'Plot Outline Agent': 'plot_outline',
   'Scene Coordinator': 'scene_coordinator',
+  'Scene Coordinator Agent': 'scene_coordinator',
+  '摘要 Agent': 'summarizer',
+  '总编剧 Agent': 'master_plotter',
+  '编剧 Agent': 'plotter',
+  '伏笔 Agent': 'hook_manager',
+  '作家 Agent': 'writer',
+  '评估 Agent': 'evaluator',
+  '角色 Agent': 'character',
+  '设定 Agent': 'setting',
+  '事件 Agent': 'event_generator',
+  '地图 Agent': 'world_map_manager',
+  '过程生成 Agent': 'proc_gen',
+  '副本生成 Agent': 'dungeon_generator',
+  '章节大纲 Agent': 'plot_outline',
+  '场景协调 Agent': 'scene_coordinator',
 }
 
-// 从节点标签/agent_type 映射到前端 Agent 名称
-const NODE_TO_AGENT_MAP: Record<string, string> = {
-  // agent_type -> Agent 名称
-  'summarizer': 'Summarizer',
-  'master_plotter': 'Master Plotter',
-  'plotter': 'Plotter',
-  'hook_manager': 'Hook Manager',
-  'writer': 'Writer',
-  'evaluator': 'Evaluator',
-  'character': 'Character Agent',
-  'setting': 'Setting',
-  'event_generator': 'Event Generator',
-  'world_map_manager': 'World Map',
-  'proc_gen': 'ProcGen',
-  'dungeon_generator': 'Dungeon Generator',
-  'plot_outline': 'Plot Outline',
-  'scene_coordinator': 'Scene Coordinator',
-  // 节点标签 -> Agent 名称
-  '剧情总结员': 'Summarizer',
-  '总编剧': 'Master Plotter',
-  '编剧 Agent': 'Plotter',
-  '编剧': 'Plotter',
-  '伏笔管理员': 'Hook Manager',
-  '伏笔 Agent': 'Hook Manager',
-  '伏笔': 'Hook Manager',
-  '内容执行官': 'Writer',
-  '作家 Agent': 'Writer',
-  '作家': 'Writer',
-  '剧情评估员': 'Evaluator',
-  '评估 Agent': 'Evaluator',
-  '评估': 'Evaluator',
-  '角色演绎': 'Character Agent',
-  '角色 Agent': 'Character Agent',
-  '角色': 'Character Agent',
-  '设定 Agent': 'Setting',
-  '设定': 'Setting',
-  '事件 Agent': 'Event Generator',
-  '事件': 'Event Generator',
-  '地图 Agent': 'World Map',
-  '地图': 'World Map',
-  // 英文标签
-  'Map Agent': 'World Map',
-  'Event Agent': 'Event Generator',
-  'Setting Agent': 'Setting',
-  'Plotter Agent': 'Plotter',
-  'Character Agent': 'Character Agent',
-  'Writer Agent': 'Writer',
-  'Evaluator Agent': 'Evaluator',
-  'Hook Agent': 'Hook Manager',
-  'ProcGen Agent': 'ProcGen',
-  'Dungeon Agent': 'Dungeon Generator',
-  'Dungeon Generator Agent': 'Dungeon Generator',
-  'Plot Outline Agent': 'Plot Outline',
-  'Scene Coordinator Agent': 'Scene Coordinator',
-  '过程生成 Agent': 'ProcGen',
-  '副本生成 Agent': 'Dungeon Generator',
-  '章节大纲 Agent': 'Plot Outline',
-  '场景协调 Agent': 'Scene Coordinator',
+function normalizeAgentIdentifier(value?: string): string | null {
+  if (!value) return null
+  return LEGACY_AGENT_KEY_MAP[value] || value
 }
 
-// 节点类型到显示名称的映射
-const NODE_TYPE_DISPLAY_NAMES: Record<string, string> = {
-  'start': '开始节点',
-  'end': '结束节点',
-  'agent': 'Agent',
-  'condition': '条件判断',
-  'parallel': '并行执行',
-  'group_discussion': '集体讨论',
-  'input': '用户输入',
+function resolveAgentKey(data: {
+  agent?: string
+  agent_type?: string
+  label?: string
+  node_type?: string
+  node_id?: string
+}): string | null {
+  const normalizedAgent = normalizeAgentIdentifier(data.agent)
+  const normalizedAgentType = normalizeAgentIdentifier(data.agent_type)
+
+  if (data.node_type === 'scene_performance' && data.node_id) {
+    return `scene_performance:${data.node_id}`
+  }
+
+  if (normalizedAgent === 'character' && data.label) {
+    return `character:${data.label}`
+  }
+
+  if (normalizedAgentType === 'character' && data.label) {
+    return `character:${data.label}`
+  }
+
+  if (normalizedAgent) {
+    return normalizedAgent
+  }
+
+  if (normalizedAgentType) {
+    return normalizedAgentType
+  }
+
+  if (data.node_id) {
+    return data.node_id
+  }
+
+  return null
 }
 
-// 根据节点信息获取对应的显示名称
-function getDisplayNameFromNode(data: any): string {
-  // 1. 优先使用 label 映射到 Agent 名称
-  if (data.label && NODE_TO_AGENT_MAP[data.label]) {
-    return NODE_TO_AGENT_MAP[data.label]
-  }
-  // 2. 使用 agent_type 映射
-  if (data.agent_type && NODE_TO_AGENT_MAP[data.agent_type]) {
-    return NODE_TO_AGENT_MAP[data.agent_type]
-  }
-  // 3. 尝试模糊匹配 label
-  if (data.label) {
-    const labelLower = data.label.toLowerCase()
-    if (labelLower.includes('编剧') || labelLower.includes('plotter')) return 'Master Plotter'
-    if (labelLower.includes('作家') || labelLower.includes('writer')) return 'Writer'
-    if (labelLower.includes('伏笔') || labelLower.includes('hook')) return 'Hook Manager'
-    if (labelLower.includes('评估') || labelLower.includes('evaluator')) return 'Evaluator'
-    if (labelLower.includes('摘要') || labelLower.includes('summarizer')) return 'Summarizer'
-    if (labelLower.includes('角色') || labelLower.includes('character')) return 'Character Agent'
-    if (labelLower.includes('事件') || labelLower.includes('event')) return 'Event Generator'
-    if (labelLower.includes('地图') || labelLower.includes('map')) return 'World Map'
-    if (labelLower.includes('设定') || labelLower.includes('setting')) return 'Setting'
-    // 如果 label 存在但没匹配到 Agent，直接返回 label
-    return data.label
-  }
-  // 4. 使用 agent_type 模糊匹配
-  if (data.agent_type) {
-    const typeLower = data.agent_type.toLowerCase()
-    if (typeLower.includes('plotter')) return 'Master Plotter'
-    if (typeLower.includes('writer')) return 'Writer'
-    if (typeLower.includes('hook')) return 'Hook Manager'
-    if (typeLower.includes('evaluator')) return 'Evaluator'
-    if (typeLower.includes('summarizer')) return 'Summarizer'
-    if (typeLower.includes('character')) return 'Character Agent'
-    if (typeLower.includes('event')) return 'Event Generator'
-    if (typeLower.includes('world') || typeLower.includes('map')) return 'World Map'
-    if (typeLower.includes('setting')) return 'Setting'
-  }
-  // 5. 使用节点类型显示名称
-  if (data.node_type && NODE_TYPE_DISPLAY_NAMES[data.node_type]) {
-    return NODE_TYPE_DISPLAY_NAMES[data.node_type]
-  }
-  // 6. 最后返回节点 ID
-  return data.node_id || '未知节点'
+function getNodeDisplayName(data: {
+  agent?: string
+  agent_type?: string
+  label?: string
+  node_type?: string
+  node_id?: string
+}): string {
+  return getAgentDisplayName({
+    agent_type: normalizeAgentIdentifier(data.agent) ?? normalizeAgentIdentifier(data.agent_type) ?? undefined,
+    label: data.label,
+    node_type: data.node_type,
+    node_id: data.node_id,
+  }) || data.node_id || '未知节点'
 }
 
-// 保持向后兼容的函数
-function getAgentNameFromNode(data: any): string | null {
-  const displayName = getDisplayNameFromNode(data)
-  // 如果返回的是 Agent 名称，返回它；否则返回 null
-  const agentNames = ['Summarizer', 'Master Plotter', 'Writer', 'Evaluator', 'Hook Manager', 'Character Agent', 'Setting', 'Event Generator', 'World Map']
-  return agentNames.includes(displayName) ? displayName : null
+function getAgentStateKey(data: {
+  agent?: string
+  agent_type?: string
+  label?: string
+  node_type?: string
+  node_id?: string
+}): string | null {
+  const preferredKey = resolveAgentKey(data)
+  if (preferredKey) {
+    return preferredKey
+  }
+
+  const displayName = getAgentDisplayName({
+    agent_type: normalizeAgentIdentifier(data.agent) ?? normalizeAgentIdentifier(data.agent_type) ?? undefined,
+    label: data.label,
+    node_type: data.node_type,
+    node_id: data.node_id,
+  })
+  return displayName || null
+}
+
+function getWorkflowOrigin(workflow: WorkflowDefinition): WorkflowOrigin {
+  return workflow.is_template && workflow.project_id === null ? 'global_template' : 'project'
+}
+
+function getWorkflowDisplayName(workflow: WorkflowDefinition): string {
+  return getWorkflowOrigin(workflow) === 'global_template'
+    ? `${workflow.name}（全局模板）`
+    : workflow.name
+}
+
+function getSelectedWorkflow(workflows: WorkflowDefinition[], workflowId: string): WorkflowDefinition | null {
+  return workflows.find(w => w.id === workflowId) || null
+}
+
+function getPreferredWorkflowId(workflows: WorkflowDefinition[], currentWorkflowId: string): string {
+  if (currentWorkflowId && workflows.some(w => w.id === currentWorkflowId)) {
+    return currentWorkflowId
+  }
+
+  const allBuiltinTemplate = workflows.find(w => w.id === 'template_all_builtin_workflow')
+  if (allBuiltinTemplate) {
+    return allBuiltinTemplate.id
+  }
+
+  const globalTemplate = workflows.find(w => getWorkflowOrigin(w) === 'global_template')
+  if (globalTemplate) {
+    return globalTemplate.id
+  }
+
+  return workflows[0]?.id || ''
 }
 
 // Agent 状态指示器
@@ -210,7 +200,7 @@ function AgentStatusBar({ agents, isDark }: { agents: AgentStatus[], isDark: boo
     <div className="flex items-center gap-1.5">
       {agents.map((agent) => (
         <div
-          key={agent.name}
+          key={agent.id || agent.agent_type || agent.name}
           className={`w-2.5 h-2.5 rounded-full ${getStatusColor(agent.status)} transition-all cursor-pointer hover:scale-125`}
           title={`${agent.name} - ${agent.message}`}
         />
@@ -237,11 +227,11 @@ function AgentStatusCard({
   onInterventionChange: (value: string) => void
   onSendIntervention: () => void
 }) {
-  // 优先使用 agent 自带的配置，否则 fallback 到 AGENT_CONFIG
+  // 优先使用 agent 自带的配置
   const config = {
-    icon: agent.icon || AGENT_CONFIG[agent.name]?.icon || '🤖',
-    color: agent.color || AGENT_CONFIG[agent.name]?.color || 'gray',
-    description: agent.description || AGENT_CONFIG[agent.name]?.description || agent.name,
+    icon: agent.icon || '🤖',
+    color: agent.color || 'gray',
+    description: agent.description || agent.name,
   }
   const isWorking = agent.status === 'working'
   const hasOutput = streamingContent || lastOutput
@@ -679,13 +669,16 @@ export default function Director() {
   const [savedWorkflows, setSavedWorkflows] = useState<WorkflowDefinition[]>([])
   const [selectedWorkflowId, setSelectedWorkflowId] = useState('')
 
+  const selectedWorkflow = useMemo(
+    () => getSelectedWorkflow(savedWorkflows, selectedWorkflowId),
+    [savedWorkflows, selectedWorkflowId],
+  )
+
   // 检查当前选中的工作流是否包含 group_discussion 节点
   const hasGroupDiscussionNode = useMemo(() => {
-    if (!selectedWorkflowId || savedWorkflows.length === 0) return false
-    const workflow = savedWorkflows.find(w => w.id === selectedWorkflowId)
-    if (!workflow) return false
-    return workflow.nodes.some(node => node.node_type === 'group_discussion')
-  }, [selectedWorkflowId, savedWorkflows])
+    if (!selectedWorkflow) return false
+    return selectedWorkflow.nodes.some(node => node.node_type === 'group_discussion')
+  }, [selectedWorkflow])
 
   // 使用 useWorkflowAgents hook 动态生成 Agent 列表
   const {
@@ -699,7 +692,7 @@ export default function Director() {
     clearAgentStreaming,
     updateAgentStreaming,
     resetAll: resetWorkflowAgents,
-  } = useWorkflowAgents(selectedWorkflowId, savedWorkflows)
+  } = useWorkflowAgents(selectedWorkflowId, savedWorkflows, currentProject?.id)
 
   // Auto mode state
   const [autoModeRunning, setAutoModeRunning] = useState(false)
@@ -757,28 +750,27 @@ export default function Director() {
   }>>([])
 
   // 设置特定Agent的干预输入
-  const setAgentInput = (agentName: string, value: string) => {
-    setAgentInterventionInputs(prev => ({ ...prev, [agentName]: value }))
+  const setAgentInput = (agentKey: string, value: string) => {
+    setAgentInterventionInputs(prev => ({ ...prev, [agentKey]: value }))
   }
 
   // 发送干预到特定Agent
-  const sendAgentIntervention = (agentName: string) => {
-    const input = agentInterventionInputs[agentName] || ''
+  const sendAgentIntervention = (agent: AgentStatus) => {
+    const agentKey = agent.id || agent.agent_type || agent.name
+    const input = agentInterventionInputs[agentKey] || ''
     if (!input.trim() || !isGenerating || wsStatus !== 'connected') return
 
     const timestamp = new Date().toLocaleTimeString()
-    // 获取 agent_type（用于工作流匹配）
-    const agentType = AGENT_TYPE_MAP[agentName] || agentName.toLowerCase().replace(' ', '_')
 
     send({
       type: 'intervention',
-      agent: agentName,
-      agent_type: agentType,  // 工作流使用的类型
+      agent: agent.name,
+      agent_type: agent.agent_type,
       message: input.trim(),
     })
-    addLog(`📤 向 ${agentName} 发送干预: ${input.trim()}`)
-    setInterventionHistory(prev => [...prev, { agent: agentName, message: input.trim(), timestamp }])
-    setAgentInput(agentName, '') // 清空输入
+    addLog(`📤 向 ${agent.name} 发送干预: ${input.trim()}`)
+    setInterventionHistory(prev => [...prev, { agent: agent.name, message: input.trim(), timestamp }])
+    setAgentInput(agentKey, '')
   }
 
   // Modals
@@ -798,11 +790,20 @@ export default function Director() {
     setLogs(prev => [`[${timestamp}] ${message}`, ...prev.slice(0, 199)])
   }
 
-  const updateAgent = (name: string, patch: Partial<AgentStatus>) => {
-    // 使用 hook 提供的 updateAgentStatus 或直接更新
-    if (patch.status) {
-      updateAgentStatus(name, patch.status, patch.message)
+  const updateAgentFromNode = (
+    data: { agent?: string; agent_type?: string; label?: string; node_type?: string; node_id?: string },
+    patch: Partial<AgentStatus>,
+  ) => {
+    if (!patch.status) return
+
+    const agentKey = getAgentStateKey(data)
+    if (agentKey) {
+      updateAgentStatus(agentKey, patch.status, patch.message)
+      return
     }
+
+    const displayName = getNodeDisplayName(data)
+    updateAgentStatus(displayName, patch.status, patch.message)
   }
 
   const getWorkingAgentName = () => agents.find(a => a.status === 'working')?.message || null
@@ -828,180 +829,125 @@ export default function Director() {
         case 'log':
           addLog(data.message)
           break
-        case 'agent_status':
-          updateAgent(data.agent, { status: data.status, message: data.message })
-          // 如果有输出数据，记录到agentOutputs
+        case 'agent_status': {
+          const statusKey = getAgentStateKey({
+            agent: data.agent,
+            agent_type: data.agent_type,
+            label: data.label,
+            node_type: data.node_type,
+            node_id: data.node_id,
+          })
+
+          if (statusKey) {
+            updateAgentStatus(statusKey, data.status, data.message)
+          }
+
           if (data.output) {
-            setAgentOutputs(prev => ({
+            const output = typeof data.output === 'string' ? data.output : JSON.stringify(data.output, null, 2)
+            if (statusKey) {
+              setAgentOutput(statusKey, output)
+            }
+          }
+
+          if (data.status !== 'working' && statusKey) {
+            clearAgentStreaming(statusKey)
+          }
+          break
+        }
+        case 'agent_streaming': {
+          const streamData = data.data || data
+          if (streamData.chunk) {
+            const streamKey = getAgentStateKey({
+              agent: streamData.agent,
+              agent_type: streamData.agent_type,
+              label: streamData.label,
+              node_type: streamData.node_type,
+              node_id: streamData.node_id,
+            })
+
+            if (streamKey) {
+              appendAgentStreaming(streamKey, streamData.chunk)
+            }
+          }
+          break
+        }
+        case 'agent_output': {
+          const outputData = data.data || data
+          if (outputData.output) {
+            const outputStr = typeof outputData.output === 'string' ? outputData.output : JSON.stringify(outputData.output, null, 2)
+            const outputKey = getAgentStateKey({
+              agent: outputData.agent,
+              agent_type: outputData.agent_type,
+              label: outputData.label,
+              node_type: outputData.node_type,
+              node_id: outputData.node_id,
+            })
+
+            if (outputKey) {
+              setAgentOutput(outputKey, outputStr)
+              clearAgentStreaming(outputKey)
+            }
+          }
+          break
+        }
+        case 'node_output': {
+          const nodeData = data.data || data
+          if (nodeData.output) {
+            const outputStr = typeof nodeData.output === 'string' ? nodeData.output : JSON.stringify(nodeData.output, null, 2)
+            const nodeKey = getAgentStateKey(nodeData)
+            const displayName = getNodeDisplayName(nodeData)
+
+            if (nodeKey) {
+              setAgentOutput(nodeKey, outputStr)
+            }
+
+            addLog(`📤 ${displayName}: ${outputStr}`)
+          }
+          break
+        }
+        case 'node_started': {
+          const nodeData = data.data || data
+          const displayName = getNodeDisplayName(nodeData)
+          addLog(`🔄 ${displayName} 开始执行`)
+          updateAgentFromNode(nodeData, { status: 'working', message: nodeData.label || '执行中' })
+
+          const nodeKey = getAgentStateKey(nodeData)
+          if (nodeKey) {
+            updateAgentStreaming(prev => ({
               ...prev,
-              [data.agent]: typeof data.output === 'string' ? data.output : JSON.stringify(data.output, null, 2)
+              [nodeKey]: prev[nodeKey] || '',
             }))
           }
-          // 如果状态变为completed/idle/error，清除流式输出
-          if (data.status !== 'working') {
-            updateAgentStreaming(prev => {
-              const next = { ...prev }
-              delete next[data.agent]
-              return next
-            })
+          break
+        }
+        case 'node_completed': {
+          const nodeData = data.data || data
+          const displayName = getNodeDisplayName(nodeData)
+          const nodeKey = getAgentStateKey(nodeData)
+
+          if (nodeData.status === 'failed' || nodeData.error) {
+            addLog(`❌ ${displayName} 执行失败: ${nodeData.error || '未知错误'}`)
+            updateAgentFromNode(nodeData, { status: 'error', message: nodeData.error || '执行失败' })
+          } else {
+            addLog(`✅ ${displayName} 完成`)
+            updateAgentFromNode(nodeData, { status: 'completed', message: nodeData.label || '完成' })
+          }
+
+          if (nodeKey) {
+            clearAgentStreaming(nodeKey)
           }
           break
-        case 'agent_streaming':
-          // Agent 流式输出 - 实时更新
-          {
-            const streamData = data.data || data
-            if (streamData.chunk) {
-              const agentName = getAgentNameFromNode({ agent_type: streamData.agent, label: streamData.label })
-              const streamKey = agentName || streamData.agent || streamData.node_id
-
-              // 调试日志
-              console.log(`[流式输出] agent: ${streamData.agent}, label: ${streamData.label}, agentName: ${agentName}, streamKey: ${streamKey}`)
-
-              updateAgentStreaming(prev => ({
-                ...prev,
-                [streamKey]: (prev[streamKey] || '') + streamData.chunk
-              }))
-
-              // 同时更新 Agent 输出记录
-              if (agentName) {
-                setAgentOutputs(prev => ({
-                  ...prev,
-                  [agentName]: (prev[agentName] || '') + streamData.chunk
-                }))
-              }
+        }
+        case 'node_streaming': {
+          const nodeData = data.data || data
+          if (nodeData.chunk) {
+            const streamKey = getAgentStateKey(nodeData)
+            if (streamKey) {
+              appendAgentStreaming(streamKey, nodeData.chunk)
             }
           }
           break
-        case 'agent_output':
-          // Agent 完整输出
-          {
-            const outputData = data.data || data
-            if (outputData.agent && outputData.output) {
-              const outputStr = typeof outputData.output === 'string' ? outputData.output : JSON.stringify(outputData.output, null, 2)
-              setAgentOutputs(prev => ({
-                ...prev,
-                [outputData.agent]: outputStr.slice(0, 1000)
-              }))
-              // 清除流式输出
-              updateAgentStreaming(prev => {
-                const next = { ...prev }
-                delete next[outputData.agent]
-                return next
-              })
-            }
-          }
-          break
-        case 'node_output':
-          // 工作流节点输出
-          {
-            const nodeData = data.data || data
-            if (nodeData.output) {
-              const outputStr = typeof nodeData.output === 'string' ? nodeData.output : JSON.stringify(nodeData.output, null, 2)
-              const agentName = getAgentNameFromNode(nodeData)
-
-              // 更新节点输出
-              if (nodeData.node_id) {
-                setAgentOutputs(prev => ({
-                  ...prev,
-                  [nodeData.node_id]: outputStr.slice(0, 500)
-                }))
-              }
-
-              // 同时更新对应 Agent 的输出
-              if (agentName) {
-                setAgentOutputs(prev => ({
-                  ...prev,
-                  [agentName]: outputStr.slice(0, 1000)
-                }))
-              }
-
-              const displayName = agentName || nodeData.label || nodeData.node_id
-              addLog(`📤 ${displayName}: ${outputStr.slice(0, 100)}...`)
-            }
-          }
-          break
-        case 'node_started':
-          // 节点开始执行
-          {
-            const nodeData = data.data || data
-            const agentName = getAgentNameFromNode(nodeData)
-            const displayName = agentName || nodeData.label || nodeData.node_id
-            addLog(`🔄 ${displayName} 开始执行`)
-
-            // 更新对应 Agent 的状态
-            if (agentName) {
-              updateAgent(agentName, { status: 'working', message: nodeData.label || '执行中' })
-            }
-
-            // 记录流式输出
-            if (nodeData.node_id) {
-              updateAgentStreaming(prev => ({
-                ...prev,
-                [nodeData.node_id]: ''
-              }))
-            }
-          }
-          break
-        case 'node_completed':
-          // 节点执行完成
-          {
-            const nodeData = data.data || data
-            const agentName = getAgentNameFromNode(nodeData)
-            const displayName = agentName || nodeData.label || nodeData.node_id
-
-            // 检查是否失败
-            if (nodeData.status === 'failed' || nodeData.error) {
-              addLog(`❌ ${displayName} 执行失败: ${nodeData.error || '未知错误'}`)
-              if (agentName) {
-                updateAgent(agentName, { status: 'error', message: nodeData.error || '执行失败' })
-              }
-            } else {
-              addLog(`✅ ${displayName} 完成`)
-              if (agentName) {
-                updateAgent(agentName, { status: 'completed', message: nodeData.label || '完成' })
-              }
-            }
-
-            // 清除流式输出
-            if (nodeData.node_id) {
-              updateAgentStreaming(prev => {
-                const next = { ...prev }
-                delete next[nodeData.node_id]
-                return next
-              })
-            }
-            if (agentName) {
-              updateAgentStreaming(prev => {
-                const next = { ...prev }
-                delete next[agentName]
-                return next
-              })
-            }
-          }
-          break
-        case 'node_streaming':
-          // 节点流式输出
-          {
-            const nodeData = data.data || data
-            if (nodeData.chunk) {
-              const agentName = getAgentNameFromNode(nodeData)
-              const streamKey = agentName || nodeData.node_id
-
-              updateAgentStreaming(prev => ({
-                ...prev,
-                [streamKey]: (prev[streamKey] || '') + nodeData.chunk
-              }))
-
-              // 同时更新 Agent 输出记录
-              if (agentName) {
-                setAgentOutputs(prev => ({
-                  ...prev,
-                  [agentName]: (prev[agentName] || '') + nodeData.chunk
-                }))
-              }
-            }
-          }
-          break
+        }
         case 'session_started':
           addLog(`✅ 会话已启动`)
           setIsGenerating(true)
@@ -1015,7 +961,7 @@ export default function Director() {
           break
         case 'hooks_managed':
           addLog('🎯 伏笔管理完成')
-          setAgentOutputs(prev => ({ ...prev, 'Hook Manager': JSON.stringify(data.data || {}, null, 2).slice(0, 500) }))
+          setAgentOutput('hook_manager', JSON.stringify(data.data || {}, null, 2))
           loadRuntimePanels()
           break
         case 'group_discussion_started':
@@ -1040,7 +986,7 @@ export default function Director() {
           const messageContent = data.data?.content || ''
           const isLLMGenerated = data.data?.is_llm_generated
           // 添加日志
-          addLog(`💬 ${speakerName}: ${messageContent.slice(0, 50)}${messageContent.length > 50 ? '...' : ''}${isLLMGenerated ? ' 🤖' : ''}`)
+          addLog(`💬 ${speakerName}: ${messageContent}${isLLMGenerated ? ' 🤖' : ''}`)
           // 更新讨论状态
           setGroupDiscussion(prev => {
             if (prev) {
@@ -1121,26 +1067,32 @@ export default function Director() {
           break
         case 'agent_response':
           // Agent 干预响应
-          addLog(`💬 ${data.agent}: ${data.response?.slice(0, 50) || '已响应'}...`)
+          addLog(`💬 ${data.agent}: ${data.response || '已响应'}`)
           setInterventionHistory(prev => prev.map(item =>
             item.agent === data.agent && !item.response
               ? { ...item, response: data.response }
               : item
           ))
           if (data.agent) {
-            setAgentOutputs(prev => ({ ...prev, [data.agent]: data.response || '' }))
+            const responseKey = getAgentStateKey({ agent: data.agent, agent_type: data.agent_type, label: data.label })
+            if (responseKey) {
+              setAgentOutput(responseKey, data.response || '')
+            }
           }
           break
         case 'intervention_response':
           // 干预响应
-          addLog(`💬 ${data.agent}: ${data.response?.slice(0, 80) || '已响应'}...`)
+          addLog(`💬 ${data.agent}: ${data.response || '已响应'}`)
           setInterventionHistory(prev => prev.map(item =>
             item.agent === data.agent && !item.response
               ? { ...item, response: data.response }
               : item
           ))
           if (data.agent) {
-            setAgentOutputs(prev => ({ ...prev, [data.agent]: data.response || '' }))
+            const responseKey = getAgentStateKey({ agent: data.agent, agent_type: data.agent_type, label: data.label })
+            if (responseKey) {
+              setAgentOutput(responseKey, data.response || '')
+            }
           }
           break
         case 'intervention_queued':
@@ -1159,7 +1111,7 @@ export default function Director() {
           break
         default:
           if (data.type !== 'heartbeat') {
-            addLog(`${data.type}: ${JSON.stringify(data.data || {}).slice(0, 50)}`)
+            addLog(`${data.type}: ${JSON.stringify(data.data || {})}`)
           }
       }
     },
@@ -1195,6 +1147,7 @@ export default function Director() {
     try {
       const workflows = await getWorkflows(currentProject.id, true)
       setSavedWorkflows(workflows)
+      setSelectedWorkflowId((currentId) => getPreferredWorkflowId(workflows, currentId))
     } catch (error) {
       console.error('Failed to load workflows:', error)
     }
@@ -1426,7 +1379,7 @@ export default function Director() {
                   <select
                     value={selectedWorkflowId}
                     onChange={(e) => setSelectedWorkflowId(e.target.value)}
-                    className={`flex-1 max-w-[220px] px-4 py-2 rounded-lg border text-sm ${
+                    className={`flex-1 max-w-[260px] px-4 py-2 rounded-lg border text-sm ${
                       isDark
                         ? 'bg-gray-800 border-gray-700 text-white'
                         : 'bg-white border-gray-200 text-gray-800'
@@ -1434,7 +1387,10 @@ export default function Director() {
                   >
                     <option value="">选择工作流...</option>
                     {savedWorkflows.map(wf => (
-                      <option key={wf.id} value={wf.id}>{wf.name} ({wf.nodes.length} 节点)</option>
+                      <option key={wf.id} value={wf.id}>
+                        {getWorkflowOrigin(wf) === 'global_template' ? '[模板] ' : ''}
+                        {wf.name} ({wf.nodes.length} 节点)
+                      </option>
                     ))}
                   </select>
                   <button
@@ -1455,11 +1411,30 @@ export default function Director() {
                   </button>
                 </div>
               </div>
-              {savedWorkflows.length === 0 && (
+              {savedWorkflows.length === 0 ? (
                 <p className={`mt-3 text-xs ${isDark ? 'text-gray-600' : 'text-gray-400'}`}>
                   💡 请先在「可视化工作台」创建工作流
                 </p>
-              )}
+              ) : selectedWorkflow ? (
+                <div className={`mt-3 flex items-center gap-2 text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+                  {getWorkflowOrigin(selectedWorkflow) === 'global_template' && (
+                    <span className={`px-2 py-1 rounded-full border ${
+                      isDark
+                        ? 'border-blue-800 bg-blue-900/30 text-blue-300'
+                        : 'border-blue-200 bg-blue-50 text-blue-700'
+                    }`}>
+                      全局模板
+                    </span>
+                  )}
+                  <span>
+                    当前将执行：
+                    <strong className={isDark ? 'text-white' : 'text-gray-800'}>
+                      {' '}
+                      {getWorkflowDisplayName(selectedWorkflow)}
+                    </strong>
+                  </span>
+                </div>
+              ) : null}
             </div>
           </div>
 
@@ -1521,9 +1496,9 @@ export default function Director() {
                   isDark={isDark}
                   lastOutput={agentOutputs[agent.id || agent.agent_type || agent.name]}
                   streamingContent={agentStreaming[agent.id || agent.agent_type || agent.name]}
-                  interventionInput={agentInterventionInputs[agent.name] || ''}
-                  onInterventionChange={(value) => setAgentInput(agent.name, value)}
-                  onSendIntervention={() => sendAgentIntervention(agent.name)}
+                  interventionInput={agentInterventionInputs[agent.id || agent.agent_type || agent.name] || ''}
+                  onInterventionChange={(value) => setAgentInput(agent.id || agent.agent_type || agent.name, value)}
+                  onSendIntervention={() => sendAgentIntervention(agent)}
                 />
               ))}
             </div>
@@ -1932,7 +1907,7 @@ export default function Director() {
             <div className={`p-3 rounded-lg border ${isDark ? 'border-blue-800 bg-blue-900/20' : 'border-blue-200 bg-blue-50'}`}>
               <p className={`text-xs font-medium mb-1 ${isDark ? 'text-blue-400' : 'text-blue-600'}`}>当前工作流</p>
               <p className={`text-sm font-semibold ${isDark ? 'text-blue-300' : 'text-blue-700'}`}>
-                {savedWorkflows.find(w => w.id === selectedWorkflowId)?.name}
+                {selectedWorkflow ? getWorkflowDisplayName(selectedWorkflow) : ''}
               </p>
             </div>
           )}
@@ -1998,7 +1973,7 @@ export default function Director() {
             <div className={`p-3 rounded-lg border ${isDark ? 'border-blue-800 bg-blue-900/20' : 'border-blue-200 bg-blue-50'}`}>
               <p className={`text-xs font-medium mb-1 ${isDark ? 'text-blue-400' : 'text-blue-600'}`}>当前工作流</p>
               <p className={`text-sm font-semibold ${isDark ? 'text-blue-300' : 'text-blue-700'}`}>
-                {savedWorkflows.find(w => w.id === selectedWorkflowId)?.name}
+                {selectedWorkflow ? getWorkflowDisplayName(selectedWorkflow) : ''}
               </p>
             </div>
           )}

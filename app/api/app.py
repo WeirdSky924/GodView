@@ -145,15 +145,30 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     try:
         from app.api.routes.agent_templates import set_agent_template_service, set_prompt_service as set_agent_prompt_service
         from app.services.agent_template_service import AgentTemplateService
+        from app.services.agent_prompt_service import set_agent_prompt_service as set_runtime_agent_prompt_service
         from app.data.system_agent_templates import SYSTEM_AGENT_TEMPLATES
         agent_template_service = AgentTemplateService(db=postgres_db)
         await agent_template_service.initialize_system_templates(SYSTEM_AGENT_TEMPLATES)
         set_agent_template_service(agent_template_service)
         # 共享 prompt_service 给 agent_templates
         set_agent_prompt_service(prompt_service)
+        set_runtime_agent_prompt_service(prompt_service, agent_template_service)
         logger.info(f"系统 Agent 模板初始化完成: {len(SYSTEM_AGENT_TEMPLATES)} 个模板")
     except Exception as e:
         logger.warning(f"系统 Agent 模板初始化失败：{e}")
+
+    # 初始化项目级 Agent 配置服务
+    try:
+        from app.services.agent_config_service import AgentConfigService, set_agent_config_service
+        agent_config_service = AgentConfigService(
+            db=postgres_db,
+            agent_template_service=agent_template_service,
+        )
+        await agent_config_service._ensure_cache()
+        set_agent_config_service(agent_config_service)
+        logger.info(f"项目 Agent 配置服务初始化完成: {len(agent_config_service._configs)} 个配置")
+    except Exception as e:
+        logger.warning(f"项目 Agent 配置服务初始化失败：{e}")
 
     # 初始化 Skill 服务（从 MD 文件同步）
     try:

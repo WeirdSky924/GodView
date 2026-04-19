@@ -13,7 +13,6 @@ import {
   CheckCircle,
   XCircle,
   Pause,
-  Play,
   Loader2,
   ChevronDown,
   ChevronRight,
@@ -31,6 +30,40 @@ const STATUS_ICONS: Record<string, React.ReactNode> = {
   completed: <CheckCircle size={14} className="text-green-500" />,
   failed: <XCircle size={14} className="text-red-500" />,
   skipped: <Pause size={14} className="text-gray-400" />,
+}
+
+function JsonBlock({
+  title,
+  value,
+  isDark,
+}: {
+  title: string
+  value: unknown
+  isDark: boolean
+}) {
+  if (
+    value == null ||
+    (typeof value === 'object' && !Array.isArray(value) && Object.keys(value as Record<string, unknown>).length === 0) ||
+    (Array.isArray(value) && value.length === 0)
+  ) {
+    return null
+  }
+
+  return (
+    <div className="space-y-1">
+      <div className={`text-[11px] font-medium ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+        {title}
+      </div>
+      <pre
+        className={`
+          text-xs p-2 rounded overflow-x-auto whitespace-pre-wrap break-all
+          ${isDark ? 'bg-gray-800 text-gray-300' : 'bg-gray-50 text-gray-600'}
+        `}
+      >
+        {JSON.stringify(value, null, 2)}
+      </pre>
+    </div>
+  )
 }
 
 export default function WorkflowMonitor({ executionId, onRefresh }: WorkflowMonitorProps) {
@@ -53,6 +86,7 @@ export default function WorkflowMonitor({ executionId, onRefresh }: WorkflowMoni
       try {
         const data = await getExecution(executionId)
         setExecution(data)
+        onRefresh?.()
       } catch (error) {
         console.error('Failed to fetch execution:', error)
       } finally {
@@ -62,12 +96,12 @@ export default function WorkflowMonitor({ executionId, onRefresh }: WorkflowMoni
 
     fetchExecution()
 
-    // 如果正在运行，每秒刷新
-    if (execution?.status === 'running') {
+    const shouldPoll = !execution || execution.status === 'running' || execution.status === 'paused'
+    if (shouldPoll) {
       const interval = setInterval(fetchExecution, 1000)
       return () => clearInterval(interval)
     }
-  }, [executionId, execution?.status])
+  }, [executionId, execution?.status, onRefresh])
 
   const toggleNode = (nodeId: string) => {
     const newExpanded = new Set(expandedNodes)
@@ -119,7 +153,6 @@ export default function WorkflowMonitor({ executionId, onRefresh }: WorkflowMoni
 
   return (
     <div className={`h-full overflow-y-auto ${isDark ? 'bg-gray-900' : 'bg-white'}`}>
-      {/* 标题 */}
       <div
         className={`
           flex items-center justify-between p-4 border-b
@@ -147,9 +180,7 @@ export default function WorkflowMonitor({ executionId, onRefresh }: WorkflowMoni
         </div>
       </div>
 
-      {/* 执行信息 */}
       <div className="p-4 space-y-3">
-        {/* 执行ID */}
         <div>
           <label
             className={`block text-xs font-medium mb-1 ${
@@ -167,7 +198,6 @@ export default function WorkflowMonitor({ executionId, onRefresh }: WorkflowMoni
           </div>
         </div>
 
-        {/* 当前节点 */}
         {execution.current_node && (
           <div>
             <label
@@ -188,7 +218,6 @@ export default function WorkflowMonitor({ executionId, onRefresh }: WorkflowMoni
           </div>
         )}
 
-        {/* 执行时间 */}
         <div>
           <label
             className={`block text-xs font-medium mb-1 ${
@@ -202,7 +231,6 @@ export default function WorkflowMonitor({ executionId, onRefresh }: WorkflowMoni
           </div>
         </div>
 
-        {/* 错误信息 */}
         {execution.error && (
           <div className="bg-red-50 border border-red-200 rounded-lg p-3">
             <div className="text-xs font-medium text-red-600 mb-1">错误</div>
@@ -211,7 +239,6 @@ export default function WorkflowMonitor({ executionId, onRefresh }: WorkflowMoni
         )}
       </div>
 
-      {/* 节点状态列表 */}
       <div
         className={`border-t ${isDark ? 'border-gray-700' : 'border-gray-200'}`}
       >
@@ -236,7 +263,6 @@ export default function WorkflowMonitor({ executionId, onRefresh }: WorkflowMoni
         </div>
       </div>
 
-      {/* 上下文变量 */}
       {Object.keys(execution.context).length > 0 && (
         <div
           className={`border-t ${isDark ? 'border-gray-700' : 'border-gray-200'}`}
@@ -251,7 +277,7 @@ export default function WorkflowMonitor({ executionId, onRefresh }: WorkflowMoni
           <div className="p-4">
             <pre
               className={`
-                text-xs p-2 rounded overflow-x-auto
+                text-xs p-2 rounded overflow-x-auto whitespace-pre-wrap break-all
                 ${isDark ? 'bg-gray-800 text-gray-300' : 'bg-gray-50 text-gray-600'}
               `}
             >
@@ -264,7 +290,6 @@ export default function WorkflowMonitor({ executionId, onRefresh }: WorkflowMoni
   )
 }
 
-// 节点状态项组件
 interface NodeStateItemProps {
   nodeId: string
   state: NodeExecutionState
@@ -274,6 +299,19 @@ interface NodeStateItemProps {
 }
 
 function NodeStateItem({ nodeId, state, isExpanded, onToggle, isDark }: NodeStateItemProps) {
+  const inputData = state.input_data || {}
+  const outputData = state.output_data || {}
+  const trace = typeof inputData._input_trace === 'object' ? inputData._input_trace : null
+  const highlightedOutput = {
+    chapter_number: outputData.chapter_number,
+    chapter_title: outputData.chapter_title,
+    chapter_outline: outputData.chapter_outline,
+    chapter_goals: outputData.chapter_goals,
+    scene_directions: outputData.scene_directions,
+    quality_passed: outputData.quality_passed,
+    revision_notes: outputData.revision_notes,
+  }
+
   return (
     <div>
       <button
@@ -295,20 +333,16 @@ function NodeStateItem({ nodeId, state, isExpanded, onToggle, isDark }: NodeStat
         )}
       </button>
       {isExpanded && (
-        <div className={`px-4 pb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+        <div className={`px-4 pb-3 space-y-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
           {state.error && (
-            <div className="text-xs text-red-500 mb-2">{state.error}</div>
+            <div className="text-xs text-red-500">{state.error}</div>
           )}
-          {Object.keys(state.output_data).length > 0 && (
-            <pre
-              className={`
-                text-xs p-2 rounded overflow-x-auto
-                ${isDark ? 'bg-gray-800' : 'bg-gray-50'}
-              `}
-            >
-              {JSON.stringify(state.output_data, null, 2)}
-            </pre>
+          {trace && (
+            <JsonBlock title="输入来源" value={trace} isDark={isDark} />
           )}
+          <JsonBlock title="输入" value={inputData} isDark={isDark} />
+          <JsonBlock title="关键输出" value={highlightedOutput} isDark={isDark} />
+          <JsonBlock title="完整输出" value={outputData} isDark={isDark} />
         </div>
       )}
     </div>

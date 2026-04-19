@@ -626,6 +626,7 @@ export default function WorkflowEditor({
 
       {/* 属性面板 */}
       <PropertyPanel
+        projectId={projectId}
         node={
           selectedNode
             ? {

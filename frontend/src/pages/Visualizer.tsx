@@ -1,7 +1,23 @@
 import { useEffect, useMemo, useState, useCallback } from 'react'
 import { Card } from '@/components/ui'
 import PageLayout from '@/components/PageLayout'
-import ReactFlow, { Background, Controls, MiniMap, addEdge, applyNodeChanges, applyEdgeChanges, type Node, type Edge, type OnNodesChange, type OnEdgesChange, type Connection, type NodeTypes, Panel, Handle, Position } from 'reactflow'
+import ReactFlow, {
+  Background,
+  Controls,
+  MiniMap,
+  addEdge,
+  applyNodeChanges,
+  applyEdgeChanges,
+  type Node,
+  type Edge,
+  type OnNodesChange,
+  type OnEdgesChange,
+  type Connection,
+  type NodeTypes,
+  Panel,
+  Handle,
+  Position,
+} from 'reactflow'
 import 'reactflow/dist/style.css'
 import { getVisualizationData } from '@/api/visualization'
 import { getWorlds, type World } from '@/api/worlds'
@@ -14,14 +30,15 @@ import {
   type WorkflowDefinition,
   type WorkflowNode as WfNode,
   type WorkflowEdge as WfEdge,
+  type NodeInputConfig,
+  type NodeOutputConfig,
 } from '@/api/workflows'
 import { getWorkflowNodeTypes, type NodeTypeInfo, type WorkflowNodeTypes } from '@/api/nodeTypes'
-import { Network, Users, GitBranch, Play, Pause, Save, Trash2, Plus, Loader2 } from 'lucide-react'
+import WorkflowMonitor from '@/components/workflow/WorkflowMonitor'
+import { Network, Users, GitBranch, Play, Save, Trash2, Plus, Loader2 } from 'lucide-react'
 import { useTheme } from '@/contexts/ThemeContext'
 import { useProject } from '@/contexts/ProjectContext'
 import WorkflowHelp from '@/components/workflow/WorkflowHelp'
-
-// ==================== 自定义节点组件 ====================
 
 function AgentNode({ data }: { data: any }) {
   const { theme } = useTheme()
@@ -49,11 +66,11 @@ function ConditionNode({ data }: { data: any }) {
   return (
     <div className="px-4 py-3 rounded-lg border-2 border-orange-400 bg-orange-50 min-w-[150px]">
       <Handle type="target" position={Position.Top} className="!bg-orange-400 !w-3 !h-3" />
-      <div className="font-medium text-sm">🔀 条件判断</div>
+      <div className="font-medium text-sm">条件分支</div>
       <div className="text-xs opacity-70">{data.label || '评估结果'}</div>
       <div className="flex justify-between text-xs mt-1 px-1">
-        <span className="text-green-600">✓ 通过</span>
-        <span className="text-red-600">✗ 重试</span>
+        <span className="text-green-600">通过</span>
+        <span className="text-red-600">重试</span>
       </div>
       <Handle type="source" position={Position.Left} id="pass" className="!bg-green-500 !w-3 !h-3" />
       <Handle type="source" position={Position.Right} id="retry" className="!bg-red-500 !w-3 !h-3" />
@@ -65,7 +82,7 @@ function ParallelNode({ data }: { data: any }) {
   return (
     <div className="px-4 py-3 rounded-lg border-2 border-purple-400 bg-purple-50 min-w-[120px]">
       <Handle type="target" position={Position.Top} className="!bg-purple-400 !w-3 !h-3" />
-      <div className="font-medium text-sm">⚡ 并行执行</div>
+      <div className="font-medium text-sm">并行执行</div>
       <div className="text-xs opacity-70">{data.label || '同时执行多个分支'}</div>
       <Handle type="source" position={Position.Bottom} className="!bg-purple-400 !w-3 !h-3" />
     </div>
@@ -76,9 +93,9 @@ function ScenePerformanceNode({ data }: { data: any }) {
   return (
     <div className="px-4 py-3 rounded-lg border-2 border-rose-400 bg-rose-50 min-w-[150px]">
       <Handle type="target" position={Position.Top} className="!bg-rose-400 !w-3 !h-3" />
-      <div className="font-medium text-sm">🎭 场景演绎</div>
+      <div className="font-medium text-sm">场景演绎</div>
       <div className="text-xs opacity-70">{data.label || '多角色同台表演'}</div>
-      <div className="text-xs text-rose-600 mt-1">自动协调角色Agent</div>
+      <div className="text-xs text-rose-600 mt-1">自动协调角色 Agent</div>
       <Handle type="source" position={Position.Bottom} className="!bg-rose-400 !w-3 !h-3" />
     </div>
   )
@@ -88,8 +105,8 @@ function GroupDiscussionNode({ data }: { data: any }) {
   return (
     <div className="px-4 py-3 rounded-lg border-2 border-indigo-400 bg-indigo-50 min-w-[150px]">
       <Handle type="target" position={Position.Top} className="!bg-indigo-400 !w-3 !h-3" />
-      <div className="font-medium text-sm">💬 集体讨论</div>
-      <div className="text-xs opacity-70">{data.label || '多Agent讨论'}</div>
+      <div className="font-medium text-sm">集体讨论</div>
+      <div className="text-xs opacity-70">{data.label || '多 Agent 讨论'}</div>
       <Handle type="source" position={Position.Bottom} className="!bg-indigo-400 !w-3 !h-3" />
     </div>
   )
@@ -99,7 +116,7 @@ function StartNode({ data }: { data: any }) {
   return (
     <div className="px-4 py-3 rounded-lg border-2 border-green-500 bg-green-50 min-w-[100px]">
       <Handle type="target" position={Position.Top} id="loop" className="!bg-green-400 !w-3 !h-3" />
-      <div className="font-medium text-sm text-center">▶️ {data.label || '开始'}</div>
+      <div className="font-medium text-sm text-center">{data.label || '开始'}</div>
       <Handle type="source" position={Position.Bottom} className="!bg-green-500 !w-3 !h-3" />
     </div>
   )
@@ -109,7 +126,7 @@ function EndNode({ data }: { data: any }) {
   return (
     <div className="px-4 py-3 rounded-lg border-2 border-red-500 bg-red-50 min-w-[100px]">
       <Handle type="target" position={Position.Top} className="!bg-red-400 !w-3 !h-3" />
-      <div className="font-medium text-sm text-center">⏹️ {data.label || '结束'}</div>
+      <div className="font-medium text-sm text-center">{data.label || '结束'}</div>
     </div>
   )
 }
@@ -118,7 +135,7 @@ function InputNode({ data }: { data: any }) {
   return (
     <div className="px-4 py-3 rounded-lg border-2 border-blue-400 bg-blue-50 min-w-[120px]">
       <Handle type="target" position={Position.Top} className="!bg-blue-400 !w-3 !h-3" />
-      <div className="font-medium text-sm">📝 用户输入</div>
+      <div className="font-medium text-sm">用户输入</div>
       <div className="text-xs opacity-70">{data.label || '等待用户输入'}</div>
       <Handle type="source" position={Position.Bottom} className="!bg-blue-400 !w-3 !h-3" />
     </div>
@@ -138,7 +155,526 @@ const nodeTypes: NodeTypes = {
 
 type TabType = 'workflow' | 'plots' | 'snapshots'
 
+type VisualNodeData = {
+  label?: string
+  agent_type?: string
+  config?: Record<string, any>
+  description?: string
+  inputs?: NodeInputConfig[]
+  outputs?: NodeOutputConfig[]
+  status?: string
+}
+
+type WorkflowOrigin = 'project' | 'global_template'
+
 const generateId = () => `node_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`
+
+const standardAllNodesDefinition = {
+  name: '全内置节点标准流程',
+  description: '包含全部内置节点的标准创作工作流，突出章节大纲驱动与逐节点输入输出观察。',
+  nodes: [
+    {
+      id: 'start',
+      node_type: 'start',
+      label: '开始',
+      description: '加载项目基础上下文',
+      config: {},
+      position: { x: 520, y: 20 },
+      outputs: [
+        { name: 'project_info', target: 'context', key: 'project_info', save_to_db: false },
+        { name: 'world_info', target: 'context', key: 'world_info', save_to_db: false },
+        { name: 'characters', target: 'context', key: 'characters', save_to_db: false },
+        { name: 'lore_entries', target: 'context', key: 'lore_entries', save_to_db: false },
+        { name: 'existing_hooks', target: 'context', key: 'existing_hooks', save_to_db: false },
+        { name: 'events', target: 'context', key: 'events', save_to_db: false },
+        { name: 'locations', target: 'context', key: 'locations', save_to_db: false },
+        { name: 'previous_chapters', target: 'context', key: 'previous_chapters', save_to_db: false },
+      ],
+    },
+    {
+      id: 'plot_outline',
+      node_type: 'agent',
+      agent_type: 'plot_outline',
+      label: '章节大纲 Agent',
+      description: '先产出当前章节目标与章节大纲',
+      config: {},
+      position: { x: 520, y: 120 },
+      inputs: [
+        { name: 'chapter_num', source: 'context', key: 'chapter_num', required: true, default: 1 },
+        { name: 'project_info', source: 'context', key: 'project_info', required: false },
+        { name: 'world_info', source: 'context', key: 'world_info', required: false },
+        { name: 'lore_entries', source: 'context', key: 'lore_entries', required: false },
+        { name: 'characters', source: 'context', key: 'characters', required: false },
+        { name: 'existing_hooks', source: 'context', key: 'existing_hooks', required: false },
+        { name: 'previous_chapters', source: 'context', key: 'previous_chapters', required: false },
+      ],
+      outputs: [
+        { name: 'chapter_number', target: 'context', key: 'chapter_number', save_to_db: false },
+        { name: 'chapter_title', target: 'context', key: 'chapter_title', save_to_db: false },
+        { name: 'chapter_outline', target: 'context', key: 'chapter_outline', save_to_db: false },
+        { name: 'chapter_summary', target: 'context', key: 'chapter_summary', save_to_db: false },
+        { name: 'scene_directions', target: 'context', key: 'scene_directions', save_to_db: false },
+        { name: 'chapter_goals', target: 'context', key: 'chapter_goals', save_to_db: false },
+      ],
+    },
+    {
+      id: 'parallel_prep',
+      node_type: 'parallel',
+      label: '并行执行',
+      description: '围绕章节大纲并行准备设定、事件、地图与探索素材',
+      config: {},
+      position: { x: 520, y: 220 },
+    },
+    {
+      id: 'setting',
+      node_type: 'agent',
+      agent_type: 'setting',
+      label: '设定 Agent',
+      description: '根据本章目标补充设定约束',
+      config: { task: 'chapter_setting_alignment' },
+      position: { x: 80, y: 340 },
+      inputs: [
+        { name: 'chapter_outline', source: 'upstream', upstream_node: 'plot_outline', upstream_field: 'chapter_outline', required: false },
+        { name: 'chapter_goals', source: 'upstream', upstream_node: 'plot_outline', upstream_field: 'chapter_goals', required: false },
+        { name: 'lore_entries', source: 'context', key: 'lore_entries', required: false },
+        { name: 'world_info', source: 'context', key: 'world_info', required: false },
+      ],
+      outputs: [
+        { name: 'lore_entries', target: 'context', key: 'lore_entries', save_to_db: false },
+        { name: 'setting_updates', target: 'context', key: 'setting_updates', save_to_db: false },
+      ],
+    },
+    {
+      id: 'event_generator',
+      node_type: 'agent',
+      agent_type: 'event_generator',
+      label: '事件 Agent',
+      description: '根据章节大纲生成事件候选',
+      config: {},
+      position: { x: 280, y: 340 },
+      inputs: [
+        { name: 'chapter_outline', source: 'upstream', upstream_node: 'plot_outline', upstream_field: 'chapter_outline', required: false },
+        { name: 'chapter_goals', source: 'upstream', upstream_node: 'plot_outline', upstream_field: 'chapter_goals', required: false },
+        { name: 'events', source: 'context', key: 'events', required: false },
+      ],
+      outputs: [
+        { name: 'events', target: 'context', key: 'events', save_to_db: false },
+        { name: 'event_candidates', target: 'context', key: 'event_candidates', save_to_db: false },
+      ],
+    },
+    {
+      id: 'world_map_manager',
+      node_type: 'agent',
+      agent_type: 'world_map_manager',
+      label: '地图 Agent',
+      description: '基于场景方向准备地图与地点信息',
+      config: {},
+      position: { x: 480, y: 340 },
+      inputs: [
+        { name: 'scene_directions', source: 'upstream', upstream_node: 'plot_outline', upstream_field: 'scene_directions', required: false },
+        { name: 'chapter_outline', source: 'upstream', upstream_node: 'plot_outline', upstream_field: 'chapter_outline', required: false },
+        { name: 'world_info', source: 'context', key: 'world_info', required: false },
+        { name: 'locations', source: 'context', key: 'locations', required: false },
+      ],
+      outputs: [
+        { name: 'locations', target: 'context', key: 'locations', save_to_db: false },
+        { name: 'world_map_plan', target: 'context', key: 'world_map_plan', save_to_db: false },
+      ],
+    },
+    {
+      id: 'proc_gen',
+      node_type: 'agent',
+      agent_type: 'proc_gen',
+      label: '过程生成 Agent',
+      description: '扩展探索区域和环境细节',
+      config: {},
+      position: { x: 680, y: 340 },
+      inputs: [
+        { name: 'scene_directions', source: 'upstream', upstream_node: 'plot_outline', upstream_field: 'scene_directions', required: false },
+        { name: 'chapter_goals', source: 'upstream', upstream_node: 'plot_outline', upstream_field: 'chapter_goals', required: false },
+        { name: 'world_info', source: 'context', key: 'world_info', required: false },
+      ],
+      outputs: [
+        { name: 'regions', target: 'context', key: 'regions', save_to_db: false },
+        { name: 'procgen_result', target: 'context', key: 'procgen_result', save_to_db: false },
+      ],
+    },
+    {
+      id: 'dungeon_generator',
+      node_type: 'agent',
+      agent_type: 'dungeon_generator',
+      label: '副本生成 Agent',
+      description: '如章节涉及探索/副本则生成可用结构',
+      config: {},
+      position: { x: 880, y: 340 },
+      inputs: [
+        { name: 'scene_directions', source: 'upstream', upstream_node: 'plot_outline', upstream_field: 'scene_directions', required: false },
+        { name: 'chapter_outline', source: 'upstream', upstream_node: 'plot_outline', upstream_field: 'chapter_outline', required: false },
+      ],
+      outputs: [
+        { name: 'dungeon_plan', target: 'context', key: 'dungeon_plan', save_to_db: false },
+      ],
+    },
+    {
+      id: 'group_discussion',
+      node_type: 'group_discussion',
+      label: '集体讨论',
+      description: '汇总并行结果，形成统一创作方向',
+      config: { leader_agent: 'master_plotter' },
+      position: { x: 520, y: 500 },
+      inputs: [
+        { name: 'chapter_title', source: 'upstream', upstream_node: 'plot_outline', upstream_field: 'chapter_title', required: false },
+        { name: 'chapter_outline', source: 'upstream', upstream_node: 'plot_outline', upstream_field: 'chapter_outline', required: false },
+        { name: 'chapter_goals', source: 'upstream', upstream_node: 'plot_outline', upstream_field: 'chapter_goals', required: false },
+        { name: 'events', source: 'upstream', upstream_node: 'event_generator', upstream_field: 'events', required: false },
+        { name: 'lore_entries', source: 'upstream', upstream_node: 'setting', upstream_field: 'lore_entries', required: false },
+        { name: 'locations', source: 'upstream', upstream_node: 'world_map_manager', upstream_field: 'locations', required: false },
+        { name: 'regions', source: 'upstream', upstream_node: 'proc_gen', upstream_field: 'regions', required: false },
+        { name: 'dungeon_plan', source: 'upstream', upstream_node: 'dungeon_generator', upstream_field: 'dungeon_plan', required: false },
+      ],
+      outputs: [
+        { name: 'group_discussion', target: 'context', key: 'group_discussion', save_to_db: false },
+        { name: 'last_discussion_summary', target: 'context', key: 'last_discussion_summary', save_to_db: false },
+      ],
+    },
+    {
+      id: 'hook_manager',
+      node_type: 'agent',
+      agent_type: 'hook_manager',
+      label: '伏笔 Agent',
+      description: '根据章节大纲和讨论结果规划伏笔',
+      config: {},
+      position: { x: 520, y: 620 },
+      inputs: [
+        { name: 'chapter_outline', source: 'upstream', upstream_node: 'plot_outline', upstream_field: 'chapter_outline', required: false },
+        { name: 'chapter_goals', source: 'upstream', upstream_node: 'plot_outline', upstream_field: 'chapter_goals', required: false },
+        { name: 'existing_hooks', source: 'context', key: 'existing_hooks', required: false },
+        { name: 'last_discussion_summary', source: 'context', key: 'last_discussion_summary', required: false },
+      ],
+      outputs: [
+        { name: 'hooks', target: 'context', key: 'hooks', save_to_db: false },
+        { name: 'existing_hooks', target: 'context', key: 'existing_hooks', save_to_db: false },
+      ],
+    },
+    {
+      id: 'scene_performance',
+      node_type: 'scene_performance',
+      label: '场景演绎',
+      description: '根据场景指令组织多角色演绎',
+      config: { scene_mode: 'interactive' },
+      position: { x: 520, y: 740 },
+      inputs: [
+        { name: 'scene_directions', source: 'upstream', upstream_node: 'plot_outline', upstream_field: 'scene_directions', required: false },
+        { name: 'chapter_outline', source: 'upstream', upstream_node: 'plot_outline', upstream_field: 'chapter_outline', required: false },
+        { name: 'characters', source: 'context', key: 'characters', required: false },
+      ],
+      outputs: [
+        { name: 'performance_result', target: 'context', key: 'performance_result', save_to_db: false },
+        { name: 'dialogues', target: 'context', key: 'dialogues', save_to_db: false },
+      ],
+    },
+    {
+      id: 'summarizer',
+      node_type: 'agent',
+      agent_type: 'summarizer',
+      label: '摘要 Agent',
+      description: '压缩上游结果为写作可用摘要',
+      config: {},
+      position: { x: 520, y: 860 },
+      inputs: [
+        { name: 'chapter_summary', source: 'upstream', upstream_node: 'plot_outline', upstream_field: 'chapter_summary', required: false },
+        { name: 'last_discussion_summary', source: 'context', key: 'last_discussion_summary', required: false },
+        { name: 'performance_result', source: 'context', key: 'performance_result', required: false },
+        { name: 'hooks', source: 'context', key: 'hooks', required: false },
+      ],
+      outputs: [
+        { name: 'summary', target: 'context', key: 'summary', save_to_db: false },
+        { name: 'chapter_summary', target: 'context', key: 'chapter_summary', save_to_db: false },
+      ],
+    },
+    {
+      id: 'condition_need_input',
+      node_type: 'condition',
+      label: '条件分支',
+      description: '保留交互检查点，通常走通过分支',
+      config: { condition_key: 'need_user_input', pass_value: false, pass_when_missing: true },
+      position: { x: 520, y: 980 },
+      inputs: [
+        { name: 'summary', source: 'context', key: 'summary', required: false },
+        { name: 'chapter_outline', source: 'context', key: 'chapter_outline', required: false },
+      ],
+      outputs: [
+        { name: 'quality_passed', target: 'context', key: 'quality_passed', save_to_db: false },
+      ],
+    },
+    {
+      id: 'input',
+      node_type: 'input',
+      label: '用户输入',
+      description: '当需要人工补充时暂停',
+      config: { prompt: '请补充本章的额外要求或修订意见' },
+      position: { x: 850, y: 980 },
+      outputs: [
+        { name: 'status', target: 'context', key: 'input_status', save_to_db: false },
+      ],
+    },
+    {
+      id: 'master_plotter',
+      node_type: 'agent',
+      agent_type: 'master_plotter',
+      label: '总编剧 Agent',
+      description: '统一整理为写作计划',
+      config: {},
+      position: { x: 520, y: 1100 },
+      inputs: [
+        { name: 'chapter_outline', source: 'context', key: 'chapter_outline', required: false },
+        { name: 'chapter_goals', source: 'context', key: 'chapter_goals', required: false },
+        { name: 'summary', source: 'context', key: 'summary', required: false },
+        { name: 'hooks', source: 'context', key: 'hooks', required: false },
+        { name: 'events', source: 'context', key: 'events', required: false },
+        { name: 'locations', source: 'context', key: 'locations', required: false },
+      ],
+      outputs: [
+        { name: 'plot_outline', target: 'context', key: 'plot_outline', save_to_db: false },
+        { name: 'chapter_outline', target: 'context', key: 'chapter_outline', save_to_db: false },
+        { name: 'chapter_goals', target: 'context', key: 'chapter_goals', save_to_db: false },
+      ],
+    },
+    {
+      id: 'writer',
+      node_type: 'agent',
+      agent_type: 'writer',
+      label: '作家 Agent',
+      description: '根据大纲与摘要完成章节写作',
+      config: {},
+      position: { x: 520, y: 1220 },
+      inputs: [
+        { name: 'chapter_title', source: 'context', key: 'chapter_title', required: false },
+        { name: 'chapter_outline', source: 'context', key: 'chapter_outline', required: false },
+        { name: 'chapter_goals', source: 'context', key: 'chapter_goals', required: false },
+        { name: 'summary', source: 'context', key: 'summary', required: false },
+        { name: 'scene_directions', source: 'context', key: 'scene_directions', required: false },
+        { name: 'hooks', source: 'context', key: 'hooks', required: false },
+        { name: 'retry_message', source: 'context', key: 'retry_message', required: false },
+      ],
+      outputs: [
+        { name: 'content', target: 'context', key: 'chapter_content', save_to_db: false },
+        { name: 'summary', target: 'context', key: 'writer_summary', save_to_db: false },
+      ],
+    },
+    {
+      id: 'evaluator',
+      node_type: 'agent',
+      agent_type: 'evaluator',
+      label: '评估 Agent',
+      description: '给出质量判定和修订建议',
+      config: {},
+      position: { x: 520, y: 1340 },
+      inputs: [
+        { name: 'chapter_content', source: 'context', key: 'chapter_content', required: false },
+        { name: 'chapter_outline', source: 'context', key: 'chapter_outline', required: false },
+        { name: 'chapter_goals', source: 'context', key: 'chapter_goals', required: false },
+        { name: 'lore_entries', source: 'context', key: 'lore_entries', required: false },
+      ],
+      outputs: [
+        { name: 'quality_passed', target: 'context', key: 'quality_passed', save_to_db: false },
+        { name: 'issues', target: 'context', key: 'evaluation_issues', save_to_db: false },
+        { name: 'suggestions', target: 'context', key: 'revision_notes', save_to_db: false },
+      ],
+    },
+    {
+      id: 'condition_quality',
+      node_type: 'condition',
+      label: '条件分支',
+      description: '决定结束还是回到写作修订',
+      config: { condition_key: 'evaluation_passed', pass_value: true, pass_when_missing: false },
+      position: { x: 520, y: 1460 },
+      inputs: [
+        { name: 'quality_passed', source: 'context', key: 'evaluation_passed', required: false, default: false },
+        { name: 'evaluation_feedback', source: 'context', key: 'evaluation_feedback', required: false },
+      ],
+      outputs: [
+        { name: 'quality_passed', target: 'context', key: 'quality_passed', save_to_db: false },
+        { name: 'revision_notes', target: 'context', key: 'revision_notes', save_to_db: false },
+      ],
+    },
+    {
+      id: 'end',
+      node_type: 'end',
+      label: '结束',
+      description: '输出完成',
+      config: {},
+      position: { x: 520, y: 1580 },
+    },
+  ] as WfNode[],
+  edges: [
+    { id: 'e1', source: 'start', target: 'plot_outline' },
+    { id: 'e2', source: 'plot_outline', target: 'parallel_prep' },
+    { id: 'e3', source: 'parallel_prep', target: 'setting' },
+    { id: 'e4', source: 'parallel_prep', target: 'event_generator' },
+    { id: 'e5', source: 'parallel_prep', target: 'world_map_manager' },
+    { id: 'e6', source: 'parallel_prep', target: 'proc_gen' },
+    { id: 'e7', source: 'parallel_prep', target: 'dungeon_generator' },
+    { id: 'e8', source: 'setting', target: 'group_discussion' },
+    { id: 'e9', source: 'event_generator', target: 'group_discussion' },
+    { id: 'e10', source: 'world_map_manager', target: 'group_discussion' },
+    { id: 'e11', source: 'proc_gen', target: 'group_discussion' },
+    { id: 'e12', source: 'dungeon_generator', target: 'group_discussion' },
+    { id: 'e13', source: 'group_discussion', target: 'hook_manager' },
+    { id: 'e14', source: 'hook_manager', target: 'scene_performance' },
+    { id: 'e15', source: 'scene_performance', target: 'summarizer' },
+    { id: 'e16', source: 'summarizer', target: 'condition_need_input', condition: { result: 'pass' }, label: '继续' },
+    { id: 'e17', source: 'condition_need_input', target: 'master_plotter', condition: { result: 'pass' }, label: '继续' },
+    { id: 'e18', source: 'condition_need_input', target: 'input', condition: { result: 'retry' }, label: '补充' },
+    { id: 'e19', source: 'input', target: 'master_plotter' },
+    { id: 'e20', source: 'master_plotter', target: 'writer' },
+    { id: 'e21', source: 'writer', target: 'evaluator' },
+    { id: 'e22', source: 'evaluator', target: 'condition_quality' },
+    { id: 'e23', source: 'condition_quality', target: 'end', condition: { result: 'pass' }, label: '通过' },
+    { id: 'e24', source: 'condition_quality', target: 'writer', condition: { result: 'retry' }, label: '返工' },
+  ] as WfEdge[],
+  variables: {
+    chapter_num: 1,
+    target_word_count: 2000,
+  },
+}
+
+function workflowToCanvasNodes(workflow: WorkflowDefinition): Node<VisualNodeData>[] {
+  return workflow.nodes.map((node) => ({
+    id: node.id,
+    type: node.node_type,
+    position: node.position,
+    data: {
+      label: node.label,
+      agent_type: node.agent_type,
+      config: node.config,
+      description: node.description,
+      inputs: node.inputs || [],
+      outputs: node.outputs || [],
+    },
+  }))
+}
+
+function workflowToCanvasEdges(workflow: WorkflowDefinition): Edge[] {
+  return workflow.edges.map((edge) => {
+    let sourceHandle: string | undefined
+    if (edge.condition?.result === 'pass') {
+      sourceHandle = 'pass'
+    } else if (edge.condition?.result === 'retry') {
+      sourceHandle = 'retry'
+    }
+
+    return {
+      id: edge.id,
+      source: edge.source,
+      target: edge.target,
+      sourceHandle,
+      animated: true,
+      label: edge.label,
+      style:
+        sourceHandle === 'pass'
+          ? { stroke: '#22c55e', strokeWidth: 2 }
+          : sourceHandle === 'retry'
+            ? { stroke: '#ef4444', strokeWidth: 2 }
+            : undefined,
+    }
+  })
+}
+
+function buildStandardTemplateWorkflow(projectId: string): WorkflowDefinition {
+  return {
+    id: `standard_all_nodes_${Date.now()}`,
+    project_id: projectId,
+    name: standardAllNodesDefinition.name,
+    description: standardAllNodesDefinition.description,
+    nodes: standardAllNodesDefinition.nodes.map((node) => ({
+      ...node,
+      config: { ...node.config },
+      inputs: node.inputs ? [...node.inputs] : [],
+      outputs: node.outputs ? [...node.outputs] : [],
+      position: { ...node.position },
+    })),
+    edges: standardAllNodesDefinition.edges.map((edge) => ({
+      ...edge,
+      condition: edge.condition ? { ...edge.condition } : undefined,
+    })),
+    variables: { ...standardAllNodesDefinition.variables },
+    is_template: false,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  }
+}
+
+function buildWorkflowNodesFromCanvas(nodes: Node<VisualNodeData>[]): WfNode[] {
+  return nodes.map((node) => ({
+    id: node.id,
+    node_type: node.type as WfNode['node_type'],
+    label: node.data.label || '节点',
+    agent_type: node.data.agent_type,
+    description: node.data.description,
+    config: node.data.config || {},
+    inputs: node.data.inputs || [],
+    outputs: node.data.outputs || [],
+    position: node.position,
+  }))
+}
+
+function buildWorkflowEdgesFromCanvas(edges: Edge[]): WfEdge[] {
+  return edges.map((edge, index) => {
+    let condition: { result: string } | undefined
+    if (edge.sourceHandle === 'pass') condition = { result: 'pass' }
+    else if (edge.sourceHandle === 'retry') condition = { result: 'retry' }
+    else if (edge.sourceHandle === 'loop') condition = { result: 'retry' }
+
+    return {
+      id: edge.id || `edge_${index}`,
+      source: edge.source,
+      target: edge.target,
+      label: typeof edge.label === 'string' ? edge.label : undefined,
+      condition,
+    }
+  })
+}
+
+function getWorkflowOrigin(workflow: WorkflowDefinition): WorkflowOrigin {
+  return workflow.is_template && workflow.project_id === null ? 'global_template' : 'project'
+}
+
+function buildWorkflowDisplayName(workflow: WorkflowDefinition, mode: WorkflowOrigin): string {
+  return mode === 'global_template' ? `${workflow.name}（模板副本）` : workflow.name
+}
+
+function buildWorkflowPayload(
+  nodes: Node<VisualNodeData>[],
+  edges: Edge[],
+  workflowName: string,
+  selectedWorkflow: WorkflowDefinition | null,
+  currentProjectId: string,
+) {
+  const workflowNodes = buildWorkflowNodesFromCanvas(nodes)
+  const workflowEdges = buildWorkflowEdgesFromCanvas(edges)
+  const isStandardTemplate = workflowName === standardAllNodesDefinition.name
+
+  return {
+    workflowNodes,
+    workflowEdges,
+    createPayload: {
+      project_id: currentProjectId,
+      name: workflowName,
+      description: selectedWorkflow?.description || (isStandardTemplate ? standardAllNodesDefinition.description : undefined),
+      nodes: workflowNodes,
+      edges: workflowEdges,
+      variables: selectedWorkflow?.variables || (isStandardTemplate ? standardAllNodesDefinition.variables : {}),
+    },
+    updatePayload: {
+      name: workflowName,
+      description: selectedWorkflow?.description || (isStandardTemplate ? standardAllNodesDefinition.description : undefined),
+      nodes: workflowNodes,
+      edges: workflowEdges,
+      variables: selectedWorkflow?.variables || (isStandardTemplate ? standardAllNodesDefinition.variables : {}),
+    },
+  }
+}
 
 export default function Visualizer() {
   const { theme } = useTheme()
@@ -149,8 +685,6 @@ export default function Visualizer() {
   const [data, setData] = useState<any>(null)
   const [worlds, setWorlds] = useState<World[]>([])
   const [selectedWorldId, setSelectedWorldId] = useState('')
-
-  // 动态节点类型
   const [nodeTypesData, setNodeTypesData] = useState<WorkflowNodeTypes>({
     agent_nodes: [],
     interaction_nodes: [],
@@ -158,17 +692,16 @@ export default function Visualizer() {
     character_nodes: [],
   })
   const [loadingNodeTypes, setLoadingNodeTypes] = useState(true)
-
-  // 工作流相关状态
   const [workflows, setWorkflows] = useState<WorkflowDefinition[]>([])
   const [selectedWorkflow, setSelectedWorkflow] = useState<WorkflowDefinition | null>(null)
-  const [nodes, setNodes] = useState<Node[]>([])
+  const [workflowSelectionMode, setWorkflowSelectionMode] = useState<WorkflowOrigin>('project')
+  const [nodes, setNodes] = useState<Node<VisualNodeData>[]>([])
   const [edges, setEdges] = useState<Edge[]>([])
   const [workflowName, setWorkflowName] = useState('新工作流')
   const [saving, setSaving] = useState(false)
   const [executing, setExecuting] = useState(false)
+  const [currentExecutionId, setCurrentExecutionId] = useState<string | null>(null)
 
-  // 加载节点类型
   useEffect(() => {
     loadNodeTypes()
   }, [currentProject])
@@ -200,7 +733,6 @@ export default function Visualizer() {
     loadData(selectedWorldId)
   }, [selectedWorldId])
 
-  // 键盘事件：Delete/Backspace 删除选中节点
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Delete' || e.key === 'Backspace') {
@@ -255,115 +787,99 @@ export default function Visualizer() {
     setEdges((eds) => addEdge({ ...connection, animated: true }, eds))
   }, [])
 
-  // 选择工作流
   const handleSelectWorkflow = (workflow: WorkflowDefinition) => {
-    setSelectedWorkflow(workflow)
-    setWorkflowName(workflow.name)
-    const flowNodes = workflow.nodes.map((node) => {
-      return {
-        id: node.id,
-        type: node.node_type,
-        position: node.position,
-        data: {
-          label: node.label,
-          agent_type: node.agent_type,
-          config: node.config,
-        },
-      }
-    })
-    const flowEdges = workflow.edges.map((edge) => {
-      let sourceHandle: string | undefined
-      if (edge.condition?.result === 'pass') {
-        sourceHandle = 'pass'
-      } else if (edge.condition?.result === 'retry') {
-        sourceHandle = 'retry'
-      }
-      return {
-        id: edge.id,
-        source: edge.source,
-        target: edge.target,
-        sourceHandle,
-        animated: true,
-        style: sourceHandle === 'pass'
-          ? { stroke: '#22c55e', strokeWidth: 2 }
-          : sourceHandle === 'retry'
-            ? { stroke: '#ef4444', strokeWidth: 2 }
-            : undefined,
-      }
-    })
-    setNodes(flowNodes)
-    setEdges(flowEdges)
+    const origin = getWorkflowOrigin(workflow)
+    setSelectedWorkflow(origin === 'global_template' ? null : workflow)
+    setWorkflowSelectionMode(origin)
+    setWorkflowName(buildWorkflowDisplayName(workflow, origin))
+    setNodes(workflowToCanvasNodes(workflow))
+    setEdges(workflowToCanvasEdges(workflow))
+    setCurrentExecutionId(null)
   }
 
-  // 创建新工作流
   const handleNewWorkflow = () => {
     setSelectedWorkflow(null)
+    setWorkflowSelectionMode('project')
     setWorkflowName('新工作流')
     setNodes([
       { id: 'start', type: 'start', position: { x: 250, y: 50 }, data: { label: '开始' } },
       { id: 'end', type: 'end', position: { x: 250, y: 400 }, data: { label: '结束' } },
     ])
     setEdges([])
+    setCurrentExecutionId(null)
   }
 
-  // 添加节点
+  const handleLoadStandardWorkflow = () => {
+    if (!currentProject) return
+    const workflow = buildStandardTemplateWorkflow(currentProject.id)
+    setSelectedWorkflow(null)
+    setWorkflowSelectionMode('project')
+    setWorkflowName(workflow.name)
+    setNodes(workflowToCanvasNodes(workflow))
+    setEdges(workflowToCanvasEdges(workflow))
+    setCurrentExecutionId(null)
+  }
+
   const handleAddNode = (nodeInfo: NodeTypeInfo) => {
-    const nodeType = nodeInfo.type
-    const newNode: Node = {
+    const nodeType = nodeInfo.type as WfNode['node_type']
+    const newNode: Node<VisualNodeData> = {
       id: generateId(),
       type: nodeType,
       position: { x: 100 + Math.random() * 300, y: 150 + nodes.length * 80 },
       data: {
         label: nodeInfo.label,
         agent_type: nodeInfo.agent_type,
+        description: nodeInfo.description,
+        config: {},
+        inputs: [],
+        outputs: [],
       },
     }
     setNodes((nds) => [...nds, newNode])
   }
 
-  // 保存工作流
+  const persistCurrentWorkflow = useCallback(async (): Promise<WorkflowDefinition | null> => {
+    if (!currentProject) return null
+
+    const baseWorkflow = workflowSelectionMode === 'global_template' ? null : selectedWorkflow
+    const { createPayload, updatePayload } = buildWorkflowPayload(
+      nodes,
+      edges,
+      workflowName,
+      baseWorkflow,
+      currentProject.id,
+    )
+
+    if (baseWorkflow) {
+      const result = await updateWorkflow(baseWorkflow.id, updatePayload)
+      setSelectedWorkflow(result.workflow)
+      setWorkflowSelectionMode('project')
+      return result.workflow
+    }
+
+    const result = await createWorkflow(createPayload)
+    setSelectedWorkflow(result.workflow)
+    setWorkflowSelectionMode('project')
+    return result.workflow
+  }, [currentProject, nodes, edges, workflowName, selectedWorkflow, workflowSelectionMode])
+
   const handleSaveWorkflow = async () => {
     if (!currentProject) return
     setSaving(true)
     try {
-      const workflowNodes: WfNode[] = nodes.map((node) => ({
-        id: node.id,
-        node_type: node.type as any,
-        label: node.data.label || '节点',
-        agent_type: node.data.agent_type,
-        config: node.data.config || {},
-        position: node.position,
-      }))
-      const workflowEdges: WfEdge[] = edges.map((edge, index) => {
-        let condition: { result: string } | undefined
-        if (edge.sourceHandle === 'pass') condition = { result: 'pass' }
-        else if (edge.sourceHandle === 'retry') condition = { result: 'retry' }
-        else if (edge.sourceHandle === 'loop') condition = { result: 'retry' }
-        return {
-          id: edge.id || `edge_${index}`,
-          source: edge.source,
-          target: edge.target,
-          condition,
-        }
-      })
-
-      if (selectedWorkflow) {
-        await updateWorkflow(selectedWorkflow.id, {
-          name: workflowName,
-          nodes: workflowNodes,
-          edges: workflowEdges,
-        })
-        alert('工作流更新成功！')
-      } else {
-        await createWorkflow({
-          project_id: currentProject.id,
-          name: workflowName,
-          nodes: workflowNodes,
-          edges: workflowEdges,
-        })
-        alert('工作流创建成功！')
+      const workflow = await persistCurrentWorkflow()
+      if (!workflow) {
+        alert('保存失败')
+        return
       }
       await loadWorkflows()
+      alert(
+        workflowSelectionMode === 'global_template'
+          ? '模板已复制到当前项目并保存成功！'
+          : selectedWorkflow
+            ? '工作流更新成功！'
+            : '工作流创建成功！',
+      )
     } catch (error) {
       console.error('Failed to save workflow:', error)
       alert('保存失败')
@@ -372,12 +888,25 @@ export default function Visualizer() {
     }
   }
 
-  // 执行工作流
   const handleExecuteWorkflow = async () => {
-    if (!selectedWorkflow || !currentProject) return
+    if (!currentProject) return
+
     setExecuting(true)
     try {
-      const result = await executeWorkflow(selectedWorkflow.id, currentProject.id)
+      const workflow = await persistCurrentWorkflow()
+      if (!workflow) {
+        alert('请先保存工作流')
+        return
+      }
+
+      if (!selectedWorkflow) {
+        await loadWorkflows()
+      }
+
+      const result = await executeWorkflow(workflow.id, currentProject.id, {
+        chapter_num: workflow.variables?.chapter_num || 1,
+      })
+      setCurrentExecutionId(result.execution_id)
       alert(`工作流已启动！执行ID: ${result.execution_id}`)
     } catch (error) {
       console.error('Failed to execute workflow:', error)
@@ -387,17 +916,23 @@ export default function Visualizer() {
     }
   }
 
-  // 删除工作流
   const handleDeleteWorkflow = async (workflow: WorkflowDefinition, e: React.MouseEvent) => {
     e.stopPropagation()
+    if (getWorkflowOrigin(workflow) === 'global_template') {
+      alert('全局模板不能直接删除，请复制到项目后编辑。')
+      return
+    }
+
     if (!confirm(`确定要删除工作流 "${workflow.name}" 吗？`)) return
     try {
       await deleteWorkflow(workflow.id)
       if (selectedWorkflow?.id === workflow.id) {
         setSelectedWorkflow(null)
+        setWorkflowSelectionMode('project')
         setNodes([])
         setEdges([])
         setWorkflowName('新工作流')
+        setCurrentExecutionId(null)
       }
       await loadWorkflows()
     } catch (error) {
@@ -406,7 +941,6 @@ export default function Visualizer() {
     }
   }
 
-  // 删除选中的节点
   const handleDeleteSelectedNodes = useCallback(() => {
     setNodes((nds) => nds.filter((node) => !node.selected))
     setEdges((eds) => eds.filter((edge) => !edge.selected))
@@ -484,15 +1018,21 @@ export default function Visualizer() {
             </>
           )}
           <div className="w-48">
-            <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>世界</label>
+            <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+              世界
+            </label>
             <select
-              className={`w-full px-3 py-2 border rounded-lg ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'bg-white border-gray-300'}`}
+              className={`w-full px-3 py-2 border rounded-lg ${
+                isDark ? 'bg-gray-800 border-gray-600 text-white' : 'bg-white border-gray-300'
+              }`}
               value={selectedWorldId}
               onChange={(e) => setSelectedWorldId(e.target.value)}
             >
               <option value="">选择世界...</option>
               {worlds.map((world) => (
-                <option key={world.id} value={world.id}>{world.name || world.id}</option>
+                <option key={world.id} value={world.id}>
+                  {world.name || world.id}
+                </option>
               ))}
             </select>
           </div>
@@ -501,20 +1041,27 @@ export default function Visualizer() {
     >
       {activeTab === 'workflow' ? (
         <div className="flex gap-4" style={{ height: 'calc(100vh - 280px)', minHeight: '500px' }}>
-          {/* 左侧面板 */}
           <div className="w-80 flex flex-col gap-3">
-            {/* 工作流列表 */}
             <Card className="p-3">
               <div className="flex items-center justify-between mb-2">
                 <h3 className={`text-sm font-semibold ${isDark ? 'text-gray-200' : 'text-gray-700'}`}>
                   工作流
                 </h3>
-                <button
-                  onClick={handleNewWorkflow}
-                  className="flex items-center gap-1 px-2 py-1 bg-green-500 text-white rounded text-xs hover:bg-green-600"
-                >
-                  <Plus size={12} /> 新建
-                </button>
+                <div className="flex gap-2">
+                  <button
+                    onClick={handleNewWorkflow}
+                    className="flex items-center gap-1 px-2 py-1 bg-green-500 text-white rounded text-xs hover:bg-green-600"
+                  >
+                    <Plus size={12} /> 新建
+                  </button>
+                  <button
+                    onClick={handleLoadStandardWorkflow}
+                    disabled={!currentProject}
+                    className="px-2 py-1 bg-indigo-500 text-white rounded text-xs hover:bg-indigo-600 disabled:opacity-50"
+                  >
+                    标准全节点
+                  </button>
+                </div>
               </div>
               <div className="space-y-1 max-h-32 overflow-y-auto">
                 {workflows.length === 0 ? (
@@ -524,7 +1071,7 @@ export default function Visualizer() {
                     <div
                       key={wf.id}
                       onClick={() => handleSelectWorkflow(wf)}
-                      className={`p-1.5 rounded cursor-pointer text-xs flex justify-between items-center ${
+                      className={`p-1.5 rounded cursor-pointer text-xs flex justify-between items-center gap-2 ${
                         selectedWorkflow?.id === wf.id
                           ? 'bg-blue-100 text-blue-700'
                           : isDark
@@ -532,21 +1079,37 @@ export default function Visualizer() {
                             : 'bg-gray-50 hover:bg-gray-100 text-gray-700'
                       }`}
                     >
-                      <span className="truncate flex-1">{wf.name}</span>
-                      <button
-                        onClick={(e) => handleDeleteWorkflow(wf, e)}
-                        className="text-red-500 hover:text-red-700 ml-2"
-                        title="删除"
-                      >
-                        <Trash2 size={10} />
-                      </button>
+                      <div className="min-w-0 flex-1 flex items-center gap-1.5">
+                        <span className="truncate flex-1">{wf.name}</span>
+                        {getWorkflowOrigin(wf) === 'global_template' && (
+                          <span
+                            className={`shrink-0 rounded px-1 py-0.5 text-[10px] ${
+                              isDark ? 'bg-indigo-900 text-indigo-200' : 'bg-indigo-100 text-indigo-700'
+                            }`}
+                          >
+                            模板
+                          </span>
+                        )}
+                      </div>
+                      {getWorkflowOrigin(wf) === 'project' ? (
+                        <button
+                          onClick={(e) => handleDeleteWorkflow(wf, e)}
+                          className="text-red-500 hover:text-red-700 ml-2"
+                          title="删除"
+                        >
+                          <Trash2 size={10} />
+                        </button>
+                      ) : (
+                        <span className={`ml-2 text-[10px] ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+                          只读
+                        </span>
+                      )}
                     </div>
                   ))
                 )}
               </div>
             </Card>
 
-            {/* 动态节点面板 */}
             <Card className="p-3 flex-1 overflow-y-auto">
               {loadingNodeTypes ? (
                 <div className="flex items-center justify-center h-32">
@@ -558,10 +1121,9 @@ export default function Visualizer() {
                     可用节点
                   </h3>
 
-                  {/* Agent 节点 */}
                   <div className="mb-3">
                     <p className={`text-xs font-medium mb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
-                      🤖 系统 Agent
+                      系统 Agent
                     </p>
                     <div className="grid grid-cols-2 gap-1">
                       {nodeTypesData.agent_nodes.map((node) => (
@@ -575,18 +1137,16 @@ export default function Visualizer() {
                           }`}
                           title={node.label}
                         >
-			
-                         {node.label.replace(' Agent', '').replace('管理员', '')}
+                          {node.label}
                         </button>
                       ))}
                     </div>
                   </div>
 
-                  {/* 角色 Agent */}
                   {nodeTypesData.character_nodes.length > 0 && (
                     <div className="mb-3">
                       <p className={`text-xs font-medium mb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
-                        👤 角色 Agent
+                        角色 Agent
                       </p>
                       <div className="grid grid-cols-2 gap-1">
                         {nodeTypesData.character_nodes.map((node) => (
@@ -607,10 +1167,9 @@ export default function Visualizer() {
                     </div>
                   )}
 
-                  {/* 交互节点 */}
                   <div className="mb-3">
                     <p className={`text-xs font-medium mb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
-                      💬 交互节点
+                      交互节点
                     </p>
                     <div className="grid grid-cols-2 gap-1">
                       {nodeTypesData.interaction_nodes.map((node) => (
@@ -630,10 +1189,9 @@ export default function Visualizer() {
                     </div>
                   </div>
 
-                  {/* 控制节点 */}
                   <div>
                     <p className={`text-xs font-medium mb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
-                      ⚙️ 控制节点
+                      控制节点
                     </p>
                     <div className="grid grid-cols-2 gap-1">
                       {nodeTypesData.control_nodes
@@ -666,78 +1224,90 @@ export default function Visualizer() {
               )}
             </Card>
 
-            {/* 执行控制 */}
-            {selectedWorkflow && (
-              <Card className="p-3">
-                <button
-                  onClick={handleExecuteWorkflow}
-                  disabled={executing}
-                  className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-green-500 text-white rounded text-sm hover:bg-green-600 disabled:opacity-50"
-                >
-                  <Play size={14} />
-                  {executing ? '执行中...' : '执行'}
-                </button>
-              </Card>
-            )}
+            <Card className="p-3">
+              <button
+                onClick={handleExecuteWorkflow}
+                disabled={executing || !selectedWorkflow}
+                className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-green-500 text-white rounded text-sm hover:bg-green-600 disabled:opacity-50"
+              >
+                <Play size={14} />
+                {executing ? '执行中...' : '执行'}
+              </button>
+            </Card>
           </div>
 
-          {/* 右侧：工作流画布 */}
-          <div className="flex-1 border-2 border-dashed border-gray-300 rounded-xl overflow-hidden" style={{ height: 'calc(100vh - 280px)', minHeight: '500px' }}>
-            {nodes.length === 0 ? (
-              <div className="h-full flex flex-col items-center justify-center text-gray-400">
-                <Network size={48} className="mb-4 opacity-50" />
-                <p className="text-lg mb-2">点击"新建工作流"开始创建</p>
-                <p className="text-sm">或从左侧选择一个已保存的工作流</p>
-              </div>
-            ) : (
-              <ReactFlow
-                nodes={nodes}
-                edges={edges}
-                onNodesChange={onNodesChange}
-                onEdgesChange={onEdgesChange}
-                onConnect={onConnect}
-                nodeTypes={nodeTypes}
-                fitView
-                selectNodesOnDrag={false}
-                panOnScroll
-                selectionOnDrag
-                proOptions={{ hideAttribution: true }}
-              >
-                <MiniMap />
-                <Controls />
-                <Background color={isDark ? '#374151' : '#e5e7eb'} gap={16} />
-                <Panel position="top-right">
-                  <div className="flex gap-2">
-                    <button
-                      onClick={handleDeleteSelectedNodes}
-                      className={`px-3 py-1.5 rounded text-sm ${
-                        isDark ? 'bg-red-900 text-red-200 hover:bg-red-800' : 'bg-red-100 text-red-700 hover:bg-red-200'
-                      }`}
-                      title="删除选中节点 (Delete)"
-                    >
-                      <Trash2 size={14} className="inline mr-1" /> 删除选中
-                    </button>
-                    <button
-                      onClick={() => {
-                        setNodes((nds) => nds.filter((node) => node.id === 'start' || node.id === 'end'))
-                        setEdges([])
-                      }}
-                      className={`px-3 py-1.5 rounded text-sm ${
-                        isDark ? 'bg-gray-800 text-gray-300 hover:bg-gray-700' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-                      }`}
-                      title="清空所有节点（保留开始和结束）"
-                    >
-                      清空
-                    </button>
-                  </div>
-                </Panel>
-              </ReactFlow>
-            )}
+          <div className="flex-1 flex gap-4 min-w-0">
+            <div
+              className="flex-1 border-2 border-dashed border-gray-300 rounded-xl overflow-hidden"
+              style={{ height: 'calc(100vh - 280px)', minHeight: '500px' }}
+            >
+              {nodes.length === 0 ? (
+                <div className="h-full flex flex-col items-center justify-center text-gray-400">
+                  <Network size={48} className="mb-4 opacity-50" />
+                  <p className="text-lg mb-2">点击“新建工作流”开始创建</p>
+                  <p className="text-sm">或使用“标准全节点”直接加载一个可执行工作流</p>
+                </div>
+              ) : (
+                <ReactFlow
+                  nodes={nodes}
+                  edges={edges}
+                  onNodesChange={onNodesChange}
+                  onEdgesChange={onEdgesChange}
+                  onConnect={onConnect}
+                  nodeTypes={nodeTypes}
+                  fitView
+                  selectNodesOnDrag={false}
+                  panOnScroll
+                  selectionOnDrag
+                  proOptions={{ hideAttribution: true }}
+                >
+                  <MiniMap />
+                  <Controls />
+                  <Background color={isDark ? '#374151' : '#e5e7eb'} gap={16} />
+                  <Panel position="top-right">
+                    <div className="flex gap-2">
+                      <button
+                        onClick={handleDeleteSelectedNodes}
+                        className={`px-3 py-1.5 rounded text-sm ${
+                          isDark
+                            ? 'bg-red-900 text-red-200 hover:bg-red-800'
+                            : 'bg-red-100 text-red-700 hover:bg-red-200'
+                        }`}
+                        title="删除选中节点 (Delete)"
+                      >
+                        <Trash2 size={14} className="inline mr-1" /> 删除选中
+                      </button>
+                      <button
+                        onClick={() => {
+                          setNodes((nds) => nds.filter((node) => node.id === 'start' || node.id === 'end'))
+                          setEdges([])
+                        }}
+                        className={`px-3 py-1.5 rounded text-sm ${
+                          isDark
+                            ? 'bg-gray-800 text-gray-300 hover:bg-gray-700'
+                            : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                        }`}
+                        title="清空所有节点（保留开始和结束）"
+                      >
+                        清空
+                      </button>
+                    </div>
+                  </Panel>
+                </ReactFlow>
+              )}
+            </div>
+
+            <div
+              className="w-[360px] border rounded-xl overflow-hidden"
+              style={{ height: 'calc(100vh - 280px)', minHeight: '500px' }}
+            >
+              <WorkflowMonitor executionId={currentExecutionId} />
+            </div>
           </div>
         </div>
       ) : (
         <Card className="min-h-[600px]">
-          {selectedWorldId ? (
+          {selectedWorldId && currentWorld ? (
             <ReactFlow
               nodes={activeTab === 'plots' ? plotNodes : snapshotNodes}
               edges={activeTab === 'plots' ? plotEdges : snapshotEdges}

@@ -12,9 +12,14 @@ from typing import Any, Dict, Optional, Set
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.config import settings
+from app.models.agent_template import AgentType
 from app.services.director import DirectorSystem
 from app.services.model_router import create_model_factory
 from app.services.workflow import DirectorWorkflow
+from app.services.workflow_node_registry import (
+    get_workflow_node_profile,
+    normalize_workflow_agent_type,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +116,131 @@ async def create_agent_provider(director: DirectorSystem):
     # 获取数据库连接（用于记忆加载）
     from app.api.app import postgres_db
 
+    async def _resolve_runtime_state(agent_type_value: str, project_id: str) -> Optional[Dict[str, Any]]:
+        if not postgres_db or not project_id:
+            return None
+
+        try:
+            from app.services.agent_config_service import get_agent_config_service
+
+            config_service = get_agent_config_service()
+            return await config_service.resolve_agent_runtime_state(project_id, agent_type_value)
+        except Exception as e:
+            logger.warning(
+                f"读取 Agent 运行时状态失败: project={project_id}, agent={agent_type_value}, error={e}"
+            )
+            return None
+
+    async def _is_agent_disabled(agent_type_value: str, project_id: str) -> tuple[bool, Optional[str]]:
+        runtime_state = await _resolve_runtime_state(agent_type_value, project_id)
+        if runtime_state and runtime_state.get("enabled") is False:
+            return True, runtime_state.get("reason", "Agent 已禁用")
+        return False, None
+
+    async def _build_runtime_world(project_id: str):
+        from app.models.world import World
+
+        world = None
+
+        if hasattr(director, "world_data") and director.world_data:
+            try:
+                world = World(**director.world_data)
+                logger.info(f"从 director.world_data 创建 World: {world.name}")
+            except Exception as e:
+                logger.warning(f"从 world_data 创建 World 失败: {e}")
+
+        if not world and postgres_db and director.project_id:
+            try:
+                project = await postgres_db.get_project(director.project_id)
+                if project and project.get("world_id"):
+                    world_data = await postgres_db.get_world(project["world_id"])
+                    if world_data:
+                        world = World(**world_data)
+                        logger.info(f"从数据库获取 World: {world.name}")
+            except Exception as e:
+                logger.warning(f"获取世界数据失败: {e}")
+
+        if not world and postgres_db and project_id:
+            try:
+                project = await postgres_db.get_project(project_id)
+                if project:
+                    world_payload = {
+                        "id": project.get("world_id") or f"world_{project_id}",
+                        "project_id": project_id,
+                        "name": project.get("name") or "项目世界",
+                        "description": project.get("description") or project.get("premise") or "",
+                        "world_type": project.get("world_type") or "unknown",
+                        "tone": project.get("tone") or "serious",
+                    }
+                    world = World(**world_payload)
+                    logger.info(f"从项目信息构建 World: {world.name}")
+            except Exception as e:
+                logger.warning(f"从项目信息构建 World 失败: {e}")
+
+        return world
+
+    async def _prepare_runtime_agent(agent):
+        if agent and hasattr(agent, 'load_memory') and not getattr(agent, '_memory_loaded', False):
+            await agent.load_memory(postgres_db)
+        return agent
+
+    async def _create_isolated_runtime_agent(
+        agent_type_lower: str,
+        normalized_agent_type: str,
+        project_id: str,
+    ):
+        model = director._model_factory() if director._model_factory else None
+
+        if agent_type_lower == "summarizer" or normalized_agent_type == AgentType.SUMMARIZER.value:
+            from app.agents.director.summarizer import SummarizerAgent
+            return await _prepare_runtime_agent(
+                SummarizerAgent(model=model, project_id=project_id)
+            )
+
+        if agent_type_lower in ["master_plotter", "plotter"] or normalized_agent_type == AgentType.MASTER_PLOTTER.value:
+            from app.agents.director.master_plotter import MasterPlotterAgent
+            return await _prepare_runtime_agent(
+                MasterPlotterAgent(model=model, project_id=project_id)
+            )
+
+        if agent_type_lower == "hook_manager" or normalized_agent_type == AgentType.HOOK_MANAGER.value:
+            from app.agents.director.hook_manager import HookManagerAgent
+            return await _prepare_runtime_agent(
+                HookManagerAgent(model=model, project_id=project_id)
+            )
+
+        if agent_type_lower == "writer" or normalized_agent_type == AgentType.WRITER.value:
+            from app.agents.director.writer import WriterAgent
+            return await _prepare_runtime_agent(
+                WriterAgent(model=model, project_id=project_id)
+            )
+
+        if agent_type_lower == "evaluator" or normalized_agent_type == AgentType.EVALUATOR.value:
+            from app.agents.evaluator import EvaluatorAgent
+            return await _prepare_runtime_agent(
+                EvaluatorAgent(model=model, project_id=project_id)
+            )
+
+        if agent_type_lower == "setting" or normalized_agent_type == AgentType.SETTING.value:
+            from app.agents.setting_agent import SettingAgent
+            return await _prepare_runtime_agent(
+                SettingAgent(model=model, project_id=project_id)
+            )
+
+        return None
+
+    async def _create_runtime_character_agent(character_agent, runtime_project_id: str):
+        from app.agents.character_agent import CharacterAgent
+
+        model = director._model_factory() if director._model_factory else None
+        runtime_agent = CharacterAgent(
+            character=character_agent.character.model_copy(deep=True),
+            model=model,
+            project_id=runtime_project_id,
+            agent_id=character_agent.character.id,
+        )
+        return await _prepare_runtime_agent(runtime_agent)
+
     async def agent_provider(agent_type: str, project_id: str):
         """
         获取 Agent 实例（并加载记忆）
@@ -124,43 +254,43 @@ async def create_agent_provider(director: DirectorSystem):
         """
         from app.models.character import CharacterPresence
 
-        # 系统内置 Agent（支持多种命名方式）
-        # 注意：对于可能并行执行的 agent，需要创建新实例以避免状态冲突
-        system_agents_shared = {
-            "summarizer": director.summarizer,
-            "master_plotter": director.master_plotter,
-            "plotter": director.master_plotter,  # 别名
-            "hook_manager": director.hook_manager,
-            "writer": director.writer,
-            "evaluator": director.evaluator,
-            # setting agent 使用独立的 SettingAgent，与 /lore 界面共享
-        }
+        normalized_agent_type = normalize_workflow_agent_type(agent_type)
+        profile = get_workflow_node_profile(agent_type)
+        agent_type_lower = normalized_agent_type.lower().replace(" ", "_").replace("-", "_")
 
-        # 检查是否是系统 Agent（共享实例）
-        agent_type_lower = agent_type.lower().replace(" ", "_").replace("-", "_")
-        if agent_type_lower in system_agents_shared:
-            agent = system_agents_shared[agent_type_lower]
-            # 确保记忆已加载
-            if agent and hasattr(agent, 'load_memory') and not agent._memory_loaded:
-                await agent.load_memory(postgres_db)
-            return agent
-        if agent_type in system_agents_shared:
-            agent = system_agents_shared[agent_type]
-            # 确保记忆已加载
-            if agent and hasattr(agent, 'load_memory') and not agent._memory_loaded:
-                await agent.load_memory(postgres_db)
-            return agent
+        agent_type_enum: Optional[AgentType] = None
+        try:
+            agent_type_enum = AgentType(normalized_agent_type)
+        except ValueError:
+            agent_type_enum = None
 
-        # ========== 需要独立实例的 Agent（避免并行执行时状态冲突）==========
-        # Setting Agent：使用独立的 SettingAgent，与 /lore 界面共享
-        if agent_type_lower == "setting":
-            from app.agents.setting_agent import get_setting_agent
-            model = director._model_factory() if director._model_factory else None
-            agent = await get_setting_agent(project_id, model=model, db=postgres_db)
-            logger.info(f"Setting Agent 实例获取成功: project_id={project_id}")
-            return agent
+        if agent_type_enum is not None:
+            disabled, reason = await _is_agent_disabled(agent_type_enum.value, project_id)
+            if disabled:
+                logger.info(
+                    f"Agent 在当前项目已禁用，provider 返回 None: type={agent_type_enum.value}, project_id={project_id}, reason={reason}"
+                )
+                return None
 
-        # Event Generator Agent：独立的事件生成 Agent
+        if profile and profile.kind == "service_adapter":
+            logger.info(
+                f"工作流节点 {agent_type} 注册为 service_adapter，跳过 agent_provider 实例化"
+            )
+            return None
+
+        # 系统内置 Agent（workflow/runtime 路径统一按需创建独立实例，避免共享状态串扰）
+        isolated_runtime_agent = await _create_isolated_runtime_agent(
+            agent_type_lower,
+            normalized_agent_type,
+            project_id,
+        )
+        if isolated_runtime_agent:
+            logger.info(
+                f"为 workflow/runtime 创建独立 Agent 实例: type={normalized_agent_type}, "
+                f"instance_id={id(isolated_runtime_agent)}, project_id={project_id}"
+            )
+            return isolated_runtime_agent
+
         if agent_type_lower == "event_generator":
             from app.agents.event_generator import EventGeneratorAgent
             model = director._model_factory() if director._model_factory else None
@@ -173,7 +303,6 @@ async def create_agent_provider(director: DirectorSystem):
             await agent_instance.load_memory(postgres_db)
             return agent_instance
 
-        # World Map Manager Agent：独立的地图管理 Agent
         if agent_type_lower == "world_map_manager":
             from app.agents.world_map_manager import WorldMapManagerAgent
             model = director._model_factory() if director._model_factory else None
@@ -186,131 +315,90 @@ async def create_agent_provider(director: DirectorSystem):
             await agent_instance.load_memory(postgres_db)
             return agent_instance
 
-        # ProcGen Agent：世界生成 Agent（保留用于底层生成能力）
-        # 支持 "procgen" 和 "proc_gen" 两种命名方式
         if agent_type_lower in ["procgen", "proc_gen"]:
             from app.agents.procgen import ProcGenAgent
-            from app.models.world import World
             model = director._model_factory() if director._model_factory else None
 
             logger.info(f"创建新的 ProcGenAgent 实例，类型: {agent_type}, 模型: {type(model) if model else None}")
-
-            # 获取或创建 world 对象
-            world = None
-
-            # 方法1: 从 director.world_data 创建 World 对象
-            if hasattr(director, 'world_data') and director.world_data:
-                try:
-                    world = World(**director.world_data)
-                    logger.info(f"从 director.world_data 创建 World: {world.name}")
-                except Exception as e:
-                    logger.warning(f"从 world_data 创建 World 失败: {e}")
-
-            # 方法2: 尝试从数据库获取
+            world = await _build_runtime_world(project_id)
             if not world:
-                if postgres_db and director.project_id:
-                    try:
-                        project = await postgres_db.get_project(director.project_id)
-                        if project and project.get("world_id"):
-                            world_data = await postgres_db.get_world(project["world_id"])
-                            if world_data:
-                                world = World(**world_data)
-                                logger.info(f"从数据库获取 World: {world.name}")
-                    except Exception as e:
-                        logger.warning(f"获取世界数据失败: {e}")
+                raise ValueError(f"项目 {project_id} 缺少世界观信息，无法执行 {normalized_agent_type}")
 
-            # 方法3: 创建默认世界
-            if not world:
-                world = World(
-                    id="default_world",
-                    name="默认世界",
-                    world_type="奇幻",
-                )
-                logger.info("创建默认 World 对象")
-
-            # 创建新的 ProcGenAgent 实例
             agent_instance = ProcGenAgent(
                 world=world,
                 model=model,
                 project_id=project_id,
                 agent_id=agent_type_lower,
             )
-            logger.info(f"ProcGenAgent 实例已创建: 类型={agent_type}, 实例ID={id(agent_instance)}, 世界={world.name}, 模型={type(model).__name__ if model else 'None'}")
-
-            # 加载记忆
+            logger.info(
+                f"ProcGenAgent 实例已创建: 类型={agent_type}, 实例ID={id(agent_instance)}, 世界={world.name}, 模型={type(model).__name__ if model else 'None'}"
+            )
             await agent_instance.load_memory(postgres_db)
-
             return agent_instance
 
-        # 检查是否是场景协调 Agent（按需创建实例）
-        if agent_type_lower == "scene_coordinator" or agent_type == "scene_coordinator":
+        if agent_type_lower == "scene_coordinator" or normalized_agent_type == "scene_coordinator":
             from app.agents.scene_coordinator import SceneCoordinatorAgent
             model = director._model_factory() if director._model_factory else None
             return SceneCoordinatorAgent(model=model, project_id=project_id)
 
-        # 检查是否是章节大纲 Agent（使用 master_plotter 作为基础）
-        if agent_type_lower == "plot_outline" or agent_type == "plot_outline":
-            # plot_outline 是 master_plotter 的一个变体，专门用于章节大纲规划
-            # 暂时使用 master_plotter，但可以后续创建专门的 PlotOutlineAgent
-            logger.info(f"获取 PlotOutline Agent (使用 master_plotter): project_id={project_id}")
-            return director.master_plotter
-
-        # 检查是否是副本生成 Agent
-        if agent_type_lower == "dungeon_generator" or agent_type == "dungeon_generator":
-            # dungeon_generator 使用 ProcGenAgent 的能力
-            logger.info(f"获取 DungeonGenerator Agent (使用 procgen): project_id={project_id}")
+        if agent_type_lower == "dungeon_generator" or normalized_agent_type == "dungeon_generator":
             from app.agents.procgen import ProcGenAgent
-            from app.models.world import World
             model = director._model_factory() if director._model_factory else None
-            world = World(id="dungeon_world", name="Dungeon World", world_type="奇幻")
-            return ProcGenAgent(world=world, model=model, project_id=project_id, agent_id="dungeon_generator")
+            logger.info(f"获取 DungeonGenerator Agent (使用 procgen): project_id={project_id}")
+            world = await _build_runtime_world(project_id)
+            if not world:
+                raise ValueError(f"项目 {project_id} 缺少世界观信息，无法执行 dungeon_generator")
+            agent_instance = ProcGenAgent(
+                world=world,
+                model=model,
+                project_id=project_id,
+                agent_id="dungeon_generator",
+                agent_type=AgentType.DUNGEON_GENERATOR.value,
+            )
+            await agent_instance.load_memory(postgres_db)
+            return agent_instance
 
-        # 检查是否是批量角色获取（格式：characters:presence_type）
         if agent_type.startswith("characters:"):
             presence_type = agent_type.split(":", 1)[1]
             agents = director.get_character_by_presence(presence_type)
             if agents:
-                # 返回角色列表（供工作流处理多角色场景）
-                return agents
+                runtime_agents = []
+                for character_agent in agents:
+                    runtime_agents.append(await _create_runtime_character_agent(character_agent, project_id))
+                return runtime_agents
             logger.warning(f"未找到在场形式为 '{presence_type}' 的角色")
             return None
 
-        # 检查是否是带在场形式的角色 Agent（格式：character:角色ID:presence_type）
         if agent_type.startswith("character:"):
             parts = agent_type.split(":")
             char_id = parts[1]
 
-            # 获取角色 Agent
             char_agent = director.get_character_agent(char_id)
             if not char_agent:
                 logger.warning(f"角色 {char_id} 不存在")
                 return None
 
-            # 如果指定了在场形式，验证角色是否支持
             if len(parts) > 2:
                 presence_type = parts[2]
                 try:
                     presence = CharacterPresence(presence_type)
                     if presence not in char_agent.character.available_presence_types:
                         logger.warning(f"角色 {char_id} 不支持在场形式 '{presence_type}'，可用: {[p.value for p in char_agent.character.available_presence_types]}")
-                        # 仍然返回，但会在执行上下文中标记
-                        return char_agent
+                        return await _create_runtime_character_agent(char_agent, project_id)
                 except ValueError:
                     logger.warning(f"未知的在场形式: {presence_type}")
 
-            return char_agent
+            return await _create_runtime_character_agent(char_agent, project_id)
 
-        # 尝试作为角色 ID 直接查找
         char_agent = director.get_character_agent(agent_type)
         if char_agent:
-            return char_agent
+            return await _create_runtime_character_agent(char_agent, project_id)
 
-        # 检查是否是角色类型（如 "CharacterAgent"）
-        if agent_type.lower() in ["character", "characteragent"]:
-            # 返回所有活跃角色的代理（用于集体讨论等场景）
+        if normalized_agent_type.lower() in ["character", "characteragent"]:
             active_chars = director.get_active_character_agents()
             if active_chars:
-                return list(active_chars.values())[0]
+                first_active_agent = list(active_chars.values())[0]
+                return await _create_runtime_character_agent(first_active_agent, project_id)
 
         logger.warning(f"未知的 Agent 类型: {agent_type}")
         return None
@@ -713,7 +801,7 @@ async def handle_intervention(websocket: WebSocket, message: dict, client_id: st
 
         # 检查工作流是否仍在运行
         execution = await engine.get_execution_state(execution_id)
-        if execution and execution.get("status") in ["running", "paused"]:
+        if execution and execution.status in ["running", "paused"]:
             # 添加干预到工作流队列（使用 agent_type 进行匹配）
             success = await engine.add_intervention(
                 execution_id=execution_id,

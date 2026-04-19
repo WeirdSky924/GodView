@@ -19,6 +19,13 @@ from app.models.workflow_execution import (
     WorkflowExecutionCreate,
     WorkflowStatus,
 )
+from app.services.workflow_node_catalog import (
+    resolve_disabled_agent_types,
+    resolve_workflow_node_types_payload,
+)
+from app.services.workflow_replay_export_service import (
+    get_workflow_replay_export_service,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -66,269 +73,15 @@ async def get_node_types(
     - 交互节点
     - 控制节点
     """
-    from app.models.agent_template import AgentType
-    from app.services.agent_template_service import AgentTemplateService
-
-    # 所有系统 Agent 节点定义
-    all_agent_nodes = [
-        {
-            "type": "agent",
-            "agent_type": AgentType.SETTING.value,
-            "label": "设定 Agent",
-            "description": "管理世界观、设定条目",
-            "category": "agent",
-            "icon": "Settings",
-            "color": "blue",
-            "is_system": True,
-        },
-        {
-            "type": "agent",
-            "agent_type": AgentType.WRITER.value,
-            "label": "作家 Agent",
-            "description": "生成小说内容",
-            "category": "agent",
-            "icon": "PenTool",
-            "color": "purple",
-            "is_system": True,
-        },
-        {
-            "type": "agent",
-            "agent_type": AgentType.MASTER_PLOTTER.value,
-            "label": "总编剧 Agent",
-            "description": "规划整体剧情结构",
-            "category": "agent",
-            "icon": "GitBranch",
-            "color": "indigo",
-            "is_system": True,
-        },
-        {
-            "type": "agent",
-            "agent_type": AgentType.SUMMARIZER.value,
-            "label": "摘要 Agent",
-            "description": "生成内容摘要",
-            "category": "agent",
-            "icon": "BookOpen",
-            "color": "amber",
-            "is_system": True,
-        },
-        {
-            "type": "agent",
-            "agent_type": AgentType.EVALUATOR.value,
-            "label": "评估 Agent",
-            "description": "评估内容质量",
-            "category": "agent",
-            "icon": "Search",
-            "color": "orange",
-            "is_system": True,
-        },
-        {
-            "type": "agent",
-            "agent_type": AgentType.HOOK_MANAGER.value,
-            "label": "伏笔 Agent",
-            "description": "管理伏笔和悬念",
-            "category": "agent",
-            "icon": "Link",
-            "color": "cyan",
-            "is_system": True,
-        },
-        {
-            "type": "agent",
-            "agent_type": AgentType.EVENT_GENERATOR.value,
-            "label": "事件 Agent",
-            "description": "生成随机事件",
-            "category": "agent",
-            "icon": "Dices",
-            "color": "pink",
-            "is_system": True,
-        },
-        {
-            "type": "agent",
-            "agent_type": AgentType.WORLD_MAP_MANAGER.value,
-            "label": "地图 Agent",
-            "description": "管理世界地图和地点",
-            "category": "agent",
-            "icon": "Map",
-            "color": "teal",
-            "is_system": True,
-        },
-        {
-            "type": "agent",
-            "agent_type": AgentType.PROC_GEN.value,
-            "label": "过程生成 Agent",
-            "description": "过程化生成内容",
-            "category": "agent",
-            "icon": "Zap",
-            "color": "yellow",
-            "is_system": True,
-        },
-        {
-            "type": "agent",
-            "agent_type": AgentType.DUNGEON_GENERATOR.value,
-            "label": "副本生成 Agent",
-            "description": "生成副本和关卡",
-            "category": "agent",
-            "icon": "Globe",
-            "color": "emerald",
-            "is_system": True,
-        },
-        {
-            "type": "agent",
-            "agent_type": AgentType.PLOT_OUTLINE.value,
-            "label": "章节大纲 Agent",
-            "description": "规划章节大纲",
-            "category": "agent",
-            "icon": "BookOpen",
-            "color": "rose",
-            "is_system": True,
-        },
-    ]
-
-    # 获取 Agent 模板的启用状态
-    # 逻辑：只有当模板存在且 is_enabled=False 时才禁用
-    # 如果模板不存在，则默认启用
-    disabled_agent_types = set()
     db = get_db()
-    if db:
-        try:
-            template_service = AgentTemplateService(db)
-            templates = await template_service.list_templates(limit=100)
+    disabled_agent_types = await resolve_disabled_agent_types(project_id, db)
+    if disabled_agent_types:
+        logger.info(f"已禁用的 Agent 类型: {disabled_agent_types}")
 
-            # 只记录被明确禁用的 Agent 类型
-            for template in templates:
-                if not template.is_enabled:
-                    disabled_agent_types.add(template.agent_type.value)
-
-            logger.info(f"已禁用的 Agent 类型: {disabled_agent_types}")
-        except Exception as e:
-            logger.warning(f"获取 Agent 模板启用状态失败: {e}")
-
-    # 过滤掉被禁用的 Agent 节点
-    agent_nodes = [
-        node for node in all_agent_nodes
-        if node.get("agent_type") not in disabled_agent_types
-    ]
-
-    logger.info(f"返回 {len(agent_nodes)} 个 Agent 节点")
-
-    # 角色 Agent 节点（从项目角色生成）
-    character_nodes = []
-    if project_id:
-        if db:
-            try:
-                characters = await db.execute_query(
-                    "SELECT id, name, importance_tier FROM characters WHERE project_id = :project_id ORDER BY importance_tier DESC, name",
-                    {"project_id": project_id}
-                )
-                for char in characters:
-                    character_nodes.append({
-                        "type": "agent",
-                        "agent_type": "character",
-                        "label": f"{char['name']} Agent",
-                        "description": f"角色 {char['name']} 的专属 Agent",
-                        "category": "agent",
-                        "icon": "User",
-                        "color": "green",
-                        "is_system": False,
-                        "character_id": str(char["id"]),
-                        "character_name": char["name"],
-                        "importance_tier": char.get("importance_tier", 1),
-                    })
-            except Exception as e:
-                logger.warning(f"获取项目角色失败: {e}")
-
-    # 交互节点
-    interaction_nodes = [
-        {
-            "type": "input",
-            "label": "用户输入",
-            "description": "暂停等待用户输入",
-            "category": "interaction",
-            "icon": "MessageSquare",
-            "color": "blue",
-            "is_system": True,
-            "config_hints": {
-                "prompt": {"type": "string", "default": "请输入内容", "description": "提示语"}
-            }
-        },
-        {
-            "type": "group_discussion",
-            "label": "集体讨论",
-            "description": "多个Agent进行创作会议",
-            "category": "interaction",
-            "icon": "MessageCircle",
-            "color": "purple",
-            "is_system": True,
-            "supports_multiple": True,
-        },
-        {
-            "type": "scene_performance",
-            "label": "场景演绎",
-            "description": "多角色同台飙戏",
-            "category": "interaction",
-            "icon": "Users",
-            "color": "green",
-            "is_system": True,
-            "supports_multiple": True,
-        },
-    ]
-
-    # 控制节点
-    control_nodes = [
-        {
-            "type": "start",
-            "label": "开始",
-            "description": "工作流起点",
-            "category": "control",
-            "icon": "Play",
-            "color": "green",
-            "is_system": True,
-        },
-        {
-            "type": "end",
-            "label": "结束",
-            "description": "工作流终点",
-            "category": "control",
-            "icon": "Square",
-            "color": "red",
-            "is_system": True,
-        },
-        {
-            "type": "condition",
-            "label": "条件分支",
-            "description": "根据条件选择分支",
-            "category": "control",
-            "icon": "GitBranch",
-            "color": "amber",
-            "is_system": True,
-            "config_hints": {
-                "condition": {"type": "string", "default": "", "description": "条件表达式"}
-            }
-        },
-        {
-            "type": "parallel",
-            "label": "并行执行",
-            "description": "同时执行多个分支",
-            "category": "control",
-            "icon": "Layers",
-            "color": "indigo",
-            "is_system": True,
-        },
-    ]
-
-    # 返回数据（添加版本号便于调试）
-    result = {
-        "version": "v9.0",
-        "agent_nodes": agent_nodes,
-        "character_nodes": character_nodes,
-        "interaction_nodes": interaction_nodes,
-        "control_nodes": control_nodes,
-    }
-
-    logger.info(f"返回节点类型: {len(agent_nodes)} 个 Agent 节点")
+    result = await resolve_workflow_node_types_payload(project_id, db, disabled_agent_types)
+    logger.info(f"返回节点类型: {len(result['agent_nodes'])} 个 Agent 节点")
     return result
 
-
-# ==================== 工作流定义 API ====================
 
 @router.get("", response_model=List[Dict[str, Any]])
 async def list_workflows(
@@ -387,6 +140,126 @@ async def create_workflow(request: WorkflowDefinitionCreate):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/executions/{execution_id}", response_model=Dict[str, Any])
+async def get_execution(execution_id: str):
+    """
+    获取工作流执行状态
+
+    Args:
+        execution_id: 执行ID
+
+    Returns:
+        Dict: 执行状态
+    """
+    engine = get_workflow_engine()
+    db = get_db()
+
+    execution = await engine.get_execution_state(execution_id, db)
+    if not execution:
+        raise HTTPException(status_code=404, detail="执行记录不存在")
+
+    return engine._serialize_for_json(execution)
+
+
+@router.get("/executions/{execution_id}/export-markdown", response_model=Dict[str, Any])
+async def export_execution_markdown(execution_id: str):
+    """
+    导出工作流执行复盘 Markdown
+
+    Args:
+        execution_id: 执行ID
+
+    Returns:
+        Dict: markdown 内容和文件名
+    """
+    engine = get_workflow_engine()
+    db = get_db()
+
+    execution = await engine.get_execution_state(execution_id, db)
+    if not execution:
+        raise HTTPException(status_code=404, detail="执行记录不存在")
+
+    workflow = await engine.get_workflow(execution.workflow_id, db)
+    if not workflow:
+        raise HTTPException(status_code=404, detail="工作流定义不存在")
+
+    export_service = get_workflow_replay_export_service()
+    content = export_service.export_markdown(execution, workflow)
+    file_path = export_service.save_markdown(execution, workflow)
+    execution.context["replay_markdown_path"] = file_path
+
+    if db:
+        await engine._save_execution_to_db(execution, db)
+
+    return {
+        "success": True,
+        "format": "markdown",
+        "content": content,
+        "filename": export_service.get_export_filename(execution),
+        "file_path": file_path,
+    }
+
+
+@router.get("/executions", response_model=List[Dict[str, Any]])
+async def list_executions(
+    project_id: str = Query(..., description="项目ID"),
+    status: Optional[str] = Query(None, description="状态过滤"),
+    limit: int = Query(default=50, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    """
+    获取工作流执行列表
+
+    Args:
+        project_id: 项目ID
+        status: 状态过滤
+        limit: 返回数量
+        offset: 偏移量
+
+    Returns:
+        List: 执行列表
+    """
+    db = get_db()
+    if not db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+
+    try:
+        conditions = ["project_id = :project_id"]
+        params = {"project_id": project_id, "limit": limit, "offset": offset}
+
+        if status:
+            conditions.append("status = :status")
+            params["status"] = status
+
+        query = f"""
+        SELECT * FROM workflow_executions
+        WHERE {' AND '.join(conditions)}
+        ORDER BY started_at DESC
+        LIMIT :limit OFFSET :offset
+        """
+
+        results = await db.execute_query(query, params)
+
+        executions = []
+        for row in results:
+            executions.append({
+                "id": row["id"],
+                "workflow_id": row["workflow_id"],
+                "project_id": str(row["project_id"]),
+                "status": row["status"],
+                "current_node": row["current_node"],
+                "started_at": row["started_at"].isoformat() if row["started_at"] else None,
+                "completed_at": row["completed_at"].isoformat() if row["completed_at"] else None,
+                "total_duration_ms": row["total_duration_ms"],
+                "error": row["error"],
+            })
+
+        return executions
+    except Exception as e:
+        logger.error(f"获取执行列表失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/{workflow_id}", response_model=Dict[str, Any])
 async def get_workflow(workflow_id: str):
     """
@@ -433,6 +306,8 @@ async def update_workflow(workflow_id: str, request: WorkflowDefinitionUpdate):
             "message": "工作流更新成功",
             "workflow": workflow.model_dump(),
         }
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except HTTPException:
         raise
     except Exception as e:
@@ -454,7 +329,11 @@ async def delete_workflow(workflow_id: str):
     engine = get_workflow_engine()
     db = get_db()
 
-    success = await engine.delete_workflow(workflow_id, db)
+    try:
+        success = await engine.delete_workflow(workflow_id, db)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+
     if not success:
         raise HTTPException(status_code=404, detail="工作流不存在")
 
@@ -581,85 +460,6 @@ async def execute_workflow(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/executions/{execution_id}", response_model=Dict[str, Any])
-async def get_execution(execution_id: str):
-    """
-    获取工作流执行状态
-
-    Args:
-        execution_id: 执行ID
-
-    Returns:
-        Dict: 执行状态
-    """
-    engine = get_workflow_engine()
-    db = get_db()
-
-    execution = await engine.get_execution_state(execution_id, db)
-    if not execution:
-        raise HTTPException(status_code=404, detail="执行记录不存在")
-
-    return execution.model_dump()
-
-
-@router.get("/executions", response_model=List[Dict[str, Any]])
-async def list_executions(
-    project_id: str = Query(..., description="项目ID"),
-    status: Optional[str] = Query(None, description="状态过滤"),
-    limit: int = Query(default=50, le=200),
-    offset: int = Query(default=0, ge=0),
-):
-    """
-    获取工作流执行列表
-
-    Args:
-        project_id: 项目ID
-        status: 状态过滤
-        limit: 返回数量
-        offset: 偏移量
-
-    Returns:
-        List: 执行列表
-    """
-    db = get_db()
-    if not db:
-        raise HTTPException(status_code=503, detail="数据库未连接")
-
-    try:
-        conditions = ["project_id = :project_id"]
-        params = {"project_id": project_id, "limit": limit, "offset": offset}
-
-        if status:
-            conditions.append("status = :status")
-            params["status"] = status
-
-        query = f"""
-        SELECT * FROM workflow_executions
-        WHERE {' AND '.join(conditions)}
-        ORDER BY started_at DESC
-        LIMIT :limit OFFSET :offset
-        """
-
-        results = await db.execute_query(query, params)
-
-        executions = []
-        for row in results:
-            executions.append({
-                "id": row["id"],
-                "workflow_id": row["workflow_id"],
-                "project_id": str(row["project_id"]),
-                "status": row["status"],
-                "current_node": row["current_node"],
-                "started_at": row["started_at"].isoformat() if row["started_at"] else None,
-                "completed_at": row["completed_at"].isoformat() if row["completed_at"] else None,
-                "total_duration_ms": row["total_duration_ms"],
-                "error": row["error"],
-            })
-
-        return executions
-    except Exception as e:
-        logger.error(f"获取执行列表失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/executions/{execution_id}/pause", response_model=Dict[str, Any])

@@ -188,6 +188,7 @@ class PostgresDatabase:
                 'characters', 'relationships', 'regions', 'hooks',
                 'coordinates', 'terrain_features', 'landmarks', 'encounters', 'connections', 'local_rules',
                 'completed_events', 'character_locations',
+                'memories', 'knowledge', 'working_memory',
                 'keywords', 'tags', 'constraints', 'related_characters', 'related_locations', 'related_items', 'forbidden_actions',
                 # project_writing_configs 表的 JSONB 字段
                 'enabled_rule_ids', 'enabled_rule_set_ids', 'rule_overrides', 'rule_priorities',

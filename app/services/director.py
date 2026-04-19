@@ -704,7 +704,12 @@ class DirectorSystem:
 
         # 如果已经是 Character 对象，直接使用
         if isinstance(char_data, Character):
-            return CharacterAgent(character=char_data, model=model, project_id=self.project_id)
+            return CharacterAgent(
+                character=char_data,
+                model=model,
+                project_id=self.project_id,
+                agent_id=char_data.id,
+            )
 
         # 处理类型转换
         char_dict = dict(char_data)
@@ -755,7 +760,12 @@ class DirectorSystem:
             char_dict["background"] = char_dict.pop("background_story")
 
         character = Character(**char_dict)
-        return CharacterAgent(character=character, model=model, project_id=self.project_id)
+        return CharacterAgent(
+            character=character,
+            model=model,
+            project_id=self.project_id,
+            agent_id=character.id,
+        )
 
     def _build_fallback_character(self, speaker_id: str) -> Dict[str, Any]:
         return {

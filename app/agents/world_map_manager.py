@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 class WorldMapManagerAgent(BaseAgent):
     """地图管理 Agent - 独立的世界地图管理者"""
 
-    AGENT_TYPE = AgentType.PROC_GEN  # 复用枚举，但实际是独立 Agent
+    AGENT_TYPE = AgentType.WORLD_MAP_MANAGER
 
     def __init__(
         self,
@@ -38,7 +38,7 @@ class WorldMapManagerAgent(BaseAgent):
         system_prompt: Optional[str] = None,
         agent_id: Optional[str] = None,
     ):
-        if not system_prompt:
+        if not system_prompt and not project_id:
             system_prompt = self._build_system_prompt()
 
         super().__init__(
@@ -191,16 +191,31 @@ class WorldMapManagerAgent(BaseAgent):
         world_info: Dict[str, Any],
     ) -> AgentResponse:
         """生成地图概述"""
-        world_name = world_info.get("name", "未知世界")
-        world_type = world_info.get("world_type", "奇幻")
+        world_name = world_info.get("name") or "未命名世界"
+        world_type = world_info.get("world_type") or world_info.get("description") or "未提供世界类型"
+        chapter_outline = world_info.get("chapter_outline") or world_info.get("plot_focus") or "未提供"
+        lore_entries = world_info.get("lore_entries") or []
+        lore_titles = []
+        for entry in lore_entries[:20]:
+            if isinstance(entry, dict):
+                title = entry.get("title") or entry.get("name") or entry.get("summary")
+                if title:
+                    lore_titles.append(title)
+            elif isinstance(entry, str):
+                lore_titles.append(entry)
 
-        prompt = f"""请为以下世界生成一个地图概述。
+        prompt = f"""请基于当前项目世界观生成地图/区域概述。
 
 【世界信息】
 - 名称：{world_name}
-- 类型：{world_type}
+- 类型/风格：{world_type}
+- 当前剧情焦点：{chapter_outline}
+- 相关设定关键词：{', '.join(lore_titles) if lore_titles else '未提供'}
 
-请生成 3-5 个主要区域的概述，输出 JSON 格式：
+要求：
+1. 区域设计必须服务当前世界观与剧情，不得默认转向奇幻地下城套路。
+2. 若世界观是赛博朋克/科幻/都市等，应体现对应空间形态、基础设施与社会氛围。
+3. 输出 3-5 个与当前项目匹配的主要区域，JSON 格式：
 {{
     "overview": "地图概述",
     "regions": [

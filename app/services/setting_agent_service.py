@@ -817,79 +817,40 @@ class SettingAgentService:
         """
         try:
             from app.api.app import postgres_db
-            from datetime import datetime
-            import json
-            import hashlib
+            from app.models.agent_memory import MemoryEntryCreate, MemoryType, MemoryImportance
+            from app.services.agent_memory_service import get_memory_service
 
             if not postgres_db:
                 return
 
-            # 生成记忆 ID
-            key = f"{project_id}:setting:setting_agent"
-            memory_id = f"memory_{hashlib.md5(key.encode()).hexdigest()[:12]}"
+            memory_service = get_memory_service(postgres_db)
 
-            # 创建新的记忆条目（不读取现有记忆）
-            timestamp = datetime.now().isoformat()
-            new_memories = [
-                {
-                    "id": f"mem_{hashlib.md5(f'{timestamp}_user'.encode()).hexdigest()[:8]}",
-                    "type": "interaction",
-                    "importance": "medium",
-                    "content": f"用户: {user_message}",
-                    "tags": [],
-                    "context": {"source": "lore_interface", "role": "user"},
-                    "created_at": timestamp,
-                },
-                {
-                    "id": f"mem_{hashlib.md5(f'{timestamp}_assistant'.encode()).hexdigest()[:8]}",
-                    "type": "interaction",
-                    "importance": "medium",
-                    "content": f"设定助手: {assistant_response}",
-                    "tags": [],
-                    "context": {"source": "lore_interface", "role": "assistant"},
-                    "created_at": timestamp,
-                },
-            ]
-
-            memories_json = json.dumps(new_memories)
-            now = datetime.now()
-
-            # 直接使用 SQL 追加记忆（不读取现有记忆）
-            query = """
-                INSERT INTO agent_memories (id, project_id, agent_type, agent_id, memories, knowledge, working_memory, total_memories, created_at, updated_at)
-                VALUES (
-                    :id,
-                    CAST(:project_id AS UUID),
-                    :agent_type,
-                    :agent_id,
-                    CAST(:memories AS jsonb),
-                    CAST('{}' AS jsonb),
-                    CAST('{}' AS jsonb),
-                    :total_memories,
-                    :created_at,
-                    :updated_at
-                )
-                ON CONFLICT (id) DO UPDATE SET
-                    memories = agent_memories.memories || CAST(:memories AS jsonb),
-                    total_memories = agent_memories.total_memories + :total_memories,
-                    updated_at = :updated_at
-            """
-
-            await postgres_db.execute_write(query, {
-                "id": memory_id,
-                "project_id": project_id,
-                "agent_type": "setting",
-                "agent_id": "setting_agent",
-                "memories": memories_json,
-                "total_memories": 2,
-                "created_at": now,
-                "updated_at": now,
-            })
+            await memory_service.add_memory_entry(
+                project_id=project_id,
+                agent_type="setting",
+                agent_id="setting_agent",
+                entry=MemoryEntryCreate(
+                    type=MemoryType.INTERACTION,
+                    importance=MemoryImportance.MEDIUM,
+                    content=f"用户: {user_message}",
+                    context={"source": "lore_interface", "role": "user"},
+                ),
+            )
+            await memory_service.add_memory_entry(
+                project_id=project_id,
+                agent_type="setting",
+                agent_id="setting_agent",
+                entry=MemoryEntryCreate(
+                    type=MemoryType.INTERACTION,
+                    importance=MemoryImportance.MEDIUM,
+                    content=f"设定助手: {assistant_response}",
+                    context={"source": "lore_interface", "role": "assistant"},
+                ),
+            )
 
             logger.debug(f"同步 Setting Agent 对话到记忆系统: project_id={project_id}")
 
         except Exception as e:
-            logger.warning(f"同步 Setting Agent 记忆失败: {e}")
             logger.warning(f"同步 Setting Agent 记忆失败: {e}")
 
     async def _extract_lore_from_conversation(

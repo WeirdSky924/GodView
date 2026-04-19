@@ -96,6 +96,42 @@ class MasterPlotterAgent(BaseAgent):
     }
 }"""
 
+    def _extract_discussion_summary(self, discussion: Dict[str, Any]) -> str:
+        """提取单条讨论记录的总结，优先读取统一后的 discussion 结构。"""
+        if not isinstance(discussion, dict):
+            return ""
+
+        for key in ("summary", "full_content"):
+            value = discussion.get(key, "")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+        messages = discussion.get("messages", [])
+        if isinstance(messages, list):
+            for message in reversed(messages):
+                if isinstance(message, dict):
+                    content = message.get("content", "")
+                    if isinstance(content, str) and content.strip():
+                        return content.strip()
+
+        return ""
+
+    def _resolve_latest_discussion_summary(self, input_data: Dict[str, Any]) -> str:
+        """提取当前输入中的最新讨论总结。"""
+        discussion_summary = input_data.get("discussion_summary", "")
+        if isinstance(discussion_summary, str) and discussion_summary.strip():
+            return discussion_summary.strip()
+
+        group_discussion = input_data.get("group_discussion") or {}
+        summary = self._extract_discussion_summary(group_discussion)
+        if summary:
+            return summary
+
+        legacy_summary = input_data.get("last_discussion_summary", "")
+        if isinstance(legacy_summary, str):
+            return legacy_summary.strip()
+        return str(legacy_summary) if legacy_summary else ""
+
     async def execute(self, input_data: Dict[str, Any]) -> AgentResponse:
         """
         执行主线剧情评估或规划
@@ -187,7 +223,7 @@ class MasterPlotterAgent(BaseAgent):
         world_info = input_data.get("world_info", {})
         main_plot_progress = input_data.get("main_plot_progress", 0.0)
         recent_discussions = input_data.get("recent_discussions", [])
-        last_discussion_summary = input_data.get("last_discussion_summary", "")
+        last_discussion_summary = self._resolve_latest_discussion_summary(input_data)
         existing_hooks = input_data.get("existing_hooks", [])
 
         # 构建世界观部分（关键信息）
@@ -256,9 +292,8 @@ class MasterPlotterAgent(BaseAgent):
             discussion_summaries = []
             for i, d in enumerate(recent_discussions[-2:]):  # 最近2次讨论
                 topic = d.get("topic", f"讨论{i+1}")
-                messages = d.get("messages", [])
-                if messages:
-                    summary_text = messages[-1].get("content", "") if messages else ""
+                summary_text = self._extract_discussion_summary(d)
+                if summary_text:
                     discussion_summaries.append(f"- {topic}: {summary_text}")
             if discussion_summaries:
                 discussion_section = f"""

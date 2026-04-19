@@ -29,8 +29,10 @@ class ProcGenAgent(BaseAgent):
         project_id: Optional[str] = None,
         system_prompt: Optional[str] = None,
         agent_id: Optional[str] = None,  # 新增：支持多实例
+        agent_type: Optional[str] = None,
     ):
         self.world = world
+        self.AGENT_TYPE = agent_type or self.__class__.AGENT_TYPE
 
         # 如果没有提供 system_prompt 且没有 project_id，使用默认的构建方式（向后兼容）
         if not system_prompt and not project_id:

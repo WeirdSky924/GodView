@@ -100,6 +100,35 @@ class WriterAgent(BaseAgent):
     "future_setup": ["为后续剧情埋下的铺垫"]
 }"""
 
+    def _extract_discussion_summary(self, input_data: Dict[str, Any]) -> str:
+        """提取讨论总结，优先读取统一后的 discussion 结构。"""
+        discussion_summary = input_data.get("discussion_summary", "")
+        if isinstance(discussion_summary, str) and discussion_summary.strip():
+            return discussion_summary.strip()
+
+        group_discussion = input_data.get("group_discussion") or {}
+        if isinstance(group_discussion, dict):
+            summary = group_discussion.get("summary", "")
+            if isinstance(summary, str) and summary.strip():
+                return summary.strip()
+
+            full_content = group_discussion.get("full_content", "")
+            if isinstance(full_content, str) and full_content.strip():
+                return full_content.strip()
+
+            messages = group_discussion.get("messages", [])
+            if isinstance(messages, list):
+                for message in reversed(messages):
+                    if isinstance(message, dict):
+                        content = message.get("content", "")
+                        if isinstance(content, str) and content.strip():
+                            return content.strip()
+
+        legacy_summary = input_data.get("last_discussion_summary", "")
+        if isinstance(legacy_summary, str):
+            return legacy_summary.strip()
+        return str(legacy_summary) if legacy_summary else ""
+
     async def execute(self, input_data: Dict[str, Any]) -> AgentResponse:
         """
         执行小说文本生成
@@ -137,7 +166,7 @@ class WriterAgent(BaseAgent):
             word_count = input_data.get("word_count", 500)
             auto_write_mode = input_data.get("auto_write_mode", False)
             writing_prompt = input_data.get("writing_prompt", "")
-            discussion_summary = input_data.get("last_discussion_summary", "")
+            discussion_summary = self._extract_discussion_summary(input_data)
             chapter_num = input_data.get("chapter_num", 1)
             total_chapters = input_data.get("total_chapters", 10)
             world_info = input_data.get("world_info")  # 世界观设定
@@ -235,7 +264,7 @@ class WriterAgent(BaseAgent):
         previous_style = input_data.get("previous_style", "")
         auto_write_mode = input_data.get("auto_write_mode", False)
         writing_prompt = input_data.get("writing_prompt", "")
-        discussion_summary = input_data.get("last_discussion_summary", "")
+        discussion_summary = self._extract_discussion_summary(input_data)
         chapter_num = input_data.get("chapter_num", 1)
         total_chapters = input_data.get("total_chapters", 10)
         world_info = input_data.get("world_info")
@@ -353,7 +382,7 @@ class WriterAgent(BaseAgent):
         character_moods = input_data.get("character_moods", {})
         hooks = input_data.get("hooks", [])
         previous_style = input_data.get("previous_style", "")
-        discussion_summary = input_data.get("last_discussion_summary", "")
+        discussion_summary = self._extract_discussion_summary(input_data)
         chapter_num = input_data.get("chapter_num", 1)
         total_chapters = input_data.get("total_chapters", 10)
         world_info = input_data.get("world_info")

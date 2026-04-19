@@ -6,6 +6,7 @@ Setting Agent 数据模型
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
@@ -95,7 +96,7 @@ class SettingChangeRequest(BaseModel):
 
 class SettingAgentSession(BaseModel):
     """Setting Agent 持久化会话模型"""
-    id: str = Field(default_factory=lambda: f"sas_{datetime.now().strftime('%Y%m%d%H%M%S')}")
+    id: str = Field(default_factory=lambda: f"sas_{uuid4().hex[:12]}")
     project_id: str
 
     # 运行模式

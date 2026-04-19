@@ -3,20 +3,20 @@ Agent 配置服务层
 管理项目级别的 Agent 配置
 """
 
+import json
 import logging
 import uuid
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.models.agent_config import (
-    ConfigOverrideType,
-    SlotOverride,
-    ModelConfig,
     AgentConfig,
     AgentConfigCreate,
     AgentConfigUpdate,
+    ModelConfig,
+    SlotOverride,
 )
-from app.models.agent_template import AgentType, AgentTemplate
+from app.models.agent_template import AgentTemplate, AgentType
 
 logger = logging.getLogger(__name__)
 
@@ -24,10 +24,146 @@ logger = logging.getLogger(__name__)
 class AgentConfigService:
     """Agent 配置服务"""
 
-    def __init__(self, agent_template_service=None):
-        # 内存存储（生产环境应使用数据库）
+    def __init__(self, db=None, agent_template_service=None):
+        self._db = db
         self._configs: Dict[str, AgentConfig] = {}
+        self._cache_valid: bool = False
         self._agent_template_service = agent_template_service
+
+    @staticmethod
+    def _normalize_agent_type(agent_type: Any) -> str:
+        if isinstance(agent_type, AgentType):
+            return agent_type.value
+        return str(agent_type)
+
+    async def _ensure_cache(self):
+        """确保缓存有效"""
+        if self._cache_valid:
+            return
+
+        self._configs.clear()
+
+        if self._db:
+            try:
+                rows = await self._db.execute_query(
+                    "SELECT * FROM agent_configs ORDER BY updated_at DESC, created_at DESC"
+                )
+                for row in rows:
+                    config = self._row_to_config(row)
+                    self._configs[config.id] = config
+                logger.info(f"从数据库加载 {len(self._configs)} 个 Agent 配置")
+            except Exception as e:
+                logger.warning(f"从数据库加载 Agent 配置失败: {e}")
+
+        self._cache_valid = True
+
+    def invalidate_cache(self):
+        """使缓存失效"""
+        self._cache_valid = False
+        self._configs.clear()
+
+    def _row_to_config(self, row: Dict[str, Any]) -> AgentConfig:
+        """将数据库行转换为 AgentConfig"""
+        slot_overrides = row.get("slot_overrides", [])
+        if isinstance(slot_overrides, str):
+            slot_overrides = json.loads(slot_overrides or "[]")
+
+        custom_prompt_order = row.get("custom_prompt_order")
+        if isinstance(custom_prompt_order, str):
+            custom_prompt_order = json.loads(custom_prompt_order or "null")
+
+        llm_config = row.get("model_config") or row.get("llm_config") or {}
+        if isinstance(llm_config, str):
+            llm_config = json.loads(llm_config or "{}")
+
+        return AgentConfig(
+            id=row["id"],
+            project_id=str(row["project_id"]),
+            agent_type=row["agent_type"],
+            name=row.get("name", f"{row['agent_type']} 配置"),
+            description=row.get("description", ""),
+            template_id=row.get("template_id"),
+            is_custom=row.get("is_custom", False),
+            slot_overrides=[SlotOverride(**item) for item in slot_overrides],
+            custom_prompt_order=custom_prompt_order,
+            llm_config=ModelConfig(**llm_config),
+            is_active=row.get("is_active", True),
+            version=row.get("version", "1.0.0"),
+            usage_count=row.get("usage_count", 0),
+            last_used_at=row.get("last_used_at"),
+            created_at=row.get("created_at", datetime.now()),
+            updated_at=row.get("updated_at", datetime.now()),
+        )
+
+    def _config_to_db_dict(self, config: AgentConfig) -> Dict[str, Any]:
+        """将 AgentConfig 转换为数据库字段"""
+        return {
+            "id": config.id,
+            "project_id": config.project_id,
+            "agent_type": config.agent_type,
+            "name": config.name,
+            "description": config.description,
+            "template_id": config.template_id,
+            "is_custom": config.is_custom,
+            "slot_overrides": json.dumps(
+                [item.model_dump(mode="json") for item in config.slot_overrides],
+                ensure_ascii=False,
+            ),
+            "custom_prompt_order": json.dumps(config.custom_prompt_order, ensure_ascii=False),
+            "model_config": json.dumps(config.llm_config.model_dump(mode="json"), ensure_ascii=False),
+            "is_active": config.is_active,
+            "version": config.version,
+            "usage_count": config.usage_count,
+            "last_used_at": config.last_used_at,
+            "updated_at": config.updated_at,
+        }
+
+    async def _save_config(self, config: AgentConfig):
+        """保存配置到数据库"""
+        if not self._db:
+            self._configs[config.id] = config
+            return
+
+        data = self._config_to_db_dict(config)
+        columns = ", ".join(data.keys())
+        placeholders = ", ".join([f":{k}" for k in data.keys()])
+        updates = ", ".join([f"{k} = :{k}" for k in data.keys() if k != "id"])
+
+        await self._db.execute_write(
+            f"""
+            INSERT INTO agent_configs ({columns})
+            VALUES ({placeholders})
+            ON CONFLICT (id) DO UPDATE SET
+            {updates}
+            """,
+            data,
+        )
+        self._configs[config.id] = config
+
+    async def _resolve_template_for_agent(
+        self,
+        project_id: str,
+        agent_type: str,
+        config: Optional[AgentConfig] = None,
+    ) -> Optional[AgentTemplate]:
+        """解析运行时实际使用的模板"""
+        if not self._agent_template_service:
+            return None
+
+        await self._ensure_cache()
+        normalized_agent_type = self._normalize_agent_type(agent_type)
+        config = config or await self.get_config_by_project_agent(project_id, normalized_agent_type)
+
+        if config and config.template_id:
+            template = await self._agent_template_service.get_template(config.template_id)
+            if template:
+                return template
+
+        try:
+            return await self._agent_template_service.get_template_by_type(AgentType(normalized_agent_type))
+        except ValueError:
+            logger.debug(f"未知 AgentType，无法按类型解析模板: {normalized_agent_type}")
+            return None
 
     # ==================== 基础 CRUD 操作 ====================
 
@@ -38,20 +174,34 @@ class AgentConfigService:
         template_id: Optional[str] = None,
     ) -> AgentConfig:
         """获取或创建项目的 Agent 配置"""
-        # 查找现有配置
-        for config in self._configs.values():
-            if config.project_id == project_id and config.agent_type == agent_type:
-                return config
+        await self._ensure_cache()
 
-        # 创建新配置
+        existing = await self.get_config_by_project_agent(project_id, agent_type)
+        if existing:
+            return existing
+
+        template = None
+        resolved_template_id = template_id
+        if self._agent_template_service:
+            if resolved_template_id:
+                template = await self._agent_template_service.get_template(resolved_template_id)
+            if not template:
+                try:
+                    template = await self._agent_template_service.get_template_by_type(AgentType(agent_type))
+                    if template and not resolved_template_id:
+                        resolved_template_id = template.id
+                except ValueError:
+                    template = None
+
         config_id = f"agent_cfg_{uuid.uuid4().hex[:12]}"
         config_name = f"{agent_type} 配置"
-
-        # 如果有模板，基于模板创建
-        if template_id and self._agent_template_service:
-            template = await self._agent_template_service.get_template(template_id)
-            if template:
-                config_name = f"{template.name} (项目配置)"
+        llm_config = ModelConfig()
+        if template:
+            config_name = f"{template.name} (项目配置)"
+            llm_config = ModelConfig(
+                model_name=template.default_model or llm_config.model_name,
+                temperature=template.default_temperature,
+            )
 
         config = AgentConfig(
             id=config_id,
@@ -59,25 +209,28 @@ class AgentConfigService:
             agent_type=agent_type,
             name=config_name,
             description=f"项目 {project_id} 的 {agent_type} Agent 配置",
-            template_id=template_id,
-            is_custom=template_id is None,
+            template_id=resolved_template_id,
+            is_custom=resolved_template_id is None,
+            llm_config=llm_config,
         )
 
-        self._configs[config_id] = config
+        await self._save_config(config)
         logger.info(f"创建 AgentConfig: {config_id} for project {project_id}, agent {agent_type}")
-
         return config
 
     async def get_config(self, config_id: str) -> Optional[AgentConfig]:
         """获取 Agent 配置"""
+        await self._ensure_cache()
         return self._configs.get(config_id)
 
     async def get_config_by_project_agent(
         self, project_id: str, agent_type: str
     ) -> Optional[AgentConfig]:
         """获取项目特定 Agent 类型的配置"""
+        await self._ensure_cache()
+        normalized_agent_type = self._normalize_agent_type(agent_type)
         for config in self._configs.values():
-            if config.project_id == project_id and config.agent_type == agent_type:
+            if config.project_id == project_id and config.agent_type == normalized_agent_type:
                 return config
         return None
 
@@ -90,45 +243,40 @@ class AgentConfigService:
         offset: int = 0,
     ) -> List[AgentConfig]:
         """获取项目的所有 Agent 配置"""
+        await self._ensure_cache()
         configs = [c for c in self._configs.values() if c.project_id == project_id]
 
-        # 按 Agent 类型过滤
         if agent_type:
             configs = [c for c in configs if c.agent_type == agent_type]
 
-        # 按激活状态过滤
         if is_active is not None:
             configs = [c for c in configs if c.is_active == is_active]
 
-        # 排序：按创建时间倒序
-        configs.sort(key=lambda x: -x.created_at.timestamp())
-
-        # 分页
-        start = offset
-        end = start + limit
-        return configs[start:end]
+        configs.sort(key=lambda x: (-x.updated_at.timestamp(), -x.created_at.timestamp()))
+        return configs[offset: offset + limit]
 
     async def update_config(
         self, config_id: str, dto: AgentConfigUpdate
     ) -> Optional[AgentConfig]:
         """更新 Agent 配置"""
+        await self._ensure_cache()
         config = self._configs.get(config_id)
         if not config:
             return None
 
-        # 更新字段
-        update_data = dto.dict(exclude_unset=True)
+        update_data = dto.model_dump(exclude_unset=True)
         for field, value in update_data.items():
             if value is not None:
                 setattr(config, field, value)
 
         config.updated_at = datetime.now()
+        await self._save_config(config)
         logger.info(f"更新 AgentConfig: {config_id}")
-
         return config
 
     async def reset_config(self, config_id: str) -> Optional[AgentConfig]:
         """重置配置为模板默认值"""
+        await self._ensure_cache()
         config = self._configs.get(config_id)
         if not config or not config.template_id:
             return None
@@ -137,25 +285,67 @@ class AgentConfigService:
             logger.warning("AgentTemplateService 未注入，无法重置配置")
             return None
 
-        # 获取模板
         template = await self._agent_template_service.get_template(config.template_id)
         if not template:
             logger.warning(f"模板不存在: {config.template_id}")
             return None
 
-        # 重置配置
         config.slot_overrides = []
         config.custom_prompt_order = None
         config.llm_config = ModelConfig(
-            model_name=template.default_model,
+            model_name=template.default_model or config.llm_config.model_name,
             temperature=template.default_temperature,
-            max_tokens=template.default_max_tokens,
+            max_tokens=config.llm_config.max_tokens,
+            top_p=config.llm_config.top_p,
+            frequency_penalty=config.llm_config.frequency_penalty,
+            presence_penalty=config.llm_config.presence_penalty,
         )
         config.is_custom = False
         config.updated_at = datetime.now()
 
+        await self._save_config(config)
         logger.info(f"重置 AgentConfig {config_id} 为模板 {config.template_id} 默认值")
         return config
+
+    # ==================== 运行时解析 ====================
+
+    async def resolve_agent_runtime_state(
+        self,
+        project_id: str,
+        agent_type: str,
+    ) -> Dict[str, Any]:
+        """解析 Agent 在当前项目下的运行时状态"""
+        normalized_agent_type = self._normalize_agent_type(agent_type)
+        config = await self.get_config_by_project_agent(project_id, normalized_agent_type)
+        template = await self._resolve_template_for_agent(project_id, normalized_agent_type, config=config)
+
+        if config and config.is_active is False:
+            return {
+                "enabled": False,
+                "reason": "项目级 Agent 配置已禁用",
+                "config": config,
+                "template": template,
+            }
+
+        if template and template.is_optional and template.is_enabled is False:
+            return {
+                "enabled": False,
+                "reason": "全局模板已禁用该可选 Agent",
+                "config": config,
+                "template": template,
+            }
+
+        return {
+            "enabled": True,
+            "reason": "enabled",
+            "config": config,
+            "template": template,
+        }
+
+    async def is_agent_enabled(self, project_id: str, agent_type: str) -> Tuple[bool, str]:
+        """检查 Agent 是否在当前项目启用"""
+        state = await self.resolve_agent_runtime_state(project_id, agent_type)
+        return state["enabled"], state["reason"]
 
     # ==================== Prompt 构建和预览 ====================
 
@@ -165,77 +355,18 @@ class AgentConfigService:
         variables: Optional[Dict[str, Any]] = None,
     ) -> str:
         """获取最终拼接的 prompt"""
-        config = self._configs.get(config_id)
+        config = await self.get_config(config_id)
         if not config:
             raise ValueError(f"配置不存在: {config_id}")
 
-        if not self._agent_template_service:
-            raise ValueError("AgentTemplateService 未注入，无法构建 prompt")
+        from app.services.agent_prompt_service import get_agent_prompt_service
 
-        # 获取模板
-        template = None
-        if config.template_id:
-            template = await self._agent_template_service.get_template(config.template_id)
-
-        if not template:
-            # 如果没有模板，返回空字符串
-            logger.warning(f"配置 {config_id} 没有关联模板，无法构建 prompt")
-            return ""
-
-        # 构建 prompt 片段列表
-        prompt_pieces = []
-
-        # 确定要使用的插槽顺序
-        slot_order = config.custom_prompt_order or template.default_prompt_order
-
-        for slot_name in slot_order:
-            # 查找插槽定义
-            slot_def = None
-            for slot in template.prompt_slots:
-                if slot.slot_name == slot_name:
-                    slot_def = slot
-                    break
-
-            if not slot_def or not slot_def.is_enabled:
-                continue
-
-            # 检查是否有覆盖配置
-            slot_override = None
-            for override in config.slot_overrides:
-                if override.slot_name == slot_name:
-                    slot_override = override
-                    break
-
-            # 应用覆盖
-            if slot_override:
-                if slot_override.override_type == ConfigOverrideType.SLOT_DISABLE:
-                    # 跳过禁用的插槽
-                    continue
-                elif slot_override.override_type == ConfigOverrideType.PROMPT_REPLACE:
-                    # 使用新的 PromptTemplate
-                    prompt_template_id = slot_override.prompt_template_id
-                else:
-                    # 使用原始插槽的 PromptTemplate
-                    prompt_template_id = slot_def.prompt_template_id
-            else:
-                prompt_template_id = slot_def.prompt_template_id
-
-            if not prompt_template_id:
-                continue
-
-            # TODO: 这里需要调用 PromptTemplateService 来获取和渲染 PromptTemplate
-            # 目前返回占位符
-            prompt_pieces.append(f"[{slot_name}: {prompt_template_id}]")
-
-        # 合并所有片段
-        final_prompt = "\n\n".join(prompt_pieces)
-
-        # TODO: 应用变量插值
-        if variables:
-            # 这里应该实现变量替换
-            pass
-
-        return final_prompt
+        prompt_service = get_agent_prompt_service()
+        return await prompt_service.build_agent_prompt(
+            agent_type=config.agent_type,
+            project_id=config.project_id,
+            variables=variables,
+        )
 
     async def preview_prompt(
         self,
@@ -243,17 +374,19 @@ class AgentConfigService:
         variables: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """预览 prompt（返回详细信息和渲染结果）"""
-        config = self._configs.get(config_id)
+        config = await self.get_config(config_id)
         if not config:
             raise ValueError(f"配置不存在: {config_id}")
 
-        # 获取最终 prompt
         final_prompt = await self.get_final_prompt(config_id, variables)
 
-        # 获取模板信息
         template_info = None
-        if config.template_id and self._agent_template_service:
-            template = await self._agent_template_service.get_template(config.template_id)
+        if self._agent_template_service:
+            template = await self._resolve_template_for_agent(
+                config.project_id,
+                config.agent_type,
+                config=config,
+            )
             if template:
                 template_info = {
                     "id": template.id,
@@ -267,7 +400,7 @@ class AgentConfigService:
             "agent_type": config.agent_type,
             "template": template_info,
             "is_custom": config.is_custom,
-            "llm_config": config.llm_config.dict(),
+            "llm_config": config.llm_config.model_dump(mode="json"),
             "final_prompt": final_prompt,
             "prompt_length": len(final_prompt),
             "variables_used": variables or {},
@@ -277,19 +410,17 @@ class AgentConfigService:
 
     async def validate_config(self, config_id: str) -> Dict[str, Any]:
         """验证配置的完整性"""
-        config = self._configs.get(config_id)
+        config = await self.get_config(config_id)
         if not config:
             return {"valid": False, "error": "配置不存在"}
 
         issues = []
 
-        # 如果有模板，验证模板是否存在
         if config.template_id and self._agent_template_service:
             template = await self._agent_template_service.get_template(config.template_id)
             if not template:
                 issues.append(f"关联的模板不存在: {config.template_id}")
             else:
-                # 验证插槽覆盖是否有效
                 for override in config.slot_overrides:
                     slot_exists = any(
                         slot.slot_name == override.slot_name
@@ -298,9 +429,7 @@ class AgentConfigService:
                     if not slot_exists:
                         issues.append(f"插槽覆盖指向不存在的插槽: {override.slot_name}")
 
-        # 验证自定义顺序
         if config.custom_prompt_order:
-            # 检查是否有重复
             if len(config.custom_prompt_order) != len(set(config.custom_prompt_order)):
                 issues.append("自定义顺序中有重复的插槽")
 
@@ -318,10 +447,34 @@ class AgentConfigService:
 
     async def record_usage(self, config_id: str):
         """记录配置使用次数"""
-        config = self._configs.get(config_id)
+        config = await self.get_config(config_id)
         if not config:
             return
 
         config.usage_count += 1
         config.last_used_at = datetime.now()
         config.updated_at = datetime.now()
+        await self._save_config(config)
+
+
+_agent_config_service: Optional[AgentConfigService] = None
+
+
+def set_agent_config_service(service: AgentConfigService):
+    """设置 AgentConfigService 单例。"""
+    global _agent_config_service
+    _agent_config_service = service
+
+
+def get_agent_config_service() -> AgentConfigService:
+    """获取 AgentConfigService 单例。"""
+    global _agent_config_service
+    if _agent_config_service is None:
+        from app.api.app import postgres_db
+        from app.api.routes.agent_templates import get_agent_template_service
+
+        _agent_config_service = AgentConfigService(
+            db=postgres_db,
+            agent_template_service=get_agent_template_service(),
+        )
+    return _agent_config_service

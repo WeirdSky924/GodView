@@ -1088,56 +1088,94 @@ CREATE INDEX idx_memory_entries_category ON memory_entries(category);
 
 -- ================== 记忆嵌入表 ==================
 CREATE TABLE IF NOT EXISTS memory_embeddings (
-    id VARCHAR(64) PRIMARY KEY,
-    memory_id VARCHAR(64) REFERENCES memory_entries(id) ON DELETE CASCADE,
-    embedding VECTOR(384),
-    embedding_model VARCHAR(100),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    memory_id VARCHAR(100) NOT NULL,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    agent_type VARCHAR(100) NOT NULL,
+    agent_id VARCHAR(100),
+    content TEXT NOT NULL,
+    content_hash VARCHAR(64),
+    embedding JSONB DEFAULT NULL,
+    memory_type VARCHAR(50),
+    importance VARCHAR(50),
+    tags JSONB DEFAULT '[]',
+    access_count INT DEFAULT 0,
+    last_accessed_at TIMESTAMP WITH TIME ZONE,
+    last_used_in_chapter INT,
+    last_used_context VARCHAR(200),
+    decay_factor FLOAT DEFAULT 1.0,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE NULLS NOT DISTINCT (memory_id, project_id, agent_type, agent_id)
 );
 
 CREATE INDEX idx_memory_embeddings_memory ON memory_embeddings(memory_id);
+CREATE INDEX idx_memory_embeddings_project ON memory_embeddings(project_id);
+CREATE INDEX idx_memory_embeddings_agent ON memory_embeddings(agent_type);
+CREATE INDEX idx_memory_embeddings_project_agent_instance ON memory_embeddings(project_id, agent_type, agent_id);
+CREATE INDEX idx_memory_embeddings_type ON memory_embeddings(memory_type);
+CREATE INDEX idx_memory_embeddings_content_hash ON memory_embeddings(content_hash);
 
 -- ================== 记忆衰减规则表 ==================
 CREATE TABLE IF NOT EXISTS memory_decay_rules (
-    id VARCHAR(64) PRIMARY KEY,
-    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    id VARCHAR(100) PRIMARY KEY,
+    name VARCHAR(200) NOT NULL,
+    description TEXT,
     memory_type VARCHAR(50),
+    importance VARCHAR(50),
+    initial_weight FLOAT DEFAULT 1.0,
     decay_rate FLOAT DEFAULT 0.1,
-    retention_days INTEGER DEFAULT 30,
-    boost_on_access FLOAT DEFAULT 0.1,
+    min_weight FLOAT DEFAULT 0.1,
+    access_boost FLOAT DEFAULT 0.1,
+    max_decay_days INTEGER DEFAULT 90,
+    is_active BOOLEAN DEFAULT TRUE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_memory_decay_rules_project ON memory_decay_rules(project_id);
+CREATE INDEX idx_memory_decay_rules_project ON memory_decay_rules(memory_type);
 
 -- ================== 记忆上下文配置表 ==================
 CREATE TABLE IF NOT EXISTS memory_context_configs (
-    id VARCHAR(64) PRIMARY KEY,
-    project_id UUID REFERENCES projects(id) ON DELETE CASCADE UNIQUE,
-    max_short_term INTEGER DEFAULT 10,
-    max_medium_term INTEGER DEFAULT 50,
-    max_long_term INTEGER DEFAULT 200,
-    relevance_threshold FLOAT DEFAULT 0.7,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    id VARCHAR(100) PRIMARY KEY,
+    name VARCHAR(200) NOT NULL,
+    description TEXT,
+    task_types JSONB DEFAULT '[]',
+    agent_types JSONB DEFAULT '[]',
+    selection_strategy VARCHAR(50) DEFAULT 'hybrid',
+    max_memories INTEGER DEFAULT 10,
+    type_weights JSONB DEFAULT '{"decision": 2.0, "observation": 1.0, "fact": 1.5}',
+    time_decay_days INTEGER DEFAULT 30,
+    time_decay_factor FLOAT DEFAULT 0.5,
+    required_tags JSONB DEFAULT '[]',
+    excluded_tags JSONB DEFAULT '[]',
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_memory_context_configs_project ON memory_context_configs(project_id);
+CREATE INDEX idx_memory_context_configs_project ON memory_context_configs USING GIN(agent_types);
 
 -- ================== 记忆使用日志表 ==================
 CREATE TABLE IF NOT EXISTS memory_usage_logs (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    memory_id VARCHAR(100) NOT NULL,
     project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
-    memory_id VARCHAR(64),
-    access_type VARCHAR(50),
-    context TEXT,
-    accessed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    agent_type VARCHAR(100) NOT NULL,
+    agent_id VARCHAR(100),
+    usage_context VARCHAR(200),
+    chapter_number INT,
+    workflow_execution_id VARCHAR(100),
+    workflow_node_id VARCHAR(100),
+    relevance_score FLOAT,
+    was_helpful BOOLEAN,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX idx_memory_usage_logs_project ON memory_usage_logs(project_id);
 CREATE INDEX idx_memory_usage_logs_memory ON memory_usage_logs(memory_id);
+CREATE INDEX idx_memory_usage_logs_project_agent_instance ON memory_usage_logs(project_id, agent_type, agent_id);
+CREATE INDEX idx_memory_usage_logs_context ON memory_usage_logs(usage_context);
+CREATE INDEX idx_memory_usage_logs_created ON memory_usage_logs(created_at);
 
--- ================== Token使用表 ==================
 CREATE TABLE IF NOT EXISTS token_usage (
     id VARCHAR(64) PRIMARY KEY,
     project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
@@ -1302,11 +1340,13 @@ CREATE TABLE IF NOT EXISTS agent_memories (
     last_execution TIMESTAMP WITH TIME ZONE,
     execution_count INTEGER DEFAULT 0,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT unique_agent_in_project UNIQUE NULLS NOT DISTINCT (project_id, agent_type, agent_id)
 );
 
 CREATE INDEX idx_agent_memories_project ON agent_memories(project_id);
 CREATE INDEX idx_agent_memories_type ON agent_memories(agent_type);
+CREATE INDEX idx_agent_memories_project_type ON agent_memories(project_id, agent_type);
 
 -- ================== Agent执行记录表 ==================
 CREATE TABLE IF NOT EXISTS agent_execution_records (

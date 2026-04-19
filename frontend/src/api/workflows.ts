@@ -45,6 +45,7 @@ export interface WorkflowNode {
   node_type: NodeType
   agent_type?: string
   label: string
+  description?: string
   config: Record<string, any>
   // 数据传递配置
   inputs?: NodeInputConfig[]
@@ -56,12 +57,13 @@ export interface WorkflowEdge {
   id: string
   source: string
   target: string
+  label?: string
   condition?: Record<string, any>
 }
 
 export interface WorkflowDefinition {
   id: string
-  project_id: string
+  project_id: string | null
   name: string
   description?: string
   nodes: WorkflowNode[]
@@ -201,7 +203,7 @@ export async function executeWorkflow(
 ): Promise<{ success: boolean; message: string; execution_id: string; workflow_id: string }> {
   const response = await axios.post(
     `${API_BASE}/workflows/${workflowId}/execute`,
-    { initial_context: initialContext },
+    initialContext || {},
     { params: { project_id: projectId } },
   )
   return response.data

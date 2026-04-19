@@ -172,17 +172,16 @@ class SettingAgent(BaseAgent):
 
             # 更新记忆
             if self._memory:
-                from app.models.agent_memory import MemoryEntry, MemoryType
-                memory_entry = MemoryEntry(
-                    type=MemoryType.OBSERVATION,
+                from app.models.agent_memory import MemoryType, MemoryImportance
+                self._memory.add_memory(
                     content=f"设定管理任务: {task}",
-                    importance=2,
-                    metadata={
+                    memory_type=MemoryType.OBSERVATION,
+                    importance=MemoryImportance.MEDIUM,
+                    context={
                         "task_type": task,
                         "has_response": bool(response_text),
-                    }
+                    },
                 )
-                self._memory.add_memory(memory_entry)
 
             return AgentResponse(
                 success=True,
@@ -237,7 +236,7 @@ class SettingAgent(BaseAgent):
 
     async def _organize_settings(self, context: Dict[str, Any]) -> str:
         """
-        整理项目设定
+        根据工作流上下文提取当前章节相关的设定约束与一致性要点。
 
         Args:
             context: 上下文信息
@@ -245,11 +244,87 @@ class SettingAgent(BaseAgent):
         Returns:
             str: 整理结果
         """
-        prompt = "请帮我整理当前项目的世界观设定，按类别分组并标记优先级。"
+        chapter_outline = context.get("chapter_outline")
+        chapter_goals = context.get("chapter_goals") or []
+        lore_entries = context.get("lore_entries") or context.get("lore_data") or []
+        world_info = context.get("world_info") or {}
+        chapter_num = context.get("chapter_num") or context.get("chapter_number")
+
+        current_outline = chapter_outline
+        if isinstance(chapter_outline, dict) and chapter_num is not None:
+            current_outline = chapter_outline.get(str(chapter_num), chapter_outline.get(chapter_num, chapter_outline))
+
+        if isinstance(current_outline, dict):
+            outline_text = current_outline.get("summary") or current_outline.get("goal") or current_outline.get("description") or str(current_outline)
+        else:
+            outline_text = str(current_outline) if current_outline else "未提供"
+
+        current_goal = None
+        if chapter_num and isinstance(chapter_goals, list) and len(chapter_goals) >= int(chapter_num):
+            current_goal = chapter_goals[int(chapter_num) - 1]
+        elif chapter_goals:
+            current_goal = chapter_goals[0]
+
+        if isinstance(current_goal, dict):
+            goal_text = current_goal.get("goal") or current_goal.get("summary") or str(current_goal)
+        else:
+            goal_text = str(current_goal) if current_goal else "未提供"
+
+        lore_summaries: List[str] = []
+        for entry in lore_entries[:20]:
+            if isinstance(entry, dict):
+                title = entry.get("title") or entry.get("name") or "未命名设定"
+                summary = entry.get("summary") or entry.get("content") or entry.get("description") or ""
+                forbidden = entry.get("forbidden_actions") or entry.get("taboos") or entry.get("constraints") or []
+                forbidden_text = ""
+                if isinstance(forbidden, list) and forbidden:
+                    forbidden_text = f"；禁止/限制：{'、'.join(str(item) for item in forbidden[:5])}"
+                lore_summaries.append(f"- {title}: {summary[:200]}{forbidden_text}")
+            elif entry:
+                lore_summaries.append(f"- {str(entry)[:220]}")
+
+        world_name = world_info.get("name") or "未命名世界"
+        world_type = world_info.get("world_type") or world_info.get("description") or "未提供"
+        world_rules = world_info.get("rules") or []
+        if isinstance(world_rules, dict):
+            world_rules_text = str(world_rules)
+        elif isinstance(world_rules, list):
+            world_rules_text = "；".join(str(item) for item in world_rules[:10])
+        else:
+            world_rules_text = str(world_rules) if world_rules else "未提供"
+
+        prompt = f"""请基于当前项目上下文，提取本章写作必须遵守的设定约束，并检查潜在冲突。
+
+【任务目标】
+你不是在泛泛整理世界观，而是要服务当前章节/当前工作流，输出对这一章真正有用的设定结论。
+
+【当前章节】
+- 章节号：{chapter_num or '未提供'}
+- 章节目标：{goal_text}
+- 当前大纲/焦点：{outline_text}
+
+【世界信息】
+- 世界名：{world_name}
+- 类型/风格：{world_type}
+- 核心规则：{world_rules_text}
+
+【相关设定】
+{chr(10).join(lore_summaries) if lore_summaries else '未提供相关设定'}
+
+要求：
+1. 只提取与当前章节直接相关的设定约束、禁忌、风险点、可用素材。
+2. 若发现上下文不足，请明确指出缺失点，不要自行脑补默认奇幻/冒险设定。
+3. 如果设定之间存在冲突，指出冲突来源、影响范围、建议处理方式。
+4. 输出尽量结构化，至少包含：
+   - 本章关键设定约束
+   - 允许使用的设定素材
+   - 潜在冲突/风险
+   - 对写作或后续节点的建议
+"""
         result = await self._setting_service.chat(
             project_id=self.project_id,
             message=prompt,
-            context=context,
+            context={**context, "workflow_setting_analysis": True},
         )
         return result.get("response", "设定整理完成")
 

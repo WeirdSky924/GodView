@@ -254,6 +254,7 @@ class BaseAgent(ABC):
                 memories = await enhanced_service.get_context_aware_memories(
                     project_id=self.project_id,
                     agent_type=self.AGENT_TYPE or self.name,
+                    agent_id=self.agent_id,
                     task_type=task_type,
                     current_context=current_context,
                     query_text=query_text,
@@ -263,6 +264,7 @@ class BaseAgent(ABC):
                 results = await enhanced_service.get_semantic_memories(
                     project_id=self.project_id,
                     agent_type=self.AGENT_TYPE or self.name,
+                    agent_id=self.agent_id,
                     query_text=query_text,
                     limit=10,
                 )
@@ -272,6 +274,7 @@ class BaseAgent(ABC):
                 memories = await enhanced_service._default_memory_selection(
                     self.project_id,
                     self.AGENT_TYPE or self.name,
+                    agent_id=self.agent_id,
                 )
 
             if not memories:
@@ -652,7 +655,8 @@ class BaseAgent(ABC):
         """
         加载绑定到当前 Agent 类型的 Skills
 
-        从 Agent 模板的 skill_slots 中获取 Skill ID，然后从 SkillService 加载
+        优先复用 AgentPromptService 的项目级运行时解析链路，确保与
+        /agent_templates、project AgentConfig、template skill_slots 保持一致。
         """
         if self._skills_loaded:
             return
@@ -661,15 +665,17 @@ class BaseAgent(ABC):
             return
 
         try:
-            from app.services.skill_service import get_skill_service
-            service = get_skill_service()
+            from app.services.agent_prompt_service import get_agent_prompt_service
 
-            # 获取适用于此 Agent 类型的所有 Skills
-            skills = await service.get_skills_for_agent_type(self.AGENT_TYPE)
+            prompt_service = get_agent_prompt_service()
+            skills = await prompt_service.get_runtime_agent_skills(
+                self.AGENT_TYPE,
+                project_id=self.project_id,
+                use_intelligent_retrieval=False,
+            )
 
             for skill in skills:
-                if skill.is_enabled and skill.status.value == 'active':
-                    self._skills[skill.id] = skill
+                self._skills[skill.id] = skill
 
             self._skills_loaded = True
             logger.info(f"Agent {self.name} 加载了 {len(self._skills)} 个 Skills")

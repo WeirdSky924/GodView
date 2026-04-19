@@ -1,11 +1,7 @@
-/**
- * Agent 私聊组件
- * v8 Agent协作可视化工作台
- */
-
 import { useState, useRef, useEffect } from 'react'
 import { useTheme } from '@/contexts/ThemeContext'
 import { sendV8Intervention, getMessageHistory } from '@/api/interventions'
+import { getAgentTypeOptions, getWorkflowNodeTypes, type WorkflowNodeTypes } from '@/api/nodeTypes'
 import {
   MessageSquare,
   Send,
@@ -14,19 +10,6 @@ import {
   Loader2,
   AlertCircle,
 } from 'lucide-react'
-
-// Agent 类型选项
-const AGENT_OPTIONS = [
-  { value: 'setting', label: '设定 Agent' },
-  { value: 'writer', label: '作家 Agent' },
-  { value: 'plotter', label: '编剧 Agent' },
-  { value: 'character', label: '角色 Agent' },
-  { value: 'summarizer', label: '摘要 Agent' },
-  { value: 'evaluator', label: '评估 Agent' },
-  { value: 'hook_manager', label: '伏笔 Agent' },
-  { value: 'event_generator', label: '事件 Agent' },
-  { value: 'world_map_manager', label: '地图 Agent' },
-]
 
 interface Message {
   id: string
@@ -56,8 +39,28 @@ export default function AgentChat({
   const [messages, setMessages] = useState<Message[]>([])
   const [sending, setSending] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [nodeTypes, setNodeTypes] = useState<WorkflowNodeTypes | null>(null)
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const agentOptions = getAgentTypeOptions(nodeTypes)
+
+  useEffect(() => {
+    let cancelled = false
+
+    getWorkflowNodeTypes(projectId)
+      .then((data) => {
+        if (!cancelled) {
+          setNodeTypes(data)
+        }
+      })
+      .catch((err) => {
+        console.error('Failed to load workflow node types:', err)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [projectId])
 
   // 加载消息历史
   useEffect(() => {
@@ -201,7 +204,7 @@ export default function AgentChat({
           `}
         >
           <option value="">选择 Agent...</option>
-          {AGENT_OPTIONS.map((opt) => (
+          {agentOptions.map((opt) => (
             <option key={opt.value} value={opt.value}>
               {opt.label}
             </option>

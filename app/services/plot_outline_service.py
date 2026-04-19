@@ -563,6 +563,36 @@ class PlotOutlineService:
     def _outlines_saved_response(self, outlines: List[ChapterOutline]) -> List[Dict[str, Any]]:
         return [self._compact_outline_payload(outline) for outline in outlines]
 
+    def _normalize_emotion_value(self, emotion: Any) -> str:
+        """标准化情绪枚举值，兼容模型返回的近义词"""
+        if isinstance(emotion, EmotionType):
+            return emotion.value
+
+        value = str(emotion or "neutral").strip().lower()
+        aliases = {
+            "shock": "surprise",
+            "shocked": "surprise",
+            "astonishment": "surprise",
+            "astonished": "surprise",
+            "surprised": "surprise",
+            "anxious": "fear",
+            "anxiety": "fear",
+            "panic": "fear",
+            "tense": "tension",
+            "suspense": "tension",
+            "calm": "neutral",
+            "peace": "relief",
+            "hope": "anticipation",
+            "hopeful": "anticipation",
+        }
+        normalized = aliases.get(value, value)
+
+        try:
+            return EmotionType(normalized).value
+        except ValueError:
+            logger.warning(f"未知情绪类型，回退为 neutral: {emotion}")
+            return EmotionType.NEUTRAL.value
+
     def _normalize_outline_updates(self, outline_updates: Dict[str, Any]) -> Dict[str, Any]:
         normalized = dict(outline_updates)
 
@@ -570,6 +600,41 @@ class PlotOutlineService:
             normalized["hooks_planted"] = normalized.get("hooks_to_plant") or []
         if "hooks_resolved" not in normalized and "hooks_to_resolve" in normalized:
             normalized["hooks_resolved"] = normalized.get("hooks_to_resolve") or []
+
+        if normalized.get("emotion_curve"):
+            emotion_curve = dict(normalized.get("emotion_curve") or {})
+            emotion_curve["dominant_emotion"] = self._normalize_emotion_value(
+                emotion_curve.get("dominant_emotion", "neutral")
+            )
+
+            normalized_points = []
+            for point in emotion_curve.get("points") or []:
+                if isinstance(point, dict):
+                    point_data = dict(point)
+                    point_data["emotion"] = self._normalize_emotion_value(
+                        point_data.get("emotion", "neutral")
+                    )
+                    normalized_points.append(point_data)
+                else:
+                    normalized_points.append(point)
+            emotion_curve["points"] = normalized_points
+            normalized["emotion_curve"] = emotion_curve
+
+        normalized_scenes = []
+        for scene in normalized.get("scenes") or []:
+            if isinstance(scene, dict):
+                scene_data = dict(scene)
+                scene_data["emotion_start"] = self._normalize_emotion_value(
+                    scene_data.get("emotion_start", "neutral")
+                )
+                scene_data["emotion_end"] = self._normalize_emotion_value(
+                    scene_data.get("emotion_end", "neutral")
+                )
+                normalized_scenes.append(scene_data)
+            else:
+                normalized_scenes.append(scene)
+        if "scenes" in normalized:
+            normalized["scenes"] = normalized_scenes
 
         if "chapters" in normalized:
             normalized_chapters = []
@@ -579,6 +644,41 @@ class PlotOutlineService:
                     chapter_data["hooks_planted"] = chapter_data.get("hooks_to_plant") or []
                 if "hooks_resolved" not in chapter_data and "hooks_to_resolve" in chapter_data:
                     chapter_data["hooks_resolved"] = chapter_data.get("hooks_to_resolve") or []
+
+                normalized_chapter_scenes = []
+                for scene in chapter_data.get("scenes") or []:
+                    if isinstance(scene, dict):
+                        scene_payload = dict(scene)
+                        scene_payload["emotion_start"] = self._normalize_emotion_value(
+                            scene_payload.get("emotion_start", "neutral")
+                        )
+                        scene_payload["emotion_end"] = self._normalize_emotion_value(
+                            scene_payload.get("emotion_end", "neutral")
+                        )
+                        normalized_chapter_scenes.append(scene_payload)
+                    else:
+                        normalized_chapter_scenes.append(scene)
+                if "scenes" in chapter_data:
+                    chapter_data["scenes"] = normalized_chapter_scenes
+
+                if chapter_data.get("emotion_curve"):
+                    chapter_curve = dict(chapter_data.get("emotion_curve") or {})
+                    chapter_curve["dominant_emotion"] = self._normalize_emotion_value(
+                        chapter_curve.get("dominant_emotion", "neutral")
+                    )
+                    chapter_points = []
+                    for point in chapter_curve.get("points") or []:
+                        if isinstance(point, dict):
+                            point_data = dict(point)
+                            point_data["emotion"] = self._normalize_emotion_value(
+                                point_data.get("emotion", "neutral")
+                            )
+                            chapter_points.append(point_data)
+                        else:
+                            chapter_points.append(point)
+                    chapter_curve["points"] = chapter_points
+                    chapter_data["emotion_curve"] = chapter_curve
+
                 normalized_chapters.append(chapter_data)
             normalized["chapters"] = normalized_chapters
 
@@ -1133,8 +1233,8 @@ class PlotOutlineService:
                 summary=s.get("summary", ""),
                 participating_characters=s.get("participating_characters", []),
                 location=s.get("location"),
-                emotion_start=EmotionType(s.get("emotion_start", "neutral")),
-                emotion_end=EmotionType(s.get("emotion_end", "neutral")),
+                emotion_start=EmotionType(self._normalize_emotion_value(s.get("emotion_start", "neutral"))),
+                emotion_end=EmotionType(self._normalize_emotion_value(s.get("emotion_end", "neutral"))),
                 conflict_level=ConflictLevel(s.get("conflict_level", "low")),
                 estimated_words=s.get("estimated_words", 500),
                 key_events=s.get("key_events", []),
@@ -1147,7 +1247,7 @@ class PlotOutlineService:
             points = [
                 EmotionPoint(
                     position=p.get("position", i / max(len(ec.get("points", [])) - 1, 1)),
-                    emotion=EmotionType(p.get("emotion", "neutral")),
+                    emotion=EmotionType(self._normalize_emotion_value(p.get("emotion", "neutral"))),
                     intensity=p.get("intensity", 0.5),
                     description=p.get("description"),
                 )
@@ -1156,7 +1256,7 @@ class PlotOutlineService:
             emotion_curve = EmotionCurve(
                 chapter_number=chapter_number,
                 points=points,
-                dominant_emotion=EmotionType(ec.get("dominant_emotion", "neutral")),
+                dominant_emotion=EmotionType(self._normalize_emotion_value(ec.get("dominant_emotion", "neutral"))),
             )
 
         return ChapterOutline(
@@ -1692,7 +1792,7 @@ class PlotOutlineService:
         try:
             result = await self._db.execute_query('''
                 SELECT * FROM chapter_outlines
-                WHERE project_id = CAST(:project_id AS UUID)
+                WHERE project_id = :project_id
                   AND chapter_number = :chapter_num
                   AND status IN ('draft', 'approved', 'completed')
                 LIMIT 1
@@ -2378,8 +2478,16 @@ class PlotOutlineService:
                         pov_character=scene_data.get("pov_character"),
                         location=scene_data.get("location"),
                         time_of_day=scene_data.get("time_of_day"),
-                        emotion_start=EmotionType(scene_data.get("emotion_start", "neutral")),
-                        emotion_end=EmotionType(scene_data.get("emotion_end", "neutral")),
+                        emotion_start=EmotionType(
+                            self._normalize_emotion_value(
+                                scene_data.get("emotion_start", "neutral")
+                            )
+                        ),
+                        emotion_end=EmotionType(
+                            self._normalize_emotion_value(
+                                scene_data.get("emotion_end", "neutral")
+                            )
+                        ),
                         emotion_arc=scene_data.get("emotion_arc", []),
                         conflict_level=ConflictLevel(scene_data.get("conflict_level", "low")),
                         conflict_description=scene_data.get("conflict_description"),

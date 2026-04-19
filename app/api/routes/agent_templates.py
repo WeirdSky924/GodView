@@ -16,6 +16,7 @@ from app.models.agent_template import (
     AgentTemplateUpdate,
 )
 from app.models.prompt_template import PromptRenderRequest
+from app.services.agent_config_service import get_agent_config_service
 
 logger = logging.getLogger(__name__)
 
@@ -483,16 +484,16 @@ async def get_agent_template_by_type(agent_type: str):
 
 
 @router.post("/agent-templates/{template_id}/toggle", response_model=Dict[str, Any])
-async def toggle_agent_template(template_id: str, enabled: bool = Query(..., description="是否启用")):
+async def toggle_agent_template(
+    template_id: str,
+    enabled: bool = Query(..., description="是否启用"),
+    project_id: Optional[str] = Query(default=None, description="项目 ID，不传则修改全局模板默认值"),
+):
     """
-    切换可选 Agent 模板的启用状态
+    切换 Agent 模板的启用状态。
 
-    Args:
-        template_id: 模板 ID
-        enabled: 是否启用
-
-    Returns:
-        Dict: 操作结果
+    - 传 project_id：写入项目级 AgentConfig.is_active，影响该项目 runtime。
+    - 不传 project_id：修改全局模板默认启用状态，影响未覆盖的默认行为。
     """
     service = get_agent_template_service()
 
@@ -500,16 +501,61 @@ async def toggle_agent_template(template_id: str, enabled: bool = Query(..., des
     if not template:
         raise HTTPException(status_code=404, detail="Agent 模板不存在")
 
-    # 检查是否为可选 Agent
     if not template.is_optional:
         raise HTTPException(
             status_code=400,
             detail="核心 Agent 无法关闭"
         )
 
-    # 更新启用状态
+    if project_id:
+        config_service = get_agent_config_service()
+        config = await config_service.get_config_by_project_agent(project_id, template.agent_type.value)
+        if not config:
+            config = await config_service.get_or_create_config(
+                project_id=project_id,
+                agent_type=template.agent_type.value,
+                template_id=template.id,
+            )
+
+        from app.models.agent_config import AgentConfigUpdate
+
+        updated_config = await config_service.update_config(
+            config.id,
+            AgentConfigUpdate(is_active=enabled),
+        )
+        if not updated_config:
+            raise HTTPException(status_code=500, detail="项目级 Agent 配置更新失败")
+
+        refreshed_template = await service.get_template(template_id)
+        return {
+            "success": True,
+            "message": f"项目 Agent '{template.name}' 已{'启用' if enabled else '禁用'}",
+            "template": refreshed_template.dict() if refreshed_template else template.dict(),
+            "project_config": updated_config.dict(),
+        }
+
     template.is_enabled = enabled
     template.updated_at = datetime.now()
+
+    if service._db:
+        try:
+            await service._db.execute_write(
+                """
+                UPDATE agent_templates
+                SET is_enabled = :is_enabled, updated_at = :updated_at
+                WHERE id = :id
+                """,
+                {
+                    "id": template.id,
+                    "is_enabled": enabled,
+                    "updated_at": template.updated_at,
+                },
+            )
+            service.invalidate_cache()
+            template = await service.get_template(template_id) or template
+        except Exception as e:
+            logger.error(f"更新 Agent 模板启用状态失败: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
     return {
         "success": True,
@@ -557,14 +603,15 @@ async def get_agent_types_metadata():
         AgentType.SETTING: "设定 Agent",
         AgentType.SUMMARIZER: "摘要 Agent",
         AgentType.MASTER_PLOTTER: "总编剧 Agent",
-        AgentType.HOOK_MANAGER: "伏笔管理 Agent",
+        AgentType.HOOK_MANAGER: "伏笔 Agent",
         AgentType.WRITER: "作家 Agent",
         AgentType.EVALUATOR: "评估 Agent",
         AgentType.PROC_GEN: "过程生成 Agent",
         AgentType.SCENE_COORDINATOR: "场景协调 Agent",
-        AgentType.EVENT_GENERATOR: "事件生成 Agent",
+        AgentType.PLOT_OUTLINE: "章节大纲 Agent",
+        AgentType.EVENT_GENERATOR: "事件 Agent",
         AgentType.DUNGEON_GENERATOR: "副本生成 Agent",
-        AgentType.WORLD_MAP_MANAGER: "世界地图 Agent",
+        AgentType.WORLD_MAP_MANAGER: "地图 Agent",
     }
 
     # Agent 类型的描述
@@ -578,6 +625,7 @@ async def get_agent_types_metadata():
         AgentType.EVALUATOR: "评估内容质量和一致性",
         AgentType.PROC_GEN: "过程化内容生成（随机事件等）",
         AgentType.SCENE_COORDINATOR: "统筹多角色演绎场景，协调信息分配",
+        AgentType.PLOT_OUTLINE: "规划当前章节目标、标题与分场大纲",
         AgentType.EVENT_GENERATOR: "生成故事事件、转折和随机变数",
         AgentType.DUNGEON_GENERATOR: "生成故事副本、挑战和任务",
         AgentType.WORLD_MAP_MANAGER: "管理世界地图、地点和空间关系",
@@ -594,6 +642,7 @@ async def get_agent_types_metadata():
         AgentType.EVALUATOR: "CheckCircle",
         AgentType.PROC_GEN: "Shuffle",
         AgentType.SCENE_COORDINATOR: "Users",
+        AgentType.PLOT_OUTLINE: "BookOpen",
         AgentType.EVENT_GENERATOR: "Zap",
         AgentType.DUNGEON_GENERATOR: "Map",
         AgentType.WORLD_MAP_MANAGER: "Globe",
@@ -630,94 +679,16 @@ async def get_workflow_node_types(project_id: Optional[str] = Query(default=None
     Returns:
         Dict: 按类别分组的节点类型
     """
-    from app.models.node_types import (
-        NodeCategory,
-        SYSTEM_AGENT_NODES,
-        INTERACTION_NODES,
-        CONTROL_NODES,
-        NodeTypeInfo,
-    )
-    from app.services.agent_template_service import AgentTemplateService
     from app.api.app import postgres_db
+    from app.services.workflow_node_catalog import (
+        resolve_disabled_agent_types,
+        resolve_workflow_node_types_payload,
+    )
 
-    def serialize_node(node: NodeTypeInfo) -> Dict[str, Any]:
-        """序列化节点，确保枚举转换为字符串"""
-        data = node.dict()
-        data["category"] = node.category.value  # 枚举转字符串
-        return data
+    disabled_agent_types = await resolve_disabled_agent_types(project_id, postgres_db)
+    if disabled_agent_types:
+        logger.info(f"已禁用的 Agent 类型: {disabled_agent_types}")
 
-    result = {
-        "agent_nodes": [],
-        "interaction_nodes": [],
-        "control_nodes": [],
-        "character_nodes": [],  # 项目角色 Agent
-    }
-
-    # 获取 Agent 模板的启用状态
-    # 逻辑：只有当模板存在且 is_enabled=False 时才禁用
-    # 如果模板不存在，则默认启用
-    disabled_agent_types = set()
-    if postgres_db:
-        try:
-            template_service = AgentTemplateService(postgres_db)
-            templates = await template_service.list_templates(limit=100)
-
-            # 只记录被明确禁用的 Agent 类型
-            for template in templates:
-                if not template.is_enabled:
-                    disabled_agent_types.add(template.agent_type.value)
-
-            logger.info(f"已禁用的 Agent 类型: {disabled_agent_types}")
-        except Exception as e:
-            logger.warning(f"获取 Agent 模板启用状态失败: {e}")
-
-    # 系统 Agent 节点 - 过滤掉被禁用的
-    for node in SYSTEM_AGENT_NODES:
-        if node.agent_type and node.agent_type not in disabled_agent_types:
-            result["agent_nodes"].append(serialize_node(node))
-        elif not node.agent_type:
-            # 没有指定 agent_type 的节点也包含
-            result["agent_nodes"].append(serialize_node(node))
-
+    result = await resolve_workflow_node_types_payload(project_id, postgres_db, disabled_agent_types)
     logger.info(f"返回 {len(result['agent_nodes'])} 个 Agent 节点")
-
-    # 交互节点
-    for node in INTERACTION_NODES:
-        result["interaction_nodes"].append(serialize_node(node))
-
-    # 控制节点
-    for node in CONTROL_NODES:
-        result["control_nodes"].append(serialize_node(node))
-
-    # 如果有项目 ID，获取项目角色
-    if project_id:
-        try:
-            from app.database.postgres import PostgresDatabase
-            db = PostgresDatabase()
-            characters = await db.fetchall(
-                """
-                SELECT id, name, role, importance_tier, has_agent, agent_enabled
-                FROM characters
-                WHERE project_id = $1 AND has_agent = true AND agent_enabled = true
-                ORDER BY importance_tier, name
-                """,
-                project_id
-            )
-            for char in characters or []:
-                result["character_nodes"].append({
-                    "type": "agent",
-                    "agent_type": f"character:{char['id']}",
-                    "label": f"{char['name']} (角色)",
-                    "description": f"角色 Agent - {char['role']}",
-                    "category": "agent",
-                    "icon": "User",
-                    "color": "orange",
-                    "is_system": False,
-                    "character_id": char["id"],
-                    "character_name": char["name"],
-                    "importance_tier": char["importance_tier"],
-                })
-        except Exception as e:
-            logger.warning(f"Failed to load characters for project {project_id}: {e}")
-
     return result

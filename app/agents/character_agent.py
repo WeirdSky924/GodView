@@ -28,6 +28,7 @@ class CharacterAgent(BaseAgent):
         prompt_template: Optional[str] = None,
         config: Optional[Dict[str, Any]] = None,
         project_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
     ):
         self.character = character
 
@@ -43,6 +44,7 @@ class CharacterAgent(BaseAgent):
             system_prompt=system_prompt,
             config=config,
             project_id=project_id,
+            agent_id=agent_id or character.id,
         )
 
     def _get_default_variables(self) -> Dict[str, Any]:

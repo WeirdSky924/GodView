@@ -20,14 +20,17 @@ import {
   CreateAgentTemplateDTO,
   UpdateAgentTemplateDTO,
 } from '@/api/agentTemplates'
+import { getAgentConfigs } from '@/api/agentConfigs'
 import { getPrompts, PromptTemplate } from '@/api/prompts'
 import { getAgentTypeSkills, type Skill } from '@/api/skills'
 import { useAgentTypes } from '@/hooks/useAgentTypes'
 import { Search, Plus, Edit2, Trash2, Eye, GripVertical, ChevronDown, ChevronUp, Settings, Lock, ToggleLeft, ToggleRight, AlertTriangle, Layers, BookOpen } from 'lucide-react'
+import { useProject } from '@/contexts/ProjectContext'
 import { useTheme } from '@/contexts/ThemeContext'
 
 export default function AgentTemplates() {
   const { theme } = useTheme()
+  const { currentProject } = useProject()
   const isDark = theme === 'dark'
 
   // 动态加载 Agent 类型元数据
@@ -65,18 +68,35 @@ export default function AgentTemplates() {
   useEffect(() => {
     loadTemplates()
     loadPrompts()
-  }, [selectedType])
+  }, [selectedType, currentProject?.id])
 
   const loadTemplates = async () => {
     setLoading(true)
     try {
       const data = await getAgentTemplates(selectedType || undefined)
+      const projectConfigs = currentProject?.id
+        ? await getAgentConfigs(currentProject.id, undefined, undefined, 200)
+        : []
+      const projectConfigMap = new Map(projectConfigs.map((config) => [config.agent_type, config]))
+
       // 确保返回的是数组
       if (Array.isArray(data)) {
+        const mergedTemplates = data.map((template) => {
+          const projectConfig = currentProject?.id ? projectConfigMap.get(template.agent_type) : undefined
+          if (!template.is_optional || !projectConfig) {
+            return template
+          }
+
+          return {
+            ...template,
+            is_enabled: projectConfig.is_active,
+          }
+        })
+
         // 前端搜索过滤
         if (searchQuery) {
           const query = searchQuery.toLowerCase()
-          const filtered = data.filter(
+          const filtered = mergedTemplates.filter(
             (t) =>
               t.name.toLowerCase().includes(query) ||
               t.description.toLowerCase().includes(query) ||
@@ -84,7 +104,7 @@ export default function AgentTemplates() {
           )
           setTemplates(filtered)
         } else {
-          setTemplates(data)
+          setTemplates(mergedTemplates)
         }
       } else {
         setTemplates([])
@@ -172,7 +192,7 @@ export default function AgentTemplates() {
     setEditingTemplate(template)
     setShowPreviewModal(true)
     try {
-      const result = await previewAgentTemplate(template.id)
+      const result = await previewAgentTemplate(template.id, currentProject?.id)
       setPreviewResult(result)
     } catch (error) {
       console.error('Failed to preview template:', error)
@@ -181,7 +201,7 @@ export default function AgentTemplates() {
 
   const handleToggle = async (template: AgentTemplate) => {
     try {
-      await toggleAgentTemplate(template.id, !template.is_enabled)
+      await toggleAgentTemplate(template.id, !template.is_enabled, currentProject?.id)
       loadTemplates()
     } catch (error) {
       console.error('Failed to toggle template:', error)
@@ -358,7 +378,9 @@ export default function AgentTemplates() {
                       )}
                       {!isCoreType(template.agent_type) && template.is_optional && (
                         <span className={`px-2 py-1 text-xs rounded ${template.is_enabled ? 'bg-green-900 text-green-300' : 'bg-gray-700 text-gray-400'}`}>
-                          {template.is_enabled ? '已启用' : '已禁用'}
+                          {currentProject?.id
+                            ? (template.is_enabled ? '项目已启用' : '项目已禁用')
+                            : (template.is_enabled ? '已启用' : '已禁用')}
                         </span>
                       )}
                       <span className={`px-2 py-1 text-xs rounded ${isDark ? 'bg-gray-700' : 'bg-gray-200'}`}>

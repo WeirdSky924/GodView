@@ -546,6 +546,7 @@ async def build_agent_prompt_with_skills(
         # 获取 Skills 信息
         skills_info = await prompt_service.get_agent_skills_info(
             agent_type=agent_type,
+            project_id=project_id,
             context_query=query,
             use_intelligent_retrieval=use_intelligent_retrieval,
         )

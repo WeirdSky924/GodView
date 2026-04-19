@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS memory_embeddings (
     memory_id VARCHAR(100) NOT NULL,
     project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     agent_type VARCHAR(100) NOT NULL,
+    agent_id VARCHAR(100),
 
     -- 记忆内容（便于重建嵌入）
     content TEXT NOT NULL,
@@ -36,11 +37,12 @@ CREATE TABLE IF NOT EXISTS memory_embeddings (
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
 
-    UNIQUE(memory_id, project_id, agent_type)
+    UNIQUE NULLS NOT DISTINCT (memory_id, project_id, agent_type, agent_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_memory_embeddings_project ON memory_embeddings(project_id);
 CREATE INDEX IF NOT EXISTS idx_memory_embeddings_agent ON memory_embeddings(agent_type);
+CREATE INDEX IF NOT EXISTS idx_memory_embeddings_project_agent_instance ON memory_embeddings(project_id, agent_type, agent_id);
 CREATE INDEX IF NOT EXISTS idx_memory_embeddings_type ON memory_embeddings(memory_type);
 CREATE INDEX IF NOT EXISTS idx_memory_embeddings_content_hash ON memory_embeddings(content_hash);
 
@@ -51,6 +53,7 @@ CREATE TABLE IF NOT EXISTS memory_usage_logs (
     memory_id VARCHAR(100) NOT NULL,
     project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     agent_type VARCHAR(100) NOT NULL,
+    agent_id VARCHAR(100),
 
     -- 使用场景
     usage_context VARCHAR(200),
@@ -69,6 +72,7 @@ CREATE TABLE IF NOT EXISTS memory_usage_logs (
 
 CREATE INDEX IF NOT EXISTS idx_memory_usage_memory ON memory_usage_logs(memory_id);
 CREATE INDEX IF NOT EXISTS idx_memory_usage_project ON memory_usage_logs(project_id);
+CREATE INDEX IF NOT EXISTS idx_memory_usage_project_agent_instance ON memory_usage_logs(project_id, agent_type, agent_id);
 CREATE INDEX IF NOT EXISTS idx_memory_usage_context ON memory_usage_logs(usage_context);
 CREATE INDEX IF NOT EXISTS idx_memory_usage_created ON memory_usage_logs(created_at);
 
@@ -173,6 +177,37 @@ ON CONFLICT (id) DO NOTHING;
 
 ALTER TABLE agent_memories ADD COLUMN IF NOT EXISTS total_accesses INT DEFAULT 0;
 ALTER TABLE agent_memories ADD COLUMN IF NOT EXISTS last_memory_decay_at TIMESTAMPTZ;
+
+-- ==================== 添加 agent_id 到增强记忆表 ====================
+
+ALTER TABLE memory_embeddings ADD COLUMN IF NOT EXISTS agent_id VARCHAR(100);
+ALTER TABLE memory_usage_logs ADD COLUMN IF NOT EXISTS agent_id VARCHAR(100);
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'memory_embeddings_memory_id_project_id_agent_type_key'
+    ) THEN
+        ALTER TABLE memory_embeddings
+        DROP CONSTRAINT memory_embeddings_memory_id_project_id_agent_type_key;
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'memory_embeddings_scope_unique'
+    ) THEN
+        ALTER TABLE memory_embeddings
+        ADD CONSTRAINT memory_embeddings_scope_unique
+        UNIQUE NULLS NOT DISTINCT (memory_id, project_id, agent_type, agent_id);
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_memory_embeddings_project_agent_instance ON memory_embeddings(project_id, agent_type, agent_id);
+CREATE INDEX IF NOT EXISTS idx_memory_usage_project_agent_instance ON memory_usage_logs(project_id, agent_type, agent_id);
 
 -- ==================== 添加嵌入向量列（如果 pgvector 可用）====================
 -- 注意：这个操作需要在 Python 迁移脚本中根据 pgvector 是否可用来决定是否执行
