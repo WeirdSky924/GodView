@@ -111,11 +111,12 @@ export async function getAgentTemplates(
   const params = new URLSearchParams()
   if (agentType) params.append('agent_type', agentType)
   if (isSystem !== undefined) params.append('is_system', String(isSystem))
-  if (tags) params.append('tags', tags.join(','))
+  tags?.forEach((tag) => params.append('tags', tag))
   params.append('limit', String(limit))
   params.append('offset', String(offset))
 
-  return await api.get(`${API_BASE}?${params.toString()}`)
+  const query = params.toString()
+  return await api.get(`${API_BASE}${query ? `?${query}` : ''}`)
 }
 
 /**
@@ -158,11 +159,9 @@ export async function previewAgentTemplate(
   if (projectId) {
     params.append('project_id', projectId)
   }
-  Object.entries(variables).forEach(([key, value]) => {
-    params.append(key, String(value))
-  })
 
-  return await api.post(`${API_BASE}/${templateId}/preview?${params.toString()}`)
+  const query = params.toString()
+  return await api.post(`${API_BASE}/${templateId}/preview${query ? `?${query}` : ''}`, variables)
 }
 
 /**

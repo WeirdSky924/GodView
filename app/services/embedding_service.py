@@ -160,6 +160,55 @@ class SentenceTransformersEmbeddingService(EmbeddingService):
     }
 
     @staticmethod
+    def _build_model_dir_patterns(model_name: str, cache_folder: Optional[str] = None) -> List[str]:
+        import os
+
+        cache_paths = []
+        if cache_folder:
+            cache_paths.append(cache_folder)
+
+        default_cache = os.path.expanduser("~/.cache/huggingface/hub")
+        cache_paths.append(default_cache)
+
+        patterns: List[str] = []
+        for cache_path in cache_paths:
+            patterns.extend([
+                os.path.join(cache_path, f"models--sentence-transformers--{model_name}"),
+                os.path.join(cache_path, f"models--{model_name.replace('/', '--')}"),
+                os.path.join(cache_path, model_name),
+            ])
+        return patterns
+
+    @staticmethod
+    def resolve_local_model_path(model_name: str, cache_folder: Optional[str] = None) -> Optional[str]:
+        import os
+
+        for model_dir in SentenceTransformersEmbeddingService._build_model_dir_patterns(model_name, cache_folder):
+            if not os.path.exists(model_dir):
+                continue
+
+            if os.path.isfile(os.path.join(model_dir, "modules.json")):
+                return model_dir
+
+            snapshots_dir = os.path.join(model_dir, "snapshots")
+            if os.path.isdir(snapshots_dir):
+                snapshots = sorted(
+                    [name for name in os.listdir(snapshots_dir) if os.path.isdir(os.path.join(snapshots_dir, name))],
+                    reverse=True,
+                )
+                for snapshot in snapshots:
+                    snapshot_dir = os.path.join(snapshots_dir, snapshot)
+                    if os.path.isfile(os.path.join(snapshot_dir, "modules.json")):
+                        return snapshot_dir
+                    if os.path.isfile(os.path.join(snapshot_dir, "config.json")):
+                        return snapshot_dir
+
+            if os.path.isfile(os.path.join(model_dir, "config.json")):
+                return model_dir
+
+        return None
+
+    @staticmethod
     def is_model_cached(model_name: str, cache_folder: Optional[str] = None) -> bool:
         """检查模型是否已在本地缓存
 
@@ -170,43 +219,7 @@ class SentenceTransformersEmbeddingService(EmbeddingService):
         Returns:
             bool: 模型是否已缓存
         """
-        import os
-
-        cache_paths = []
-        if cache_folder:
-            cache_paths.append(cache_folder)
-
-        default_cache = os.path.expanduser("~/.cache/huggingface/hub")
-        cache_paths.append(default_cache)
-
-        for cache_path in cache_paths:
-            model_dir_patterns = [
-                os.path.join(cache_path, f"models--sentence-transformers--{model_name}"),
-                os.path.join(cache_path, f"models--{model_name.replace('/', '--')}"),
-                os.path.join(cache_path, model_name),
-            ]
-
-            for model_dir in model_dir_patterns:
-                if os.path.exists(model_dir):
-                    # 检查是否有必要的模型文件
-                    # 至少要有 config.json 或者 pytorch_model.bin / model.safetensors
-                    config_path = os.path.join(model_dir, "config.json")
-                    has_model_file = any(
-                        os.path.exists(os.path.join(model_dir, f))
-                        for f in ["pytorch_model.bin", "model.safetensors", "pytorch_model.bin.index"]
-                    ) or os.path.exists(os.path.join(model_dir, "snapshots"))
-
-                    if os.path.exists(config_path) or has_model_file:
-                        return True
-
-                    # 检查 snapshots 目录（HuggingFace Hub 格式）
-                    snapshots_dir = os.path.join(model_dir, "snapshots")
-                    if os.path.exists(snapshots_dir):
-                        snapshots = os.listdir(snapshots_dir)
-                        if snapshots:
-                            return True
-
-        return False
+        return SentenceTransformersEmbeddingService.resolve_local_model_path(model_name, cache_folder) is not None
 
     @staticmethod
     def get_known_dimension(model_name: str, cache_folder: Optional[str] = None) -> Optional[int]:
@@ -227,26 +240,22 @@ class SentenceTransformersEmbeddingService(EmbeddingService):
         import json
         import os
 
-        cache_paths = []
-        if cache_folder:
-            cache_paths.append(cache_folder)
+        for model_dir in SentenceTransformersEmbeddingService._build_model_dir_patterns(model_name, cache_folder):
+            if not os.path.exists(model_dir):
+                continue
 
-        default_cache = os.path.expanduser("~/.cache/huggingface/hub")
-        cache_paths.append(default_cache)
+            candidate_dirs = [model_dir]
+            snapshots_dir = os.path.join(model_dir, "snapshots")
+            if os.path.isdir(snapshots_dir):
+                candidate_dirs = [
+                    os.path.join(snapshots_dir, name)
+                    for name in os.listdir(snapshots_dir)
+                    if os.path.isdir(os.path.join(snapshots_dir, name))
+                ] + candidate_dirs
 
-        for cache_path in cache_paths:
-            model_dir_patterns = [
-                os.path.join(cache_path, f"models--sentence-transformers--{model_name}"),
-                os.path.join(cache_path, f"models--{model_name.replace('/', '--')}"),
-                os.path.join(cache_path, model_name),
-            ]
-
-            for model_dir in model_dir_patterns:
-                if not os.path.exists(model_dir):
-                    continue
-
+            for candidate_dir in candidate_dirs:
                 # 1_Pooling/config.json
-                pooling_config = os.path.join(model_dir, "1_Pooling", "config.json")
+                pooling_config = os.path.join(candidate_dir, "1_Pooling", "config.json")
                 if os.path.exists(pooling_config):
                     try:
                         with open(pooling_config, "r") as f:
@@ -257,7 +266,7 @@ class SentenceTransformersEmbeddingService(EmbeddingService):
                         pass
 
                 # config.json
-                config_path = os.path.join(model_dir, "config.json")
+                config_path = os.path.join(candidate_dir, "config.json")
                 if os.path.exists(config_path):
                     try:
                         with open(config_path, "r") as f:
@@ -279,60 +288,11 @@ class SentenceTransformersEmbeddingService(EmbeddingService):
         self._model = None
         self._dimension = None
         self._is_cached = None  # 缓存检查结果
+        self._load_error: Optional[Exception] = None
 
     def _get_dimension_from_config(self) -> Optional[int]:
         """方法二：从配置文件读取维度（轻量级，无需加载模型）"""
-        import json
-        import os
-
-        # 1. 首先检查已知维度
-        if self.model_name in self.KNOWN_DIMENSIONS:
-            return self.KNOWN_DIMENSIONS[self.model_name]
-
-        # 2. 尝试从本地缓存读取配置文件
-        cache_paths = []
-        if self.cache_folder:
-            cache_paths.append(self.cache_folder)
-
-        # 默认 HuggingFace 缓存路径
-        default_cache = os.path.expanduser("~/.cache/huggingface/hub")
-        cache_paths.append(default_cache)
-
-        for cache_path in cache_paths:
-            # 查找模型目录
-            model_dir_patterns = [
-                os.path.join(cache_path, f"models--sentence-transformers--{self.model_name}"),
-                os.path.join(cache_path, f"models--{self.model_name.replace('/', '--')}"),
-                os.path.join(cache_path, self.model_name),
-            ]
-
-            for model_dir in model_dir_patterns:
-                if not os.path.exists(model_dir):
-                    continue
-
-                # 尝试读取 1_Pooling/config.json (Sentence-Transformers 特有)
-                pooling_config = os.path.join(model_dir, "1_Pooling", "config.json")
-                if os.path.exists(pooling_config):
-                    try:
-                        with open(pooling_config, "r") as f:
-                            config = json.load(f)
-                            if "word_embedding_dimension" in config:
-                                return config["word_embedding_dimension"]
-                    except Exception:
-                        pass
-
-                # 尝试读取 config.json (标准 Transformer 配置)
-                config_path = os.path.join(model_dir, "config.json")
-                if os.path.exists(config_path):
-                    try:
-                        with open(config_path, "r") as f:
-                            config = json.load(f)
-                            if "hidden_size" in config:
-                                return config["hidden_size"]
-                    except Exception:
-                        pass
-
-        return None
+        return self.get_known_dimension(self.model_name, self.cache_folder)
 
     def _download_progress_callback(self, progress: float, desc: str = ""):
         """下载进度回调"""
@@ -346,6 +306,9 @@ class SentenceTransformersEmbeddingService(EmbeddingService):
 
     def _get_model(self):
         """懒加载模型"""
+        if self._load_error is not None:
+            raise self._load_error
+
         if self._model is None:
             try:
                 from sentence_transformers import SentenceTransformer
@@ -358,41 +321,39 @@ class SentenceTransformersEmbeddingService(EmbeddingService):
                     os.environ['TRANSFORMERS_CACHE'] = self.cache_folder
                     os.environ['HF_HUB_CACHE'] = self.cache_folder
 
-                # 先检查模型是否已在本地缓存
-                is_cached = self.is_model_cached(self.model_name, self.cache_folder)
+                local_model_path = self.resolve_local_model_path(self.model_name, self.cache_folder)
+                is_cached = local_model_path is not None
+                self._is_cached = is_cached
 
                 if is_cached:
-                    # 模型已缓存，直接加载，不触发下载进度
                     logger.info(f"模型 '{self.model_name}' 已在本地缓存，直接加载")
                     set_download_progress("completed", 100, f"模型已缓存，正在加载...", self.model_name)
                 else:
-                    # 模型未缓存，显示下载进度
                     logger.info(f"模型 '{self.model_name}' 未缓存，开始下载")
                     set_download_progress("downloading", 0, "检查模型...", self.model_name)
-
-                # 加载模型
-                if not is_cached:
                     set_download_progress("downloading", 10, "加载模型...", self.model_name)
 
-                # 构建模型名称（sentence-transformers 格式）
-                model_id = f"sentence-transformers/{self.model_name}" if "/" not in self.model_name else self.model_name
+                # 已缓存时直接用真实本地目录，避免 SentenceTransformer 再走 hub 解析
+                model_id = local_model_path or (f"sentence-transformers/{self.model_name}" if "/" not in self.model_name else self.model_name)
 
                 if self.cache_folder:
                     self._model = SentenceTransformer(
                         model_id,
                         cache_folder=self.cache_folder,
-                        local_files_only=is_cached  # 仅在已缓存时禁用网络请求
+                        model_kwargs={"cache_dir": self.cache_folder},
+                        local_files_only=is_cached,
                     )
                 else:
                     self._model = SentenceTransformer(
                         model_id,
-                        local_files_only=is_cached
+                        local_files_only=is_cached,
                     )
 
-                self._dimension = self._model.get_sentence_embedding_dimension()
+                self._dimension = self._model.get_embedding_dimension()
                 set_download_progress("completed", 100, f"模型加载完成，维度：{self._dimension}", self.model_name)
 
             except Exception as e:
+                self._load_error = e
                 set_download_progress("error", 0, f"加载失败: {str(e)}", self.model_name)
                 raise
 

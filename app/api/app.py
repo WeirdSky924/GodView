@@ -112,7 +112,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         )
         try:
             await qdrant_db.connect()
-            await qdrant_db.init_collection()
+            await qdrant_db.init_collections()
+            try:
+                from app.services.writing_rule_index_service import get_writing_rule_index_service
+                synced = await get_writing_rule_index_service().sync_all_rules()
+                logger.info(f"写作规则索引初始化完成: {synced} 条")
+            except Exception as sync_error:
+                logger.warning(f"写作规则索引初始化失败：{sync_error}")
             logger.info("Qdrant 初始化完成")
         except Exception as e:
             logger.warning(f"Qdrant 连接失败：{e}")

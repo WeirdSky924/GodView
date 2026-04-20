@@ -24,7 +24,6 @@ import {
   Link,
   Dices,
   Map,
-  User,
   Zap,
   Globe,
   CheckCircle,
@@ -44,7 +43,6 @@ const ICON_MAP: Record<string, React.ElementType> = {
   GitBranch,
   Dices,
   Map,
-  User,
   Users,
   MessageCircle,
   MessageSquare,
@@ -142,19 +140,6 @@ export default function NodePanel({ onDragStart }: NodePanelProps) {
           {nodeTypes.agent_nodes.map(renderNodeItem)}
         </div>
       </div>
-
-      {/* 角色 Agent 节点 */}
-      {nodeTypes.character_nodes.length > 0 && (
-        <div className="p-4 border-t border-gray-200 dark:border-gray-700">
-          <h3 className={`text-sm font-semibold mb-3 flex items-center gap-2 ${isDark ? 'text-gray-200' : 'text-gray-700'}`}>
-            <User size={16} />
-            角色 Agent
-          </h3>
-          <div className="space-y-2">
-            {nodeTypes.character_nodes.map(renderNodeItem)}
-          </div>
-        </div>
-      )}
 
       {/* 交互节点 */}
       <div className="p-4 border-t border-gray-200 dark:border-gray-700">

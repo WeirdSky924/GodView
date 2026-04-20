@@ -221,7 +221,7 @@ const standardAllNodesDefinition = {
       id: 'parallel_prep',
       node_type: 'parallel',
       label: '并行执行',
-      description: '围绕章节大纲并行准备设定、事件、地图与探索素材',
+      description: '围绕章节大纲并行执行设定、事件、地图与探索素材',
       config: {},
       position: { x: 520, y: 220 },
     },
@@ -1142,30 +1142,6 @@ export default function Visualizer() {
                       ))}
                     </div>
                   </div>
-
-                  {nodeTypesData.character_nodes.length > 0 && (
-                    <div className="mb-3">
-                      <p className={`text-xs font-medium mb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
-                        角色 Agent
-                      </p>
-                      <div className="grid grid-cols-2 gap-1">
-                        {nodeTypesData.character_nodes.map((node) => (
-                          <button
-                            key={node.character_id}
-                            onClick={() => handleAddNode(node)}
-                            className={`text-left px-2 py-1.5 rounded text-xs transition-colors truncate ${
-                              isDark
-                                ? 'bg-orange-900/50 hover:bg-orange-800/50 text-orange-300'
-                                : 'bg-orange-50 hover:bg-orange-100 text-orange-700'
-                            }`}
-                            title={node.label}
-                          >
-                            {node.character_name}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  )}
 
                   <div className="mb-3">
                     <p className={`text-xs font-medium mb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>

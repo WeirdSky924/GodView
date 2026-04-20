@@ -9,6 +9,8 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+from sqlalchemy.exc import ProgrammingError
+
 from app.models.agent_config import (
     AgentConfig,
     AgentConfigCreate,
@@ -52,6 +54,12 @@ class AgentConfigService:
                     config = self._row_to_config(row)
                     self._configs[config.id] = config
                 logger.info(f"从数据库加载 {len(self._configs)} 个 Agent 配置")
+            except ProgrammingError as e:
+                error_text = str(e)
+                if "relation \"agent_configs\" does not exist" in error_text or "UndefinedTableError" in error_text:
+                    logger.warning("agent_configs 表不存在，先以空配置启动；需补跑 V7_prompt_management.sql")
+                else:
+                    logger.warning(f"从数据库加载 Agent 配置失败: {e}")
             except Exception as e:
                 logger.warning(f"从数据库加载 Agent 配置失败: {e}")
 
@@ -265,6 +273,11 @@ class AgentConfigService:
             return None
 
         update_data = dto.model_dump(exclude_unset=True)
+        if "llm_config" in update_data and dto.llm_config is not None:
+            update_data["llm_config"] = dto.llm_config
+        if "slot_overrides" in update_data and dto.slot_overrides is not None:
+            update_data["slot_overrides"] = dto.slot_overrides
+
         for field, value in update_data.items():
             if value is not None:
                 setattr(config, field, value)

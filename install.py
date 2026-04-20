@@ -1225,6 +1225,7 @@ CREATE TABLE IF NOT EXISTS writing_rules (
     description TEXT,
     category VARCHAR(50) NOT NULL,
     severity VARCHAR(50) DEFAULT 'recommended',
+    application_mode VARCHAR(50) DEFAULT 'retrieve',
     tags JSONB DEFAULT '[]',
     content TEXT NOT NULL,
     examples JSONB DEFAULT '[]',

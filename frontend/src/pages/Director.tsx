@@ -909,7 +909,7 @@ export default function Director() {
           const nodeData = data.data || data
           const displayName = getNodeDisplayName(nodeData)
           addLog(`🔄 ${displayName} 开始执行`)
-          updateAgentFromNode(nodeData, { status: 'working', message: nodeData.label || '执行中' })
+          updateAgentFromNode(nodeData, { status: 'working', message: displayName || '执行中' })
 
           const nodeKey = getAgentStateKey(nodeData)
           if (nodeKey) {
@@ -930,7 +930,7 @@ export default function Director() {
             updateAgentFromNode(nodeData, { status: 'error', message: nodeData.error || '执行失败' })
           } else {
             addLog(`✅ ${displayName} 完成`)
-            updateAgentFromNode(nodeData, { status: 'completed', message: nodeData.label || '完成' })
+            updateAgentFromNode(nodeData, { status: 'completed', message: displayName || '完成' })
           }
 
           if (nodeKey) {

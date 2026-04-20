@@ -17,6 +17,7 @@ from app.models.agent_template import (
 )
 from app.models.prompt_template import PromptRenderRequest
 from app.services.agent_config_service import get_agent_config_service
+from app.services.writing_rule_rag import get_writing_rule_rag_service
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,7 @@ def get_writing_rules_service():
     """获取写作规则服务实例"""
     global _writing_rules_service
     if _writing_rules_service is None:
-        from app.api.routes.writing_rules import get_writing_rules_service as get_service
+        from app.services.writing_rule_service import get_writing_rule_service as get_service
         _writing_rules_service = get_service()
     return _writing_rules_service
 
@@ -262,7 +263,7 @@ async def preview_agent_template(
 
         # 特殊处理：writing_rules 插槽（动态加载）
         if slot_name == "writing_rules" and not slot.prompt_template_id:
-            prompt_content = await _build_writing_rules_prompt(project_id)
+            prompt_content = await _build_writing_rules_prompt(project_id, variables or {})
             # 替换 available_skills 占位符
             prompt_content = _inject_skills(prompt_content, skills_content)
             rendered_prompts.append({
@@ -410,49 +411,60 @@ async def _build_available_skills_content(template: AgentTemplate) -> str:
     return ""
 
 
-async def _build_writing_rules_prompt(project_id: Optional[str]) -> str:
+async def _build_writing_rules_prompt(project_id: Optional[str], context: Optional[Dict[str, Any]] = None) -> str:
     """
     构建写作规则提示词
 
     Args:
         project_id: 项目 ID
+        context: 预览上下文
 
     Returns:
         str: 写作规则提示词
     """
-    from app.services.writing_rules_init import build_writing_prompt, get_system_rule_by_id, get_system_rule_set_by_id
-
-    if not project_id:
-        # 没有项目 ID，使用默认规则集
-        return build_writing_prompt(rule_set_ids=["rule_set_web_novel_basics"])
-
-    # 从数据库获取项目写作配置
     try:
-        from app.api.routes.writing_rules import _get_db
-        db = _get_db()
-        if db:
-            config = await db.fetchone(
-                """
-                SELECT enabled_rule_ids, enabled_rule_set_ids
-                FROM project_writing_configs
-                WHERE project_id = $1
-                """,
-                project_id
-            )
-            if config:
-                enabled_rule_ids = config.get("enabled_rule_ids", []) or []
-                enabled_rule_set_ids = config.get("enabled_rule_set_ids", []) or []
+        lines = [
+            "## 写作规则检索协议",
+            "- 写作前先按当前章节目标、环境、讨论摘要、角色状态检索相关写作规则。",
+            "- 常驻规则只保留不可违反的高优先级约束；其余规则按需检索注入。",
+            "- 场景、分段焦点或修订目标发生明显变化时，应再次检索。",
+        ]
 
-                if enabled_rule_ids or enabled_rule_set_ids:
-                    return build_writing_prompt(
-                        rule_ids=enabled_rule_ids,
-                        rule_set_ids=enabled_rule_set_ids,
-                    )
+        if not project_id:
+            return "\n".join(lines)
+
+        service = get_writing_rules_service()
+        scope = await service.resolve_project_rule_scope(project_id)
+        scope_summary = service.describe_project_rule_scope(scope)
+        if not scope_summary.get("is_active"):
+            return ""
+
+        lines.append(
+            f"- 当前作用域规则数：{scope_summary.get('resolved_rule_count', 0)}，基线规则集：{'是' if scope_summary.get('used_baseline') else '否'}。"
+        )
+
+        retrieval = await get_writing_rule_rag_service().retrieve_for_project(
+            project_id,
+            context=context or {},
+            limit=4,
+        )
+        retrieved_rules = retrieval.get("retrieved_rules", [])
+        if retrieved_rules:
+            lines.append("\n## 当前预览命中的规则")
+            for rule in retrieved_rules:
+                lines.append(
+                    f"- [{rule.get('severity')}] {rule.get('name')}: {rule.get('summary')}"
+                )
+
+        rendered_guidance = retrieval.get("rendered_guidance", "").strip()
+        if rendered_guidance:
+            lines.append("\n## 最终注入片段")
+            lines.append(rendered_guidance)
+
+        return "\n".join(lines)
     except Exception as e:
-        logger.warning(f"Failed to load project writing config: {e}")
-
-    # 默认使用基础规则集
-    return build_writing_prompt(rule_set_ids=["rule_set_web_novel_basics"])
+        logger.warning(f"Failed to build writing rules prompt: {e}")
+        return ""
 
 
 @router.get("/agent-templates/by-type/{agent_type}", response_model=Dict[str, Any])

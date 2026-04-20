@@ -94,7 +94,8 @@ export async function getAgentConfigs(
   params.append('limit', String(limit))
   params.append('offset', String(offset))
 
-  return await api.get(`${API_BASE}/projects/${projectId}/agents?${params.toString()}`)
+  const query = params.toString()
+  return await api.get(`${API_BASE}/projects/${projectId}/agents${query ? `?${query}` : ''}`)
 }
 
 /**
@@ -123,12 +124,7 @@ export async function previewAgentConfig(
   agentType: string,
   variables: Record<string, any> = {}
 ): Promise<PreviewConfigResult> {
-  const params = new URLSearchParams()
-  Object.entries(variables).forEach(([key, value]) => {
-    params.append(key, String(value))
-  })
-
-  return await api.post(`${API_BASE}/projects/${projectId}/agents/${agentType}/preview?${params.toString()}`)
+  return await api.post(`${API_BASE}/projects/${projectId}/agents/${agentType}/preview`, variables)
 }
 
 /**

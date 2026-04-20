@@ -13,6 +13,7 @@ from langchain_core.messages import HumanMessage
 from app.agents.base import BaseAgent, AgentResponse
 from app.models.agent_template import AgentType
 from app.models.token_usage import UsageCategory
+from app.services.writing_rule_rag import get_writing_rule_rag_service
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +129,62 @@ class WriterAgent(BaseAgent):
         if isinstance(legacy_summary, str):
             return legacy_summary.strip()
         return str(legacy_summary) if legacy_summary else ""
+
+    def _build_writing_rule_context(
+        self,
+        *,
+        chapter_num: Optional[int] = None,
+        total_chapters: Optional[int] = None,
+        discussion_summary: Optional[str] = None,
+        environment: Optional[str] = None,
+        intents: Optional[List[str]] = None,
+        hooks: Optional[List[Dict[str, Any]]] = None,
+        character_moods: Optional[Dict[str, str]] = None,
+        world_info: Optional[Dict[str, Any]] = None,
+        scene: Optional[str] = None,
+        segment_focus: Optional[str] = None,
+        segment_elements: Optional[List[str]] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        context: Dict[str, Any] = {
+            "chapter_num": chapter_num,
+            "total_chapters": total_chapters,
+            "discussion_summary": discussion_summary,
+            "environment": environment,
+            "intents": intents,
+            "hooks": hooks,
+            "character_moods": character_moods,
+            "world_info": world_info,
+            "scene": scene,
+            "segment_focus": segment_focus,
+            "segment_elements": segment_elements,
+        }
+        if extra:
+            context.update(extra)
+        return {
+            key: value
+            for key, value in context.items()
+            if value not in (None, "", [], {})
+        }
+
+    async def _retrieve_writing_rule_guidance(
+        self,
+        context: Optional[Dict[str, Any]] = None,
+        limit: int = 6,
+    ) -> str:
+        if not self.project_id:
+            return ""
+
+        try:
+            result = await get_writing_rule_rag_service().retrieve_for_project(
+                project_id=self.project_id,
+                context=context or {},
+                limit=limit,
+            )
+            return (result.get("rendered_guidance") or "").strip()
+        except Exception as e:
+            logger.warning(f"写作规则检索失败: {e}")
+            return ""
 
     async def execute(self, input_data: Dict[str, Any]) -> AgentResponse:
         """
@@ -269,9 +326,26 @@ class WriterAgent(BaseAgent):
         total_chapters = input_data.get("total_chapters", 10)
         world_info = input_data.get("world_info")
 
+        rule_context = self._build_writing_rule_context(
+            chapter_num=chapter_num,
+            total_chapters=total_chapters,
+            discussion_summary=discussion_summary,
+            environment=environment,
+            intents=intents,
+            hooks=hooks,
+            character_moods=character_moods,
+            world_info=world_info,
+        )
+        writing_rules_guidance = await self._retrieve_writing_rule_guidance(
+            context=rule_context,
+            limit=6,
+        )
+
         # 构建用户消息
         if auto_write_mode and writing_prompt:
             user_message = writing_prompt
+            if writing_rules_guidance:
+                user_message = f"{writing_prompt}\n\n{writing_rules_guidance}"
         else:
             user_message = self._build_user_message(
                 intents=intents,
@@ -285,6 +359,7 @@ class WriterAgent(BaseAgent):
                 chapter_num=chapter_num,
                 total_chapters=total_chapters,
                 world_info=world_info,
+                writing_rules_guidance=writing_rules_guidance,
             )
 
         # 调用 LLM
@@ -333,6 +408,7 @@ class WriterAgent(BaseAgent):
                 character_moods=character_moods,
                 chapter_num=chapter_num,
                 total_chapters=total_chapters,
+                writing_rules_guidance=writing_rules_guidance,
             )
 
             # 调用 LLM 续写
@@ -387,6 +463,21 @@ class WriterAgent(BaseAgent):
         total_chapters = input_data.get("total_chapters", 10)
         world_info = input_data.get("world_info")
 
+        chapter_rule_context = self._build_writing_rule_context(
+            chapter_num=chapter_num,
+            total_chapters=total_chapters,
+            discussion_summary=discussion_summary,
+            environment=environment,
+            intents=intents,
+            hooks=hooks,
+            character_moods=character_moods,
+            world_info=world_info,
+        )
+        chapter_writing_rules_guidance = await self._retrieve_writing_rule_guidance(
+            context=chapter_rule_context,
+            limit=6,
+        )
+
         # 计算分段数
         segment_count = min(MAX_SEGMENTS, (word_count + SEGMENT_SIZE - 1) // SEGMENT_SIZE)
         segment_target = word_count // segment_count
@@ -414,6 +505,25 @@ class WriterAgent(BaseAgent):
             segment_num = i + 1
             logger.info(f"生成第 {segment_num}/{segment_count} 段...")
 
+            segment_rule_context = self._build_writing_rule_context(
+                chapter_num=chapter_num,
+                total_chapters=total_chapters,
+                discussion_summary=discussion_summary,
+                environment=environment,
+                intents=intents,
+                hooks=hooks,
+                character_moods=character_moods,
+                world_info=world_info,
+                segment_focus=segment_info.get("focus"),
+                segment_elements=segment_info.get("key_elements"),
+            )
+            segment_writing_rules_guidance = await self._retrieve_writing_rule_guidance(
+                context=segment_rule_context,
+                limit=4,
+            )
+            if not segment_writing_rules_guidance:
+                segment_writing_rules_guidance = chapter_writing_rules_guidance
+
             # 构建分段提示
             segment_prompt = self._build_segment_prompt(
                 segment_info=segment_info,
@@ -423,6 +533,7 @@ class WriterAgent(BaseAgent):
                 target_words=segment_target,
                 world_info=world_info,
                 previous_style=previous_style if i == 0 else None,
+                writing_rules_guidance=segment_writing_rules_guidance,
             )
 
             # 生成该段
@@ -475,6 +586,7 @@ class WriterAgent(BaseAgent):
                 shortage=shortage,
                 chapter_num=chapter_num,
                 total_chapters=total_chapters,
+                writing_rules_guidance=chapter_writing_rules_guidance,
             )
 
             supplement_response = await self._call_llm(
@@ -588,6 +700,7 @@ class WriterAgent(BaseAgent):
         target_words: int,
         world_info: Optional[Dict[str, Any]] = None,
         previous_style: Optional[str] = None,
+        writing_rules_guidance: str = "",
     ) -> str:
         """构建分段生成提示"""
         parts = []
@@ -601,6 +714,9 @@ class WriterAgent(BaseAgent):
         key_elements = segment_info.get('key_elements', [])
         if key_elements:
             parts.append(f"\n【本段关键元素】\n{chr(10).join(['- ' + e for e in key_elements])}")
+
+        if writing_rules_guidance:
+            parts.append(f"\n{writing_rules_guidance}")
 
         if world_info:
             parts.append(f"\n【世界观参考】\n名称：{world_info.get('name', '未知')}\n类型：{world_info.get('world_type', '奇幻')}")
@@ -634,13 +750,14 @@ class WriterAgent(BaseAgent):
         shortage: int,
         chapter_num: int,
         total_chapters: int,
+        writing_rules_guidance: str = "",
     ) -> str:
         """构建补充内容提示"""
+        guidance_block = f"\n【当前相关写作规则】\n{writing_rules_guidance}\n" if writing_rules_guidance else ""
         return f"""请为以下章节内容进行补充，增加约 {shortage} 字。
 
 【已有内容】
-{existing_content}
-
+{existing_content}{guidance_block}
 【长篇创作意识】
 - 当前是第 {chapter_num} 章，全书共 {total_chapters} 章
 - 保持剧情可持续发展，不要急于推进到高潮
@@ -668,13 +785,14 @@ class WriterAgent(BaseAgent):
         character_moods: Dict[str, str],
         chapter_num: int,
         total_chapters: int,
+        writing_rules_guidance: str = "",
     ) -> str:
         """构建续写提示"""
+        guidance_block = f"\n【当前相关写作规则】\n{writing_rules_guidance}\n" if writing_rules_guidance else ""
         return f"""请继续写作，补充约 {shortage} 字的内容。
 
 【已有内容】
-{existing_content}
-
+{existing_content}{guidance_block}
 【长篇创作意识】
 - 当前是第 {chapter_num} 章，全书共 {total_chapters} 章
 - 请保持剧情可持续发展的节奏
@@ -788,6 +906,7 @@ class WriterAgent(BaseAgent):
         chapter_num: int = 1,
         total_chapters: int = 10,
         world_info: Optional[Dict[str, Any]] = None,
+        writing_rules_guidance: str = "",
     ) -> str:
         """构建用户消息"""
         message_parts = []
@@ -803,6 +922,9 @@ class WriterAgent(BaseAgent):
 
         # 字数要求（放在最前面强调）
         message_parts.append(f"【字数要求（强制）】\n目标：约 {word_count} 字\n最低要求：{min_word_count} 字（必须达到）\n写作完成后请自行统计字数。")
+
+        if writing_rules_guidance:
+            message_parts.append(writing_rules_guidance)
 
         # 世界观设定（重要！所有写作都要符合世界观）
         if world_info:

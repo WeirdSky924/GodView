@@ -20,7 +20,7 @@ from app.models.agent_template import AgentTemplate, AgentType, PromptSlot, Skil
 from app.models.prompt_template import PromptTemplate
 from app.models.skill import Skill, SkillType, SkillLoadMode
 from app.services.prompt_builder import PromptBuilder
-from app.services.writing_rules_init import build_writing_prompt
+from app.services.writing_rule_service import get_writing_rule_service
 
 logger = logging.getLogger(__name__)
 
@@ -750,25 +750,23 @@ class AgentPromptService:
         if not project_id:
             return ""
 
-        # 获取项目的写作规则配置
-        config = self.get_project_writing_config(project_id)
-        enabled_rule_ids = config.get("enabled_rule_ids", [])
-        enabled_rule_set_ids = config.get("enabled_rule_set_ids", [])
-
-        if not enabled_rule_ids and not enabled_rule_set_ids:
-            # 使用默认规则集
-            enabled_rule_set_ids = ["rule_set_web_novel_basics"]
-
-        # 构建写作规则 prompt
-        writing_prompt = build_writing_prompt(
-            rule_ids=enabled_rule_ids,
-            rule_set_ids=enabled_rule_set_ids,
-        )
-
-        if writing_prompt:
-            logger.info(f"为项目 {project_id} 构建写作规则 prompt, 包含 {len(enabled_rule_ids)} 条规则和 {len(enabled_rule_set_ids)} 个规则集")
-
-        return writing_prompt
+        try:
+            writing_rule_service = get_writing_rule_service()
+            scope = await writing_rule_service.resolve_project_rule_scope(project_id)
+            scope_summary = writing_rule_service.describe_project_rule_scope(scope)
+            if not scope_summary.get("is_active"):
+                return ""
+            lines = [
+                "## 写作规则检索协议",
+                "- 写作前先按当前章节目标、环境、讨论摘要、角色状态检索相关写作规则。",
+                "- 常驻规则只保留不可违反的高优先级约束；其余规则按需检索注入。",
+                "- 场景、分段焦点或修订目标发生明显变化时，应再次检索。",
+                f"- 当前作用域规则数：{scope_summary.get('resolved_rule_count', 0)}，基线规则集：{'是' if scope_summary.get('used_baseline') else '否'}。",
+            ]
+            return "\n".join(lines)
+        except Exception as e:
+            logger.error(f"构建写作规则 prompt 失败: {e}")
+            return ""
 
     def _render_template(self, template: PromptTemplate, variables: Dict[str, Any]) -> str:
         """

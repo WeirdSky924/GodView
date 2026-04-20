@@ -11,7 +11,6 @@ import {
   updateWritingRule,
   deleteWritingRule,
   getWritingRuleSets,
-  getWritingRuleSet,
   createWritingRuleSet,
   updateWritingRuleSet,
   deleteWritingRuleSet,
@@ -22,13 +21,15 @@ import {
   WritingRuleSet,
   WritingRuleCategory,
   RuleSeverity,
+  WritingRuleApplicationMode,
   CreateWritingRuleDTO,
   UpdateWritingRuleDTO,
   ProjectWritingConfig,
+  PreviewResult,
 } from '@/api/writingRules'
 import { useProject } from '@/contexts/ProjectContext'
 import { useTheme } from '@/contexts/ThemeContext'
-import { Search, Plus, Edit2, Trash2, Eye, Check, BookOpen, Layers, Settings } from 'lucide-react'
+import { Search, Plus, Edit2, Trash2, Eye, BookOpen, Layers, Settings } from 'lucide-react'
 
 const CATEGORY_LABELS: Record<WritingRuleCategory, string> = {
   dialogue: '对话类',
@@ -47,6 +48,23 @@ const SEVERITY_LABELS: Record<RuleSeverity, { label: string; color: string }> = 
   recommended: { label: '推荐', color: 'bg-yellow-900 text-yellow-300' },
   optional: { label: '可选', color: 'bg-gray-700 text-gray-300' },
   info: { label: '信息', color: 'bg-blue-900 text-blue-300' },
+}
+
+const APPLICATION_MODE_LABELS: Record<WritingRuleApplicationMode, string> = {
+  always: '常驻',
+  always_postcheck: '常驻+复检',
+  retrieve: '按需检索',
+  retrieve_postcheck: '检索+复检',
+  retrieve_on_match: '强匹配检索',
+  reference: '仅参考',
+}
+
+const DEFAULT_APPLICATION_MODE: Record<RuleSeverity, WritingRuleApplicationMode> = {
+  required: 'always_postcheck',
+  strong: 'retrieve_postcheck',
+  recommended: 'retrieve',
+  optional: 'retrieve_on_match',
+  info: 'reference',
 }
 
 type TabType = 'rules' | 'sets' | 'config'
@@ -73,7 +91,9 @@ export default function WritingRules() {
   const [showEditModal, setShowEditModal] = useState(false)
   const [showPreviewModal, setShowPreviewModal] = useState(false)
   const [editingRule, setEditingRule] = useState<WritingRule | null>(null)
-  const [previewContent, setPreviewContent] = useState('')
+  const [previewResult, setPreviewResult] = useState<PreviewResult | null>(null)
+
+  const previewContent = previewResult?.rendered_guidance || ''
 
   // 表单状态
   const [formData, setFormData] = useState<CreateWritingRuleDTO>({
@@ -81,6 +101,7 @@ export default function WritingRules() {
     description: '',
     category: 'dialogue',
     severity: 'recommended',
+    application_mode: DEFAULT_APPLICATION_MODE.recommended,
     content: '',
     examples: [],
     anti_patterns: [],
@@ -98,9 +119,11 @@ export default function WritingRules() {
     name: '',
     description: '',
     rule_ids: [] as string[],
+    category: 'style' as WritingRuleCategory,
     target_genre: '',
     tags: [] as string[],
   })
+  const [ruleSetTagInput, setRuleSetTagInput] = useState('')
 
   useEffect(() => {
     loadData()
@@ -164,6 +187,7 @@ export default function WritingRules() {
       description: '',
       category: 'dialogue',
       severity: 'recommended',
+      application_mode: DEFAULT_APPLICATION_MODE.recommended,
       content: '',
       examples: [],
       anti_patterns: [],
@@ -179,6 +203,7 @@ export default function WritingRules() {
       description: rule.description,
       category: rule.category,
       severity: rule.severity,
+      application_mode: rule.application_mode,
       content: rule.content,
       examples: rule.examples || [],
       anti_patterns: rule.anti_patterns || [],
@@ -211,15 +236,31 @@ export default function WritingRules() {
     }
   }
 
+  const handleSeverityChange = (severity: RuleSeverity) => {
+    setFormData(prev => ({
+      ...prev,
+      severity,
+      application_mode: DEFAULT_APPLICATION_MODE[severity],
+    }))
+  }
+
+  const handleApplicationModeChange = (application_mode: WritingRuleApplicationMode) => {
+    setFormData(prev => ({
+      ...prev,
+      application_mode,
+    }))
+  }
+
   const handlePreview = async () => {
     if (!currentProject) return
     setShowPreviewModal(true)
+    setPreviewResult(null)
     try {
       const result = await previewWritingPrompt(currentProject.id)
-      setPreviewContent(result.prompt)
+      setPreviewResult(result)
     } catch (error) {
       console.error('Failed to preview:', error)
-      setPreviewContent('预览失败')
+      setPreviewResult(null)
     }
   }
 
@@ -262,9 +303,11 @@ export default function WritingRules() {
       name: ruleSet.name,
       description: ruleSet.description,
       rule_ids: ruleSet.rule_ids,
+      category: ruleSet.category,
       target_genre: ruleSet.target_genre || '',
       tags: ruleSet.tags,
     })
+    setRuleSetTagInput('')
     setShowRuleSetModal(true)
   }
 
@@ -274,9 +317,11 @@ export default function WritingRules() {
       name: '',
       description: '',
       rule_ids: [],
+      category: 'style',
       target_genre: '',
       tags: [],
     })
+    setRuleSetTagInput('')
     setShowRuleSetModal(true)
   }
 
@@ -290,6 +335,7 @@ export default function WritingRules() {
         await createWritingRuleSet(ruleSetForm)
       }
       setShowRuleSetModal(false)
+      setRuleSetTagInput('')
       loadData()
     } catch (error) {
       console.error('Failed to save rule set:', error)
@@ -326,6 +372,14 @@ export default function WritingRules() {
     if (tagInput.trim() && !currentTags.includes(tagInput.trim())) {
       setFormData({ ...formData, tags: [...currentTags, tagInput.trim()] })
       setTagInput('')
+    }
+  }
+
+  const addRuleSetTag = () => {
+    const currentTags = ruleSetForm.tags || []
+    if (ruleSetTagInput.trim() && !currentTags.includes(ruleSetTagInput.trim())) {
+      setRuleSetForm({ ...ruleSetForm, tags: [...currentTags, ruleSetTagInput.trim()] })
+      setRuleSetTagInput('')
     }
   }
 
@@ -379,7 +433,7 @@ export default function WritingRules() {
           {activeTab === 'config' && (
             <Button onClick={handlePreview}>
               <Eye className="w-4 h-4 mr-2" />
-              预览 Prompt
+              预览检索
             </Button>
           )}
         </div>
@@ -632,7 +686,7 @@ export default function WritingRules() {
                 placeholder="规则名称"
               />
             </div>
-            <div className="grid grid-cols-2 gap-2">
+            <div className="grid grid-cols-3 gap-2">
               <div>
                 <label className={`block text-sm mb-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>分类</label>
                 <select
@@ -650,9 +704,21 @@ export default function WritingRules() {
                 <select
                   className={`w-full border rounded px-3 py-2 ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'bg-white border-gray-300 text-gray-800'}`}
                   value={formData.severity}
-                  onChange={(e) => setFormData({ ...formData, severity: e.target.value as RuleSeverity })}
+                  onChange={(e) => handleSeverityChange(e.target.value as RuleSeverity)}
                 >
                   {Object.entries(SEVERITY_LABELS).map(([key, { label }]) => (
+                    <option key={key} value={key}>{label}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className={`block text-sm mb-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>应用模式</label>
+                <select
+                  className={`w-full border rounded px-3 py-2 ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'bg-white border-gray-300 text-gray-800'}`}
+                  value={formData.application_mode || DEFAULT_APPLICATION_MODE[formData.severity]}
+                  onChange={(e) => handleApplicationModeChange(e.target.value as WritingRuleApplicationMode)}
+                >
+                  {Object.entries(APPLICATION_MODE_LABELS).map(([key, label]) => (
                     <option key={key} value={key}>{label}</option>
                   ))}
                 </select>
@@ -754,10 +820,51 @@ export default function WritingRules() {
       </Modal>
 
       {/* 预览 Modal */}
-      <Modal isOpen={showPreviewModal} onClose={() => setShowPreviewModal(false)} title="写作规则 Prompt 预览" size="xl">
-        <pre className={`p-4 rounded text-sm overflow-auto max-h-[500px] whitespace-pre-wrap ${isDark ? 'bg-gray-900' : 'bg-gray-100'}`}>
-          {previewContent || '加载中...'}
-        </pre>
+      <Modal isOpen={showPreviewModal} onClose={() => setShowPreviewModal(false)} title="写作规则检索预览" size="xl">
+        {!previewResult ? (
+          <div className={`p-4 text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>加载中...</div>
+        ) : (
+          <div className="space-y-4 max-h-[500px] overflow-auto p-1">
+            <div className={`p-3 rounded ${isDark ? 'bg-gray-800' : 'bg-gray-100'}`}>
+              <div className={`text-xs mb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>检索 Query</div>
+              <pre className={`text-sm whitespace-pre-wrap ${isDark ? 'text-gray-200' : 'text-gray-800'}`}>{previewResult.query || '无检索上下文'}</pre>
+            </div>
+
+            <div className={`p-3 rounded ${isDark ? 'bg-gray-800' : 'bg-gray-100'}`}>
+              <div className={`text-xs mb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>作用域摘要</div>
+              <div className={`text-sm space-y-1 ${isDark ? 'text-gray-200' : 'text-gray-800'}`}>
+                <div>启用状态：{previewResult.resolved_scope.is_active ? '启用' : '停用'}</div>
+                <div>作用域规则数：{previewResult.resolved_scope.resolved_rule_count}</div>
+                <div>是否基线规则集：{previewResult.resolved_scope.used_baseline ? '是' : '否'}</div>
+              </div>
+            </div>
+
+            <div>
+              <div className={`text-sm font-medium mb-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>命中规则</div>
+              <div className="space-y-2">
+                {previewResult.retrieved_rules.length === 0 ? (
+                  <div className={`p-3 rounded text-sm ${isDark ? 'bg-gray-800 text-gray-400' : 'bg-gray-100 text-gray-500'}`}>未命中额外规则，仅使用常驻约束。</div>
+                ) : previewResult.retrieved_rules.map((rule) => (
+                  <div key={rule.id} className={`p-3 rounded ${isDark ? 'bg-gray-800' : 'bg-gray-100'}`}>
+                    <div className="flex items-center gap-2 flex-wrap mb-1">
+                      <span className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>{rule.name}</span>
+                      <span className={`px-2 py-0.5 text-xs rounded ${SEVERITY_LABELS[rule.severity].color}`}>{SEVERITY_LABELS[rule.severity].label}</span>
+                      <span className={`px-2 py-0.5 text-xs rounded ${isDark ? 'bg-gray-700 text-gray-300' : 'bg-white text-gray-600 border border-gray-200'}`}>{APPLICATION_MODE_LABELS[rule.application_mode]}</span>
+                      <span className={`text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>score {rule.score.toFixed(3)}</span>
+                    </div>
+                    <div className={`text-xs mb-1 ${isDark ? 'text-gray-500' : 'text-gray-500'}`}>命中原因：{rule.reason}</div>
+                    <div className={`text-sm ${isDark ? 'text-gray-200' : 'text-gray-700'}`}>{rule.summary}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className={`p-3 rounded ${isDark ? 'bg-gray-800' : 'bg-gray-100'}`}>
+              <div className={`text-xs mb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>最终注入内容</div>
+              <pre className={`text-sm whitespace-pre-wrap ${isDark ? 'text-gray-200' : 'text-gray-800'}`}>{previewContent || '无注入内容'}</pre>
+            </div>
+          </div>
+        )}
       </Modal>
 
       {/* 规则集详情 Modal */}
@@ -853,12 +960,43 @@ export default function WritingRules() {
           </div>
 
           <div>
+            <label className={`block text-sm mb-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>分类</label>
+            <select
+              className={`w-full border rounded px-3 py-2 ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'bg-white border-gray-300 text-gray-800'}`}
+              value={ruleSetForm.category}
+              onChange={(e) => setRuleSetForm({ ...ruleSetForm, category: e.target.value as WritingRuleCategory })}
+            >
+              {Object.entries(CATEGORY_LABELS).map(([key, label]) => (
+                <option key={key} value={key}>{label}</option>
+              ))}
+            </select>
+          </div>
+
+          <div>
             <label className={`block text-sm mb-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>目标体裁</label>
             <Input
               value={ruleSetForm.target_genre}
               onChange={(e) => setRuleSetForm({ ...ruleSetForm, target_genre: e.target.value })}
               placeholder="如：玄幻、都市、仙侠等"
             />
+          </div>
+
+          <div>
+            <label className={`block text-sm mb-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>标签</label>
+            <div className="flex gap-2 mb-2">
+              <Input
+                value={ruleSetTagInput}
+                onChange={(e) => setRuleSetTagInput(e.target.value)}
+                placeholder="添加规则集标签"
+                className="flex-1"
+              />
+              <Button variant="secondary" onClick={addRuleSetTag} className="whitespace-nowrap">添加</Button>
+            </div>
+            <div className="flex gap-1 flex-wrap">
+              {(ruleSetForm.tags || []).map((tag) => (
+                <span key={tag} className={`px-2 py-1 rounded text-sm ${isDark ? 'bg-gray-700 text-gray-300' : 'bg-gray-200 text-gray-700'}`}>{tag}</span>
+              ))}
+            </div>
           </div>
 
           <div>

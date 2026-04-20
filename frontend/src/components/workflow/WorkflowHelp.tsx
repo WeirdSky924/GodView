@@ -279,7 +279,7 @@ export default function WorkflowHelp() {
   ↓
 作家
   ↓
-评估 → 条件判断 → (retry) → 作家
+评估 → 条件分支 → (retry) → 作家
   ↓ pass
 摘要
   ↓
@@ -290,10 +290,10 @@ export default function WorkflowHelp() {
             </p>
           </div>
 
-          {/* 示例3：并行准备流程 */}
+          {/* 示例3：并行执行流程 */}
           <div className={`p-3 rounded-lg ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
             <h4 className={`font-semibold mb-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>
-              示例 3：并行准备流程
+              示例 3：并行执行流程
             </h4>
             <div className={`font-mono text-xs mb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
               <pre>{`         ┌→ 设定 ──────┐
@@ -303,7 +303,7 @@ export default function WorkflowHelp() {
          └→ 地图 ──────┘`}</pre>
             </div>
             <p className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
-              并行准备设定、事件、地图等素材，然后进行场景演绎（自动协调角色表演）
+              通过并行执行节点并发准备设定、事件、地图等素材，然后进行场景演绎（自动协调角色表演）
             </p>
           </div>
 
@@ -335,7 +335,7 @@ export default function WorkflowHelp() {
                    ↓
                 作家
                    ↓
-                评估 → 条件判断 → (retry) → 作家
+                评估 → 条件分支 → (retry) → 作家
                    ↓ pass
                 摘要
                    ↓
@@ -376,7 +376,7 @@ export default function WorkflowHelp() {
             ↓
         作家
             ↓
-        评估 → 条件判断
+        评估 → 条件分支
             ↓ pass
         结束`}</pre>
             </div>
@@ -455,7 +455,7 @@ export default function WorkflowHelp() {
               ✍️ 执行阶段
             </h4>
             <div className={`text-sm space-y-1 ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
-              <p>1. <strong>事件</strong> - 事件生成</p>
+              <p>1. <strong>事件</strong> - 事件 Agent 生成候选事件</p>
               <p>2. <strong>过程生成</strong> - 动态生成内容</p>
               <p>3. <strong>副本生成</strong> - 关卡/副本内容</p>
               <p>4. <strong>场景演绎</strong> - 多角色场景表演（自动协调角色）</p>
@@ -470,7 +470,7 @@ export default function WorkflowHelp() {
             </h4>
             <div className={`text-sm space-y-1 ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
               <p>1. <strong>评估</strong> - 质量检查</p>
-              <p>2. <strong>条件判断</strong> - 通过/重试</p>
+              <p>2. <strong>条件分支</strong> - 通过/重试</p>
               <p>3. <strong>摘要</strong> - 内容摘要（通过后）</p>
             </div>
           </div>
@@ -495,7 +495,7 @@ export default function WorkflowHelp() {
         ↓
        评估
         ↓
-    条件判断
+    条件分支
    ↙      ↘
 retry      pass
   ↓          ↓

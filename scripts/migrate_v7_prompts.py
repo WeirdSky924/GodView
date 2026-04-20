@@ -121,6 +121,7 @@ async def verify_migration() -> Dict[str, Any]:
     """
     from app.services.prompt_template_service import PromptTemplateService
     from app.services.agent_template_service import AgentTemplateService
+    from app.models.prompt_template import PromptFilter
 
     prompt_service = PromptTemplateService()
     agent_service = AgentTemplateService()

@@ -5,9 +5,9 @@
 
 import { useEffect, useState } from 'react'
 import { Card, Button, Input, TextArea, Modal } from '@/components/ui'
+import AgentConfigPanel from '@/components/AgentConfigPanel'
 import {
   getAgentTemplates,
-  getAgentTemplateByType,
   createAgentTemplate,
   updateAgentTemplate,
   deleteAgentTemplate,
@@ -24,7 +24,7 @@ import { getAgentConfigs } from '@/api/agentConfigs'
 import { getPrompts, PromptTemplate } from '@/api/prompts'
 import { getAgentTypeSkills, type Skill } from '@/api/skills'
 import { useAgentTypes } from '@/hooks/useAgentTypes'
-import { Search, Plus, Edit2, Trash2, Eye, GripVertical, ChevronDown, ChevronUp, Settings, Lock, ToggleLeft, ToggleRight, AlertTriangle, Layers, BookOpen } from 'lucide-react'
+import { Plus, Edit2, Trash2, Eye, GripVertical, ChevronDown, ChevronUp, Lock, ToggleLeft, ToggleRight, AlertTriangle, Layers, BookOpen } from 'lucide-react'
 import { useProject } from '@/contexts/ProjectContext'
 import { useTheme } from '@/contexts/ThemeContext'
 
@@ -34,13 +34,14 @@ export default function AgentTemplates() {
   const isDark = theme === 'dark'
 
   // 动态加载 Agent 类型元数据
-  const { labels: AGENT_TYPE_LABELS, isCoreType, metadata, loading: loadingTypes } = useAgentTypes()
+  const { labels: AGENT_TYPE_LABELS, isCoreType } = useAgentTypes()
 
   const [templates, setTemplates] = useState<AgentTemplate[]>([])
   const [prompts, setPrompts] = useState<PromptTemplate[]>([])
   const [loading, setLoading] = useState(true)
   const [searchQuery, setSearchQuery] = useState('')
   const [selectedType, setSelectedType] = useState<AgentType | null>(null)
+  const [configRefreshKey, setConfigRefreshKey] = useState(0)
 
   // Modal 状态
   const [showEditModal, setShowEditModal] = useState(false)
@@ -117,6 +118,10 @@ export default function AgentTemplates() {
     }
   }
 
+  const bumpConfigRefreshKey = () => {
+    setConfigRefreshKey((value) => value + 1)
+  }
+
   const loadPrompts = async () => {
     try {
       const data = await getPrompts({ limit: 200 })
@@ -182,7 +187,8 @@ export default function AgentTemplates() {
     if (!confirm('确定要删除此 Agent 模板吗？')) return
     try {
       await deleteAgentTemplate(templateId)
-      loadTemplates()
+      await loadTemplates()
+      bumpConfigRefreshKey()
     } catch (error) {
       console.error('Failed to delete template:', error)
     }
@@ -202,10 +208,16 @@ export default function AgentTemplates() {
   const handleToggle = async (template: AgentTemplate) => {
     try {
       await toggleAgentTemplate(template.id, !template.is_enabled, currentProject?.id)
-      loadTemplates()
+      await loadTemplates()
+      bumpConfigRefreshKey()
     } catch (error) {
       console.error('Failed to toggle template:', error)
     }
+  }
+
+  const handleConfigChanged = async () => {
+    await loadTemplates()
+    bumpConfigRefreshKey()
   }
 
   const handleSave = async () => {
@@ -216,7 +228,8 @@ export default function AgentTemplates() {
         await createAgentTemplate(formData)
       }
       setShowEditModal(false)
-      loadTemplates()
+      await loadTemplates()
+      bumpConfigRefreshKey()
     } catch (error) {
       console.error('Failed to save template:', error)
     }
@@ -356,140 +369,159 @@ export default function AgentTemplates() {
         </div>
       </div>
 
-      {/* 列表 */}
-      <div className="flex-1 overflow-auto p-4">
-        {loading ? (
-          <div className={`text-center py-8 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>加载中...</div>
-        ) : (!templates || templates.length === 0) ? (
-          <div className={`text-center py-8 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>暂无数据</div>
+      <div className="flex-1 overflow-auto p-4 space-y-6">
+        {currentProject?.id ? (
+          <AgentConfigPanel
+            projectId={currentProject.id}
+            refreshKey={configRefreshKey}
+            agentTypeFilter={selectedType}
+            onChanged={handleConfigChanged}
+          />
         ) : (
-          <div className="space-y-4">
-            {templates.map((template) => (
-              <Card key={template.id} className={`p-4 ${!template.is_enabled && template.is_optional ? 'opacity-60' : ''}`}>
-                <div className="flex items-start justify-between">
-                  <div className="flex-1">
-                    <div className="flex items-center gap-2 mb-1">
-                      <h3 className={`font-semibold text-lg ${isDark ? 'text-white' : 'text-gray-800'}`}>{template.name}</h3>
-                      {template.is_system && (
-                        <span className="px-2 py-1 text-xs bg-blue-900 text-blue-300 rounded">系统</span>
-                      )}
-                      {template.is_optional && (
-                        <span className="px-2 py-1 text-xs bg-purple-900 text-purple-300 rounded">可选</span>
-                      )}
-                      {!isCoreType(template.agent_type) && template.is_optional && (
-                        <span className={`px-2 py-1 text-xs rounded ${template.is_enabled ? 'bg-green-900 text-green-300' : 'bg-gray-700 text-gray-400'}`}>
-                          {currentProject?.id
-                            ? (template.is_enabled ? '项目已启用' : '项目已禁用')
-                            : (template.is_enabled ? '已启用' : '已禁用')}
-                        </span>
-                      )}
-                      <span className={`px-2 py-1 text-xs rounded ${isDark ? 'bg-gray-700' : 'bg-gray-200'}`}>
-                        {AGENT_TYPE_LABELS[template.agent_type]}
-                      </span>
-                    </div>
-                    <p className={`text-sm mb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>{template.description}</p>
+          <Card className={`p-4 ${isDark ? 'bg-gray-900 border-gray-800' : 'bg-blue-50 border-blue-200'}`}>
+            <div className={`text-sm ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+              选择项目后，可在这里查看、预览、编辑和重置该项目的 Agent 覆盖配置。
+            </div>
+          </Card>
+        )}
 
-                    {/* Prompt 插槽预览 */}
-                    <div className="flex items-center gap-2 mb-2">
-                      <span className={`text-sm ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>Prompt 插槽：</span>
-                      <div className="flex gap-1 flex-wrap">
-                        {template.prompt_slots
-                          .filter((s) => s.is_enabled)
-                          .slice(0, 5)
-                          .map((slot, idx) => (
-                            <span
-                              key={slot.prompt_template_id || `prompt-${idx}`}
-                              className={`px-2 py-0.5 text-xs rounded ${
-                                slot.prompt_template_id ? 'bg-green-900 text-green-300' : isDark ? 'bg-gray-700 text-gray-400' : 'bg-gray-200 text-gray-500'
-                              }`}
-                            >
-                              {slot.slot_name}
-                            </span>
-                          ))}
-                        {template.prompt_slots.filter((s) => s.is_enabled).length > 5 && (
-                          <span className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
-                            +{template.prompt_slots.filter((s) => s.is_enabled).length - 5}
+        <div>
+          <div className="flex items-center justify-between mb-3">
+            <div>
+              <h2 className={`text-xl font-bold ${isDark ? 'text-white' : 'text-gray-800'}`}>Agent 模板列表</h2>
+              <p className={`mt-1 text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+                模板定义全局默认结构；上方的项目级配置用于覆盖当前项目的运行时行为。
+              </p>
+            </div>
+          </div>
+
+          {loading ? (
+            <div className={`text-center py-8 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>加载中...</div>
+          ) : (!templates || templates.length === 0) ? (
+            <div className={`text-center py-8 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>暂无数据</div>
+          ) : (
+            <div className="space-y-4">
+              {templates.map((template) => (
+                <Card key={template.id} className={`p-4 ${!template.is_enabled && template.is_optional ? 'opacity-60' : ''}`}>
+                  <div className="flex items-start justify-between">
+                    <div className="flex-1">
+                      <div className="flex items-center gap-2 mb-1">
+                        <h3 className={`font-semibold text-lg ${isDark ? 'text-white' : 'text-gray-800'}`}>{template.name}</h3>
+                        {template.is_system && (
+                          <span className="px-2 py-1 text-xs bg-blue-900 text-blue-300 rounded">系统</span>
+                        )}
+                        {template.is_optional && (
+                          <span className="px-2 py-1 text-xs bg-purple-900 text-purple-300 rounded">可选</span>
+                        )}
+                        {!isCoreType(template.agent_type) && template.is_optional && (
+                          <span className={`px-2 py-1 text-xs rounded ${template.is_enabled ? 'bg-green-900 text-green-300' : 'bg-gray-700 text-gray-400'}`}>
+                            {currentProject?.id
+                              ? (template.is_enabled ? '项目已启用' : '项目已禁用')
+                              : (template.is_enabled ? '已启用' : '已禁用')}
                           </span>
                         )}
+                        <span className={`px-2 py-1 text-xs rounded ${isDark ? 'bg-gray-700' : 'bg-gray-200'}`}>
+                          {AGENT_TYPE_LABELS[template.agent_type]}
+                        </span>
                       </div>
-                    </div>
+                      <p className={`text-sm mb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>{template.description}</p>
 
-                    {/* Skill 插槽预览 */}
-                    {template.skill_slots && template.skill_slots.length > 0 && (
-                      <div className="flex items-center gap-2">
-                        <span className={`text-sm ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>Skill 插槽：</span>
+                      <div className="flex items-center gap-2 mb-2">
+                        <span className={`text-sm ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>Prompt 插槽：</span>
                         <div className="flex gap-1 flex-wrap">
-                          {template.skill_slots
+                          {template.prompt_slots
                             .filter((s) => s.is_enabled)
                             .slice(0, 5)
                             .map((slot, idx) => (
                               <span
-                                key={slot.skill_id || `skill-${idx}`}
+                                key={slot.prompt_template_id || `prompt-${idx}`}
                                 className={`px-2 py-0.5 text-xs rounded ${
-                                  slot.skill_id ? 'bg-purple-900 text-purple-300' : isDark ? 'bg-gray-700 text-gray-400' : 'bg-gray-200 text-gray-500'
+                                  slot.prompt_template_id ? 'bg-green-900 text-green-300' : isDark ? 'bg-gray-700 text-gray-400' : 'bg-gray-200 text-gray-500'
                                 }`}
                               >
                                 {slot.slot_name}
                               </span>
                             ))}
-                          {template.skill_slots.filter((s) => s.is_enabled).length > 5 && (
+                          {template.prompt_slots.filter((s) => s.is_enabled).length > 5 && (
                             <span className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
-                              +{template.skill_slots.filter((s) => s.is_enabled).length - 5}
+                              +{template.prompt_slots.filter((s) => s.is_enabled).length - 5}
                             </span>
                           )}
                         </div>
                       </div>
-                    )}
-                  </div>
 
-                  <div className="flex gap-2 items-center">
-                    {/* 可选 Agent 的启用/禁用开关 */}
-                    {template.is_optional && (
-                      <Button
-                        size="sm"
-                        variant={template.is_enabled ? 'primary' : 'secondary'}
-                        onClick={() => handleToggle(template)}
-                        title={template.is_enabled ? '点击禁用' : '点击启用'}
-                      >
-                        {template.is_enabled ? (
-                          <ToggleRight className="w-4 h-4 mr-1" />
-                        ) : (
-                          <ToggleLeft className="w-4 h-4 mr-1" />
-                        )}
-                        {template.is_enabled ? '启用' : '禁用'}
+                      {template.skill_slots && template.skill_slots.length > 0 && (
+                        <div className="flex items-center gap-2">
+                          <span className={`text-sm ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>Skill 插槽：</span>
+                          <div className="flex gap-1 flex-wrap">
+                            {template.skill_slots
+                              .filter((s) => s.is_enabled)
+                              .slice(0, 5)
+                              .map((slot, idx) => (
+                                <span
+                                  key={slot.skill_id || `skill-${idx}`}
+                                  className={`px-2 py-0.5 text-xs rounded ${
+                                    slot.skill_id ? 'bg-purple-900 text-purple-300' : isDark ? 'bg-gray-700 text-gray-400' : 'bg-gray-200 text-gray-500'
+                                  }`}
+                                >
+                                  {slot.slot_name}
+                                </span>
+                              ))}
+                            {template.skill_slots.filter((s) => s.is_enabled).length > 5 && (
+                              <span className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+                                +{template.skill_slots.filter((s) => s.is_enabled).length - 5}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="flex gap-2 items-center">
+                      {template.is_optional && (
+                        <Button
+                          size="sm"
+                          variant={template.is_enabled ? 'primary' : 'secondary'}
+                          onClick={() => handleToggle(template)}
+                          title={template.is_enabled ? '点击禁用' : '点击启用'}
+                        >
+                          {template.is_enabled ? (
+                            <ToggleRight className="w-4 h-4 mr-1" />
+                          ) : (
+                            <ToggleLeft className="w-4 h-4 mr-1" />
+                          )}
+                          {template.is_enabled ? '启用' : '禁用'}
+                        </Button>
+                      )}
+
+                      {!template.is_optional && isCoreType(template.agent_type) && (
+                        <span className={`flex items-center gap-1 text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+                          <Lock className="w-3 h-3" />
+                          核心
+                        </span>
+                      )}
+
+                      <Button size="sm" variant="secondary" onClick={() => handlePreview(template)}>
+                        <Eye className="w-4 h-4 mr-1" />
+                        预览
                       </Button>
-                    )}
-
-                    {/* 核心 Agent 显示锁定图标 */}
-                    {!template.is_optional && isCoreType(template.agent_type) && (
-                      <span className={`flex items-center gap-1 text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
-                        <Lock className="w-3 h-3" />
-                        核心
-                      </span>
-                    )}
-
-                    <Button size="sm" variant="secondary" onClick={() => handlePreview(template)}>
-                      <Eye className="w-4 h-4 mr-1" />
-                      预览
-                    </Button>
-                    <Button size="sm" variant="secondary" onClick={() => handleEdit(template)}>
-                      <Edit2 className="w-4 h-4 mr-1" />
-                      编辑
-                    </Button>
-                    {!template.is_system && (
-                      <Button size="sm" variant="danger" onClick={() => handleDelete(template.id)}>
-                        <Trash2 className="w-4 h-4" />
+                      <Button size="sm" variant="secondary" onClick={() => handleEdit(template)}>
+                        <Edit2 className="w-4 h-4 mr-1" />
+                        编辑
                       </Button>
-                    )}
+                      {!template.is_system && (
+                        <Button size="sm" variant="danger" onClick={() => handleDelete(template.id)}>
+                          <Trash2 className="w-4 h-4" />
+                        </Button>
+                      )}
+                    </div>
                   </div>
-                </div>
-              </Card>
-            ))}
-          </div>
-        )}
+                </Card>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
-
-      {/* 编辑/创建 Modal */}
       <Modal
         isOpen={showEditModal}
         onClose={() => setShowEditModal(false)}

@@ -185,7 +185,7 @@ VALUES (
     'template_all_builtin_workflow',
     NULL,
     '全内置节点标准流程',
-    '包含全部内置系统节点的标准创作工作流，突出章节大纲驱动、并行准备和逐节点输入输出观察。',
+    '包含全部内置系统节点的标准创作工作流，突出章节大纲驱动、并行执行和逐节点输入输出观察。',
     $$[
         {
             "id": "start",
@@ -235,7 +235,7 @@ VALUES (
             "id": "parallel_prep",
             "node_type": "parallel",
             "label": "并行执行",
-            "description": "围绕章节大纲并行准备设定、事件、地图与探索素材",
+            "description": "围绕章节大纲并行执行设定、事件、地图与探索素材",
             "config": {},
             "position": {"x": 520, "y": 220}
         },

@@ -27,27 +27,27 @@ export interface AgentStatus {
 }
 
 // Agent 默认配置
-const AGENT_DEFAULTS: Record<string, { icon: string; color: string; description: string }> = {
-  'summarizer': { icon: '📝', color: 'blue', description: '剧情总结员' },
-  'master_plotter': { icon: '🎬', color: 'purple', description: '总编剧' },
-  'hook_manager': { icon: '🎯', color: 'orange', description: '伏笔管理员' },
-  'writer': { icon: '✍️', color: 'green', description: '内容执行官' },
-  'evaluator': { icon: '🔍', color: 'red', description: '剧情评估员' },
-  'character': { icon: '🎭', color: 'pink', description: '角色演绎' },
-  'setting': { icon: '⚙️', color: 'indigo', description: '设定 Agent' },
-  'event_generator': { icon: '🎲', color: 'pink', description: '事件生成' },
-  'world_map_manager': { icon: '🗺️', color: 'teal', description: '地图管理' },
-  'scene_coordinator': { icon: '🎭', color: 'rose', description: '场景协调' },
-  'proc_gen': { icon: '🎰', color: 'amber', description: '过程生成' },
-  'dungeon_generator': { icon: '🏰', color: 'violet', description: '副本生成' },
-  'plotter': { icon: '🪄', color: 'violet', description: '剧情规划' },
-  'plot_outline': { icon: '📑', color: 'rose', description: '章节大纲规划' },
+const AGENT_DEFAULTS: Record<string, { icon: string; color: string }> = {
+  'summarizer': { icon: '📝', color: 'blue' },
+  'master_plotter': { icon: '🎬', color: 'purple' },
+  'hook_manager': { icon: '🎯', color: 'orange' },
+  'writer': { icon: '✍️', color: 'green' },
+  'evaluator': { icon: '🔍', color: 'red' },
+  'character': { icon: '🎭', color: 'pink' },
+  'setting': { icon: '⚙️', color: 'indigo' },
+  'event_generator': { icon: '🎲', color: 'pink' },
+  'world_map_manager': { icon: '🗺️', color: 'teal' },
+  'scene_coordinator': { icon: '🎭', color: 'rose' },
+  'proc_gen': { icon: '🎰', color: 'amber' },
+  'dungeon_generator': { icon: '🏰', color: 'violet' },
+  'plotter': { icon: '🪄', color: 'violet' },
+  'plot_outline': { icon: '📑', color: 'rose' },
 }
 
 const NODE_TYPE_TO_NAME: Record<string, string> = {
   'scene_performance': '场景演绎',
   'group_discussion': '集体讨论',
-  'condition': '条件判断',
+  'condition': '条件分支',
   'parallel': '并行执行',
   'input': '用户输入',
   'start': '开始',
@@ -73,6 +73,10 @@ function getAgentLabel(agentType: string | undefined, label: string | undefined,
   return agentLabelMap.get(agentType) || label || FALLBACK_AGENT_LABELS.get(agentType) || agentType
 }
 
+function getAgentDescription(agentType: string | undefined, label: string | undefined, agentLabelMap: Map<string, string>): string {
+  return getAgentLabel(agentType, label, agentLabelMap)
+}
+
 /**
  * 从工作流节点提取唯一的 Agent 类型
  */
@@ -86,18 +90,19 @@ function extractAgentsFromWorkflow(workflow: WorkflowDefinition, agentLabelMap: 
       const agentKey = agentType === 'character' ? `character:${node.label}` : agentType
 
       if (!agentMap.has(agentKey)) {
-        const defaults = AGENT_DEFAULTS[agentType] || { icon: '🤖', color: 'gray', description: node.label }
+        const defaults = AGENT_DEFAULTS[agentType] || { icon: '🤖', color: 'gray' }
         const name = getAgentLabel(agentType, node.label, agentLabelMap)
+        const description = getAgentDescription(agentType, node.label, agentLabelMap)
 
         agentMap.set(agentKey, {
           id: agentKey,
           name,
           status: 'idle',
-          message: defaults.description,
+          message: description,
           agent_type: agentType,
           icon: defaults.icon,
           color: defaults.color,
-          description: defaults.description,
+          description,
         })
       }
     }
@@ -179,16 +184,16 @@ export function useWorkflowAgents(selectedWorkflowId: string, workflows: Workflo
     } else {
       // 没有选择工作流时，使用默认 Agent 列表
       const defaultAgents: AgentStatus[] = getAgentTypeOptions(nodeTypes).map((option) => {
-        const defaults = AGENT_DEFAULTS[option.value] || { icon: '🤖', color: 'gray', description: option.label }
+        const defaults = AGENT_DEFAULTS[option.value] || { icon: '🤖', color: 'gray' }
         return {
           id: option.value,
           name: option.label,
           status: 'idle',
-          message: defaults.description,
+          message: option.label,
           agent_type: option.value,
           icon: defaults.icon,
           color: defaults.color,
-          description: defaults.description,
+          description: option.label,
         }
       })
       setAgents(defaultAgents)

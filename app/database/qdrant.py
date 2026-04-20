@@ -5,6 +5,7 @@ Qdrant 向量数据库操作层
 
 import logging
 import time
+import uuid
 from typing import Any, Dict, List, Optional
 
 from qdrant_client import QdrantClient
@@ -29,6 +30,7 @@ class QdrantDatabase:
     COLLECTION_LORE = "godview_lore"
     COLLECTION_NARRATIVE = "godview_narrative"
     COLLECTION_VOICE = "godview_voice"
+    COLLECTION_WRITING_RULES = "godview_writing_rules"
 
     def __init__(
         self,
@@ -124,6 +126,7 @@ class QdrantDatabase:
             self.COLLECTION_LORE,
             self.COLLECTION_NARRATIVE,
             self.COLLECTION_VOICE,
+            self.COLLECTION_WRITING_RULES,
         ]
 
         existing_collections = [c.name for c in self._client.get_collections().collections]
@@ -143,6 +146,45 @@ class QdrantDatabase:
 
     # ==================== 向量插入 ====================
 
+    async def _insert_vector_to_collection(
+        self,
+        collection_name: str,
+        vector: List[float],
+        payload: Dict[str, Any],
+        vector_id: Optional[str] = None,
+    ) -> str:
+        import uuid
+
+        point_id = vector_id or str(uuid.uuid4())
+        point = PointStruct(
+            id=point_id,
+            vector=vector,
+            payload=payload,
+        )
+        self._client.upsert(
+            collection_name=collection_name,
+            points=[point],
+        )
+        return point_id
+
+    async def _insert_text_to_collection(
+        self,
+        collection_name: str,
+        text: str,
+        payload: Dict[str, Any],
+        vector_id: Optional[str] = None,
+    ) -> Optional[str]:
+        if not self.embedding_service:
+            logger.warning("未配置 Embedding 服务，无法插入文本")
+            return None
+
+        try:
+            vector = await self.embedding_service.embed_text(text)
+            return await self._insert_vector_to_collection(collection_name, vector, payload, vector_id)
+        except Exception as e:
+            logger.error(f"文本嵌入失败：{e}")
+            return None
+
     async def insert_vector(
         self,
         vector: List[float],
@@ -160,22 +202,7 @@ class QdrantDatabase:
         Returns:
             str: 向量 ID
         """
-        import uuid
-
-        point_id = vector_id or str(uuid.uuid4())
-
-        point = PointStruct(
-            id=point_id,
-            vector=vector,
-            payload=payload,
-        )
-
-        self._client.upsert(
-            collection_name=self.collection_name,
-            points=[point],
-        )
-
-        return point_id
+        return await self._insert_vector_to_collection(self.collection_name, vector, payload, vector_id)
 
     async def insert_text(
         self,
@@ -194,16 +221,7 @@ class QdrantDatabase:
         Returns:
             str: 向量 ID，失败返回 None
         """
-        if not self.embedding_service:
-            logger.warning("未配置 Embedding 服务，无法插入文本")
-            return None
-
-        try:
-            vector = await self.embedding_service.embed_text(text)
-            return await self.insert_vector(vector, payload, vector_id)
-        except Exception as e:
-            logger.error(f"文本嵌入失败：{e}")
-            return None
+        return await self._insert_text_to_collection(self.collection_name, text, payload, vector_id)
 
     async def insert_vectors_batch(
         self,
@@ -884,7 +902,119 @@ class QdrantDatabase:
             for point in all_points
         ]
 
-    # ==================== 动态剧情 (Narrative) RAG 操作 ====================
+    # ==================== 写作规则 (Writing Rules) RAG 操作 ====================
+
+    async def add_writing_rule_entry(
+        self,
+        rule_id: str,
+        title: str,
+        content: str,
+        category: str,
+        severity: str,
+        application_mode: str,
+        tags: Optional[List[str]] = None,
+        source: Optional[str] = None,
+        is_system: bool = False,
+        embedding: Optional[List[float]] = None,
+    ) -> Optional[str]:
+        payload = {
+            "type": "writing_rule",
+            "rule_id": rule_id,
+            "title": title,
+            "category": category,
+            "severity": severity,
+            "application_mode": application_mode,
+            "tags": tags or [],
+            "source": source or "",
+            "is_system": is_system,
+        }
+        point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"writing_rule:{rule_id}"))
+
+        if embedding:
+            return await self._insert_vector_to_collection(
+                self.COLLECTION_WRITING_RULES,
+                embedding,
+                payload,
+                point_id,
+            )
+        return await self._insert_text_to_collection(
+            self.COLLECTION_WRITING_RULES,
+            content,
+            payload,
+            point_id,
+        )
+
+    async def search_writing_rules_by_text(
+        self,
+        query_text: str,
+        limit: int = 10,
+        score_threshold: float = 0.45,
+        filter_conditions: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        if not self.embedding_service:
+            logger.warning("未配置 Embedding 服务，无法通过文本搜索写作规则")
+            return []
+
+        embedding = await self.embedding_service.embed_text(query_text)
+        conditions = {"type": "writing_rule"}
+        if filter_conditions:
+            conditions.update(filter_conditions)
+
+        query_filter = None
+        if conditions:
+            query_filter = Filter(
+                must=[
+                    FieldCondition(key=key, match=MatchValue(value=value))
+                    for key, value in conditions.items()
+                ]
+            )
+
+        results = self._client.query_points(
+            collection_name=self.COLLECTION_WRITING_RULES,
+            query=embedding,
+            query_filter=query_filter,
+            limit=limit,
+            score_threshold=score_threshold,
+            search_params=SearchParams(hnsw_ef=128, exact=False),
+        )
+
+        return [
+            {
+                "id": result.payload.get("rule_id") or str(result.id),
+                "score": result.score,
+                "payload": result.payload,
+            }
+            for result in results.points
+        ]
+
+    async def delete_writing_rule_entry(self, rule_id: str) -> bool:
+        point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"writing_rule:{rule_id}"))
+        result = self._client.delete(
+            collection_name=self.COLLECTION_WRITING_RULES,
+            points_selector=[point_id],
+        )
+        return result.status == "completed"
+
+    async def get_writing_rules_by_ids(self, rule_ids: List[str]) -> List[Dict[str, Any]]:
+        if not rule_ids:
+            return []
+
+        point_ids = [str(uuid.uuid5(uuid.NAMESPACE_URL, f"writing_rule:{rule_id}")) for rule_id in rule_ids]
+        records = self._client.retrieve(
+            collection_name=self.COLLECTION_WRITING_RULES,
+            ids=point_ids,
+            with_payload=True,
+            with_vectors=False,
+        )
+        return [
+            {
+                "id": record.payload.get("rule_id") or str(record.id),
+                "score": 1.0,
+                "payload": record.payload,
+            }
+            for record in records
+        ]
+
 
     async def add_narrative_entry(
         self,

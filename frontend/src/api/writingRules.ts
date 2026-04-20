@@ -11,6 +11,7 @@ const API_BASE = ''
 
 export type WritingRuleCategory = 'dialogue' | 'structure' | 'style' | 'pacing' | 'character' | 'plot' | 'format' | 'grammar'
 export type RuleSeverity = 'required' | 'strong' | 'recommended' | 'optional' | 'info'
+export type WritingRuleApplicationMode = 'always' | 'always_postcheck' | 'retrieve' | 'retrieve_postcheck' | 'retrieve_on_match' | 'reference'
 
 export interface WritingRule {
   id: string
@@ -18,6 +19,7 @@ export interface WritingRule {
   description: string
   category: WritingRuleCategory
   severity: RuleSeverity
+  application_mode: WritingRuleApplicationMode
   content: string
   examples: string[]
   counter_examples?: string[]
@@ -33,21 +35,24 @@ export interface WritingRuleSet {
   name: string
   description: string
   rule_ids: string[]
+  category: WritingRuleCategory
   target_genre?: string
+  target_genres?: string[]
   tags: string[]
   is_system: boolean
-  created_at: string
-  updated_at: string
+  created_at?: string
+  updated_at?: string
 }
 
 export interface ProjectWritingConfig {
   project_id: string
   enabled_rule_ids: string[]
   enabled_rule_set_ids: string[]
-  custom_rules: WritingRule[]
+  rule_overrides?: Record<string, Record<string, any>>
+  rule_priorities?: Record<string, number>
   is_active: boolean
-  created_at: string
-  updated_at: string
+  created_at?: string
+  updated_at?: string
 }
 
 export interface CreateWritingRuleDTO {
@@ -55,6 +60,7 @@ export interface CreateWritingRuleDTO {
   description: string
   category: WritingRuleCategory
   severity: RuleSeverity
+  application_mode?: WritingRuleApplicationMode
   content: string
   examples?: string[]
   anti_patterns?: string[]
@@ -66,6 +72,7 @@ export interface UpdateWritingRuleDTO {
   description?: string
   category?: WritingRuleCategory
   severity?: RuleSeverity
+  application_mode?: WritingRuleApplicationMode
   content?: string
   examples?: string[]
   anti_patterns?: string[]
@@ -76,6 +83,16 @@ export interface CreateWritingRuleSetDTO {
   name: string
   description: string
   rule_ids?: string[]
+  category: WritingRuleCategory
+  target_genre?: string
+  tags?: string[]
+}
+
+export interface UpdateWritingRuleSetDTO {
+  name?: string
+  description?: string
+  rule_ids?: string[]
+  category?: WritingRuleCategory
   target_genre?: string
   tags?: string[]
 }
@@ -83,14 +100,40 @@ export interface CreateWritingRuleSetDTO {
 export interface UpdateProjectWritingConfigDTO {
   enabled_rule_ids?: string[]
   enabled_rule_set_ids?: string[]
-  custom_rules?: CreateWritingRuleDTO[]
   is_active?: boolean
+}
+
+export interface PreviewRetrievedRule {
+  id: string
+  name: string
+  severity: RuleSeverity
+  application_mode: WritingRuleApplicationMode
+  score: number
+  summary: string
+  tags: string[]
+  reason: string
+}
+
+export interface PreviewScopeSummary {
+  project_id: string
+  is_active: boolean
+  used_baseline: boolean
+  enabled_rule_ids: string[]
+  enabled_rule_set_ids: string[]
+  resolved_rule_ids: string[]
+  resolved_rule_count: number
+  severity_counts: Partial<Record<RuleSeverity, number>>
+  application_mode_counts: Partial<Record<WritingRuleApplicationMode, number>>
 }
 
 export interface PreviewResult {
   project_id: string
-  prompt: string
+  query: string
   context: Record<string, any>
+  resolved_scope: PreviewScopeSummary
+  retrieved_rules: PreviewRetrievedRule[]
+  always_rules: string[]
+  rendered_guidance: string
 }
 
 // ==================== API 函数 ====================
@@ -111,7 +154,7 @@ export async function getWritingRules(
   const params = new URLSearchParams()
   if (category) params.append('category', category)
   if (severity) params.append('severity', severity)
-  if (tags) params.append('tags', tags.join(','))
+  if (tags) tags.forEach(tag => params.append('tags', tag))
   if (isSystem !== undefined) params.append('is_system', String(isSystem))
   if (search) params.append('search', search)
   if (source) params.append('source', source)
@@ -125,7 +168,10 @@ export async function getWritingRules(
  * 创建写作规则
  */
 export async function createWritingRule(dto: CreateWritingRuleDTO): Promise<{ success: boolean; message: string; rule: WritingRule }> {
-  return await api.post(`${API_BASE}/writing-rules`, dto)
+  return await api.post(`${API_BASE}/writing-rules`, {
+    ...dto,
+    counter_examples: dto.anti_patterns,
+  })
 }
 
 /**
@@ -139,7 +185,10 @@ export async function getWritingRule(ruleId: string): Promise<WritingRule> {
  * 更新写作规则
  */
 export async function updateWritingRule(ruleId: string, dto: UpdateWritingRuleDTO): Promise<{ success: boolean; message: string }> {
-  return await api.put(`${API_BASE}/writing-rules/${ruleId}`, dto)
+  return await api.put(`${API_BASE}/writing-rules/${ruleId}`, {
+    ...dto,
+    counter_examples: dto.anti_patterns,
+  })
 }
 
 /**
@@ -162,7 +211,7 @@ export async function getWritingRuleSets(
 ): Promise<WritingRuleSet[]> {
   const params = new URLSearchParams()
   if (category) params.append('category', category)
-  if (tags) params.append('tags', tags.join(','))
+  if (tags) tags.forEach(tag => params.append('tags', tag))
   if (targetGenre) params.append('target_genre', targetGenre)
   if (isSystem !== undefined) params.append('is_system', String(isSystem))
   params.append('limit', String(limit))
@@ -175,7 +224,10 @@ export async function getWritingRuleSets(
  * 创建写作规则集
  */
 export async function createWritingRuleSet(dto: CreateWritingRuleSetDTO): Promise<{ success: boolean; message: string; rule_set: WritingRuleSet }> {
-  return await api.post(`${API_BASE}/writing-rule-sets`, dto)
+  return await api.post(`${API_BASE}/writing-rule-sets`, {
+    ...dto,
+    target_genres: dto.target_genre ? [dto.target_genre] : [],
+  })
 }
 
 /**
@@ -188,8 +240,11 @@ export async function getWritingRuleSet(ruleSetId: string): Promise<WritingRuleS
 /**
  * 更新写作规则集
  */
-export async function updateWritingRuleSet(ruleSetId: string, dto: CreateWritingRuleSetDTO): Promise<{ success: boolean; message: string }> {
-  return await api.put(`${API_BASE}/writing-rule-sets/${ruleSetId}`, dto)
+export async function updateWritingRuleSet(ruleSetId: string, dto: UpdateWritingRuleSetDTO): Promise<{ success: boolean; message: string }> {
+  return await api.put(`${API_BASE}/writing-rule-sets/${ruleSetId}`, {
+    ...dto,
+    target_genres: dto.target_genre ? [dto.target_genre] : [],
+  })
 }
 
 /**
@@ -243,6 +298,8 @@ export interface AgentPromptPreview {
   project_id?: string
   prompt: string
   prompt_length: number
+  writing_rule_scope?: PreviewScopeSummary
+  writing_rule_preview?: PreviewResult
 }
 
 /**
