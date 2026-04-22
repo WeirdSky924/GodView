@@ -73,6 +73,12 @@ class ExecuteLoreModificationRequest(BaseModel):
     modification: Dict[str, Any]
 
 
+class AnalyzeWorldDescriptionRequest(BaseModel):
+    """世界观描述结构化分析请求"""
+    project_id: str
+    description: str
+
+
 # ==================== API 端点 ====================
 
 @router.post("/chat")
@@ -96,6 +102,23 @@ async def chat_with_setting_agent(request: ChatRequest):
             context=request.context,
         )
         return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/analyze-world")
+async def analyze_world_description(request: AnalyzeWorldDescriptionRequest):
+    """
+    对世界观描述做结构化分析 (strict)，返回 power_system/technology_level/history/geography。
+    供 Worlds 编辑界面等前端 UI 直接消费结构化字段，避免在前端做 prompt-only JSON 提取。
+    """
+    service = get_setting_agent_service()
+    try:
+        data = await service.analyze_world_description(
+            project_id=request.project_id,
+            description=request.description,
+        )
+        return {"structured_data": data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

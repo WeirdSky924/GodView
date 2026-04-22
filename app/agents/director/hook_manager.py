@@ -15,8 +15,14 @@ from langchain_core.language_models import BaseLanguageModel
 from langchain_core.messages import HumanMessage
 
 from app.agents.base import BaseAgent, AgentResponse
+from app.models.agent_output_schemas import (
+    HookManagerDecisionSchema,
+    HookPlantSuggestionSchema,
+    HookResolutionSuggestionSchema,
+)
 from app.models.agent_template import AgentType
 from app.models.token_usage import UsageCategory
+from app.services.structured_llm import StructuredOutputError
 
 logger = logging.getLogger(__name__)
 
@@ -153,14 +159,14 @@ class HookManagerAgent(BaseAgent):
                 chapter_goal=chapter_goal,
             )
 
-            # 调用 LLM
-            response_text = await self._call_llm(
-                messages=[HumanMessage(content=user_message)], temperature=0.5,
-                category=UsageCategory.HOOK
+            # 调用 LLM (structured)
+            parsed = await self._call_structured(
+                HookManagerDecisionSchema,
+                messages=[HumanMessage(content=user_message)],
+                temperature=0.5,
+                category=UsageCategory.HOOK,
             )
-
-            # 解析响应
-            result = self._parse_json_response(response_text)
+            result = parsed.model_dump()
 
             return AgentResponse(
                 success=True,
@@ -171,6 +177,9 @@ class HookManagerAgent(BaseAgent):
                 },
             )
 
+        except StructuredOutputError as e:
+            logger.error(f"HookManagerAgent structured 失败：{e}")
+            return AgentResponse(success=False, error=str(e))
         except Exception as e:
             logger.error(f"HookManagerAgent 执行失败：{e}")
             return AgentResponse(success=False, error=str(e))
@@ -300,12 +309,17 @@ class HookManagerAgent(BaseAgent):
 }}"""
 
         try:
-            response_text = await self._call_llm(
-                messages=[HumanMessage(content=prompt)], temperature=0.6,
-                category=UsageCategory.HOOK
+            parsed = await self._call_structured(
+                HookPlantSuggestionSchema,
+                messages=[HumanMessage(content=prompt)],
+                temperature=0.6,
+                category=UsageCategory.HOOK,
             )
-            result = self._parse_json_response(response_text)
+            result = parsed.model_dump()
             return AgentResponse(success=True, data=result)
+        except StructuredOutputError as e:
+            logger.error(f"伏笔埋设建议 structured 失败：{e}")
+            return AgentResponse(success=False, error=str(e))
         except Exception as e:
             logger.error(f"伏笔埋设建议失败：{e}")
             return AgentResponse(success=False, error=str(e))
@@ -350,12 +364,17 @@ class HookManagerAgent(BaseAgent):
 }}"""
 
         try:
-            response_text = await self._call_llm(
-                messages=[HumanMessage(content=prompt)], temperature=0.5,
-                category=UsageCategory.HOOK
+            parsed = await self._call_structured(
+                HookResolutionSuggestionSchema,
+                messages=[HumanMessage(content=prompt)],
+                temperature=0.5,
+                category=UsageCategory.HOOK,
             )
-            result = self._parse_json_response(response_text)
+            result = parsed.model_dump()
             return AgentResponse(success=True, data=result)
+        except StructuredOutputError as e:
+            logger.error(f"伏笔回收建议 structured 失败：{e}")
+            return AgentResponse(success=False, error=str(e))
         except Exception as e:
             logger.error(f"伏笔回收建议失败：{e}")
             return AgentResponse(success=False, error=str(e))

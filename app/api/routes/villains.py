@@ -10,11 +10,20 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from app.models.skill import SkillTestResult
 from app.services.skill_service import get_skill_service, ExecuteSkillDTO
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _require_structured_dict(result: SkillTestResult, error_detail: str) -> Dict[str, Any]:
+    try:
+        return result.require_structured_dict()
+    except ValueError as exc:
+        logger.warning("反派管理 Skill 返回了无效结构化输出: %s", exc)
+        raise HTTPException(status_code=500, detail=error_detail) from exc
 
 
 # ==================== 数据模型 ====================
@@ -161,18 +170,14 @@ async def design_villain(request: VillainDesignRequest):
     if not result.success:
         raise HTTPException(status_code=500, detail=result.error)
 
-    import json
-    try:
-        data = json.loads(result.output)
-        return VillainDesignResponse(
-            success=True,
-            villain_design=data.get("villain_design", {}),
-            conflict_design=data.get("conflict_design", {}),
-            defeat_timeline=data.get("defeat_timeline", {}),
-            suggestions=data.get("suggestions", []),
-        )
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="解析设计结果失败")
+    data = _require_structured_dict(result, "解析设计结果失败")
+    return VillainDesignResponse(
+        success=True,
+        villain_design=data.get("villain_design", {}),
+        conflict_design=data.get("conflict_design", {}),
+        defeat_timeline=data.get("defeat_timeline", {}),
+        suggestions=data.get("suggestions", []),
+    )
 
 
 @router.post("", response_model=VillainResponse)
@@ -334,17 +339,13 @@ async def track_conflicts(request: ConflictTrackingRequest):
     if not result.success:
         raise HTTPException(status_code=500, detail=result.error)
 
-    import json
-    try:
-        data = json.loads(result.output)
-        return ConflictTrackingResponse(
-            success=True,
-            conflict_status=data.get("conflict_status", []),
-            escalation_warnings=data.get("escalation_warnings", []),
-            resolution_suggestions=data.get("resolution_suggestions", []),
-        )
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="解析追踪结果失败")
+    data = _require_structured_dict(result, "解析追踪结果失败")
+    return ConflictTrackingResponse(
+        success=True,
+        conflict_status=data.get("conflict_status", []),
+        escalation_warnings=data.get("escalation_warnings", []),
+        resolution_suggestions=data.get("resolution_suggestions", []),
+    )
 
 
 @router.get("/conflicts/{conflict_id}")

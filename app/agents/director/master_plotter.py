@@ -9,8 +9,13 @@ from langchain_core.language_models import BaseLanguageModel
 from langchain_core.messages import HumanMessage
 
 from app.agents.base import BaseAgent, AgentResponse
+from app.models.agent_output_schemas import (
+    MasterPlotterAdvanceSchema,
+    MasterPlotterPlanSchema,
+)
 from app.models.agent_template import AgentType
 from app.models.token_usage import UsageCategory
+from app.services.structured_llm import StructuredOutputError
 
 logger = logging.getLogger(__name__)
 
@@ -177,14 +182,14 @@ class MasterPlotterAgent(BaseAgent):
                 max_turns_threshold=max_turns_threshold,
             )
 
-            # 调用 LLM
-            response_text = await self._call_llm(
-                messages=[HumanMessage(content=user_message)], temperature=0.5,
-                category=UsageCategory.PLOT
+            # 调用 LLM (structured)
+            parsed = await self._call_structured(
+                MasterPlotterAdvanceSchema,
+                messages=[HumanMessage(content=user_message)],
+                temperature=0.5,
+                category=UsageCategory.PLOT,
             )
-
-            # 解析响应
-            result = self._parse_json_response(response_text)
+            result = parsed.model_dump()
 
             # 检查是否需要强制推进
             if interaction_turns >= max_turns_threshold and not result.get("forced_event"):
@@ -203,6 +208,9 @@ class MasterPlotterAgent(BaseAgent):
                 },
             )
 
+        except StructuredOutputError as e:
+            logger.error(f"MasterPlotterAgent structured 失败: {e}")
+            return AgentResponse(success=False, error=str(e))
         except Exception as e:
             logger.error(f"MasterPlotterAgent 执行失败：{e}")
             return AgentResponse(success=False, error=str(e))
@@ -385,11 +393,13 @@ class MasterPlotterAgent(BaseAgent):
 8. 确保长篇小说的可持续发展，不要让读者感觉开头就是高潮"""
 
         try:
-            response_text = await self._call_llm(
-                messages=[HumanMessage(content=prompt)], temperature=0.7,
-                category=UsageCategory.PLOT
+            parsed = await self._call_structured(
+                MasterPlotterPlanSchema,
+                messages=[HumanMessage(content=prompt)],
+                temperature=0.7,
+                category=UsageCategory.PLOT,
             )
-            result = self._parse_json_response(response_text)
+            result = parsed.model_dump()
 
             # 确保返回必要字段
             if not result.get("chapter_titles"):
@@ -399,6 +409,9 @@ class MasterPlotterAgent(BaseAgent):
 
             return AgentResponse(success=True, data=result)
 
+        except StructuredOutputError as e:
+            logger.error(f"剧情规划 structured 失败: {e}")
+            return AgentResponse(success=False, error=str(e))
         except Exception as e:
             logger.error(f"剧情规划失败: {e}")
             # 返回默认规划

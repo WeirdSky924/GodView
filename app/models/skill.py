@@ -13,9 +13,12 @@ Skill 是 Agent 可以执行的独立能力单元，可以被多个 Agent 共享
 
 from datetime import datetime
 from enum import Enum
+import json
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+from app.models.agent_output_contract import OutputContractMode
 
 
 class SkillType(str, Enum):
@@ -445,3 +448,50 @@ class SkillTestResult(BaseModel):
     error: Optional[str] = None
     execution_time_ms: Optional[int] = None
     token_usage: Optional[Dict[str, int]] = None
+
+    mode: Optional[OutputContractMode] = None
+    structured_output: Optional[Any] = None
+    text_output: Optional[str] = None
+    contract_id: Optional[str] = None
+    schema_name: Optional[str] = None
+    schema_version: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _sync_output_fields(self):
+        if self.output is not None:
+            if self.text_output is None:
+                self.text_output = self.output
+            if self.structured_output is None:
+                try:
+                    parsed = json.loads(self.output)
+                    if isinstance(parsed, (dict, list)):
+                        self.structured_output = parsed
+                        if self.mode is None:
+                            self.mode = OutputContractMode.STRICT
+                except (TypeError, json.JSONDecodeError):
+                    pass
+            if self.mode is None:
+                self.mode = OutputContractMode.TEXT
+        elif self.structured_output is not None:
+            self.output = json.dumps(self.structured_output, ensure_ascii=False)
+            if self.mode is None:
+                self.mode = OutputContractMode.STRICT
+        elif self.text_output is not None:
+            self.output = self.text_output
+            if self.mode is None:
+                self.mode = OutputContractMode.TEXT
+        return self
+
+    def get_structured_output(self) -> Optional[Any]:
+        return self.structured_output
+
+    def require_structured_output(self) -> Any:
+        if self.structured_output is None:
+            raise ValueError("Skill 未返回结构化输出")
+        return self.structured_output
+
+    def require_structured_dict(self) -> Dict[str, Any]:
+        data = self.require_structured_output()
+        if not isinstance(data, dict):
+            raise ValueError("Skill 结构化输出不是对象")
+        return data

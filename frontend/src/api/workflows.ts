@@ -12,6 +12,7 @@ const API_BASE = '/api'
 export type NodeType = 'agent' | 'condition' | 'group_discussion' | 'scene_performance' | 'parallel' | 'start' | 'end' | 'input'
 export type NodeStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped'
 export type WorkflowStatus = 'pending' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled'
+export type OutputContractMode = 'text' | 'hybrid' | 'strict'
 
 // 数据输入来源
 export type DataInputSource = 'database' | 'context' | 'upstream' | 'variable' | 'user_input'
@@ -36,6 +37,7 @@ export interface NodeOutputConfig {
   name: string
   target: DataOutputTarget
   key?: string
+  contract_id?: string
   save_to_db: boolean
   db_table?: string
 }
@@ -100,6 +102,10 @@ export interface NodeExecutionState {
   completed_at?: string
   input_data: Record<string, any>
   output_data: Record<string, any>
+  output_contract_id?: string
+  output_mode?: OutputContractMode
+  output_schema_name?: string
+  output_schema_version?: string
   error?: string
   duration_ms?: number
 }
@@ -127,6 +133,12 @@ export interface WorkflowValidationResult {
   edge_count: number
   has_cycle?: boolean
   is_connected?: boolean
+}
+
+export interface WorkflowEventMessage {
+  type: string
+  execution_id: string
+  data: Record<string, any>
 }
 
 // ==================== API 函数 ====================
@@ -215,6 +227,13 @@ export async function executeWorkflow(
 export async function getExecution(executionId: string): Promise<WorkflowExecution> {
   const response = await axios.get(`${API_BASE}/workflows/executions/${executionId}`)
   return response.data
+}
+
+/**
+ * 创建工作流执行 SSE 连接
+ */
+export function createWorkflowExecutionEventSource(executionId: string): EventSource {
+  return new EventSource(`${API_BASE}/workflows/executions/${executionId}/events`)
 }
 
 /**

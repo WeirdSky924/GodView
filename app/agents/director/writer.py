@@ -11,8 +11,20 @@ from langchain_core.language_models import BaseLanguageModel
 from langchain_core.messages import HumanMessage
 
 from app.agents.base import BaseAgent, AgentResponse
+from app.models.agent_output_contract import DEFAULT_AGENT_OUTPUT_CONTRACT_REGISTRY
+from app.models.agent_output_schemas import (
+    WriterChapterSchema,
+    WriterCharacterVoiceRewriteSchema,
+    WriterContinueSchema,
+    WriterSceneDescriptionSchema,
+    WriterSegmentPlanSchema,
+    WriterSegmentSchema,
+    WriterStyleConsistencySchema,
+    WriterSupplementSchema,
+)
 from app.models.agent_template import AgentType
 from app.models.token_usage import UsageCategory
+from app.services.structured_llm import StructuredOutputError
 from app.services.writing_rule_rag import get_writing_rule_rag_service
 
 logger = logging.getLogger(__name__)
@@ -28,7 +40,22 @@ class WriterAgent(BaseAgent):
     """内容执行官 Agent"""
 
     AGENT_TYPE = AgentType.WRITER
+    WRITER_OUTPUT_CONTRACT = DEFAULT_AGENT_OUTPUT_CONTRACT_REGISTRY.get("writer.workflow_output")
 
+    def _ensure_chapter_content(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """统一正文文本字段，兼容旧 content 与新 chapter_content。"""
+        chapter_content = result.get("chapter_content") or result.get("content") or ""
+        result["chapter_content"] = chapter_content
+        result["content"] = chapter_content
+        return result
+
+    def _ensure_rewritten_text(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """统一改写文本字段，兼容旧 rewritten_text 与通用 text_output。"""
+        rewritten_text = result.get("rewritten_text") or result.get("text_output") or result.get("content") or ""
+        result["rewritten_text"] = rewritten_text
+        if "text_output" not in result:
+            result["text_output"] = rewritten_text
+        return result
     def __init__(
         self,
         model: Optional[BaseLanguageModel] = None,
@@ -260,7 +287,7 @@ class WriterAgent(BaseAgent):
                 result["retry_count"] = retry_count
 
             # 最终字数验证
-            content = result.get("content", "")
+            content = result.get("chapter_content") or result.get("content", "")
             actual_word_count = await self._count_words_async(content)
 
             # 字数检查
@@ -286,19 +313,27 @@ class WriterAgent(BaseAgent):
                 )
                 result["style_check_result"] = style_check
 
-            return AgentResponse(
-                success=True,
+            metadata = {
+                "target_word_count": word_count,
+                "actual_word_count": actual_word_count,
+                "min_word_count": min_word_count,
+                "word_count_passed": word_count_passed,
+                "auto_write_mode": auto_write_mode,
+                "is_retry": is_retry,
+                "retry_count": retry_count,
+                "use_segmented": use_segmented,
+            }
+            result["metadata"] = {**metadata, **result.get("metadata", {})}
+            chapter_content = result.get("chapter_content") or result.get("content", "")
+
+            return AgentResponse.hybrid(
+                text_output=chapter_content,
+                structured_data=result,
+                contract_id=self.WRITER_OUTPUT_CONTRACT.contract_id if self.WRITER_OUTPUT_CONTRACT else None,
+                schema_name=self.WRITER_OUTPUT_CONTRACT.schema_name if self.WRITER_OUTPUT_CONTRACT else None,
+                schema_version=self.WRITER_OUTPUT_CONTRACT.schema_version if self.WRITER_OUTPUT_CONTRACT else None,
+                metadata=metadata,
                 data=result,
-                metadata={
-                    "target_word_count": word_count,
-                    "actual_word_count": actual_word_count,
-                    "min_word_count": min_word_count,
-                    "word_count_passed": word_count_passed,
-                    "auto_write_mode": auto_write_mode,
-                    "is_retry": is_retry,
-                    "retry_count": retry_count,
-                    "use_segmented": use_segmented,
-                },
             )
 
         except Exception as e:
@@ -362,25 +397,32 @@ class WriterAgent(BaseAgent):
                 writing_rules_guidance=writing_rules_guidance,
             )
 
-        # 调用 LLM
+        # 调用 LLM (structured)
         temperature = 0.8 if auto_write_mode else 0.7
-        response_text = await self._call_llm(
-            messages=[HumanMessage(content=user_message)], temperature=temperature,
-            category=UsageCategory.CHAPTER
-        )
-
-        # 解析响应
-        result = self._parse_json_response(response_text)
-
-        # 如果解析失败，尝试直接返回文本
-        if not result or not result.get("content"):
+        try:
+            parsed = await self._call_structured(
+                WriterChapterSchema,
+                messages=[HumanMessage(content=user_message)],
+                temperature=temperature,
+                category=UsageCategory.CHAPTER,
+            )
+            result = parsed.model_dump()
+        except StructuredOutputError as e:
+            logger.warning(f"Writer structured 失败，降级为纯文本: {e}")
+            # hybrid 场景：即使结构化失败也尝试 fallback 纯文本
+            response_text = await self._call_llm(
+                messages=[HumanMessage(content=user_message)], temperature=temperature,
+                category=UsageCategory.CHAPTER
+            )
             result = {
                 "content": response_text,
                 "word_count": len(response_text),
             }
 
+        result = self._ensure_chapter_content(result)
+
         # 进行字数统计验证
-        content = result.get("content", "")
+        content = result.get("chapter_content", "")
         actual_word_count = await self._count_words_async(content)
 
         # 如果LLM报告的字数与实际统计差距较大，使用实际统计
@@ -411,26 +453,34 @@ class WriterAgent(BaseAgent):
                 writing_rules_guidance=writing_rules_guidance,
             )
 
-            # 调用 LLM 续写
-            continue_response = await self._call_llm(
-                messages=[HumanMessage(content=continue_prompt)], temperature=0.75,
-                category=UsageCategory.CHAPTER
-            )
+            # 调用 LLM 续写 (structured)
+            try:
+                continue_parsed = await self._call_structured(
+                    WriterContinueSchema,
+                    messages=[HumanMessage(content=continue_prompt)],
+                    temperature=0.75,
+                    category=UsageCategory.CHAPTER,
+                )
+                continue_result = continue_parsed.model_dump()
+            except StructuredOutputError as e:
+                logger.warning(f"续写 structured 失败，降级纯文本: {e}")
+                continue_response = await self._call_llm(
+                    messages=[HumanMessage(content=continue_prompt)], temperature=0.75,
+                    category=UsageCategory.CHAPTER
+                )
+                continue_result = {"content": continue_response}
 
-            # 解析续写内容
-            continue_result = self._parse_json_response(continue_response)
             if continue_result and continue_result.get("content"):
                 new_content = continue_result.get("content", "")
                 content = content + "\n\n" + new_content
                 actual_word_count = await self._count_words_async(content)
                 logger.info(f"续写完成，新增 {await self._count_words_async(new_content)} 字，当前总字数: {actual_word_count}")
             else:
-                # 如果解析失败，直接追加
-                content = content + "\n\n" + continue_response
                 actual_word_count = await self._count_words_async(content)
 
         # 更新结果
         result["content"] = content
+        result["chapter_content"] = content
         result["word_count"] = actual_word_count
         result["continue_count"] = continue_count
         result["max_retry_count"] = max_retry_count
@@ -536,17 +586,22 @@ class WriterAgent(BaseAgent):
                 writing_rules_guidance=segment_writing_rules_guidance,
             )
 
-            # 生成该段
-            segment_response = await self._call_llm(
-                messages=[HumanMessage(content=segment_prompt)], temperature=0.75,
-                category=UsageCategory.CHAPTER
-            )
-
-            # 解析
-            segment_result = self._parse_json_response(segment_response)
-            if segment_result and segment_result.get("content"):
+            # 生成该段 (structured)
+            try:
+                segment_parsed = await self._call_structured(
+                    WriterSegmentSchema,
+                    messages=[HumanMessage(content=segment_prompt)],
+                    temperature=0.75,
+                    category=UsageCategory.CHAPTER,
+                )
+                segment_result = segment_parsed.model_dump()
                 segment_content = segment_result.get("content", "")
-            else:
+            except StructuredOutputError as e:
+                logger.warning(f"分段 structured 失败，降级纯文本: {e}")
+                segment_response = await self._call_llm(
+                    messages=[HumanMessage(content=segment_prompt)], temperature=0.75,
+                    category=UsageCategory.CHAPTER
+                )
                 segment_content = segment_response
 
             segment_words = await self._count_words_async(segment_content)
@@ -589,24 +644,33 @@ class WriterAgent(BaseAgent):
                 writing_rules_guidance=chapter_writing_rules_guidance,
             )
 
-            supplement_response = await self._call_llm(
-                messages=[HumanMessage(content=supplement_prompt)], temperature=0.7,
-                category=UsageCategory.CHAPTER
-            )
+            try:
+                supplement_parsed = await self._call_structured(
+                    WriterSupplementSchema,
+                    messages=[HumanMessage(content=supplement_prompt)],
+                    temperature=0.7,
+                    category=UsageCategory.CHAPTER,
+                )
+                supplement_result = supplement_parsed.model_dump()
+            except StructuredOutputError as e:
+                logger.warning(f"补充 structured 失败，降级纯文本: {e}")
+                supplement_response = await self._call_llm(
+                    messages=[HumanMessage(content=supplement_prompt)], temperature=0.7,
+                    category=UsageCategory.CHAPTER
+                )
+                supplement_result = {"content": supplement_response}
 
-            supplement_result = self._parse_json_response(supplement_response)
             if supplement_result and supplement_result.get("content"):
                 new_content = supplement_result.get("content", "")
                 full_content = full_content + "\n\n" + new_content
                 actual_word_count = await self._count_words_async(full_content)
                 logger.info(f"补充完成，新增 {await self._count_words_async(new_content)} 字，当前总字数: {actual_word_count}")
             else:
-                # 如果解析失败，直接追加
-                full_content = full_content + "\n\n" + supplement_response
                 actual_word_count = await self._count_words_async(full_content)
 
         return {
             "content": full_content,
+            "chapter_content": full_content,
             "word_count": actual_word_count,
             "continue_count": continue_count,
             "max_retry_count": max_retry_count,
@@ -670,12 +734,17 @@ class WriterAgent(BaseAgent):
 }}"""
 
         try:
-            response = await self._call_llm(
-                messages=[HumanMessage(content=prompt)], temperature=0.5,
-                category=UsageCategory.PLANNING
+            parsed = await self._call_structured(
+                WriterSegmentPlanSchema,
+                messages=[HumanMessage(content=prompt)],
+                temperature=0.5,
+                category=UsageCategory.PLANNING,
             )
-            result = self._parse_json_response(response)
-            return result if result else {"segments": self._get_default_segments(segment_count)}
+            result = parsed.model_dump()
+            return result if result.get("segments") else {"segments": self._get_default_segments(segment_count)}
+        except StructuredOutputError as e:
+            logger.warning(f"分段规划 structured 失败，使用默认结构: {e}")
+            return {"segments": self._get_default_segments(segment_count)}
         except Exception as e:
             logger.warning(f"分段规划失败，使用默认结构: {e}")
             return {"segments": self._get_default_segments(segment_count)}
@@ -1026,11 +1095,13 @@ class WriterAgent(BaseAgent):
 }}"""
 
         try:
-            response_text = await self._call_llm(
-                messages=[HumanMessage(content=prompt)], temperature=0.3,
-                category=UsageCategory.CHAPTER
+            parsed = await self._call_structured(
+                WriterStyleConsistencySchema,
+                messages=[HumanMessage(content=prompt)],
+                temperature=0.3,
+                category=UsageCategory.CHAPTER,
             )
-            return self._parse_json_response(response_text)
+            return parsed.model_dump()
         except Exception:
             return {"is_consistent": True, "confidence": 0.5, "differences": [], "suggestions": []}
 
@@ -1080,12 +1151,27 @@ class WriterAgent(BaseAgent):
 }}"""
 
         try:
-            response_text = await self._call_llm(
-                messages=[HumanMessage(content=prompt)], temperature=0.6,
-                category=UsageCategory.CHAPTER
+            parsed = await self._call_structured(
+                WriterSceneDescriptionSchema,
+                messages=[HumanMessage(content=prompt)],
+                temperature=0.6,
+                category=UsageCategory.CHAPTER,
             )
-            result = self._parse_json_response(response_text)
-            return AgentResponse(success=True, data=result)
+            result = parsed.model_dump()
+
+            description = result.get("description") or ""
+            result["description"] = description
+            result["word_count"] = result.get("word_count") or await self._count_words_async(description)
+
+            return AgentResponse.hybrid(
+                text_output=description,
+                structured_data=result,
+                metadata={"surface": "scene_description"},
+                data=result,
+            )
+        except StructuredOutputError as e:
+            logger.error(f"场景描写 structured 失败：{e}")
+            return AgentResponse(success=False, error=str(e))
         except Exception as e:
             logger.error(f"场景描写生成失败：{e}")
             return AgentResponse(success=False, error=str(e))
@@ -1134,12 +1220,26 @@ class WriterAgent(BaseAgent):
 }}"""
 
         try:
-            response_text = await self._call_llm(
-                messages=[HumanMessage(content=prompt)], temperature=0.5,
-                category=UsageCategory.CHAPTER
+            parsed = await self._call_structured(
+                WriterCharacterVoiceRewriteSchema,
+                messages=[HumanMessage(content=prompt)],
+                temperature=0.5,
+                category=UsageCategory.CHAPTER,
             )
-            result = self._parse_json_response(response_text)
-            return AgentResponse(success=True, data=result)
+            result = parsed.model_dump()
+
+            result = self._ensure_rewritten_text(result)
+            rewritten_text = result.get("rewritten_text", "")
+
+            return AgentResponse.hybrid(
+                text_output=rewritten_text,
+                structured_data=result,
+                metadata={"surface": "character_voice_rewrite"},
+                data=result,
+            )
+        except StructuredOutputError as e:
+            logger.error(f"角色声音改写 structured 失败：{e}")
+            return AgentResponse(success=False, error=str(e))
         except Exception as e:
             logger.error(f"角色声音重写失败：{e}")
             return AgentResponse(success=False, error=str(e))

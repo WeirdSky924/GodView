@@ -10,11 +10,20 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from app.models.skill import SkillTestResult
 from app.services.skill_service import get_skill_service, ExecuteSkillDTO
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _require_structured_dict(result: SkillTestResult, error_detail: str) -> Dict[str, Any]:
+    try:
+        return result.require_structured_dict()
+    except ValueError as exc:
+        logger.warning("卷规划 Skill 返回了无效结构化输出: %s", exc)
+        raise HTTPException(status_code=500, detail=error_detail) from exc
 
 
 # ==================== 数据模型 ====================
@@ -126,20 +135,16 @@ async def plan_volume(request: VolumePlanRequest):
     if not result.success:
         raise HTTPException(status_code=500, detail=result.error)
 
-    import json
-    try:
-        data = json.loads(result.output)
-        return VolumePlanResponse(
-            success=True,
-            volume_info=data.get("volume_info", {}),
-            emotional_arc=data.get("emotional_arc", {}),
-            climax_design=data.get("climax_design", {}),
-            chapter_plan=data.get("chapter_plan", []),
-            transitions=data.get("transitions", {}),
-            word_distribution=data.get("word_distribution", {}),
-        )
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="解析规划结果失败")
+    data = _require_structured_dict(result, "解析规划结果失败")
+    return VolumePlanResponse(
+        success=True,
+        volume_info=data.get("volume_info", {}),
+        emotional_arc=data.get("emotional_arc", {}),
+        climax_design=data.get("climax_design", {}),
+        chapter_plan=data.get("chapter_plan", []),
+        transitions=data.get("transitions", {}),
+        word_distribution=data.get("word_distribution", {}),
+    )
 
 
 @router.post("", response_model=VolumeResponse)
@@ -235,18 +240,14 @@ async def design_volume_climax(
     if not result.success:
         raise HTTPException(status_code=500, detail=result.error)
 
-    import json
-    try:
-        data = json.loads(result.output)
-        return ClimaxDesignResponse(
-            success=True,
-            climax_chapter=data.get("climax_chapter", 0),
-            climax_description=data.get("climax_description", ""),
-            buildup_scenes=data.get("buildup_scenes", []),
-            aftermath_scenes=data.get("aftermath_scenes", []),
-        )
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="解析设计结果失败")
+    data = _require_structured_dict(result, "解析设计结果失败")
+    return ClimaxDesignResponse(
+        success=True,
+        climax_chapter=data.get("climax_chapter", 0),
+        climax_description=data.get("climax_description", ""),
+        buildup_scenes=data.get("buildup_scenes", []),
+        aftermath_scenes=data.get("aftermath_scenes", []),
+    )
 
 
 @router.get("/{volume_number}/emotional-arc")

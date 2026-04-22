@@ -4,7 +4,14 @@ import PageLayout from '@/components/PageLayout'
 import { useDynamicWebSocket } from '@/hooks/useWebSocket'
 import { getDirectorState, getSnapshotTree } from '@/api/director'
 import { getCharacters } from '@/api/characters'
-import { getWorkflows, type WorkflowDefinition } from '@/api/workflows'
+import {
+  getWorkflows,
+  getExecution,
+  createWorkflowExecutionEventSource,
+  type WorkflowDefinition,
+  type WorkflowExecution,
+  type WorkflowEventMessage,
+} from '@/api/workflows'
 import { useWorkflowAgents, type AgentStatus, getAgentDisplayName } from '@/hooks/useWorkflowAgents'
 import {
   Play, Pause, RotateCcw, Target, BookOpen, MessageSquare, GitBranch, Settings,
@@ -155,6 +162,88 @@ function getAgentStateKey(data: {
 
 function getWorkflowOrigin(workflow: WorkflowDefinition): WorkflowOrigin {
   return workflow.is_template && workflow.project_id === null ? 'global_template' : 'project'
+}
+
+function isWorkflowExecutionEventType(type?: string): boolean {
+  return [
+    'execution_snapshot',
+    'workflow_started',
+    'workflow_completed',
+    'workflow_failed',
+    'workflow_paused',
+    'workflow_resumed',
+    'workflow_cancelled',
+    'node_started',
+    'node_completed',
+    'node_output',
+    'node_streaming',
+    'agent_status',
+    'agent_streaming',
+    'agent_output',
+    'group_discussion_started',
+    'discussion_message',
+    'discussion_ended',
+    'intervention_queued',
+    'intervention_applied',
+  ].includes(type || '')
+}
+
+function extractNodeOutputText(outputData?: Record<string, any>): string | null {
+  if (!outputData || Object.keys(outputData).length === 0) {
+    return null
+  }
+
+  const preferredOutput =
+    outputData.output ??
+    outputData.content ??
+    outputData.result ??
+    outputData.response ??
+    outputData.text ??
+    outputData.chapter_content
+
+  if (typeof preferredOutput === 'string' && preferredOutput.trim()) {
+    return preferredOutput
+  }
+
+  if (preferredOutput !== undefined && preferredOutput !== null) {
+    return typeof preferredOutput === 'string'
+      ? preferredOutput
+      : JSON.stringify(preferredOutput, null, 2)
+  }
+
+  return JSON.stringify(outputData, null, 2)
+}
+
+function getExecutionIdFromPayload(payload: any): string | null {
+  return payload?.execution_id || payload?.data?.execution_id || null
+}
+
+function getNodeDataFromWorkflowExecution(
+  execution: WorkflowExecution,
+  nodeId: string,
+  workflow: WorkflowDefinition | null,
+) {
+  const workflowNode = workflow?.nodes.find((node) => node.id === nodeId)
+  return {
+    agent_type: workflowNode?.agent_type,
+    label: workflowNode?.label,
+    node_type: workflowNode?.node_type,
+    node_id: nodeId,
+    execution_id: execution.id,
+  }
+}
+
+function mapNodeExecutionStatus(status?: string): AgentStatus['status'] {
+  switch (status) {
+    case 'running':
+      return 'working'
+    case 'completed':
+      return 'completed'
+    case 'failed':
+      return 'error'
+    default:
+      return 'idle'
+  }
 }
 
 function getWorkflowDisplayName(workflow: WorkflowDefinition): string {
@@ -668,11 +757,18 @@ export default function Director() {
   // Workflow state
   const [savedWorkflows, setSavedWorkflows] = useState<WorkflowDefinition[]>([])
   const [selectedWorkflowId, setSelectedWorkflowId] = useState('')
+  const [executionId, setExecutionId] = useState('')
+  const [isExecutionStreamReady, setIsExecutionStreamReady] = useState(false)
 
   const selectedWorkflow = useMemo(
     () => getSelectedWorkflow(savedWorkflows, selectedWorkflowId),
     [savedWorkflows, selectedWorkflowId],
   )
+  const selectedWorkflowRef = useRef<WorkflowDefinition | null>(null)
+
+  useEffect(() => {
+    selectedWorkflowRef.current = selectedWorkflow
+  }, [selectedWorkflow])
 
   // 检查当前选中的工作流是否包含 group_discussion 节点
   const hasGroupDiscussionNode = useMemo(() => {
@@ -785,12 +881,12 @@ export default function Director() {
   const sessionStartAttempted = useRef(false)
 
   // Helpers
-  const addLog = (message: string) => {
+  const addLog = useCallback((message: string) => {
     const timestamp = new Date().toLocaleTimeString()
     setLogs(prev => [`[${timestamp}] ${message}`, ...prev.slice(0, 199)])
-  }
+  }, [])
 
-  const updateAgentFromNode = (
+  const updateAgentFromNode = useCallback((
     data: { agent?: string; agent_type?: string; label?: string; node_type?: string; node_id?: string },
     patch: Partial<AgentStatus>,
   ) => {
@@ -804,318 +900,409 @@ export default function Director() {
 
     const displayName = getNodeDisplayName(data)
     updateAgentStatus(displayName, patch.status, patch.message)
-  }
+  }, [updateAgentStatus])
 
   const getWorkingAgentName = () => agents.find(a => a.status === 'working')?.message || null
 
-  // WebSocket - 只有点击启动后才连接
-  const wsPath = useMemo(
-    () => (isConnected && sessionId.trim()) ? `/api/ws/connect/${sessionId.trim()}` : '',
-    [isConnected, sessionId]
-  )
+  const applyWorkflowExecutionSnapshot = useCallback((execution: WorkflowExecution, workflow: WorkflowDefinition | null) => {
+    if (!execution) return
 
-  const { status: wsStatus, send } = useDynamicWebSocket(wsPath, {
-    onOpen: () => addLog('✅ WebSocket 已连接，正在启动会话...'),
-    onClose: () => {
-      addLog('WebSocket 已断开')
-      setIsGenerating(false)
-    },
-    onError: () => {
-      addLog('❌ WebSocket 连接异常')
-      setIsConnected(false)
-    },
-    onMessage: (data) => {
-      switch (data.type) {
-        case 'log':
-          addLog(data.message)
-          break
-        case 'agent_status': {
-          const statusKey = getAgentStateKey({
-            agent: data.agent,
-            agent_type: data.agent_type,
-            label: data.label,
-            node_type: data.node_type,
-            node_id: data.node_id,
-          })
+    setExecutionId(execution.id)
 
-          if (statusKey) {
-            updateAgentStatus(statusKey, data.status, data.message)
-          }
+    Object.entries(execution.node_states || {}).forEach(([nodeId, nodeState]) => {
+      const nodeData = getNodeDataFromWorkflowExecution(execution, nodeId, workflow)
+      const nodeKey = getAgentStateKey(nodeData)
+      const mappedStatus = mapNodeExecutionStatus(nodeState.status)
+      const outputText = extractNodeOutputText(nodeState.output_data)
+      const statusMessage =
+        nodeState.error ||
+        (mappedStatus === 'working' ? '执行中' : undefined)
 
-          if (data.output) {
-            const output = typeof data.output === 'string' ? data.output : JSON.stringify(data.output, null, 2)
-            if (statusKey) {
-              setAgentOutput(statusKey, output)
-            }
-          }
+      updateAgentFromNode(nodeData, { status: mappedStatus, message: statusMessage })
 
-          if (data.status !== 'working' && statusKey) {
-            clearAgentStreaming(statusKey)
-          }
-          break
-        }
-        case 'agent_streaming': {
-          const streamData = data.data || data
-          if (streamData.chunk) {
-            const streamKey = getAgentStateKey({
-              agent: streamData.agent,
-              agent_type: streamData.agent_type,
-              label: streamData.label,
-              node_type: streamData.node_type,
-              node_id: streamData.node_id,
-            })
-
-            if (streamKey) {
-              appendAgentStreaming(streamKey, streamData.chunk)
-            }
-          }
-          break
-        }
-        case 'agent_output': {
-          const outputData = data.data || data
-          if (outputData.output) {
-            const outputStr = typeof outputData.output === 'string' ? outputData.output : JSON.stringify(outputData.output, null, 2)
-            const outputKey = getAgentStateKey({
-              agent: outputData.agent,
-              agent_type: outputData.agent_type,
-              label: outputData.label,
-              node_type: outputData.node_type,
-              node_id: outputData.node_id,
-            })
-
-            if (outputKey) {
-              setAgentOutput(outputKey, outputStr)
-              clearAgentStreaming(outputKey)
-            }
-          }
-          break
-        }
-        case 'node_output': {
-          const nodeData = data.data || data
-          if (nodeData.output) {
-            const outputStr = typeof nodeData.output === 'string' ? nodeData.output : JSON.stringify(nodeData.output, null, 2)
-            const nodeKey = getAgentStateKey(nodeData)
-            const displayName = getNodeDisplayName(nodeData)
-
-            if (nodeKey) {
-              setAgentOutput(nodeKey, outputStr)
-            }
-
-            addLog(`📤 ${displayName}: ${outputStr}`)
-          }
-          break
-        }
-        case 'node_started': {
-          const nodeData = data.data || data
-          const displayName = getNodeDisplayName(nodeData)
-          addLog(`🔄 ${displayName} 开始执行`)
-          updateAgentFromNode(nodeData, { status: 'working', message: displayName || '执行中' })
-
-          const nodeKey = getAgentStateKey(nodeData)
-          if (nodeKey) {
-            updateAgentStreaming(prev => ({
-              ...prev,
-              [nodeKey]: prev[nodeKey] || '',
-            }))
-          }
-          break
-        }
-        case 'node_completed': {
-          const nodeData = data.data || data
-          const displayName = getNodeDisplayName(nodeData)
-          const nodeKey = getAgentStateKey(nodeData)
-
-          if (nodeData.status === 'failed' || nodeData.error) {
-            addLog(`❌ ${displayName} 执行失败: ${nodeData.error || '未知错误'}`)
-            updateAgentFromNode(nodeData, { status: 'error', message: nodeData.error || '执行失败' })
-          } else {
-            addLog(`✅ ${displayName} 完成`)
-            updateAgentFromNode(nodeData, { status: 'completed', message: displayName || '完成' })
-          }
-
-          if (nodeKey) {
-            clearAgentStreaming(nodeKey)
-          }
-          break
-        }
-        case 'node_streaming': {
-          const nodeData = data.data || data
-          if (nodeData.chunk) {
-            const streamKey = getAgentStateKey(nodeData)
-            if (streamKey) {
-              appendAgentStreaming(streamKey, nodeData.chunk)
-            }
-          }
-          break
-        }
-        case 'session_started':
-          addLog(`✅ 会话已启动`)
-          setIsGenerating(true)
-          loadRuntimePanels()
-          break
-        case 'session_stopped':
-          addLog('会话已停止')
-          setIsGenerating(false)
-          setIsConnected(false)
-          loadRuntimePanels()
-          break
-        case 'hooks_managed':
-          addLog('🎯 伏笔管理完成')
-          setAgentOutput('hook_manager', JSON.stringify(data.data || {}, null, 2))
-          loadRuntimePanels()
-          break
-        case 'group_discussion_started':
-          addLog(`🌟 集体讨论开始`)
-          // 处理从工作流引擎发送的讨论消息
-          const discussionMessages = data.data?.messages || []
-          const formattedMessages = discussionMessages.map((msg: any) => ({
-            character: msg.agent || msg.character || 'Agent',
-            content: msg.content || '',
-            timestamp: new Date().toLocaleTimeString(),
-          }))
-          setGroupDiscussion({
-            topic: data.data?.discussion_topic || '讨论',
-            messages: formattedMessages,
-            characters: data.data?.characters || [],
-            participants: data.data?.participants || [],
-            isActive: true,
-          })
-          break
-        case 'discussion_message':
-          const speakerName = data.data?.agent || data.data?.character || '未知'
-          const messageContent = data.data?.content || ''
-          const isLLMGenerated = data.data?.is_llm_generated
-          // 添加日志
-          addLog(`💬 ${speakerName}: ${messageContent}${isLLMGenerated ? ' 🤖' : ''}`)
-          // 更新讨论状态
-          setGroupDiscussion(prev => {
-            if (prev) {
-              return {
-                ...prev,
-                messages: [...prev.messages, {
-                  character: speakerName,
-                  content: messageContent,
-                  timestamp: new Date().toLocaleTimeString(),
-                  isLLMGenerated,
-                }],
-              }
-            } else {
-              // 如果讨论还未初始化，创建一个新的讨论状态
-              return {
-                topic: '创作讨论会',
-                messages: [{
-                  character: speakerName,
-                  content: messageContent,
-                  timestamp: new Date().toLocaleTimeString(),
-                  isLLMGenerated,
-                }],
-                characters: [],
-                participants: [],
-                isActive: true,
-              }
-            }
-          })
-          break
-        case 'discussion_ended':
-          addLog('📝 集体讨论结束')
-          if (groupDiscussion) {
-            setGroupDiscussion(prev => prev ? { ...prev, isActive: false } : null)
-          }
-          break
-        case 'auto_mode_chapter_start':
-          addLog(`📖 开始写作第 ${data.chapter_num} 章: ${data.title}`)
-          break
-        case 'auto_mode_chapter_completed':
-          addLog(`✅ 第 ${data.chapter_num} 章完成: ${data.title} (${data.word_count} 字)`)
-          setAutoModeChapters(prev => [...prev, {
-            chapter_num: data.chapter_num,
-            title: data.title,
-            word_count: data.word_count,
-            content: data.content,
-          }])
-          break
-        case 'auto_mode_completed':
-          setAutoModeRunning(false)
-          addLog(`🎉 连续创作完成！共 ${data.data?.total_chapters} 章，${data.data?.total_words} 字`)
-          loadRuntimePanels()
-          break
-        case 'auto_mode_error':
-          setAutoModeRunning(false)
-          addLog(`❌ 错误: ${data.error}`)
-          break
-        case 'auto_write_chapter_result':
-          if (data.status === 'success') {
-            addLog(`✅ 章节生成完成: ${data.data?.title} (${data.data?.word_count} 字)`)
-            setAutoModeChapters(prev => [...prev, {
-              chapter_num: data.data?.chapter_num || prev.length + 1,
-              title: data.data?.title || '',
-              word_count: data.data?.word_count || 0,
-              content: data.data?.content || '',
-            }])
-            loadRuntimePanels()
-          } else {
-            addLog(`❌ 章节生成失败: ${data.error}`)
-          }
-          break
-        case 'character_added':
-          addLog(`👤 角色已添加: ${data.data?.name}`)
-          if (currentProject) loadCharacters()
-          break
-        case 'character_removed':
-          addLog(`👤 角色已移除`)
-          if (currentProject) loadCharacters()
-          break
-        case 'agent_response':
-          // Agent 干预响应
-          addLog(`💬 ${data.agent}: ${data.response || '已响应'}`)
-          setInterventionHistory(prev => prev.map(item =>
-            item.agent === data.agent && !item.response
-              ? { ...item, response: data.response }
-              : item
-          ))
-          if (data.agent) {
-            const responseKey = getAgentStateKey({ agent: data.agent, agent_type: data.agent_type, label: data.label })
-            if (responseKey) {
-              setAgentOutput(responseKey, data.response || '')
-            }
-          }
-          break
-        case 'intervention_response':
-          // 干预响应
-          addLog(`💬 ${data.agent}: ${data.response || '已响应'}`)
-          setInterventionHistory(prev => prev.map(item =>
-            item.agent === data.agent && !item.response
-              ? { ...item, response: data.response }
-              : item
-          ))
-          if (data.agent) {
-            const responseKey = getAgentStateKey({ agent: data.agent, agent_type: data.agent_type, label: data.label })
-            if (responseKey) {
-              setAgentOutput(responseKey, data.response || '')
-            }
-          }
-          break
-        case 'intervention_queued':
-          // 干预已加入工作流队列
-          addLog(`📤 干预已排队，等待 ${data.agent} 执行`)
-          break
-        case 'intervention_applied':
-          // 干预已应用到Agent
-          addLog(`✅ 干预已应用到 ${data.agent} (${data.intervention_count} 条)`)
-          break
-        case 'intervention_logged':
-          addLog(`📝 干预已记录`)
-          break
-        case 'error':
-          addLog(`❌ ${data.message}`)
-          break
-        default:
-          if (data.type !== 'heartbeat') {
-            addLog(`${data.type}: ${JSON.stringify(data.data || {})}`)
-          }
+      if (nodeKey && outputText) {
+        setAgentOutput(nodeKey, outputText)
       }
-    },
-  })
+
+      if (nodeKey) {
+        if (mappedStatus === 'working') {
+          updateAgentStreaming((prev) => ({
+            ...prev,
+            [nodeKey]: prev[nodeKey] || '',
+          }))
+        } else {
+          clearAgentStreaming(nodeKey)
+        }
+      }
+    })
+
+    if (execution.status === 'completed') {
+      setIsGenerating(false)
+    }
+  }, [clearAgentStreaming, setAgentOutput, updateAgentFromNode, updateAgentStreaming])
+
+  const applyDirectorEvent = useCallback((payload: any) => {
+    const eventType = payload?.type
+    const eventData = payload?.data || payload
+
+    if (eventType === 'execution_snapshot') {
+      applyWorkflowExecutionSnapshot(eventData as WorkflowExecution, selectedWorkflowRef.current)
+      return true
+    }
+
+    switch (eventType) {
+      case 'workflow_started': {
+        const nextExecutionId = getExecutionIdFromPayload(payload)
+        if (nextExecutionId) {
+          setExecutionId(nextExecutionId)
+        }
+        addLog('🚀 工作流已启动')
+        setIsGenerating(true)
+        return true
+      }
+      case 'workflow_completed': {
+        addLog('✅ 工作流执行完成')
+        setIsGenerating(false)
+        return true
+      }
+      case 'workflow_failed': {
+        addLog(`❌ 工作流执行失败: ${eventData?.error || '未知错误'}`)
+        setIsGenerating(false)
+        return true
+      }
+      case 'workflow_paused': {
+        addLog('⏸️ 工作流已暂停')
+        return true
+      }
+      case 'workflow_resumed': {
+        addLog('▶️ 工作流已恢复')
+        setIsGenerating(true)
+        return true
+      }
+      case 'workflow_cancelled': {
+        addLog('🛑 工作流已取消')
+        setIsGenerating(false)
+        return true
+      }
+      case 'agent_status': {
+        const statusKey = getAgentStateKey({
+          agent: payload.agent,
+          agent_type: payload.agent_type,
+          label: payload.label,
+          node_type: payload.node_type,
+          node_id: payload.node_id,
+        })
+
+        if (statusKey) {
+          updateAgentStatus(statusKey, payload.status, payload.message)
+        }
+
+        if (payload.output) {
+          const output = typeof payload.output === 'string' ? payload.output : JSON.stringify(payload.output, null, 2)
+          if (statusKey) {
+            setAgentOutput(statusKey, output)
+          }
+        }
+
+        if (payload.status !== 'working' && statusKey) {
+          clearAgentStreaming(statusKey)
+        }
+        return true
+      }
+      case 'agent_streaming': {
+        if (eventData.chunk) {
+          const streamKey = getAgentStateKey({
+            agent: eventData.agent,
+            agent_type: eventData.agent_type,
+            label: eventData.label,
+            node_type: eventData.node_type,
+            node_id: eventData.node_id,
+          })
+
+          if (streamKey) {
+            appendAgentStreaming(streamKey, eventData.chunk)
+          }
+        }
+        return true
+      }
+      case 'agent_output': {
+        if (eventData.output) {
+          const outputStr = typeof eventData.output === 'string' ? eventData.output : JSON.stringify(eventData.output, null, 2)
+          const outputKey = getAgentStateKey({
+            agent: eventData.agent,
+            agent_type: eventData.agent_type,
+            label: eventData.label,
+            node_type: eventData.node_type,
+            node_id: eventData.node_id,
+          })
+
+          if (outputKey) {
+            setAgentOutput(outputKey, outputStr)
+            clearAgentStreaming(outputKey)
+          }
+        }
+        return true
+      }
+      case 'node_output': {
+        if (eventData.output) {
+          const outputStr = typeof eventData.output === 'string' ? eventData.output : JSON.stringify(eventData.output, null, 2)
+          const nodeKey = getAgentStateKey(eventData)
+          const displayName = getNodeDisplayName(eventData)
+
+          if (nodeKey) {
+            setAgentOutput(nodeKey, outputStr)
+          }
+
+          addLog(`📤 ${displayName}: ${outputStr}`)
+        }
+        return true
+      }
+      case 'node_started': {
+        const displayName = getNodeDisplayName(eventData)
+        addLog(`🔄 ${displayName} 开始执行`)
+        updateAgentFromNode(eventData, { status: 'working', message: displayName || '执行中' })
+
+        const nodeKey = getAgentStateKey(eventData)
+        if (nodeKey) {
+          updateAgentStreaming(prev => ({
+            ...prev,
+            [nodeKey]: prev[nodeKey] || '',
+          }))
+        }
+        return true
+      }
+      case 'node_completed': {
+        const displayName = getNodeDisplayName(eventData)
+        const nodeKey = getAgentStateKey(eventData)
+        const outputText = extractNodeOutputText(eventData.output_data)
+
+        if (eventData.status === 'failed' || eventData.error) {
+          addLog(`❌ ${displayName} 执行失败: ${eventData.error || '未知错误'}`)
+          updateAgentFromNode(eventData, { status: 'error', message: eventData.error || '执行失败' })
+        } else {
+          addLog(`✅ ${displayName} 完成`)
+          updateAgentFromNode(eventData, { status: 'completed', message: displayName || '完成' })
+        }
+
+        if (nodeKey && outputText) {
+          setAgentOutput(nodeKey, outputText)
+        }
+
+        if (nodeKey) {
+          clearAgentStreaming(nodeKey)
+        }
+        return true
+      }
+      case 'node_streaming': {
+        if (eventData.chunk) {
+          const streamKey = getAgentStateKey(eventData)
+          if (streamKey) {
+            appendAgentStreaming(streamKey, eventData.chunk)
+          }
+        }
+        return true
+      }
+      case 'group_discussion_started': {
+        addLog('🌟 集体讨论开始')
+        const discussionMessages = eventData?.messages || []
+        const formattedMessages = discussionMessages.map((msg: any) => ({
+          character: msg.agent || msg.character || 'Agent',
+          content: msg.content || '',
+          timestamp: new Date().toLocaleTimeString(),
+        }))
+        setGroupDiscussion({
+          topic: eventData?.discussion_topic || '讨论',
+          messages: formattedMessages,
+          characters: eventData?.characters || [],
+          participants: eventData?.participants || [],
+          isActive: true,
+        })
+        return true
+      }
+      case 'discussion_message': {
+        const speakerName = eventData?.agent || eventData?.character || '未知'
+        const messageContent = eventData?.content || ''
+        const isLLMGenerated = eventData?.is_llm_generated
+        addLog(`💬 ${speakerName}: ${messageContent}${isLLMGenerated ? ' 🤖' : ''}`)
+        setGroupDiscussion(prev => {
+          if (prev) {
+            return {
+              ...prev,
+              messages: [...prev.messages, {
+                character: speakerName,
+                content: messageContent,
+                timestamp: new Date().toLocaleTimeString(),
+                isLLMGenerated,
+              }],
+            }
+          }
+          return {
+            topic: '创作讨论会',
+            messages: [{
+              character: speakerName,
+              content: messageContent,
+              timestamp: new Date().toLocaleTimeString(),
+              isLLMGenerated,
+            }],
+            characters: [],
+            participants: [],
+            isActive: true,
+          }
+        })
+        return true
+      }
+      case 'discussion_ended': {
+        addLog('📝 集体讨论结束')
+        setGroupDiscussion(prev => prev ? { ...prev, isActive: false } : null)
+        return true
+      }
+      case 'intervention_queued': {
+        const agentName = eventData?.agent || 'Agent'
+        addLog(`📤 干预已排队，等待 ${agentName} 执行`)
+        return true
+      }
+      case 'intervention_applied': {
+        const agentName = eventData?.agent || 'Agent'
+        addLog(`✅ 干预已应用到 ${agentName} (${eventData?.intervention_count || 0} 条)`)
+        return true
+      }
+      default:
+        return false
+    }
+  }, [
+    addLog,
+    appendAgentStreaming,
+    applyWorkflowExecutionSnapshot,
+    clearAgentStreaming,
+    setAgentOutput,
+    updateAgentFromNode,
+    updateAgentStatus,
+    updateAgentStreaming,
+  ])
+
+  const { status: wsStatus, send } = useDynamicWebSocket(
+    isConnected && sessionId.trim() ? `/api/ws/connect/${sessionId.trim()}` : '',
+    {
+      onOpen: () => addLog('✅ WebSocket 已连接，正在启动会话...'),
+      onClose: () => {
+        addLog('WebSocket 已断开')
+        if (!executionId) {
+          setIsGenerating(false)
+        }
+      },
+      onError: () => {
+        addLog('❌ WebSocket 连接异常')
+        setIsConnected(false)
+      },
+      onMessage: (data) => {
+        if (data.type === 'log') {
+          addLog(data.message)
+          return
+        }
+
+        if (data.type === 'workflow_started') {
+          applyDirectorEvent(data)
+          return
+        }
+
+        if (isWorkflowExecutionEventType(data.type)) {
+          if (!isExecutionStreamReady) {
+            applyDirectorEvent(data)
+          }
+          return
+        }
+
+        switch (data.type) {
+          case 'session_started':
+            addLog('✅ 会话已启动')
+            setIsGenerating(true)
+            loadRuntimePanels()
+            break
+          case 'session_stopped':
+            addLog('会话已停止')
+            setIsGenerating(false)
+            setExecutionId('')
+            setIsExecutionStreamReady(false)
+            setIsConnected(false)
+            loadRuntimePanels()
+            break
+          case 'hooks_managed':
+            addLog('🎯 伏笔管理完成')
+            setAgentOutput('hook_manager', JSON.stringify(data.data || {}, null, 2))
+            loadRuntimePanels()
+            break
+          case 'auto_mode_chapter_start':
+            addLog(`📖 开始写作第 ${data.chapter_num} 章: ${data.title}`)
+            break
+          case 'auto_mode_chapter_completed':
+            addLog(`✅ 第 ${data.chapter_num} 章完成: ${data.title} (${data.word_count} 字)`)
+            setAutoModeChapters(prev => [...prev, {
+              chapter_num: data.chapter_num,
+              title: data.title,
+              word_count: data.word_count,
+              content: data.content,
+            }])
+            break
+          case 'auto_mode_completed':
+            setAutoModeRunning(false)
+            addLog(`🎉 连续创作完成！共 ${data.data?.total_chapters} 章，${data.data?.total_words} 字`)
+            loadRuntimePanels()
+            break
+          case 'auto_mode_error':
+            setAutoModeRunning(false)
+            addLog(`❌ 错误: ${data.error}`)
+            break
+          case 'auto_write_chapter_result':
+            if (data.status === 'success') {
+              addLog(`✅ 章节生成完成: ${data.data?.title} (${data.data?.word_count} 字)`)
+              setAutoModeChapters(prev => [...prev, {
+                chapter_num: data.data?.chapter_num || prev.length + 1,
+                title: data.data?.title || '',
+                word_count: data.data?.word_count || 0,
+                content: data.data?.content || '',
+              }])
+              loadRuntimePanels()
+            } else {
+              addLog(`❌ 章节生成失败: ${data.error}`)
+            }
+            break
+          case 'character_added':
+            addLog(`👤 角色已添加: ${data.data?.name}`)
+            if (currentProject) loadCharacters()
+            break
+          case 'character_removed':
+            addLog('👤 角色已移除')
+            if (currentProject) loadCharacters()
+            break
+          case 'agent_response':
+          case 'intervention_response':
+            addLog(`💬 ${data.agent}: ${data.response || '已响应'}`)
+            setInterventionHistory(prev => prev.map(item =>
+              item.agent === data.agent && !item.response
+                ? { ...item, response: data.response }
+                : item
+            ))
+            if (data.agent) {
+              const responseKey = getAgentStateKey({ agent: data.agent, agent_type: data.agent_type, label: data.label })
+              if (responseKey) {
+                setAgentOutput(responseKey, data.response || '')
+              }
+            }
+            break
+          case 'intervention_logged':
+            addLog('📝 干预已记录')
+            break
+          case 'error':
+            addLog(`❌ ${data.message}`)
+            break
+          default:
+            if (data.type !== 'heartbeat') {
+              addLog(`${data.type}: ${JSON.stringify(data.data || {})}`)
+            }
+        }
+      },
+    }
+  )
 
   // Data loading
   const loadRuntimePanels = async () => {
@@ -1157,6 +1344,73 @@ export default function Director() {
   useEffect(() => { loadWorkflows() }, [loadWorkflows])
   useEffect(() => { if (sessionId.trim()) loadRuntimePanels() }, [sessionId])
 
+  useEffect(() => {
+    if (!executionId) {
+      setIsExecutionStreamReady(false)
+      return
+    }
+
+    let active = true
+    let eventSource: EventSource | null = null
+
+    const hydrateExecutionState = async (showErrorLog = false) => {
+      try {
+        const execution = await getExecution(executionId)
+        if (!active) return false
+        applyWorkflowExecutionSnapshot(execution, selectedWorkflowRef.current)
+        return true
+      } catch (error) {
+        if (!active) return false
+        console.error('Failed to hydrate workflow execution:', error)
+        setIsExecutionStreamReady(false)
+        if (showErrorLog) {
+          addLog('❌ 获取工作流执行快照失败')
+        }
+        return false
+      }
+    }
+
+    const connectExecutionStream = async () => {
+      setIsExecutionStreamReady(false)
+      await hydrateExecutionState(false)
+      if (!active) return
+
+      eventSource = createWorkflowExecutionEventSource(executionId)
+
+      const handleWorkflowEvent = (event: MessageEvent<string>) => {
+        try {
+          const payload = JSON.parse(event.data) as WorkflowEventMessage
+          applyDirectorEvent(payload)
+        } catch (error) {
+          console.error('Failed to parse workflow SSE message:', error)
+        }
+      }
+
+      eventSource.addEventListener('workflow_event', handleWorkflowEvent as EventListener)
+
+      eventSource.onopen = () => {
+        if (!active) return
+        setIsExecutionStreamReady(true)
+        void hydrateExecutionState(false)
+      }
+
+      eventSource.onerror = () => {
+        if (!active) return
+        setIsExecutionStreamReady(false)
+      }
+    }
+
+    void connectExecutionStream()
+
+    return () => {
+      active = false
+      setIsExecutionStreamReady(false)
+      if (eventSource) {
+        eventSource.close()
+      }
+    }
+  }, [addLog, applyDirectorEvent, applyWorkflowExecutionSnapshot, executionId])
+
   // 当 WebSocket 连接成功后，发送 start_session
   useEffect(() => {
     if (wsStatus === 'connected' && isConnected && !sessionStartAttempted.current && currentProject) {
@@ -1179,6 +1433,8 @@ export default function Director() {
   const startSession = () => {
     if (!sessionId.trim()) return addLog('请输入会话 ID')
     if (!currentProject) return addLog('请先选择项目')
+    setExecutionId('')
+    setIsExecutionStreamReady(false)
     // 重置标志并设置连接状态，触发 WebSocket 连接
     sessionStartAttempted.current = false
     setIsConnected(true)
@@ -1187,6 +1443,8 @@ export default function Director() {
   const stopSession = () => {
     send({ type: 'stop_session' }) // 先发送停止消息
     setIsGenerating(false)
+    setExecutionId('')
+    setIsExecutionStreamReady(false)
     setIsConnected(false) // 然后断开 WebSocket
     sessionStartAttempted.current = false // 重置以便下次启动
   }
@@ -1197,6 +1455,8 @@ export default function Director() {
     setRuntimeState(null)
     setSnapshotTree([])
     setAutoModeChapters([])
+    setExecutionId('')
+    setIsExecutionStreamReady(false)
     setIsConnected(false)
     setIsGenerating(false)
     sessionStartAttempted.current = false

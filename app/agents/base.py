@@ -9,25 +9,138 @@ import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain_core.language_models import BaseLanguageModel
 
+from app.models.agent_output_contract import OutputContractMode
 from app.models.token_usage import UsageCategory
 
 logger = logging.getLogger(__name__)
 
 
 class AgentResponse(BaseModel):
-    """Agent 响应基类"""
+    """Agent 响应基类。"""
 
     success: bool = Field(default=True, description="是否成功")
-    data: Optional[Any] = Field(default=None, description="响应数据")
+    data: Optional[Any] = Field(default=None, description="兼容旧调用方的响应数据")
     error: Optional[str] = Field(default=None, description="错误信息")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="元数据")
 
+    mode: Optional[OutputContractMode] = Field(default=None, description="输出模式")
+    contract_id: Optional[str] = Field(default=None, description="输出契约 ID")
+    schema_name: Optional[str] = Field(default=None, description="输出 schema 名称")
+    schema_version: Optional[str] = Field(default=None, description="输出 schema 版本")
+    structured_data: Optional[Any] = Field(default=None, description="结构化输出")
+    text_output: Optional[str] = Field(default=None, description="文本输出")
+
     class Config:
         arbitrary_types_allowed = True
+
+    @model_validator(mode="after")
+    def _sync_legacy_and_contract_fields(self):
+        if self.data is not None:
+            if self.structured_data is None and isinstance(self.data, dict):
+                self.structured_data = self.data
+            if self.text_output is None and isinstance(self.data, str):
+                self.text_output = self.data
+            if self.mode is None:
+                if isinstance(self.data, dict):
+                    self.mode = OutputContractMode.STRICT
+                elif isinstance(self.data, str):
+                    self.mode = OutputContractMode.TEXT
+        else:
+            if self.mode == OutputContractMode.TEXT:
+                self.data = self.text_output
+            elif self.mode == OutputContractMode.STRICT:
+                self.data = self.structured_data
+            elif self.mode == OutputContractMode.HYBRID:
+                if self.structured_data is not None and self.text_output is not None:
+                    self.data = {
+                        "text_output": self.text_output,
+                        **self.structured_data,
+                    } if isinstance(self.structured_data, dict) else {
+                        "text_output": self.text_output,
+                        "structured_data": self.structured_data,
+                    }
+                elif self.structured_data is not None:
+                    self.data = self.structured_data
+                elif self.text_output is not None:
+                    self.data = self.text_output
+            elif self.structured_data is not None:
+                self.data = self.structured_data
+                if self.mode is None:
+                    self.mode = OutputContractMode.STRICT
+            elif self.text_output is not None:
+                self.data = self.text_output
+                if self.mode is None:
+                    self.mode = OutputContractMode.TEXT
+
+        return self
+
+    @classmethod
+    def strict(
+        cls,
+        structured_data: Any,
+        *,
+        contract_id: Optional[str] = None,
+        schema_name: Optional[str] = None,
+        schema_version: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> "AgentResponse":
+        return cls(
+            success=True,
+            mode=OutputContractMode.STRICT,
+            contract_id=contract_id,
+            schema_name=schema_name,
+            schema_version=schema_version,
+            structured_data=structured_data,
+            metadata=metadata or {},
+        )
+
+    @classmethod
+    def hybrid(
+        cls,
+        *,
+        text_output: str,
+        structured_data: Optional[Any] = None,
+        contract_id: Optional[str] = None,
+        schema_name: Optional[str] = None,
+        schema_version: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        data: Optional[Any] = None,
+    ) -> "AgentResponse":
+        return cls(
+            success=True,
+            data=data,
+            mode=OutputContractMode.HYBRID,
+            contract_id=contract_id,
+            schema_name=schema_name,
+            schema_version=schema_version,
+            structured_data=structured_data,
+            text_output=text_output,
+            metadata=metadata or {},
+        )
+
+    @classmethod
+    def text(
+        cls,
+        text_output: str,
+        *,
+        contract_id: Optional[str] = None,
+        schema_name: Optional[str] = None,
+        schema_version: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> "AgentResponse":
+        return cls(
+            success=True,
+            mode=OutputContractMode.TEXT,
+            contract_id=contract_id,
+            schema_name=schema_name,
+            schema_version=schema_version,
+            text_output=text_output,
+            metadata=metadata or {},
+        )
 
 
 class BaseAgent(ABC):
@@ -609,7 +722,88 @@ class BaseAgent(ABC):
         except Exception as e:
             logger.warning(f"记录 token 使用失败: {e}")
 
+    async def _call_structured(
+        self,
+        schema,
+        messages: List,
+        *,
+        contract=None,
+        temperature: float = 0.5,
+        category: UsageCategory = UsageCategory.OTHER,
+        max_repair: Optional[int] = None,
+    ):
+        """调用 LLM 获取 schema 校验后的 Pydantic 对象。
+
+        strict / hybrid 输出必须走此方法，而不是 ``_call_llm + _parse_json_response``
+        的文本后解析模式。
+
+        Args:
+            schema: 期望输出对应的 Pydantic 类
+            messages: 消息列表（system prompt 会在此方法内注入）
+            contract: 关联 :class:`AgentOutputContract`，用于决定 retry 策略
+            temperature: 采样温度
+            category: token 用量归类
+            max_repair: 修复轮数上限
+
+        Returns:
+            校验通过的 Pydantic 对象（schema 实例）
+
+        Raises:
+            app.services.structured_llm.StructuredOutputError: 校验最终失败
+        """
+        if not self.model:
+            raise ValueError(f"Agent {self.name} 未配置模型")
+
+        await self._ensure_system_prompt_loaded()
+
+        # 与 _call_llm 保持一致：注入 system prompt + 记忆上下文
+        full_system_prompt = self.system_prompt
+        if self._memory:
+            memory_context = self.get_memory_context()
+            if memory_context:
+                full_system_prompt = f"{self.system_prompt}\n\n{memory_context}"
+
+        full_messages = list(messages)
+        if full_system_prompt:
+            full_messages = [SystemMessage(content=full_system_prompt)] + full_messages
+
+        # 延迟 import 避免循环依赖
+        from app.services.structured_llm import get_structured_llm_runner
+
+        runner = get_structured_llm_runner()
+
+        # 设置 temperature（若模型支持）
+        model_to_use = self.model
+        try:
+            if hasattr(self.model, "bind") and temperature is not None:
+                model_to_use = self.model.bind(temperature=temperature)
+        except Exception:
+            model_to_use = self.model
+
+        parsed, raw_text = await runner.run_structured(
+            model_to_use,
+            schema,
+            full_messages,
+            contract=contract,
+            max_repair=max_repair,
+        )
+
+        # 估算 token 用量（structured output 目前不一定返回 usage_metadata，走估算）
+        try:
+            input_tokens = sum(len(getattr(msg, "content", "") or "") // 4 for msg in full_messages)
+            output_tokens = len(raw_text or "") // 4 or len(parsed.model_dump_json()) // 4
+            self._record_token_usage(input_tokens, output_tokens, category)
+        except Exception as exc:
+            logger.debug(f"structured token 估算失败: {exc}")
+
+        return parsed
+
     def _parse_json_response(self, text: str) -> Dict[str, Any]:
+        """[DEPRECATED] 文本后解析 JSON。
+
+        新代码应使用 :meth:`_call_structured` 直接拿 schema 校验后的 Pydantic 对象。
+        本方法仅保留作为兼容期 fallback，不应再用于新增的 strict / hybrid 输出。
+        """
         import re
 
         # 尝试多种 JSON 提取模式

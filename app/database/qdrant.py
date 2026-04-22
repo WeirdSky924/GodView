@@ -15,6 +15,7 @@ from qdrant_client.models import (
     PointStruct,
     Filter,
     FieldCondition,
+    MatchAny,
     MatchValue,
     SearchParams,
 )
@@ -962,12 +963,20 @@ class QdrantDatabase:
 
         query_filter = None
         if conditions:
-            query_filter = Filter(
-                must=[
-                    FieldCondition(key=key, match=MatchValue(value=value))
-                    for key, value in conditions.items()
-                ]
-            )
+            must_conditions = []
+            for key, value in conditions.items():
+                if isinstance(value, list):
+                    if not value:
+                        continue
+                    must_conditions.append(
+                        FieldCondition(key=key, match=MatchAny(any=value))
+                    )
+                else:
+                    must_conditions.append(
+                        FieldCondition(key=key, match=MatchValue(value=value))
+                    )
+            if must_conditions:
+                query_filter = Filter(must=must_conditions)
 
         results = self._client.query_points(
             collection_name=self.COLLECTION_WRITING_RULES,

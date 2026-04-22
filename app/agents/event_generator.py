@@ -19,8 +19,10 @@ from langchain_core.language_models import BaseLanguageModel
 from langchain_core.messages import HumanMessage
 
 from app.agents.base import BaseAgent, AgentResponse
+from app.models.agent_output_schemas import EventGeneratorEventSchema
 from app.models.agent_template import AgentType
 from app.models.token_usage import UsageCategory
+from app.services.structured_llm import StructuredOutputError
 
 logger = logging.getLogger(__name__)
 
@@ -130,12 +132,12 @@ class EventGeneratorAgent(BaseAgent):
             # 生成事件
             prompt = self._build_generation_prompt(event_type, context, characters, world_info)
 
-            response_text = await self._call_llm(
+            response_parsed = await self._call_structured(
+                EventGeneratorEventSchema,
                 messages=[HumanMessage(content=prompt)],
                 category=UsageCategory.PLOT,
             )
-
-            event_data = self._parse_json_response(response_text)
+            event_data = response_parsed.model_dump()
 
             # 添加到事件池
             if event_data:
@@ -152,6 +154,9 @@ class EventGeneratorAgent(BaseAgent):
                 metadata={"task": task, "event_type": event_type},
             )
 
+        except StructuredOutputError as e:
+            logger.error(f"事件生成 structured 失败: {e}")
+            return AgentResponse(success=False, error=str(e))
         except Exception as e:
             logger.error(f"事件生成失败: {e}")
             return AgentResponse(success=False, error=str(e))

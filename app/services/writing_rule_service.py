@@ -73,11 +73,37 @@ class WritingRuleService:
 
     @staticmethod
     def _ensure_list(value: Optional[List[Any]]) -> List[Any]:
-        return value or []
+        if value in (None, ""):
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except (TypeError, ValueError):
+                return [value] if value else []
+            if parsed is None:
+                return []
+            if isinstance(parsed, list):
+                return parsed
+            return [parsed]
+        return [value]
 
     @staticmethod
     def _ensure_dict(value: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        return value or {}
+        if value in (None, ""):
+            return {}
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except (TypeError, ValueError):
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+        return {}
 
     @staticmethod
     def _normalize_application_mode(value: Any, severity: Any) -> WritingRuleApplicationMode:

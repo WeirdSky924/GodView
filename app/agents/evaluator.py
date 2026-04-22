@@ -9,8 +9,14 @@ from langchain_core.language_models import BaseLanguageModel
 from langchain_core.messages import HumanMessage
 
 from app.agents.base import BaseAgent, AgentResponse
+from app.models.agent_output_schemas import (
+    EvaluatorChapterEndSchema,
+    EvaluatorOOCSchema,
+    EvaluatorReaderSimulateSchema,
+)
 from app.models.agent_template import AgentType
 from app.models.token_usage import UsageCategory
+from app.services.structured_llm import StructuredOutputError
 
 logger = logging.getLogger(__name__)
 
@@ -141,12 +147,19 @@ class EvaluatorAgent(BaseAgent):
 }}"""
 
         try:
-            response_text = await self._call_llm(
-                messages=[HumanMessage(content=prompt)], temperature=0.5,
-                category=UsageCategory.DIRECTOR
+            parsed = await self._call_structured(
+                EvaluatorChapterEndSchema,
+                messages=[HumanMessage(content=prompt)],
+                temperature=0.5,
+                category=UsageCategory.DIRECTOR,
             )
-            result = self._parse_json_response(response_text)
-            return AgentResponse(success=True, data=result)
+            return AgentResponse.strict(
+                structured_data=parsed.model_dump(),
+                schema_name="evaluator.chapter_end",
+            )
+        except StructuredOutputError as e:
+            logger.error(f"章节结束评估 structured 失败：{e}")
+            return AgentResponse(success=False, error=str(e))
         except Exception as e:
             logger.error(f"章节结束评估失败：{e}")
             return AgentResponse(success=False, error=str(e))
@@ -226,25 +239,32 @@ class EvaluatorAgent(BaseAgent):
 }}"""
 
         try:
-            response_text = await self._call_llm(
-                messages=[HumanMessage(content=prompt)], temperature=0.3,
-                category=UsageCategory.DIRECTOR
+            parsed = await self._call_structured(
+                EvaluatorReaderSimulateSchema,
+                messages=[HumanMessage(content=prompt)],
+                temperature=0.3,
+                category=UsageCategory.DIRECTOR,
             )
-            result = self._parse_json_response(response_text)
+            result = parsed.model_dump()
 
             # 计算总体评分
-            if "scores" in result:
-                scores = result["scores"]
-                if isinstance(scores, dict):
-                    values = [
-                        v
-                        for v in scores.values()
-                        if isinstance(v, (int, float)) and 0 <= v <= 10
-                    ]
-                    if values:
-                        result["overall"] = round(sum(values) / len(values), 2)
+            scores = result.get("scores") or {}
+            if isinstance(scores, dict):
+                values = [
+                    v
+                    for v in scores.values()
+                    if isinstance(v, (int, float)) and 0 <= v <= 10
+                ]
+                if values:
+                    result["overall"] = round(sum(values) / len(values), 2)
 
-            return AgentResponse(success=True, data=result)
+            return AgentResponse.strict(
+                structured_data=result,
+                schema_name="evaluator.reader_simulate",
+            )
+        except StructuredOutputError as e:
+            logger.error(f"读者模拟评分 structured 失败：{e}")
+            return AgentResponse(success=False, error=str(e))
         except Exception as e:
             logger.error(f"读者模拟评分失败：{e}")
             return AgentResponse(success=False, error=str(e))
@@ -302,12 +322,19 @@ class EvaluatorAgent(BaseAgent):
 }}"""
 
         try:
-            response_text = await self._call_llm(
-                messages=[HumanMessage(content=prompt)], temperature=0.2,
-                category=UsageCategory.CHARACTER
+            parsed = await self._call_structured(
+                EvaluatorOOCSchema,
+                messages=[HumanMessage(content=prompt)],
+                temperature=0.2,
+                category=UsageCategory.CHARACTER,
             )
-            result = self._parse_json_response(response_text)
-            return AgentResponse(success=True, data=result)
+            return AgentResponse.strict(
+                structured_data=parsed.model_dump(),
+                schema_name="evaluator.ooc",
+            )
+        except StructuredOutputError as e:
+            logger.error(f"OOC 审查 structured 失败：{e}")
+            return AgentResponse(success=False, error=str(e))
         except Exception as e:
             logger.error(f"OOC 审查失败：{e}")
             return AgentResponse(success=False, error=str(e))

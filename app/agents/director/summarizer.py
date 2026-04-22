@@ -9,8 +9,14 @@ from langchain_core.language_models import BaseLanguageModel
 from langchain_core.messages import HumanMessage
 
 from app.agents.base import BaseAgent, AgentResponse
+from app.models.agent_output_schemas import (
+    SummarizerSettingCheckSchema,
+    SummarizerSettingConfirmSchema,
+    SummarizerSummarySchema,
+)
 from app.models.agent_template import AgentType
 from app.models.token_usage import UsageCategory
+from app.services.structured_llm import StructuredOutputError
 
 logger = logging.getLogger(__name__)
 
@@ -110,14 +116,14 @@ class SummarizerAgent(BaseAgent):
                 active_hooks=active_hooks,
             )
 
-            # 调用 LLM
-            response_text = await self._call_llm(
-                messages=[HumanMessage(content=user_message)], temperature=0.3,
-                category=UsageCategory.PLOT
+            # 调用 LLM (structured)
+            parsed = await self._call_structured(
+                SummarizerSummarySchema,
+                messages=[HumanMessage(content=user_message)],
+                temperature=0.3,
+                category=UsageCategory.PLOT,
             )
-
-            # 解析响应
-            result = self._parse_json_response(response_text)
+            result = parsed.model_dump()
 
             return AgentResponse(
                 success=True,
@@ -125,6 +131,9 @@ class SummarizerAgent(BaseAgent):
                 metadata={"participant_count": len(normalized_participants), "dialogue_turns": len(dialogue_history)},
             )
 
+        except StructuredOutputError as e:
+            logger.error(f"SummarizerAgent structured 失败：{e}")
+            return AgentResponse(success=False, error=str(e))
         except Exception as e:
             logger.error(f"SummarizerAgent 执行失败：{e}")
             return AgentResponse(success=False, error=str(e))
@@ -179,12 +188,24 @@ class SummarizerAgent(BaseAgent):
 }}"""
 
             try:
-                response_text = await self._call_llm(
-                    messages=[HumanMessage(content=prompt)], temperature=0.3,
-                    category=UsageCategory.PLOT
+                parsed = await self._call_structured(
+                    SummarizerSettingConfirmSchema,
+                    messages=[HumanMessage(content=prompt)],
+                    temperature=0.3,
+                    category=UsageCategory.PLOT,
                 )
-                result = self._parse_json_response(response_text)
+                result = parsed.model_dump()
                 return AgentResponse(success=True, data=result)
+            except StructuredOutputError as e:
+                logger.error(f"设定确认 structured 失败：{e}")
+                return AgentResponse(
+                    success=True,
+                    data={
+                        "status": "confirmed",
+                        "consistency_check": "世界观设定已加载，等待内容生成后进行一致性检查",
+                        "error": str(e)
+                    }
+                )
             except Exception as e:
                 logger.error(f"设定确认失败：{e}")
                 return AgentResponse(
@@ -228,12 +249,17 @@ class SummarizerAgent(BaseAgent):
 }}"""
 
         try:
-            response_text = await self._call_llm(
-                messages=[HumanMessage(content=prompt)], temperature=0.3,
-                category=UsageCategory.PLOT
+            parsed = await self._call_structured(
+                SummarizerSettingCheckSchema,
+                messages=[HumanMessage(content=prompt)],
+                temperature=0.3,
+                category=UsageCategory.PLOT,
             )
-            result = self._parse_json_response(response_text)
+            result = parsed.model_dump()
             return AgentResponse(success=True, data=result)
+        except StructuredOutputError as e:
+            logger.error(f"设定检查 structured 失败：{e}")
+            return AgentResponse(success=False, error=str(e))
         except Exception as e:
             logger.error(f"设定检查失败：{e}")
             return AgentResponse(success=False, error=str(e))

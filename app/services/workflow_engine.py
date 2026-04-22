@@ -12,6 +12,13 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from app.agents.base import AgentResponse
+from app.models.agent_output_contract import (
+    AgentOutputContract,
+    DEFAULT_AGENT_OUTPUT_CONTRACT_REGISTRY,
+    OutputContractConsumer,
+    OutputContractMode,
+    OutputContractScene,
+)
 from app.models.workflow_definition import (
     NodeType,
     NodeStatus,
@@ -51,6 +58,8 @@ class WorkflowEngine:
         self._workflows: Dict[str, WorkflowDefinition] = {}
         # WebSocket 广播回调
         self._broadcast_callback: Optional[Callable] = None
+        # 执行事件订阅者：execution_id -> queues
+        self._event_subscribers: Dict[str, Set[asyncio.Queue]] = defaultdict(set)
         # Agent 实例获取回调
         self._agent_provider: Optional[Callable] = None
         # 干预队列：execution_id -> List[干预消息]
@@ -61,6 +70,26 @@ class WorkflowEngine:
     def set_broadcast_callback(self, callback: Callable):
         """设置 WebSocket 广播回调"""
         self._broadcast_callback = callback
+
+    def subscribe_execution_events(
+        self,
+        execution_id: str,
+        max_queue_size: int = 100,
+    ) -> asyncio.Queue:
+        """订阅工作流执行事件。"""
+        queue: asyncio.Queue = asyncio.Queue(maxsize=max_queue_size)
+        self._event_subscribers[execution_id].add(queue)
+        return queue
+
+    def unsubscribe_execution_events(self, execution_id: str, queue: asyncio.Queue):
+        """取消订阅工作流执行事件。"""
+        subscribers = self._event_subscribers.get(execution_id)
+        if not subscribers:
+            return
+
+        subscribers.discard(queue)
+        if not subscribers:
+            self._event_subscribers.pop(execution_id, None)
 
     def set_agent_provider(self, provider: Callable):
         """设置 Agent 实例获取回调"""
@@ -1398,6 +1427,190 @@ class WorkflowEngine:
             logger.error(f"从数据库加载数据类型 '{data_type}' 失败: {e}")
             return None
 
+    def _resolve_output_contract(self, contract_id: Optional[str]) -> Optional[AgentOutputContract]:
+        """根据 contract_id 解析输出契约。"""
+        if not contract_id:
+            return None
+        return DEFAULT_AGENT_OUTPUT_CONTRACT_REGISTRY.get(contract_id)
+
+    def _get_response_payload(self, response: Optional[AgentResponse]) -> Any:
+        """提取 AgentResponse 的兼容 payload。"""
+        if response is None:
+            return None
+        if response.structured_data is not None:
+            return response.structured_data
+        if response.text_output is not None:
+            return response.text_output
+        if response.data is not None:
+            return response.data
+        return None
+
+    def _get_response_output_keys(self, response: Optional[AgentResponse]) -> List[str]:
+        """提取响应中的结构化字段名。"""
+        payload = self._get_response_payload(response)
+        if isinstance(payload, dict):
+            return list(payload.keys())
+        return []
+
+    def _normalize_contract_payload(
+        self,
+        contract: AgentOutputContract,
+        payload: Any,
+        response: Optional[AgentResponse] = None,
+    ) -> Any:
+        """针对兼容期的旧输出形态做最小归一化。"""
+        if not isinstance(payload, dict):
+            return payload
+
+        normalized = dict(payload)
+
+        if contract.mode == OutputContractMode.HYBRID and contract.text_field and contract.text_field not in normalized:
+            if response and response.text_output:
+                normalized[contract.text_field] = response.text_output
+            else:
+                for alias in ("content", "message", "text", "output"):
+                    alias_value = normalized.get(alias)
+                    if isinstance(alias_value, str) and alias_value:
+                        normalized[contract.text_field] = alias_value
+                        break
+
+        if contract.contract_id == "writer.workflow_output" and "metadata" not in normalized:
+            metadata = {}
+            for field_name in ("word_count", "style_check", "hooks_embedded", "future_setup"):
+                if field_name in normalized:
+                    metadata[field_name] = normalized[field_name]
+            if response and response.metadata:
+                metadata = {**response.metadata, **metadata}
+            if metadata:
+                normalized["metadata"] = metadata
+
+        return normalized
+
+    def _validate_contract_payload(
+        self,
+        contract: AgentOutputContract,
+        payload: Any,
+        *,
+        node: WorkflowNode,
+        response: Optional[AgentResponse] = None,
+    ) -> Any:
+        """校验 payload 是否符合输出契约。"""
+        normalized = self._normalize_contract_payload(contract, payload, response=response)
+
+        if contract.mode == OutputContractMode.TEXT:
+            if isinstance(normalized, str):
+                return normalized
+            if isinstance(normalized, dict) and contract.text_field and isinstance(normalized.get(contract.text_field), str):
+                return normalized
+            raise ValueError(
+                f"节点 '{node.label}' 输出不符合文本契约 {contract.contract_id}: 缺少文本字段"
+            )
+
+        if not isinstance(normalized, dict):
+            raise ValueError(
+                f"节点 '{node.label}' 输出不符合契约 {contract.contract_id}: 期望对象，实际为 {type(normalized).__name__}"
+            )
+
+        missing_fields: List[str] = []
+        for field_path in contract.structured_fields:
+            top_level_field = field_path.split(".")[0].split("[")[0]
+            if top_level_field and top_level_field not in normalized:
+                missing_fields.append(field_path)
+
+        if contract.mode == OutputContractMode.HYBRID and contract.text_field:
+            text_value = normalized.get(contract.text_field)
+            if not isinstance(text_value, str) or not text_value:
+                missing_fields.append(contract.text_field)
+
+        if missing_fields:
+            raise ValueError(
+                f"节点 '{node.label}' 输出不符合契约 {contract.contract_id}: 缺少字段 {', '.join(sorted(set(missing_fields)))}"
+            )
+
+        return normalized
+
+    def _resolve_node_output_contract(
+        self,
+        node: WorkflowNode,
+        response: Optional[AgentResponse] = None,
+    ) -> AgentOutputContract:
+        """解析节点本次执行的主输出契约。"""
+        explicit_contract_ids = [cfg.contract_id for cfg in node.outputs if cfg.contract_id]
+        if explicit_contract_ids:
+            contract = self._resolve_output_contract(explicit_contract_ids[0])
+            if not contract:
+                raise ValueError(f"节点 '{node.label}' 引用了不存在的输出契约: {explicit_contract_ids[0]}")
+            return contract
+
+        if response and response.contract_id:
+            contract = self._resolve_output_contract(response.contract_id)
+            if not contract:
+                raise ValueError(f"节点 '{node.label}' 返回了不存在的输出契约: {response.contract_id}")
+            return contract
+
+        default_contract = self._resolve_output_contract("workflow.node_output")
+        if not default_contract:
+            raise ValueError("默认工作流输出契约 workflow.node_output 不存在")
+        return default_contract
+
+    def _apply_node_output_contract(
+        self,
+        node: WorkflowNode,
+        output: Any,
+        response: Optional[AgentResponse] = None,
+    ) -> tuple[Any, AgentOutputContract]:
+        """对节点输出应用主契约与工作流包装契约校验。"""
+        contract = self._resolve_node_output_contract(node, response)
+        validated_output = output
+
+        if contract.contract_id != "workflow.node_output":
+            validated_output = self._validate_contract_payload(
+                contract,
+                output,
+                node=node,
+                response=response,
+            )
+
+        wrapper_contract = self._resolve_output_contract("workflow.node_output")
+        if not wrapper_contract:
+            raise ValueError("默认工作流输出契约 workflow.node_output 不存在")
+
+        self._validate_contract_payload(
+            wrapper_contract,
+            {
+                "node_id": node.id,
+                "output": validated_output,
+            },
+            node=node,
+        )
+
+        return validated_output, contract
+
+    def _build_contract_metadata(
+        self,
+        contract: Optional[AgentOutputContract],
+        response: Optional[AgentResponse] = None,
+    ) -> Dict[str, Any]:
+        """构建可序列化的输出契约元数据。"""
+        if not contract and not response:
+            return {}
+
+        mode = response.mode if response and response.mode else (contract.mode if contract else None)
+        contract_id = response.contract_id if response and response.contract_id else (contract.contract_id if contract else None)
+        schema_name = response.schema_name if response and response.schema_name else (contract.schema_name if contract else None)
+        schema_version = (
+            response.schema_version
+            if response and response.schema_version
+            else (contract.schema_version if contract else None)
+        )
+
+        return {
+            "output_contract_id": contract_id,
+            "output_mode": mode.value if isinstance(mode, OutputContractMode) else mode,
+            "output_schema_name": schema_name,
+            "output_schema_version": schema_version,
+        }
+
     async def _process_node_outputs(
         self,
         node: WorkflowNode,
@@ -1528,6 +1741,8 @@ class WorkflowEngine:
 
         prepared_context: Optional[Dict[str, Any]] = None
         context_updates: List[str] = []
+        output_contract: Optional[AgentOutputContract] = None
+        agent_response: Optional[AgentResponse] = None
 
         # ========== 根据节点 inputs 配置准备输入数据 ==========
         # 如果节点有 inputs 配置，使用新逻辑；否则保持原有行为（向后兼容）
@@ -1551,7 +1766,7 @@ class WorkflowEngine:
         await self._broadcast_status(execution.id, "node_started", broadcast_data)
 
         try:
-            output = {}
+            output: Any = {}
 
             if actual_node_type == NodeType.START:
                 # 开始节点：加载基础上下文并传递给后续节点
@@ -1565,7 +1780,17 @@ class WorkflowEngine:
 
             elif actual_node_type == NodeType.AGENT:
                 # Agent节点：调用 Agent
-                output = await self._execute_agent_node(node, execution, execution.project_id, db)
+                output, agent_response, output_contract = await self._execute_agent_node(
+                    node,
+                    execution,
+                    execution.project_id,
+                    db,
+                )
+                output, output_contract = self._apply_node_output_contract(
+                    node,
+                    output,
+                    response=agent_response,
+                )
 
             elif node.node_type == NodeType.CONDITION:
                 # 条件节点：评估条件
@@ -1593,11 +1818,18 @@ class WorkflowEngine:
             node_state.output_data = self._make_json_safe(output)
             node_state.completed_at = datetime.now()
 
+            if output_contract:
+                contract_metadata = self._build_contract_metadata(output_contract, agent_response)
+                node_state.output_contract_id = contract_metadata.get("output_contract_id")
+                node_state.output_mode = output_contract.mode
+                node_state.output_schema_name = contract_metadata.get("output_schema_name")
+                node_state.output_schema_version = contract_metadata.get("output_schema_version")
+
             if node_state.started_at and node_state.completed_at:
                 delta = node_state.completed_at - node_state.started_at
                 node_state.duration_ms = int(delta.total_seconds() * 1000)
 
-            if actual_node_type == NodeType.CONDITION and "quality_passed" in output:
+            if actual_node_type == NodeType.CONDITION and isinstance(output, dict) and "quality_passed" in output:
                 execution.context["evaluation_passed"] = output["quality_passed"]
 
             # ========== 根据节点 outputs 配置处理输出 ==========
@@ -1607,10 +1839,14 @@ class WorkflowEngine:
                 execution.context.update(processed_output)
                 context_updates = list(processed_output.keys())
                 logger.info(f"节点 '{node.label}' 根据 outputs 配置处理了 {len(node.outputs)} 个输出")
-            else:
+            elif isinstance(output, dict):
                 # 向后兼容：所有输出保存到上下文
                 execution.context.update(output)
                 context_updates = list(output.keys())
+            elif output is not None:
+                default_output_key = f"{node.id}_output"
+                execution.context[default_output_key] = output
+                context_updates = [default_output_key]
 
         except Exception as e:
             logger.error(f"节点执行失败: {node.id} - {e}")
@@ -1632,12 +1868,15 @@ class WorkflowEngine:
             "context_updates": context_updates,
             "duration_ms": node_state.duration_ms,
             "error": node_state.error,
+            "output_contract_id": node_state.output_contract_id,
+            "output_mode": node_state.output_mode.value if node_state.output_mode else None,
+            "output_schema_name": node_state.output_schema_name,
+            "output_schema_version": node_state.output_schema_version,
         }
         # 如果是 Agent 节点，添加 agent_type
         if actual_node_type == NodeType.AGENT and node.agent_type:
             completed_data["agent_type"] = node.agent_type
         await self._broadcast_status(execution.id, "node_completed", completed_data)
-
     async def _execute_start_node(
         self,
         execution: "WorkflowExecution",
@@ -1823,7 +2062,7 @@ class WorkflowEngine:
         execution: "WorkflowExecution",
         project_id: str,
         db=None,
-    ) -> Dict[str, Any]:
+    ) -> tuple[Any, Optional[AgentResponse], Optional[AgentOutputContract]]:
         """执行 Agent 节点（支持 runtime 禁用校验、adapter 和实时干预）。"""
         profile = get_workflow_node_profile(node.agent_type)
         resolved_agent_type = profile.agent_type if profile else (node.agent_type or "")
@@ -1872,17 +2111,19 @@ class WorkflowEngine:
             logger.info(
                 f"跳过 Agent 节点: type={resolved_agent_type}, node_id={node.id}, reason={reason}"
             )
-            return {
+            skipped_output = {
                 "skipped": True,
                 "reason": reason,
                 "agent_type": resolved_agent_type,
                 "node_id": node.id,
             }
+            return skipped_output, None, None
 
         if adapter:
             execution.context.update(context)
             logger.info(f"节点 '{node.label}' 使用 workflow adapter 执行: {resolved_agent_type}")
-            return await adapter.execute(node, execution, db)
+            adapter_output = await adapter.execute(node, execution, db)
+            return adapter_output, None, None
 
         if not self._agent_provider:
             raise ValueError("Agent provider 未设置")
@@ -2322,7 +2563,7 @@ class WorkflowEngine:
         execution: "WorkflowExecution",
         node: WorkflowNode,
         db=None,
-    ) -> Dict[str, Any]:
+    ) -> tuple[Any, Optional[AgentResponse], Optional[AgentOutputContract]]:
         """执行Agent并处理结果"""
         if isinstance(agent, list):
             logger.info(f"Agent 节点 {node.agent_type} 返回 {len(agent)} 个实例，按多 Agent 模式执行")
@@ -2387,8 +2628,10 @@ class WorkflowEngine:
                     if hasattr(sub_agent, '_stream_callback'):
                         sub_agent._stream_callback = None
 
-                if sub_result.success and sub_result.data:
-                    data = sub_result.data
+                sub_payload = self._get_response_payload(sub_result)
+
+                if sub_result.success and isinstance(sub_payload, dict):
+                    data = sub_payload
                     character_name = (
                         data.get("character_name")
                         or getattr(getattr(sub_agent, 'character', None), 'name', None)
@@ -2451,7 +2694,7 @@ class WorkflowEngine:
                                 context={
                                     "node_id": node.id,
                                     "execution_id": execution.id,
-                                    "output_keys": list(sub_result.data.keys()) if sub_result.data else [],
+                                    "output_keys": self._get_response_output_keys(sub_result),
                                 },
                             )
                         else:
@@ -2480,7 +2723,7 @@ class WorkflowEngine:
             }
             if errors:
                 result_payload["errors"] = errors
-            return result_payload
+            return result_payload, None, None
 
         chunk_count = 0  # 统计发送的 chunk 数量
         agent_id = id(agent)  # 获取 agent 实例 ID 用于调试
@@ -2557,6 +2800,14 @@ class WorkflowEngine:
             if hasattr(agent, '_stream_callback'):
                 agent._stream_callback = None
 
+        payload = self._get_response_payload(result)
+        resolved_contract = None
+        if result.success:
+            try:
+                resolved_contract = self._resolve_node_output_contract(node, result)
+            except Exception as e:
+                logger.warning(f"解析 Agent 输出契约失败: node={node.id}, error={e}")
+
         # 日志记录流式输出统计
         if chunk_count > 0:
             logger.info(f"Agent {node.agent_type} (实例ID: {agent_id}) 发送了 {chunk_count} 个流式 chunk")
@@ -2570,17 +2821,19 @@ class WorkflowEngine:
 
         # 广播 Agent 完成输出
         if result.success:
-            await self._broadcast_status(execution.id, "agent_output", {
+            agent_output_event = {
                 "agent": node.agent_type,
                 "node_id": node.id,
                 "label": node.label,
-                "output": result.data,
-            })
+                "output": payload,
+            }
+            agent_output_event.update(self._build_contract_metadata(resolved_contract, result))
+            await self._broadcast_status(execution.id, "agent_output", agent_output_event)
+
+        output_data = payload if isinstance(payload, dict) else {}
 
         # 如果是评估 Agent，保存完整评估结果
         if node.agent_type == "evaluator" and result.success:
-            output_data = result.data or {}
-
             # 字数检查
             word_count_check = output_data.get("word_count_check", {})
             chapter_content = execution.context.get("chapter_content", "")
@@ -2648,9 +2901,9 @@ class WorkflowEngine:
 
         # 如果是角色 Agent，保存角色对话和状态
         if node.agent_type in ["character", "character_agent"] or node.agent_type.startswith("character:") or node.agent_type.startswith("char_"):
-            if result.success and result.data:
+            if result.success and output_data:
                 # 保存角色状态
-                new_status = result.data.get("new_status")
+                new_status = output_data.get("new_status")
                 if new_status:
                     execution.context.setdefault("character_status_changes", []).append({
                         "character_id": node.agent_type,
@@ -2658,7 +2911,7 @@ class WorkflowEngine:
                     })
 
                 # 保存角色对话内容（供 Writer 参考）
-                dialogue = result.data.get("dialogue", result.data.get("content", ""))
+                dialogue = output_data.get("dialogue", output_data.get("content", ""))
                 if dialogue:
                     execution.context.setdefault("character_dialogues", []).append({
                         "character": node.agent_type,
@@ -2666,20 +2919,20 @@ class WorkflowEngine:
                     })
 
                 # 保存角色情绪状态
-                emotion = result.data.get("emotion", result.data.get("mood", ""))
-                character_name = result.data.get("character_name", node.agent_type.split(":")[-1] if ":" in node.agent_type else "角色")
+                emotion = output_data.get("emotion", output_data.get("mood", ""))
+                character_name = output_data.get("character_name", node.agent_type.split(":")[-1] if ":" in node.agent_type else "角色")
                 if emotion:
                     execution.context.setdefault("character_moods", {})[character_name] = emotion
 
                 logger.info(f"角色 Agent {node.agent_type} 输出已保存")
 
         # 如果是 Writer Agent，保存章节到数据库
-        if node.agent_type == "writer" and result.success and result.data:
-            await self._save_chapter_from_writer(execution, result.data, db)
+        if node.agent_type == "writer" and result.success and output_data:
+            await self._save_chapter_from_writer(execution, output_data, db)
 
             # ========== 角色检测与晋升 ==========
             # 在章节内容生成后，检测可能的新角色
-            chapter_content = result.data.get("content", "")
+            chapter_content = output_data.get("content") or output_data.get("chapter_content", "")
             if chapter_content and len(chapter_content) > 500:
                 # 获取 Writer Agent 的 LLM 模型用于智能角色检测
                 writer_model = getattr(agent, 'model', None) if agent else None
@@ -2691,24 +2944,24 @@ class WorkflowEngine:
                 )
 
         # 如果是伏笔管理 Agent，保存伏笔到数据库
-        if node.agent_type == "hook_manager" and result.success and result.data:
-            await self._save_hooks_from_manager(execution, result.data, db)
+        if node.agent_type == "hook_manager" and result.success and output_data:
+            await self._save_hooks_from_manager(execution, output_data, db)
 
         # 如果是设定 Agent，保存设定到 lore_entries 表
-        if node.agent_type == "setting" and result.success and result.data:
-            await self._save_lore_from_setting(execution, result.data, db)
+        if node.agent_type == "setting" and result.success and output_data:
+            await self._save_lore_from_setting(execution, output_data, db)
 
         # 如果是世界生成 Agent，保存区域到数据库
-        if node.agent_type in ["procgen", "proc_gen", "world_map_manager", "event_generator", "dungeon_generator"] and result.success and result.data:
-            await self._save_world_data_from_procgen(execution, result.data, db)
+        if node.agent_type in ["procgen", "proc_gen", "world_map_manager", "event_generator", "dungeon_generator"] and result.success and output_data:
+            await self._save_world_data_from_procgen(execution, output_data, db)
 
         # 如果是摘要 Agent，保存剧情摘要
-        if node.agent_type == "summarizer" and result.success and result.data:
-            await self._save_summary_from_summarizer(execution, result.data, db)
+        if node.agent_type == "summarizer" and result.success and output_data:
+            await self._save_summary_from_summarizer(execution, output_data, db)
 
         # 如果是编剧 Agent，保存剧情规划
-        if node.agent_type in ["master_plotter", "plotter"] and result.success and result.data:
-            await self._save_plot_from_plotter(execution, result.data, db)
+        if node.agent_type in ["master_plotter", "plotter"] and result.success and output_data:
+            await self._save_plot_from_plotter(execution, output_data, db)
 
         # ========== 保存 Agent 记忆 ==========
         if hasattr(agent, 'save_memory') and agent._memory:
@@ -2723,7 +2976,7 @@ class WorkflowEngine:
                         context={
                             "node_id": node.id,
                             "execution_id": execution.id,
-                            "output_keys": list(result.data.keys()) if result.data else [],
+                            "output_keys": self._get_response_output_keys(result),
                         },
                     )
                 else:
@@ -2746,7 +2999,7 @@ class WorkflowEngine:
             except Exception as e:
                 logger.warning(f"保存 Agent {node.agent_type} 记忆失败: {e}")
 
-        return result.data if result.success else {"error": result.error}
+        return (payload if result.success else {"error": result.error}), result, resolved_contract
 
     def _infer_task_type(self, agent_type: str, node_label: str) -> str:
         """
@@ -3706,7 +3959,11 @@ class WorkflowEngine:
                 logger.error(f"场景协调执行失败: {result.error}")
                 return {"error": result.error, "status": "failed"}
 
-            performance_result = dict(result.data or {})
+            performance_result = self._get_response_payload(result)
+            if isinstance(performance_result, dict):
+                performance_result = dict(performance_result)
+            else:
+                performance_result = {}
             performance_messages = list(performance_result.get("performances", []))
 
             for msg in performance_messages:
@@ -6519,10 +6776,16 @@ class WorkflowEngine:
 
     async def _broadcast_status(self, execution_id: str, event_type: str, data: Dict[str, Any]):
         """广播状态更新"""
+        # 序列化数据，处理 UUID 和其他非 JSON 类型
+        serialized_data = self._serialize_for_json(data)
+        event_payload = {
+            "type": event_type,
+            "execution_id": execution_id,
+            "data": serialized_data,
+        }
+
         if self._broadcast_callback:
             try:
-                # 序列化数据，处理 UUID 和其他非 JSON 类型
-                serialized_data = self._serialize_for_json(data)
                 await self._broadcast_callback(execution_id, event_type, serialized_data)
             except Exception as e:
                 # 连接断开是正常情况，使用 debug 级别避免日志污染
@@ -6530,6 +6793,29 @@ class WorkflowEngine:
                     logger.debug(f"WebSocket 已断开，跳过广播: {event_type}")
                 else:
                     logger.warning(f"广播状态失败: {e}")
+
+        subscribers = list(self._event_subscribers.get(execution_id, set()))
+        stale_queues: List[asyncio.Queue] = []
+        for queue in subscribers:
+            try:
+                queue.put_nowait(event_payload)
+            except asyncio.QueueFull:
+                logger.debug(f"执行事件订阅队列已满，丢弃最旧事件: {execution_id}")
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+
+                try:
+                    queue.put_nowait(event_payload)
+                except asyncio.QueueFull:
+                    stale_queues.append(queue)
+            except Exception as e:
+                logger.debug(f"推送执行事件失败，移除订阅者: {execution_id}, error={e}")
+                stale_queues.append(queue)
+
+        for queue in stale_queues:
+            self.unsubscribe_execution_events(execution_id, queue)
 
     def _serialize_for_json(self, obj: Any) -> Any:
         """递归序列化对象，处理 UUID 等非 JSON 类型"""

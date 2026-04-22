@@ -114,7 +114,7 @@ export default function SettingAgentChat({
       const assistantMessage: Message = {
         id: `assistant_${Date.now()}`,
         role: 'assistant',
-        content: response.response,
+        content: response.message,
         timestamp: new Date(),
       }
 
@@ -513,13 +513,13 @@ export default function SettingAgentChat({
           },
         ])
         onConflictResolved?.()
-      } else if (result.response) {
+      } else if (result.message) {
         setMessages((prev) => [
           ...prev,
           {
             id: `negotiate_${Date.now()}`,
             role: 'assistant',
-            content: result.response!,
+            content: result.message!,
             timestamp: new Date(),
             conflict: result.conflict,
           },

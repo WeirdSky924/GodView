@@ -851,8 +851,9 @@ class SkillService:
         start_time = time.time()
 
         try:
-            result = await self._execute_skill_internal(skill, dto.parameters)
+            raw_result = await self._execute_skill_internal(skill, dto.parameters)
             execution_time_ms = int((time.time() - start_time) * 1000)
+            result = self._build_skill_test_result(raw_result, execution_time_ms)
 
             # 更新使用统计
             skill.usage_count += 1
@@ -878,16 +879,12 @@ class SkillService:
                 project_id=dto.project_id,
                 agent_id=dto.agent_id,
                 input_params=dto.parameters,
-                output_result=result,
+                output_result=result.output,
                 success=True,
                 execution_time_ms=execution_time_ms,
             )
 
-            return SkillTestResult(
-                success=True,
-                output=result,
-                execution_time_ms=execution_time_ms,
-            )
+            return result
 
         except Exception as e:
             execution_time_ms = int((time.time() - start_time) * 1000)
@@ -914,7 +911,7 @@ class SkillService:
         self,
         skill: Skill,
         parameters: Dict[str, Any],
-    ) -> str:
+    ) -> Any:
         """内部执行逻辑"""
         if skill.skill_type == SkillType.PROMPT:
             return await self._execute_prompt_skill(skill, parameters)
@@ -926,6 +923,42 @@ class SkillService:
             return await self._execute_knowledge_skill(skill, parameters)
         else:
             raise ValueError(f"未知的 Skill 类型: {skill.skill_type}")
+
+    def _build_skill_test_result(
+        self,
+        raw_result: Any,
+        execution_time_ms: int,
+    ) -> SkillTestResult:
+        """将 Skill 原始执行结果标准化为兼容新旧边界的响应对象。"""
+        if isinstance(raw_result, str):
+            return SkillTestResult(
+                success=True,
+                output=raw_result,
+                execution_time_ms=execution_time_ms,
+            )
+
+        if raw_result is None:
+            return SkillTestResult(
+                success=True,
+                text_output="",
+                execution_time_ms=execution_time_ms,
+            )
+
+        if hasattr(raw_result, "model_dump") and callable(raw_result.model_dump):
+            raw_result = raw_result.model_dump()
+
+        if isinstance(raw_result, (dict, list)):
+            return SkillTestResult(
+                success=True,
+                structured_output=raw_result,
+                execution_time_ms=execution_time_ms,
+            )
+
+        return SkillTestResult(
+            success=True,
+            text_output=str(raw_result),
+            execution_time_ms=execution_time_ms,
+        )
 
     async def _execute_prompt_skill(
         self,

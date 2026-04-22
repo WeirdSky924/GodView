@@ -1322,8 +1322,11 @@ async def design_supporting_character_exit(
         if not result.success:
             raise HTTPException(status_code=500, detail=result.error)
 
-        import json
-        exit_design = json.loads(result.output)
+        try:
+            exit_design = result.require_structured_output()
+        except Exception as exc:
+            logger.error(f"配角退场设计输出缺少结构化字段: {exc}")
+            raise HTTPException(status_code=500, detail="退场设计输出格式错误") from exc
 
         # 更新生命周期状态
         await postgres_db.execute_query(

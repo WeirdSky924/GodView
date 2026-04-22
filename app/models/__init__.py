@@ -29,6 +29,16 @@ from app.models.agent_config import (
     AgentConfigCreate,
     AgentConfigUpdate
 )
+from app.models.agent_output_contract import (
+    OutputContractMode,
+    OutputContractScene,
+    OutputContractConsumer,
+    OutputContractRetryPolicy,
+    AgentOutputContract,
+    AgentOutputContractRegistry,
+    DEFAULT_AGENT_OUTPUT_CONTRACTS,
+    DEFAULT_AGENT_OUTPUT_CONTRACT_REGISTRY,
+)
 from app.models.skill import (
     SkillType,
     SkillStatus,
@@ -153,6 +163,15 @@ __all__ = [
     "AgentConfig",
     "AgentConfigCreate",
     "AgentConfigUpdate",
+    # Agent output contract models
+    "OutputContractMode",
+    "OutputContractScene",
+    "OutputContractConsumer",
+    "OutputContractRetryPolicy",
+    "AgentOutputContract",
+    "AgentOutputContractRegistry",
+    "DEFAULT_AGENT_OUTPUT_CONTRACTS",
+    "DEFAULT_AGENT_OUTPUT_CONTRACT_REGISTRY",
     # Skill models
     "SkillType",
     "SkillStatus",

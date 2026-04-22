@@ -3,7 +3,7 @@ import { Button, Input, TextArea } from '@/components/ui'
 import PageLayout from '@/components/PageLayout'
 import TagSelector from '@/components/world/TagSelector'
 import { getWorlds, createWorld, updateWorld } from '@/api/worlds'
-import { chatWithSettingAgent } from '@/api/settingAgent'
+import { analyzeWorldDescription } from '@/api/settingAgent'
 import type { World, CreateWorldDTO, UpdateWorldDTO } from '@/api/worlds'
 import {
   Save,
@@ -223,29 +223,10 @@ export default function Worlds() {
 
     setAnalyzing(true)
     try {
-      const prompt = `分析以下世界观描述，提取关键信息：
-
-${formData.description}
-
-以 JSON 格式输出：
-{
-  "power_system": "力量体系描述",
-  "technology_level": "科技水平描述",
-  "history": "世界历史概述",
-  "geography": "地理环境描述"
-}
-
-只输出 JSON。`
-
-      const response = await chatWithSettingAgent(currentProject.id, prompt)
-      let jsonStr = response.response
-      if (jsonStr.includes('```json')) {
-        jsonStr = jsonStr.split('```json')[1].split('```')[0]
-      } else if (jsonStr.includes('```')) {
-        jsonStr = jsonStr.split('```')[1].split('```')[0]
-      }
-
-      const result = JSON.parse(jsonStr.trim())
+      const { structured_data: result } = await analyzeWorldDescription(
+        currentProject.id,
+        formData.description,
+      )
       setFormData(prev => ({
         ...prev,
         power_system: result.power_system || prev.power_system,

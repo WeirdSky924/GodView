@@ -19,8 +19,10 @@ from langchain_core.language_models import BaseLanguageModel
 from langchain_core.messages import HumanMessage
 
 from app.agents.base import BaseAgent, AgentResponse
+from app.models.agent_output_schemas import WorldMapOverviewSchema
 from app.models.agent_template import AgentType
 from app.models.token_usage import UsageCategory
+from app.services.structured_llm import StructuredOutputError
 
 logger = logging.getLogger(__name__)
 
@@ -229,12 +231,16 @@ class WorldMapManagerAgent(BaseAgent):
     "suggested_starting_location": "建议的起始地点"
 }}"""
 
-        response_text = await self._call_llm(
-            messages=[HumanMessage(content=prompt)],
-            category=UsageCategory.WORLD,
-        )
-
-        map_data = self._parse_json_response(response_text)
+        try:
+            parsed = await self._call_structured(
+                WorldMapOverviewSchema,
+                messages=[HumanMessage(content=prompt)],
+                category=UsageCategory.WORLD,
+            )
+            map_data = parsed.model_dump()
+        except StructuredOutputError as e:
+            logger.error(f"地图概述 structured 失败: {e}")
+            return AgentResponse(success=False, error=str(e))
 
         # 缓存区域
         for region in map_data.get("regions", []):

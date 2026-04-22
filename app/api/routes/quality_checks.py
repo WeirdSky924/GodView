@@ -9,11 +9,20 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from app.models.skill import SkillTestResult
 from app.services.skill_service import get_skill_service, ExecuteSkillDTO
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _require_structured_dict(result: SkillTestResult, error_detail: str) -> Dict[str, Any]:
+    try:
+        return result.require_structured_dict()
+    except ValueError as exc:
+        logger.warning("质量检测 Skill 返回了无效结构化输出: %s", exc)
+        raise HTTPException(status_code=500, detail=error_detail) from exc
 
 
 # ==================== 请求/响应模型 ====================
@@ -189,20 +198,16 @@ async def check_golden_three_chapters(request: GoldenThreeCheckRequest):
     if not result.success:
         raise HTTPException(status_code=500, detail=result.error)
 
-    import json
-    try:
-        data = json.loads(result.output)
-        return GoldenThreeCheckResponse(
-            success=True,
-            opening_analysis=data.get("opening_analysis", {}),
-            chapter_scores=data.get("chapter_scores", {}),
-            golden_rules=data.get("golden_rules", {}),
-            reader_retention_prediction=data.get("reader_retention_prediction", "中"),
-            improvement_suggestions=data.get("improvement_suggestions", []),
-            overall_score=data.get("overall_score", 0),
-        )
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="解析检测结果失败")
+    data = _require_structured_dict(result, "解析检测结果失败")
+    return GoldenThreeCheckResponse(
+        success=True,
+        opening_analysis=data.get("opening_analysis", {}),
+        chapter_scores=data.get("chapter_scores", {}),
+        golden_rules=data.get("golden_rules", {}),
+        reader_retention_prediction=data.get("reader_retention_prediction", "中"),
+        improvement_suggestions=data.get("improvement_suggestions", []),
+        overall_score=data.get("overall_score", 0),
+    )
 
 
 @router.post("/satisfaction", response_model=SatisfactionAnalysisResponse)
@@ -225,18 +230,14 @@ async def analyze_satisfaction(request: SatisfactionAnalysisRequest):
     if not result.success:
         raise HTTPException(status_code=500, detail=result.error)
 
-    import json
-    try:
-        data = json.loads(result.output)
-        return SatisfactionAnalysisResponse(
-            success=True,
-            cool_points=data.get("cool_points", []),
-            density_analysis=data.get("density_analysis", {}),
-            overall_assessment=data.get("overall_assessment", ""),
-            suggestions=data.get("suggestions", []),
-        )
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="解析检测结果失败")
+    data = _require_structured_dict(result, "解析检测结果失败")
+    return SatisfactionAnalysisResponse(
+        success=True,
+        cool_points=data.get("cool_points", []),
+        density_analysis=data.get("density_analysis", {}),
+        overall_assessment=data.get("overall_assessment", ""),
+        suggestions=data.get("suggestions", []),
+    )
 
 
 @router.post("/consistency", response_model=ConsistencyCheckResponse)
@@ -262,18 +263,14 @@ async def check_consistency(request: ConsistencyCheckRequest):
     if not result.success:
         raise HTTPException(status_code=500, detail=result.error)
 
-    import json
-    try:
-        data = json.loads(result.output)
-        return ConsistencyCheckResponse(
-            success=True,
-            conflicts=data.get("conflicts", []),
-            setting_gaps=data.get("setting_gaps", []),
-            consistency_score=data.get("consistency_score", 0),
-            risk_areas=data.get("risk_areas", []),
-        )
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="解析检测结果失败")
+    data = _require_structured_dict(result, "解析检测结果失败")
+    return ConsistencyCheckResponse(
+        success=True,
+        conflicts=data.get("conflicts", []),
+        setting_gaps=data.get("setting_gaps", []),
+        consistency_score=data.get("consistency_score", 0),
+        risk_areas=data.get("risk_areas", []),
+    )
 
 
 @router.post("/plot-hole", response_model=PlotHoleCheckResponse)
@@ -298,18 +295,14 @@ async def check_plot_hole(request: PlotHoleCheckRequest):
     if not result.success:
         raise HTTPException(status_code=500, detail=result.error)
 
-    import json
-    try:
-        data = json.loads(result.output)
-        return PlotHoleCheckResponse(
-            success=True,
-            plot_holes=data.get("plot_holes", []),
-            logic_issues=data.get("logic_issues", []),
-            overall_quality=data.get("overall_quality", ""),
-            risk_level=data.get("risk_level", "low"),
-        )
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="解析检测结果失败")
+    data = _require_structured_dict(result, "解析检测结果失败")
+    return PlotHoleCheckResponse(
+        success=True,
+        plot_holes=data.get("plot_holes", []),
+        logic_issues=data.get("logic_issues", []),
+        overall_quality=data.get("overall_quality", ""),
+        risk_level=data.get("risk_level", "low"),
+    )
 
 
 @router.post("/character-memory", response_model=CharacterMemoryCheckResponse)
@@ -335,18 +328,14 @@ async def check_character_memory(request: CharacterMemoryCheckRequest):
     if not result.success:
         raise HTTPException(status_code=500, detail=result.error)
 
-    import json
-    try:
-        data = json.loads(result.output)
-        return CharacterMemoryCheckResponse(
-            success=True,
-            memory_issues=data.get("memory_issues", []),
-            consistency_score=data.get("consistency_score", 0),
-            character_authenticity=data.get("character_authenticity", ""),
-            warnings=data.get("warnings", []),
-        )
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="解析检测结果失败")
+    data = _require_structured_dict(result, "解析检测结果失败")
+    return CharacterMemoryCheckResponse(
+        success=True,
+        memory_issues=data.get("memory_issues", []),
+        consistency_score=data.get("consistency_score", 0),
+        character_authenticity=data.get("character_authenticity", ""),
+        warnings=data.get("warnings", []),
+    )
 
 
 @router.post("/power-level", response_model=PowerLevelCheckResponse)
@@ -372,19 +361,15 @@ async def check_power_level(request: PowerLevelCheckRequest):
     if not result.success:
         raise HTTPException(status_code=500, detail=result.error)
 
-    import json
-    try:
-        data = json.loads(result.output)
-        return PowerLevelCheckResponse(
-            success=True,
-            power_issues=data.get("power_issues", []),
-            battle_analysis=data.get("battle_analysis", []),
-            power_balance_score=data.get("power_balance_score", 0),
-            collapse_risk=data.get("collapse_risk", "low"),
-            warnings=data.get("warnings", []),
-        )
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="解析检测结果失败")
+    data = _require_structured_dict(result, "解析检测结果失败")
+    return PowerLevelCheckResponse(
+        success=True,
+        power_issues=data.get("power_issues", []),
+        battle_analysis=data.get("battle_analysis", []),
+        power_balance_score=data.get("power_balance_score", 0),
+        collapse_risk=data.get("collapse_risk", "low"),
+        warnings=data.get("warnings", []),
+    )
 
 
 @router.post("/pacing", response_model=PacingAnalysisResponse)
@@ -408,20 +393,16 @@ async def analyze_pacing(request: PacingAnalysisRequest):
     if not result.success:
         raise HTTPException(status_code=500, detail=result.error)
 
-    import json
-    try:
-        data = json.loads(result.output)
-        return PacingAnalysisResponse(
-            success=True,
-            pacing_score=data.get("pacing_score", 0),
-            pacing_status=data.get("pacing_status", "适中"),
-            sections_analysis=data.get("sections_analysis", []),
-            water_content=data.get("water_content", {}),
-            rhythm_curve=data.get("rhythm_curve", []),
-            improvement_suggestions=data.get("improvement_suggestions", []),
-        )
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="解析检测结果失败")
+    data = _require_structured_dict(result, "解析检测结果失败")
+    return PacingAnalysisResponse(
+        success=True,
+        pacing_score=data.get("pacing_score", 0),
+        pacing_status=data.get("pacing_status", "适中"),
+        sections_analysis=data.get("sections_analysis", []),
+        water_content=data.get("water_content", {}),
+        rhythm_curve=data.get("rhythm_curve", []),
+        improvement_suggestions=data.get("improvement_suggestions", []),
+    )
 
 
 @router.post("/dialogue-style", response_model=DialogueStyleCheckResponse)
@@ -449,19 +430,15 @@ async def check_dialogue_style(request: DialogueStyleCheckRequest):
     if not result.success:
         raise HTTPException(status_code=500, detail=result.error)
 
-    import json
-    try:
-        data = json.loads(result.output)
-        return DialogueStyleCheckResponse(
-            success=True,
-            dialogue_analysis=data.get("dialogue_analysis", []),
-            character_voice_score=data.get("character_voice_score", 0),
-            uniqueness_score=data.get("uniqueness_score", 0),
-            ooc_warnings=data.get("ooc_warnings", []),
-            style_suggestions=data.get("style_suggestions", ""),
-        )
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="解析检测结果失败")
+    data = _require_structured_dict(result, "解析检测结果失败")
+    return DialogueStyleCheckResponse(
+        success=True,
+        dialogue_analysis=data.get("dialogue_analysis", []),
+        character_voice_score=data.get("character_voice_score", 0),
+        uniqueness_score=data.get("uniqueness_score", 0),
+        ooc_warnings=data.get("ooc_warnings", []),
+        style_suggestions=data.get("style_suggestions", ""),
+    )
 
 
 # ==================== 开局设计 API ====================
@@ -511,20 +488,16 @@ async def design_opening(request: OpeningDesignRequest):
     if not result.success:
         raise HTTPException(status_code=500, detail=result.error)
 
-    import json
-    try:
-        data = json.loads(result.output)
-        return OpeningDesignResponse(
-            success=True,
-            golden_finger=data.get("golden_finger", {}),
-            protagonist_design=data.get("protagonist_design", {}),
-            opening_conflict=data.get("opening_conflict", {}),
-            goals=data.get("goals", {}),
-            first_chapter_outline=data.get("first_chapter_outline", {}),
-            suggestions=data.get("suggestions", []),
-        )
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="解析设计结果失败")
+    data = _require_structured_dict(result, "解析设计结果失败")
+    return OpeningDesignResponse(
+        success=True,
+        golden_finger=data.get("golden_finger", {}),
+        protagonist_design=data.get("protagonist_design", {}),
+        opening_conflict=data.get("opening_conflict", {}),
+        goals=data.get("goals", {}),
+        first_chapter_outline=data.get("first_chapter_outline", {}),
+        suggestions=data.get("suggestions", []),
+    )
 
 
 class GoldenFingerSuggestionRequest(BaseModel):
@@ -563,16 +536,12 @@ async def suggest_golden_finger(request: GoldenFingerSuggestionRequest):
     if not result.success:
         raise HTTPException(status_code=500, detail=result.error)
 
-    import json
-    try:
-        data = json.loads(result.output)
-        return GoldenFingerSuggestionResponse(
-            success=True,
-            suggestions=data.get("suggestions", []),
-            recommended=data.get("recommended", {}),
-        )
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="解析建议失败")
+    data = _require_structured_dict(result, "解析建议失败")
+    return GoldenFingerSuggestionResponse(
+        success=True,
+        suggestions=data.get("suggestions", []),
+        recommended=data.get("recommended", {}),
+    )
 
 
 @router.get("/skills")

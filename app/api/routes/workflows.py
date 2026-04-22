@@ -3,10 +3,13 @@
 v8 Agent协作可视化工作台
 """
 
+import asyncio
+import json
 import logging
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
 
 from app.models.workflow_definition import (
     WorkflowDefinition,
@@ -50,13 +53,17 @@ def get_db():
     return postgres_db
 
 
+
+
 def set_workflow_engine(engine):
     """设置工作流引擎实例"""
     global _workflow_engine
     _workflow_engine = engine
 
 
-# ==================== 节点类型 API ====================
+def _format_sse(event_name: str, payload: Dict[str, Any]) -> str:
+    return f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
 
 from fastapi import Response
 
@@ -159,6 +166,53 @@ async def get_execution(execution_id: str):
         raise HTTPException(status_code=404, detail="执行记录不存在")
 
     return engine._serialize_for_json(execution)
+
+
+
+
+@router.get("/executions/{execution_id}/events")
+async def stream_execution_events(request: Request, execution_id: str):
+    """以 SSE 形式订阅工作流执行事件。"""
+    engine = get_workflow_engine()
+    db = get_db()
+
+    execution = await engine.get_execution_state(execution_id, db)
+    if not execution:
+        raise HTTPException(status_code=404, detail="执行记录不存在")
+
+    queue = engine.subscribe_execution_events(execution_id)
+
+    async def event_generator():
+        try:
+            initial_event = {
+                "type": "execution_snapshot",
+                "execution_id": execution_id,
+                "data": engine._serialize_for_json(execution),
+            }
+            yield _format_sse("workflow_event", initial_event)
+
+            while True:
+                if await request.is_disconnected():
+                    break
+
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=15)
+                    yield _format_sse("workflow_event", event)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        finally:
+            engine.unsubscribe_execution_events(execution_id, queue)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
 
 
 @router.get("/executions/{execution_id}/export-markdown", response_model=Dict[str, Any])

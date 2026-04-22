@@ -29,6 +29,7 @@ from app.models.chapter_outline import (
     ValidateOutlineResponse,
 )
 from app.models.plot import Hook, HookStatus, HookType
+from app.models.skill import SkillTestResult
 
 logger = logging.getLogger(__name__)
 
@@ -362,7 +363,9 @@ class PlotOutlineService:
                 logger.warning(f"[PlotOutline] 设定一致性检测失败: {result.error}")
                 return {"conflicts": [], "setting_gaps": [], "risk_areas": [], "consistency_score": 100}
 
-            parsed = self._parse_consistency_result(result.output)
+            parsed = self._parse_consistency_result(
+                self._require_structured_dict(result, "解析设定一致性检测结果失败")
+            )
             return {
                 "conflicts": parsed.get("conflicts", []),
                 "setting_gaps": parsed.get("setting_gaps", []),
@@ -483,10 +486,16 @@ class PlotOutlineService:
             return True
         return False
 
-    def _parse_consistency_result(self, output: str) -> Dict[str, Any]:
-        data = self._extract_json_object(output)
-        if not data:
-            raise json.JSONDecodeError("No JSON object found", output, 0)
+    def _require_structured_dict(self, result: SkillTestResult, error_detail: str) -> Dict[str, Any]:
+        try:
+            return result.require_structured_dict()
+        except ValueError as exc:
+            logger.warning("[PlotOutline] Skill 返回了无效结构化输出: %s", exc)
+            raise ValueError(error_detail) from exc
+
+    def _parse_consistency_result(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(data, dict):
+            raise ValueError("设定一致性检测结果不是对象")
 
         conflicts = data.get("conflicts", [])
         critical_conflicts = data.get("critical_conflicts", [])
@@ -1072,7 +1081,7 @@ class PlotOutlineService:
                     }
                 ))
                 if result.success:
-                    data = json.loads(result.output)
+                    data = self._require_structured_dict(result, "解析章节大纲生成结果失败")
                     outline = self._parse_generated_outline(project_id, chapter_number, self._select_outline_payload(data, chapter_number))
                     consistency = await self._check_outline_setting_consistency(project_id, data, full_context)
                     warnings = list(data.get("warnings", []))
@@ -1446,7 +1455,7 @@ class PlotOutlineService:
                     }
                 ))
                 if result.success:
-                    data = json.loads(result.output)
+                    data = self._require_structured_dict(result, "解析章节大纲验证结果失败")
                     # 合并 Skill 返回的问题
                     issues.extend(data.get("issues", []))
                     suggestions.extend(data.get("suggestions", []))

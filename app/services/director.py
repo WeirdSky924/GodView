@@ -503,9 +503,12 @@ class DirectorSystem:
         })
 
         if result.success:
-            narrative = result.data
+            narrative = result.structured_data or result.data or {}
+            narrative_content = result.text_output or narrative.get("chapter_content") or narrative.get("content", "")
+            narrative["chapter_content"] = narrative_content
+            narrative["content"] = narrative_content
             narrative_voice_review = await self._review_narrative_voice(
-                narrative.get("content", ""),
+                narrative_content,
                 character_moods or {},
                 environment,
             )
@@ -878,7 +881,7 @@ class DirectorSystem:
         if not rewrite.success:
             return None
 
-        rewritten_text = rewrite.data.get("rewritten_text", "").strip()
+        rewritten_text = rewrite.text_output or (rewrite.structured_data or rewrite.data or {}).get("rewritten_text", "").strip()
         if not rewritten_text:
             return None
 
@@ -888,7 +891,7 @@ class DirectorSystem:
             "voice_review": second_review,
             "rewrite_result": {
                 "applied": True,
-                "changes_made": rewrite.data.get("changes_made", []),
+                "changes_made": (rewrite.structured_data or rewrite.data or {}).get("changes_made", []),
                 "original_dialogue": dialogue,
             },
         }
@@ -961,7 +964,7 @@ class DirectorSystem:
         if not rewrite.success:
             return None
 
-        rewritten_text = rewrite.data.get("rewritten_text", "").strip()
+        rewritten_text = rewrite.text_output or (rewrite.structured_data or rewrite.data or {}).get("rewritten_text", "").strip()
         if not rewritten_text:
             return None
 
@@ -971,7 +974,7 @@ class DirectorSystem:
             "voice_review": second_review,
             "rewrite_result": {
                 "applied": True,
-                "changes_made": rewrite.data.get("changes_made", []),
+                "changes_made": (rewrite.structured_data or rewrite.data or {}).get("changes_made", []),
                 "original_content": content,
                 "target_character_id": character_id,
                 "target_character_name": agent.character.name,
@@ -1525,7 +1528,8 @@ class DirectorSystem:
         })
 
         if result.success:
-            chapter_content = result.data.get("content", "")
+            chapter_payload = result.structured_data or result.data or {}
+            chapter_content = result.text_output or chapter_payload.get("chapter_content") or chapter_payload.get("content", "")
             self.current_chapter["content"] = chapter_content
             self.current_chapter["word_count"] = len(chapter_content)
             self.current_chapter["status"] = "completed"

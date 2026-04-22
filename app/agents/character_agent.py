@@ -9,9 +9,11 @@ from langchain_core.language_models import BaseLanguageModel
 from langchain_core.messages import HumanMessage
 
 from app.agents.base import BaseAgent, AgentResponse
+from app.models.agent_output_schemas import CharacterDecisionSchema
 from app.models.character import Character
 from app.models.agent_template import AgentType
 from app.models.token_usage import UsageCategory
+from app.services.structured_llm import StructuredOutputError
 
 logger = logging.getLogger(__name__)
 
@@ -146,23 +148,12 @@ class CharacterAgent(BaseAgent):
                 dialogue_history=dialogue_history,
             )
 
-            # 调用 LLM
-            response_text = await self._call_llm(
+            parsed = await self._call_structured(
+                CharacterDecisionSchema,
                 messages=[HumanMessage(content=user_message)],
-                category=UsageCategory.CHARACTER
+                category=UsageCategory.CHARACTER,
             )
-
-            # 解析响应
-            try:
-                response_data = self._parse_json_response(response_text)
-            except ValueError:
-                # 如果 JSON 解析失败，尝试提取关键信息
-                response_data = {
-                    "dialogue": response_text.strip(),
-                    "action": "",
-                    "inner_thought": "",
-                    "emotion": "neutral",
-                }
+            response_data = parsed.model_dump()
 
             return AgentResponse(
                 success=True,
@@ -170,6 +161,9 @@ class CharacterAgent(BaseAgent):
                 metadata={"character_id": self.character.id, "model_used": self.name},
             )
 
+        except StructuredOutputError as e:
+            logger.error(f"CharacterAgent structured 失败：{e}")
+            return AgentResponse(success=False, error=str(e))
         except Exception as e:
             logger.error(f"CharacterAgent 执行失败：{e}")
             return AgentResponse(success=False, error=str(e))

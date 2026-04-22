@@ -330,11 +330,12 @@ class SettingAgentService:
         if all_resolved and session.current_request:
             session.current_request.status = "resolved"
 
-        return {
-            "status": "resolved" if all_resolved else "negotiating",
-            "conflict": conflict.model_dump(),
-            "can_proceed": all_resolved,
-        }
+        return self._build_negotiation_response(
+            status="resolved" if all_resolved else "negotiating",
+            can_proceed=all_resolved,
+            conflict=conflict,
+            message="冲突已解决，可以继续后续操作。" if all_resolved else "当前冲突已处理，仍有其他冲突待解决。",
+        )
 
     def _is_save_intent(self, message: str) -> bool:
         """检测用户消息是否为保存/确认意图（不需要调用LLM）"""
@@ -371,13 +372,94 @@ class SettingAgentService:
                 break
 
     def invalidate_context_cache(self, project_id: str):
-        """使指定项目的上下文缓存失效（当设定/角色变更后调用）"""
+        """失效指定项目 session 的上下文缓存"""
         for session in self._management_sessions.values():
             if session.project_id == project_id and session.is_active:
-                session.full_context_loaded = False
                 session.cached_context_sections = {}
-                logger.info(f"[SettingAgent] 已清除项目 {project_id} 的上下文缓存")
-                break
+                session.full_context_loaded = False
+
+    def _build_chat_response(
+        self,
+        session: SettingAgentSession,
+        *,
+        message: str,
+        structured_data: Optional[Dict[str, Any]] = None,
+        pending_lores: Optional[List[Dict[str, Any]]] = None,
+        pending_characters: Optional[List[Dict[str, Any]]] = None,
+        pending_hooks: Optional[List[Dict[str, Any]]] = None,
+        improvement_suggestions: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "message": message,
+            "session_id": session.id,
+            "mode": session.mode.value,
+        }
+        if structured_data is not None:
+            result["structured_data"] = structured_data
+        if pending_lores:
+            result["pending_lores"] = pending_lores
+        if pending_characters:
+            result["pending_characters"] = pending_characters
+        if pending_hooks:
+            result["pending_hooks"] = pending_hooks
+        if improvement_suggestions:
+            result["improvement_suggestions"] = improvement_suggestions
+        return result
+
+    def _build_negotiation_response(
+        self,
+        *,
+        status: str,
+        can_proceed: bool,
+        conflict: Optional[SettingConflict] = None,
+        message: Optional[str] = None,
+        suggestions: Optional[List[str]] = None,
+        error: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "status": status,
+            "can_proceed": can_proceed,
+        }
+        if conflict is not None:
+            result["conflict"] = conflict.model_dump()
+        if message:
+            result["message"] = message
+        if suggestions:
+            result["suggestions"] = suggestions
+        if error:
+            result["error"] = error
+        return result
+
+    async def _analyze_world_description(
+        self,
+        project_id: str,
+        description: str,
+    ) -> Dict[str, Any]:
+        prompt = f"""请分析以下世界观描述，并提取结构化信息。\n\n世界观描述：\n{description}\n\n请输出 JSON 对象，字段固定为：\n{{\n  \"power_system\": \"力量体系描述\",\n  \"technology_level\": \"科技水平描述\",\n  \"history\": \"世界历史概述\",\n  \"geography\": \"地理环境描述\"\n}}\n\n要求：\n- 只输出 JSON 对象\n- 不要输出 markdown 代码块\n- 没有明确信息时填空字符串\n"""
+
+        response = await self._call_llm_simple(prompt, project_id=project_id)
+        payload = response.strip()
+        if payload.startswith("```"):
+            payload = payload.strip("`")
+            if payload.startswith("json"):
+                payload = payload[4:]
+            payload = payload.strip()
+
+        data = json.loads(payload)
+        return {
+            "power_system": data.get("power_system") or "",
+            "technology_level": data.get("technology_level") or "",
+            "history": data.get("history") or "",
+            "geography": data.get("geography") or "",
+        }
+
+    async def analyze_world_description(
+        self,
+        project_id: str,
+        description: str,
+    ) -> Dict[str, Any]:
+        """公开的世界观描述结构化分析入口 (strict structured_data)."""
+        return await self._analyze_world_description(project_id, description)
 
     async def _analyze_user_intent(self, user_response: str) -> str:
         """分析用户意图"""
@@ -385,12 +467,24 @@ class SettingAgentService:
 
         if any(word in response_lower for word in ["接受", "同意", "好的", "可以"]):
             return "accept_suggestion"
-        elif any(word in response_lower for word in ["覆盖", "强制", "忽略"]):
+        if any(word in response_lower for word in ["覆盖", "强制", "忽略"]):
             return "override"
-        elif any(word in response_lower for word in ["取消", "放弃", "算了"]):
+        if any(word in response_lower for word in ["取消", "放弃", "算了"]):
             return "cancel"
-        else:
-            return "continue"
+        return "continue"
+
+    async def _analyze_world_description_via_chat(
+        self,
+        session: SettingAgentSession,
+        project_id: str,
+        description: str,
+    ) -> Dict[str, Any]:
+        structured_data = await self._analyze_world_description(project_id, description)
+        return self._build_chat_response(
+            session,
+            message="我已经提取出这段世界观描述里的关键结构化信息，你可以直接检查并调整表单内容。",
+            structured_data=structured_data,
+        )
 
     async def _extract_suggestion_index(self, response: str) -> Optional[int]:
         """从回复中提取建议索引"""
@@ -443,11 +537,13 @@ class SettingAgentService:
             conflict_id=conflict.id,
         ))
 
-        return {
-            "status": "negotiating",
-            "response": assistant_response,
-            "suggestions": conflict.resolution_suggestions,
-        }
+        return self._build_negotiation_response(
+            status="negotiating",
+            can_proceed=False,
+            conflict=conflict,
+            message=assistant_response,
+            suggestions=conflict.resolution_suggestions,
+        )
 
     # ==================== 执行变更 ====================
 
@@ -599,17 +695,13 @@ class SettingAgentService:
 
             session.last_activity_at = datetime.now()
 
-            result = {
-                "response": response,
-                "session_id": session.id,
-                "mode": session.mode.value,
-            }
-            if session.cached_pending_lores:
-                result["pending_lores"] = session.cached_pending_lores
-            if session.cached_pending_characters:
-                result["pending_characters"] = session.cached_pending_characters
-            if session.cached_pending_hooks:
-                result["pending_hooks"] = session.cached_pending_hooks
+            result = self._build_chat_response(
+                session,
+                message=response,
+                pending_lores=session.cached_pending_lores or None,
+                pending_characters=session.cached_pending_characters or None,
+                pending_hooks=session.cached_pending_hooks or None,
+            )
 
             return result
 
@@ -779,25 +871,14 @@ class SettingAgentService:
             except Exception as e:
                 logger.warning(f"[SettingAgent] 设定分析失败: {e}")
 
-        result = {
-            "response": response,
-            "session_id": session.id,
-            "mode": session.mode.value,
-        }
-
-        # 返回待确认的设定、伏笔和角色，由前端显示确认弹窗
-        if pending_lores:
-            result["pending_lores"] = pending_lores
-        if pending_hooks:
-            result["pending_hooks"] = pending_hooks
-        if pending_characters:
-            result["pending_characters"] = pending_characters
-
-        # 返回设定改进建议
-        if improvement_suggestions:
-            result["improvement_suggestions"] = improvement_suggestions
-
-        return result
+        return self._build_chat_response(
+            session,
+            message=response,
+            pending_lores=pending_lores or None,
+            pending_characters=pending_characters or None,
+            pending_hooks=pending_hooks or None,
+            improvement_suggestions=improvement_suggestions or None,
+        )
 
     async def _sync_to_agent_memory(
         self,
@@ -909,20 +990,21 @@ class SettingAgentService:
 """
 
         try:
-            response = await self._call_llm_simple(extraction_prompt)
+            from app.models.agent_output_schemas import SettingPendingLoresExtractionSchema
+            from app.services.structured_llm import StructuredOutputError
 
-            # 解析 JSON
-            if "```json" in response:
-                response = response.split("```json")[1].split("```")[0]
-            elif "```" in response:
-                response = response.split("```")[1].split("```")[0]
-
-            response = response.strip()
-            if not response or response == "[]":
+            try:
+                parsed = await self._call_structured(
+                    SettingPendingLoresExtractionSchema,
+                    extraction_prompt,
+                    project_id=project_id,
+                )
+                lores = [item.model_dump() for item in parsed.lores]
+            except StructuredOutputError as e:
+                logger.warning(f"提取设定 structured 失败：{e}")
                 return []
 
-            lores = json.loads(response)
-            if not isinstance(lores, list) or len(lores) == 0:
+            if not lores:
                 return []
 
             # 返回待确认的设定（不保存到数据库）
@@ -949,9 +1031,6 @@ class SettingAgentService:
 
             return valid_lores
 
-        except json.JSONDecodeError:
-            logger.warning("解析设定 JSON 失败")
-            return []
         except Exception as e:
             logger.error(f"提取设定失败: {e}")
             return []
@@ -1045,19 +1124,21 @@ class SettingAgentService:
 """
 
         try:
-            response = await self._call_llm_simple(extraction_prompt)
+            from app.models.agent_output_schemas import SettingPendingHooksExtractionSchema
+            from app.services.structured_llm import StructuredOutputError
 
-            if "```json" in response:
-                response = response.split("```json")[1].split("```")[0]
-            elif "```" in response:
-                response = response.split("```")[1].split("```")[0]
-
-            response = response.strip()
-            if not response or response == "[]":
+            try:
+                parsed = await self._call_structured(
+                    SettingPendingHooksExtractionSchema,
+                    extraction_prompt,
+                    project_id=project_id,
+                )
+                hooks = [item.model_dump() for item in parsed.hooks]
+            except StructuredOutputError as e:
+                logger.warning(f"提取伏笔 structured 失败：{e}")
                 return []
 
-            hooks = json.loads(response)
-            if not isinstance(hooks, list) or len(hooks) == 0:
+            if not hooks:
                 return []
 
             valid_hooks = []
@@ -1082,9 +1163,6 @@ class SettingAgentService:
 
             return valid_hooks
 
-        except json.JSONDecodeError:
-            logger.warning("解析伏笔 JSON 失败")
-            return []
         except Exception as e:
             logger.error(f"提取伏笔失败: {e}")
             return []
@@ -1304,20 +1382,18 @@ class SettingAgentService:
 
 只输出 JSON 数组，不要其他内容。"""
 
-            response = await self._call_llm_simple(analysis_prompt)
+            from app.models.agent_output_schemas import SettingImprovementSuggestionsSchema
+            from app.services.structured_llm import StructuredOutputError
 
-            # 解析 JSON
-            if "```json" in response:
-                response = response.split("```json")[1].split("```")[0]
-            elif "```" in response:
-                response = response.split("```")[1].split("```")[0]
-
-            response = response.strip()
-            if not response or response == "[]":
-                return []
-
-            suggestions = json.loads(response)
-            if not isinstance(suggestions, list):
+            try:
+                parsed = await self._call_structured(
+                    SettingImprovementSuggestionsSchema,
+                    analysis_prompt,
+                    project_id=project_id,
+                )
+                suggestions = [item.model_dump() for item in parsed.suggestions]
+            except StructuredOutputError as e:
+                logger.warning(f"[SettingAgent] 改进建议 structured 失败：{e}")
                 return []
 
             # 过滤并验证
@@ -1341,9 +1417,6 @@ class SettingAgentService:
 
             return valid_suggestions
 
-        except json.JSONDecodeError as e:
-            logger.warning(f"[SettingAgent] 解析改进建议 JSON 失败: {e}")
-            return []
         except Exception as e:
             logger.error(f"[SettingAgent] 分析设定失败: {e}")
             return []
@@ -1631,19 +1704,21 @@ class SettingAgentService:
 """
 
         try:
-            response = await self._call_llm_simple(extraction_prompt)
+            from app.models.agent_output_schemas import SettingPendingCharactersExtractionSchema
+            from app.services.structured_llm import StructuredOutputError
 
-            if "```json" in response:
-                response = response.split("```json")[1].split("```")[0]
-            elif "```" in response:
-                response = response.split("```")[1].split("```")[0]
-
-            response = response.strip()
-            if not response or response == "[]":
+            try:
+                parsed = await self._call_structured(
+                    SettingPendingCharactersExtractionSchema,
+                    extraction_prompt,
+                    project_id=project_id,
+                )
+                characters = [item.model_dump() for item in parsed.characters]
+            except StructuredOutputError as e:
+                logger.warning(f"提取角色 structured 失败：{e}")
                 return []
 
-            characters = json.loads(response)
-            if not isinstance(characters, list) or len(characters) == 0:
+            if not characters:
                 return []
 
             valid_characters = []
@@ -1682,9 +1757,6 @@ class SettingAgentService:
 
             return valid_characters
 
-        except json.JSONDecodeError:
-            logger.warning("解析角色 JSON 失败")
-            return []
         except Exception as e:
             logger.error(f"提取角色失败: {e}")
             return []
@@ -1987,15 +2059,24 @@ class SettingAgentService:
         prompt = self._build_personality_generation_prompt(character_data, existing_characters, project_context)
 
         try:
-            response = await self._call_llm_simple(prompt)
+            from app.models.agent_output_schemas import SettingPersonalityGenerationSchema
+            from app.services.structured_llm import StructuredOutputError
 
-            # 解析 JSON
-            if "```json" in response:
-                response = response.split("```json")[1].split("```")[0]
-            elif "```" in response:
-                response = response.split("```")[1].split("```")[0]
-
-            personality_data = json.loads(response.strip())
+            try:
+                parsed = await self._call_structured(
+                    SettingPersonalityGenerationSchema,
+                    prompt,
+                    project_id=project_id,
+                )
+                personality_data = parsed.model_dump()
+            except StructuredOutputError as e:
+                logger.error(f"生成角色性格 structured 失败: {e}")
+                return {
+                    "success": False,
+                    "error": "解析失败",
+                    "personality": "",
+                    "speech_pattern": "",
+                }
 
             logger.info(
                 "为角色 '%s' 生成性格: %s",
@@ -2013,14 +2094,6 @@ class SettingAgentService:
                 "agent_memory": personality_data.get("agent_memory", []),
             }
 
-        except json.JSONDecodeError as e:
-            logger.error(f"解析性格 JSON 失败: {e}")
-            return {
-                "success": False,
-                "error": "解析失败",
-                "personality": "",
-                "speech_pattern": "",
-            }
         except Exception as e:
             logger.error(f"生成角色性格失败: {e}")
             return {
@@ -3098,6 +3171,59 @@ class SettingAgentService:
             log_context=False,
         )
 
+    async def _call_structured(
+        self,
+        schema,
+        prompt: str,
+        *,
+        system_prompt: str = "你是一个有帮助的助手。请严格按照指定的结构输出。",
+        project_id: Optional[str] = None,
+        temperature: Optional[float] = None,
+    ):
+        """使用 LangChain ``with_structured_output`` 进行结构化生成。
+
+        与 ``_call_llm`` 共享 token 跟踪与 provider 配置，但绕过自定义重试，
+        把校验/修复交给 :class:`StructuredLLMRunner`。
+        """
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        from app.services.model_router import create_llm
+        from app.services.structured_llm import (
+            StructuredOutputError,
+            get_structured_llm_runner,
+        )
+
+        model = create_llm(
+            provider=self.llm_provider,
+            model=self.llm_model,
+            api_key=self.llm_api_key,
+            base_url=self.llm_base_url,
+            temperature=self.llm_temperature if temperature is None else temperature,
+        )
+
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=prompt),
+        ]
+
+        runner = get_structured_llm_runner()
+        parsed, raw_text = await runner.run_structured(model, schema, messages)
+
+        # 估算 token 用量并记录（与 _call_llm 保持一致）
+        if project_id:
+            try:
+                input_tokens = (len(system_prompt) + len(prompt)) // 4
+                output_tokens = len(raw_text or "") // 4
+                await self._record_token_usage(
+                    project_id,
+                    {"input_tokens": input_tokens, "output_tokens": output_tokens},
+                    input_tokens,
+                )
+            except Exception as exc:  # pragma: no cover
+                logger.warning(f"[SettingAgent] structured token 记录失败: {exc}")
+
+        return parsed
+
     async def _call_openai(self, messages: List[Dict[str, Any]]) -> str:
         """调用 OpenAI API"""
         result, _ = await self._call_openai_with_usage(messages)
@@ -3362,12 +3488,14 @@ class SettingAgentService:
 只输出 JSON。
 """
         try:
-            response = await self._call_llm_simple(extraction_prompt)
-            if "```json" in response:
-                response = response.split("```json")[1].split("```")[0]
-            elif "```" in response:
-                response = response.split("```")[1].split("```")[0]
-            return json.loads(response.strip())
+            from app.models.agent_output_schemas import BootstrapSeedExtractionSchema
+
+            parsed = await self._call_structured(
+                BootstrapSeedExtractionSchema,
+                extraction_prompt,
+                project_id=session.project_id,
+            )
+            return parsed.model_dump()
         except Exception as e:
             logger.error(f"提取 seed 失败：{e}")
             return None

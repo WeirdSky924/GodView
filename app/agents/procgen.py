@@ -9,9 +9,11 @@ from langchain_core.language_models import BaseLanguageModel
 from langchain_core.messages import HumanMessage
 
 from app.agents.base import BaseAgent, AgentResponse
+from app.models.agent_output_schemas import ProcGenEncounterSchema, ProcGenRegionSchema
 from app.models.world import World, Region, RegionType, TerrainType
 from app.models.agent_template import AgentType
 from app.models.token_usage import UsageCategory
+from app.services.structured_llm import StructuredOutputError
 
 logger = logging.getLogger(__name__)
 
@@ -113,31 +115,24 @@ class ProcGenAgent(BaseAgent):
                 generation_type=generation_type,
             )
 
-            # 调用 LLM
-            response_text = await self._call_llm(
-                messages=[HumanMessage(content=user_message)],
-                category=UsageCategory.WORLD
-            )
-
-            logger.info(f"ProcGenAgent LLM 调用完成，响应长度: {len(response_text)}")
-
-            # 解析响应
+            # 调用 LLM (structured)
             try:
-                region_data = self._parse_json_response(response_text)
-            except ValueError as e:
-                logger.error(f"ProcGenAgent JSON 解析失败: {e}")
-                # 尝试宽松解析
-                region_data = self._try_extract_any_json(response_text)
-                if not region_data:
-                    return AgentResponse(
-                        success=False, error=f"生成内容格式错误：{str(e)}"
-                    )
+                parsed = await self._call_structured(
+                    ProcGenRegionSchema,
+                    messages=[HumanMessage(content=user_message)],
+                    category=UsageCategory.WORLD,
+                )
+                region_data = parsed.model_dump()
+            except StructuredOutputError as e:
+                logger.error(f"ProcGenAgent structured 失败: {e}")
+                return AgentResponse(success=False, error=str(e))
+
+            logger.info(f"ProcGenAgent structured 完成")
 
             # 放宽验证：只要求有 description，其他字段可选
             # 这样可以支持多种输出格式（事件、区域、地图等）
             if "description" not in region_data and "content" not in region_data:
-                # 如果完全没有描述性字段，尝试从响应文本中提取
-                region_data["description"] = response_text[:500]
+                region_data["description"] = ""
                 region_data["raw_response"] = True
 
             # 为缺少的字段提供默认值
@@ -253,12 +248,16 @@ class ProcGenAgent(BaseAgent):
 }}"""
 
         try:
-            response_text = await self._call_llm(
+            parsed = await self._call_structured(
+                ProcGenEncounterSchema,
                 messages=[HumanMessage(content=prompt)],
-                category=UsageCategory.WORLD
+                category=UsageCategory.WORLD,
             )
-            encounter_data = self._parse_json_response(response_text)
+            encounter_data = parsed.model_dump()
             return AgentResponse(success=True, data=encounter_data)
+        except StructuredOutputError as e:
+            logger.error(f"生成遭遇事件 structured 失败: {e}")
+            return AgentResponse(success=False, error=str(e))
         except Exception as e:
             logger.error(f"生成遭遇事件失败：{e}")
             return AgentResponse(success=False, error=str(e))

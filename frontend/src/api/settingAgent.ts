@@ -65,9 +65,10 @@ export interface PendingHook {
 }
 
 export interface ChatResponse {
-  response: string
+  message: string
   session_id: string
   mode: string
+  structured_data?: Record<string, unknown>
   lore_saved?: boolean
   pending_lores?: PendingLore[]
   pending_characters?: PendingCharacter[]
@@ -123,7 +124,7 @@ export interface NegotiateResult {
   status: 'resolved' | 'negotiating'
   conflict?: SettingConflict
   can_proceed: boolean
-  response?: string
+  message?: string
   suggestions?: string[]
 }
 
@@ -316,5 +317,25 @@ export async function executeLoreModification(
   return await api.post(`${API_BASE}/execute-modification`, {
     project_id: projectId,
     modification,
+  })
+}
+
+/**
+ * 世界观描述结构化分析 (strict)
+ */
+export interface WorldDescriptionAnalysis {
+  power_system: string
+  technology_level: string
+  history: string
+  geography: string
+}
+
+export async function analyzeWorldDescription(
+  projectId: string,
+  description: string
+): Promise<{ structured_data: WorldDescriptionAnalysis }> {
+  return await api.post(`${API_BASE}/analyze-world`, {
+    project_id: projectId,
+    description,
   })
 }
