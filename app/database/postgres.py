@@ -187,6 +187,7 @@ class PostgresDatabase:
                 'details', 'affected_hooks', 'affected_relationships', 'affected_characters',
                 'characters', 'relationships', 'regions', 'hooks',
                 'coordinates', 'terrain_features', 'landmarks', 'encounters', 'connections', 'local_rules',
+                'before_state', 'after_state', 'diff',
                 'completed_events', 'character_locations',
                 'memories', 'knowledge', 'working_memory',
                 'keywords', 'tags', 'constraints', 'related_characters', 'related_locations', 'related_items', 'forbidden_actions',
@@ -265,8 +266,8 @@ class PostgresDatabase:
         params['id'] = char_id
 
         # 处理 JSONB 字段 (包括数组和对象类型)
-        jsonb_list_fields = ['lexicon', 'forbidden_words', 'voice_samples', 'goals', 'inventory', 'agent_goals', 'agent_memory', 'personality_traits', 'relationships', 'major_events']
-        jsonb_dict_fields = ['attributes', 'key_relationships']
+        jsonb_list_fields = ['lexicon', 'forbidden_words', 'voice_samples', 'goals', 'inventory', 'agent_goals', 'agent_memory', 'personality_traits', 'relationships', 'major_events', 'available_presence_types']
+        jsonb_dict_fields = ['attributes', 'key_relationships', 'death_detail']
 
         # 处理字段名映射 (background -> background_story)
         if 'background' in params and 'background_story' not in params:
@@ -307,6 +308,9 @@ class PostgresDatabase:
         # 处理可选的 UUID 字段 - 验证是否为有效 UUID
         params['world_id'] = _validate_uuid(params.get('world_id'))
         params['project_id'] = _validate_uuid(params.get('project_id'))
+        params['current_region_id'] = _validate_uuid(params.get('current_region_id'))
+        params['current_location'] = params.get('current_location')
+        params['current_location_reason'] = params.get('current_location_reason') or ''
 
         # 处理布尔字段
         params['has_agent'] = params.get('has_agent', False)
@@ -349,6 +353,7 @@ class PostgresDatabase:
                                 appearance, age, gender,
                                 personality, personality_traits, background_story, speech_pattern, lexicon,
                                 forbidden_words, voice_samples, attributes, goals, inventory, current_location,
+                                current_region_id, current_location_reason, death_detail, available_presence_types,
                                 has_agent, agent_enabled, agent_goals, agent_memory,
                                 total_scenes, dialogue_count, major_events)
         VALUES (:id, :name, :project_id, :world_id, :description, :role, :status,
@@ -359,6 +364,7 @@ class PostgresDatabase:
                 :personality, CAST(:personality_traits AS jsonb), :background_story, :speech_pattern, CAST(:lexicon AS jsonb),
                 CAST(:forbidden_words AS jsonb), CAST(:voice_samples AS jsonb), CAST(:attributes AS jsonb),
                 CAST(:goals AS jsonb), CAST(:inventory AS jsonb), :current_location,
+                :current_region_id, :current_location_reason, CAST(:death_detail AS jsonb), CAST(:available_presence_types AS jsonb),
                 :has_agent, :agent_enabled, CAST(:agent_goals AS jsonb), CAST(:agent_memory AS jsonb),
                 :total_scenes, :dialogue_count, CAST(:major_events AS jsonb))
         ON CONFLICT (id) DO UPDATE SET
@@ -393,6 +399,10 @@ class PostgresDatabase:
             goals = EXCLUDED.goals,
             inventory = EXCLUDED.inventory,
             current_location = EXCLUDED.current_location,
+            current_region_id = EXCLUDED.current_region_id,
+            current_location_reason = EXCLUDED.current_location_reason,
+            death_detail = EXCLUDED.death_detail,
+            available_presence_types = EXCLUDED.available_presence_types,
             has_agent = EXCLUDED.has_agent,
             agent_enabled = EXCLUDED.agent_enabled,
             agent_goals = EXCLUDED.agent_goals,
@@ -403,7 +413,7 @@ class PostgresDatabase:
             updated_at = CURRENT_TIMESTAMP
         """
         await self.execute_write(query, params)
-        return character_data.get("id", "")
+        return params.get("id", "")
 
     async def get_character(self, character_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -727,6 +737,10 @@ class PostgresDatabase:
             region_data["area_size"] = 0.0
         if region_data.get("atmosphere") is None:
             region_data["atmosphere"] = ""
+        if region_data.get("state") is None:
+            region_data["state"] = "normal"
+        if region_data.get("state_summary") is None:
+            region_data["state_summary"] = ""
         logger.info(f"save_region after fix: area_size={region_data.get('area_size')}")
 
         # 验证 id 字段（必须是有效 UUID）
@@ -754,13 +768,13 @@ class PostgresDatabase:
                     region_data[field] = '{}' if field == 'coordinates' else '[]'
 
         # 确保 datetime 字段是 datetime 对象
-        datetime_fields = ['created_at', 'updated_at']
+        datetime_fields = ['created_at', 'updated_at', 'destroyed_at']
         for field in datetime_fields:
-            if field in region_data and isinstance(region_data[field], str):
+            if field in region_data and region_data[field]:
                 try:
                     region_data[field] = datetime.fromisoformat(region_data[field].replace('Z', '+00:00'))
                 except:
-                    region_data[field] = datetime.utcnow()
+                    region_data[field] = None
 
         # 动态构建 world_id 的 SQL
         world_id_sql = "CAST(:world_id AS UUID)" if region_data.get('world_id') else "NULL"
@@ -768,12 +782,13 @@ class PostgresDatabase:
         query = """
         INSERT INTO regions (id, name, world_id, region_type, terrain_type, description,
                             atmosphere, coordinates, area_size, terrain_features, landmarks,
-                            encounters, connections, local_rules, is_generated, visit_count,
-                            created_at, updated_at)
+                            encounters, connections, local_rules, state, state_summary, destroyed_at,
+                            is_generated, visit_count, created_at, updated_at)
         VALUES (:id, :name, """ + world_id_sql + """, :region_type, :terrain_type, :description,
                 :atmosphere, CAST(:coordinates AS jsonb), :area_size, CAST(:terrain_features AS jsonb),
                 CAST(:landmarks AS jsonb), CAST(:encounters AS jsonb), CAST(:connections AS jsonb),
-                CAST(:local_rules AS jsonb), :is_generated, :visit_count, :created_at, :updated_at)
+                CAST(:local_rules AS jsonb), :state, :state_summary, :destroyed_at,
+                :is_generated, :visit_count, :created_at, :updated_at)
         ON CONFLICT (id) DO UPDATE SET
             name = EXCLUDED.name,
             world_id = EXCLUDED.world_id,
@@ -788,6 +803,9 @@ class PostgresDatabase:
             encounters = EXCLUDED.encounters,
             connections = EXCLUDED.connections,
             local_rules = EXCLUDED.local_rules,
+            state = EXCLUDED.state,
+            state_summary = EXCLUDED.state_summary,
+            destroyed_at = EXCLUDED.destroyed_at,
             is_generated = EXCLUDED.is_generated,
             visit_count = EXCLUDED.visit_count,
             updated_at = EXCLUDED.updated_at
@@ -818,7 +836,174 @@ class PostgresDatabase:
         rowcount = await self.execute_write(query, {"id": region_id})
         return rowcount > 0
 
+    async def save_narrative_state_change(self, change_data: Dict[str, Any]) -> str:
+        """保存剧情状态变更日志。"""
+        params = change_data.copy()
+        change_id = _validate_uuid(params.get('id')) or str(uuid_module.uuid4())
+        params['id'] = change_id
+        params['project_id'] = _validate_uuid(params.get('project_id'))
+        if not params['project_id']:
+            raise ValueError("剧情状态变更缺少有效 project_id")
+        params['chapter_id'] = _validate_uuid(params.get('chapter_id'))
+
+        for field in ['before_state', 'after_state', 'diff', 'metadata']:
+            value = params.get(field) or {}
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except (json.JSONDecodeError, TypeError):
+                    value = {}
+            params[field] = json.dumps(value if isinstance(value, dict) else {})
+
+        for field in ['created_at', 'confirmed_at', 'applied_at', 'rejected_at']:
+            if isinstance(params.get(field), str):
+                try:
+                    params[field] = datetime.fromisoformat(params[field].replace('Z', '+00:00'))
+                except ValueError:
+                    params[field] = None
+        params['created_at'] = params.get('created_at') or datetime.utcnow()
+        params['status'] = params.get('status') or 'proposed'
+        params['confirmation_required'] = params.get('confirmation_required', True)
+        params['title'] = params.get('title') or ''
+        params['summary'] = params.get('summary') or ''
+        params['reason'] = params.get('reason') or ''
+        for field in [
+            'entity_id', 'entity_name', 'workflow_execution_id', 'workflow_id',
+            'node_id', 'agent_type', 'discussion_id', 'source_text', 'fingerprint',
+            'confirmed_at', 'applied_at', 'rejected_at',
+        ]:
+            params.setdefault(field, None)
+
+        chapter_id_sql = "CAST(:chapter_id AS UUID)" if params.get('chapter_id') else "NULL"
+        query = """
+        INSERT INTO narrative_state_changes (
+            id, project_id, entity_type, entity_id, entity_name, change_type, status,
+            confirmation_required, title, summary, reason, before_state, after_state,
+            diff, metadata, workflow_execution_id, workflow_id, node_id, agent_type,
+            chapter_id, discussion_id, source_text, fingerprint, created_at,
+            confirmed_at, applied_at, rejected_at
+        ) VALUES (
+            CAST(:id AS UUID), CAST(:project_id AS UUID), :entity_type, :entity_id, :entity_name,
+            :change_type, :status, :confirmation_required, :title, :summary, :reason,
+            CAST(:before_state AS jsonb), CAST(:after_state AS jsonb), CAST(:diff AS jsonb),
+            CAST(:metadata AS jsonb), :workflow_execution_id, :workflow_id, :node_id, :agent_type,
+            """ + chapter_id_sql + """, :discussion_id, :source_text, :fingerprint, :created_at,
+            :confirmed_at, :applied_at, :rejected_at
+        )
+        ON CONFLICT (id) DO UPDATE SET
+            entity_type = EXCLUDED.entity_type,
+            entity_id = EXCLUDED.entity_id,
+            entity_name = EXCLUDED.entity_name,
+            change_type = EXCLUDED.change_type,
+            status = EXCLUDED.status,
+            confirmation_required = EXCLUDED.confirmation_required,
+            title = EXCLUDED.title,
+            summary = EXCLUDED.summary,
+            reason = EXCLUDED.reason,
+            before_state = EXCLUDED.before_state,
+            after_state = EXCLUDED.after_state,
+            diff = EXCLUDED.diff,
+            metadata = EXCLUDED.metadata,
+            workflow_execution_id = EXCLUDED.workflow_execution_id,
+            workflow_id = EXCLUDED.workflow_id,
+            node_id = EXCLUDED.node_id,
+            agent_type = EXCLUDED.agent_type,
+            chapter_id = EXCLUDED.chapter_id,
+            discussion_id = EXCLUDED.discussion_id,
+            source_text = EXCLUDED.source_text,
+            fingerprint = EXCLUDED.fingerprint,
+            confirmed_at = EXCLUDED.confirmed_at,
+            applied_at = EXCLUDED.applied_at,
+            rejected_at = EXCLUDED.rejected_at
+        """
+        if params.get('fingerprint'):
+            existing = await self.get_state_change_by_fingerprint(params['project_id'], params['fingerprint'])
+            if existing and existing.get('id') != change_id:
+                return str(existing['id'])
+        await self.execute_write(query, params)
+        return change_id
+
+    async def get_narrative_state_change(self, change_id: str) -> Optional[Dict[str, Any]]:
+        """获取单条剧情状态变更。"""
+        results = await self.execute_query(
+            "SELECT * FROM narrative_state_changes WHERE id = CAST(:id AS UUID)",
+            {"id": change_id},
+        )
+        return results[0] if results else None
+
+    async def get_state_change_by_fingerprint(self, project_id: str, fingerprint: str) -> Optional[Dict[str, Any]]:
+        """按幂等指纹获取剧情状态变更。"""
+        results = await self.execute_query(
+            """
+            SELECT * FROM narrative_state_changes
+            WHERE project_id = CAST(:project_id AS UUID) AND fingerprint = :fingerprint
+            LIMIT 1
+            """,
+            {"project_id": project_id, "fingerprint": fingerprint},
+        )
+        return results[0] if results else None
+
+    async def list_narrative_state_changes(
+        self,
+        project_id: str,
+        entity_type: Optional[str] = None,
+        entity_id: Optional[str] = None,
+        status: Optional[str] = None,
+        change_type: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """列出项目剧情状态变更。"""
+        conditions = ["project_id = CAST(:project_id AS UUID)"]
+        params: Dict[str, Any] = {"project_id": project_id, "limit": limit}
+        if entity_type:
+            conditions.append("entity_type = :entity_type")
+            params["entity_type"] = entity_type
+        if entity_id:
+            conditions.append("entity_id = :entity_id")
+            params["entity_id"] = entity_id
+        if status:
+            conditions.append("status = :status")
+            params["status"] = status
+        if change_type:
+            conditions.append("change_type = :change_type")
+            params["change_type"] = change_type
+        query = f"""
+        SELECT * FROM narrative_state_changes
+        WHERE {' AND '.join(conditions)}
+        ORDER BY created_at DESC
+        LIMIT :limit
+        """
+        return await self.execute_query(query, params)
+
+    async def update_narrative_state_change_status(
+        self,
+        change_id: str,
+        status: str,
+        timestamp_field: Optional[str] = None,
+    ) -> bool:
+        """更新剧情状态变更状态。"""
+        allowed_timestamp_fields = {"confirmed_at", "applied_at", "rejected_at"}
+        if timestamp_field in allowed_timestamp_fields:
+            query = f"""
+            UPDATE narrative_state_changes
+            SET status = :status, {timestamp_field} = NOW()
+            WHERE id = CAST(:id AS UUID)
+            """
+        else:
+            query = """
+            UPDATE narrative_state_changes
+            SET status = :status
+            WHERE id = CAST(:id AS UUID)
+            """
+        rowcount = await self.execute_write(query, {"id": change_id, "status": status})
+        return rowcount > 0
+
+    async def mark_narrative_state_change_applied(self, change_id: str) -> bool:
+        """标记剧情状态变更已应用。"""
+        return await self.update_narrative_state_change_status(change_id, 'applied', 'applied_at')
+
     # ==================== 伏笔相关操作 ====================
+
 
     async def save_hook(self, hook_data: Dict[str, Any]) -> str:
         """保存伏笔数据"""
@@ -1332,6 +1517,9 @@ class PostgresDatabase:
                 encounters JSONB DEFAULT '[]',
                 connections JSONB DEFAULT '[]',
                 local_rules JSONB DEFAULT '[]',
+                state TEXT DEFAULT 'normal',
+                state_summary TEXT,
+                destroyed_at TIMESTAMP WITH TIME ZONE,
                 is_generated BOOLEAN DEFAULT FALSE,
                 visit_count INTEGER DEFAULT 0,
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
@@ -1405,6 +1593,44 @@ class PostgresDatabase:
             CREATE INDEX IF NOT EXISTS idx_event_summaries_chapter_id ON event_summaries(chapter_id);
             """)
 
+        # 剧情状态变更表
+        if 'narrative_state_changes' not in existing_tables:
+            tables_to_create.append("""
+            CREATE TABLE narrative_state_changes (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                entity_type TEXT NOT NULL,
+                entity_id TEXT,
+                entity_name TEXT,
+                change_type TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'proposed',
+                confirmation_required BOOLEAN NOT NULL DEFAULT TRUE,
+                title TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '',
+                before_state JSONB NOT NULL DEFAULT '{}',
+                after_state JSONB NOT NULL DEFAULT '{}',
+                diff JSONB NOT NULL DEFAULT '{}',
+                metadata JSONB NOT NULL DEFAULT '{}',
+                workflow_execution_id TEXT,
+                workflow_id TEXT,
+                node_id TEXT,
+                agent_type TEXT,
+                chapter_id UUID REFERENCES chapters(id) ON DELETE SET NULL,
+                discussion_id TEXT,
+                source_text TEXT,
+                fingerprint TEXT,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                confirmed_at TIMESTAMP WITH TIME ZONE,
+                applied_at TIMESTAMP WITH TIME ZONE,
+                rejected_at TIMESTAMP WITH TIME ZONE
+            );
+            CREATE INDEX IF NOT EXISTS idx_narrative_state_changes_project_created ON narrative_state_changes(project_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_narrative_state_changes_entity ON narrative_state_changes(project_id, entity_type, entity_id);
+            CREATE INDEX IF NOT EXISTS idx_narrative_state_changes_status ON narrative_state_changes(project_id, status);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_narrative_state_changes_fingerprint ON narrative_state_changes(project_id, fingerprint) WHERE fingerprint IS NOT NULL;
+            """)
+
         # 执行创建表
         async with self.get_session() as session:
             for table_sql in tables_to_create:
@@ -1414,6 +1640,56 @@ class PostgresDatabase:
                             await session.execute(text(statement))
                         except Exception as e:
                             logger.warning(f"创建表时出错（可能已存在）: {str(e)[:100]}")
+
+            region_schema_updates = [
+                "ALTER TABLE regions ADD COLUMN IF NOT EXISTS state TEXT DEFAULT 'normal'",
+                "ALTER TABLE regions ADD COLUMN IF NOT EXISTS state_summary TEXT",
+                "ALTER TABLE regions ADD COLUMN IF NOT EXISTS destroyed_at TIMESTAMP WITH TIME ZONE",
+            ]
+            if 'regions' in existing_tables or tables_to_create:
+                for statement in region_schema_updates:
+                    try:
+                        await session.execute(text(statement))
+                    except Exception as e:
+                        logger.warning(f"更新区域表结构时出错: {str(e)[:100]}")
+
+            state_change_schema_updates = [
+                "ALTER TABLE narrative_state_changes ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'",
+                "ALTER TABLE narrative_state_changes ADD COLUMN IF NOT EXISTS workflow_execution_id TEXT",
+                "ALTER TABLE narrative_state_changes ADD COLUMN IF NOT EXISTS workflow_id TEXT",
+                "ALTER TABLE narrative_state_changes ADD COLUMN IF NOT EXISTS node_id TEXT",
+                "ALTER TABLE narrative_state_changes ADD COLUMN IF NOT EXISTS agent_type TEXT",
+                "ALTER TABLE narrative_state_changes ADD COLUMN IF NOT EXISTS chapter_id UUID REFERENCES chapters(id) ON DELETE SET NULL",
+                "ALTER TABLE narrative_state_changes ADD COLUMN IF NOT EXISTS discussion_id TEXT",
+                "ALTER TABLE narrative_state_changes ADD COLUMN IF NOT EXISTS source_text TEXT",
+                "CREATE INDEX IF NOT EXISTS idx_narrative_state_changes_project_created ON narrative_state_changes(project_id, created_at DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_narrative_state_changes_entity ON narrative_state_changes(project_id, entity_type, entity_id)",
+                "CREATE INDEX IF NOT EXISTS idx_narrative_state_changes_status ON narrative_state_changes(project_id, status)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_narrative_state_changes_fingerprint ON narrative_state_changes(project_id, fingerprint) WHERE fingerprint IS NOT NULL",
+            ]
+            if 'narrative_state_changes' in existing_tables or any('narrative_state_changes' in sql for sql in tables_to_create):
+                for statement in state_change_schema_updates:
+                    try:
+                        await session.execute(text(statement))
+                    except Exception as e:
+                        logger.warning(f"更新剧情状态变更表结构时出错: {str(e)[:100]}")
+
+            character_schema_updates = [
+                "ALTER TABLE characters ADD COLUMN IF NOT EXISTS world_id UUID REFERENCES worlds(id) ON DELETE SET NULL",
+                "ALTER TABLE characters ADD COLUMN IF NOT EXISTS current_location TEXT",
+                "ALTER TABLE characters ADD COLUMN IF NOT EXISTS current_region_id UUID REFERENCES regions(id) ON DELETE SET NULL",
+                "ALTER TABLE characters ADD COLUMN IF NOT EXISTS current_location_reason TEXT DEFAULT ''",
+                "ALTER TABLE characters ADD COLUMN IF NOT EXISTS death_detail JSONB",
+                "ALTER TABLE characters ADD COLUMN IF NOT EXISTS available_presence_types JSONB DEFAULT '[\"present\"]'::jsonb",
+                "CREATE INDEX IF NOT EXISTS idx_characters_world_id ON characters(world_id)",
+                "CREATE INDEX IF NOT EXISTS idx_characters_current_region_id ON characters(current_region_id)",
+            ]
+            if 'characters' in existing_tables or tables_to_create:
+                for statement in character_schema_updates:
+                    try:
+                        await session.execute(text(statement))
+                    except Exception as e:
+                        logger.warning(f"更新角色表结构时出错: {str(e)[:100]}")
             await session.commit()
 
         logger.info(f"数据库表结构初始化完成，已存在表: {existing_tables}, 新创建表: {len(tables_to_create)}")

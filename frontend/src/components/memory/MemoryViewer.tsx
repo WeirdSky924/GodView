@@ -15,6 +15,14 @@ import {
   MemoryType,
   MemoryCategory,
 } from '../../api/memories';
+import {
+  applyStateChange,
+  confirmStateChange,
+  getStateChanges,
+  rejectStateChange,
+  NarrativeStateChange,
+  NarrativeStateChangeStatus,
+} from '../../api/stateChanges';
 
 interface MemoryViewerProps {
   projectId: string;
@@ -22,8 +30,9 @@ interface MemoryViewerProps {
 }
 
 const MemoryViewer: React.FC<MemoryViewerProps> = ({ projectId, currentChapter = 1 }) => {
-  const [activeTab, setActiveTab] = useState<'memories' | 'snapshot' | 'foreshadowing'>('memories');
+  const [activeTab, setActiveTab] = useState<'memories' | 'snapshot' | 'foreshadowing' | 'stateChanges'>('memories');
   const [loading, setLoading] = useState(false);
+  const [actionLoadingId, setActionLoadingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   // 记忆列表
@@ -38,6 +47,12 @@ const MemoryViewer: React.FC<MemoryViewerProps> = ({ projectId, currentChapter =
 
   // 伏笔
   const [foreshadowings, setForeshadowings] = useState<Foreshadowing[]>([]);
+
+  // 剧情状态变更
+  const [stateChanges, setStateChanges] = useState<NarrativeStateChange[]>([]);
+  const [stateChangeEntityType, setStateChangeEntityType] = useState('');
+  const [stateChangeStatus, setStateChangeStatus] = useState<NarrativeStateChangeStatus | ''>('');
+  const [stateChangeType, setStateChangeType] = useState('');
 
   // 加载记忆列表
   const loadMemories = useCallback(async () => {
@@ -106,12 +121,33 @@ const MemoryViewer: React.FC<MemoryViewerProps> = ({ projectId, currentChapter =
     }
   }, [projectId]);
 
+  // 加载剧情状态变更
+  const loadStateChanges = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await getStateChanges({
+        project_id: projectId,
+        entity_type: stateChangeEntityType || undefined,
+        status: stateChangeStatus || undefined,
+        change_type: stateChangeType || undefined,
+        limit: 100,
+      });
+      setStateChanges(data);
+    } catch (err: any) {
+      setError(err.message || '加载剧情状态变更失败');
+    } finally {
+      setLoading(false);
+    }
+  }, [projectId, stateChangeEntityType, stateChangeStatus, stateChangeType]);
+
   // 初始化加载
   useEffect(() => {
     if (activeTab === 'memories') loadMemories();
     else if (activeTab === 'snapshot') loadSnapshot();
     else if (activeTab === 'foreshadowing') loadForeshadowings();
-  }, [activeTab, loadMemories, loadSnapshot, loadForeshadowings]);
+    else if (activeTab === 'stateChanges') loadStateChanges();
+  }, [activeTab, loadMemories, loadSnapshot, loadForeshadowings, loadStateChanges]);
 
   const getMemoryTypeColor = (type: MemoryType) => {
     const colors: Record<MemoryType, string> = {
@@ -138,6 +174,60 @@ const MemoryViewer: React.FC<MemoryViewerProps> = ({ projectId, currentChapter =
       abandoned: 'bg-gray-100 text-gray-800',
     };
     return colors[status] || 'bg-gray-100';
+  };
+
+  const getStateChangeStatusColor = (status: string) => {
+    const colors: Record<string, string> = {
+      proposed: 'bg-yellow-100 text-yellow-800',
+      confirmed: 'bg-blue-100 text-blue-800',
+      applied: 'bg-green-100 text-green-800',
+      rejected: 'bg-gray-100 text-gray-700',
+    };
+    return colors[status] || 'bg-gray-100 text-gray-700';
+  };
+
+  const getStateChangeStatusLabel = (status: string) => {
+    const labels: Record<string, string> = {
+      proposed: '待确认',
+      confirmed: '已确认',
+      applied: '已应用',
+      rejected: '已拒绝',
+    };
+    return labels[status] || status;
+  };
+
+  const formatTime = (value?: string | null) => {
+    if (!value) return '';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return value;
+    return date.toLocaleString();
+  };
+
+  const renderJsonDetail = (label: string, value: Record<string, any>) => {
+    if (!value || Object.keys(value).length === 0) return null;
+    return (
+      <details className="mt-2 text-xs">
+        <summary className="cursor-pointer text-gray-500 hover:text-gray-700">{label}</summary>
+        <pre className="mt-1 max-h-40 overflow-auto rounded bg-white p-2 text-gray-600 border">
+          {JSON.stringify(value, null, 2)}
+        </pre>
+      </details>
+    );
+  };
+
+  const handleStateChangeAction = async (changeId: string, action: 'confirm' | 'apply' | 'reject') => {
+    setActionLoadingId(changeId);
+    setError(null);
+    try {
+      if (action === 'confirm') await confirmStateChange(changeId);
+      else if (action === 'apply') await applyStateChange(changeId);
+      else await rejectStateChange(changeId);
+      await loadStateChanges();
+    } catch (err: any) {
+      setError(err.message || '剧情状态变更操作失败');
+    } finally {
+      setActionLoadingId(null);
+    }
   };
 
   const renderMemoryList = () => (
@@ -321,15 +411,141 @@ const MemoryViewer: React.FC<MemoryViewerProps> = ({ projectId, currentChapter =
     </div>
   );
 
+  const renderStateChanges = () => (
+    <div>
+      <div className="flex flex-wrap gap-2 mb-4">
+        <select
+          value={stateChangeEntityType}
+          onChange={(e) => setStateChangeEntityType(e.target.value)}
+          className="px-3 py-2 border rounded"
+        >
+          <option value="">全部实体</option>
+          <option value="character">角色</option>
+          <option value="region">区域</option>
+          <option value="hook">伏笔</option>
+          <option value="relationship">关系</option>
+          <option value="world">世界</option>
+          <option value="plot">剧情</option>
+          <option value="custom">自定义</option>
+        </select>
+        <select
+          value={stateChangeStatus}
+          onChange={(e) => setStateChangeStatus(e.target.value as NarrativeStateChangeStatus | '')}
+          className="px-3 py-2 border rounded"
+        >
+          <option value="">全部状态</option>
+          <option value="proposed">待确认</option>
+          <option value="confirmed">已确认</option>
+          <option value="applied">已应用</option>
+          <option value="rejected">已拒绝</option>
+        </select>
+        <select
+          value={stateChangeType}
+          onChange={(e) => setStateChangeType(e.target.value)}
+          className="px-3 py-2 border rounded"
+        >
+          <option value="">全部变化</option>
+          <option value="status_change">状态变化</option>
+          <option value="death">死亡</option>
+          <option value="resurrection">复活</option>
+          <option value="location_change">位置变化</option>
+          <option value="hook_triggered">伏笔触发</option>
+          <option value="hook_resolved">伏笔解决</option>
+          <option value="hook_dropped">伏笔废弃</option>
+          <option value="region_state_change">区域状态变化</option>
+          <option value="region_destroyed">区域被毁</option>
+          <option value="relationship_change">关系变化</option>
+          <option value="world_state_change">世界状态变化</option>
+          <option value="custom">自定义</option>
+        </select>
+        <button
+          onClick={loadStateChanges}
+          className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
+        >
+          筛选
+        </button>
+      </div>
+
+      <div className="space-y-3 max-h-[32rem] overflow-y-auto">
+        {stateChanges.map((change) => (
+          <div key={change.id} className="p-3 bg-gray-50 rounded-lg border">
+            <div className="flex items-start justify-between gap-3 mb-2">
+              <div>
+                <h4 className="font-medium text-gray-800">{change.title || change.summary || change.change_type}</h4>
+                <div className="mt-1 flex flex-wrap gap-2 text-xs text-gray-500">
+                  <span>{change.entity_type}{change.entity_name ? ` · ${change.entity_name}` : ''}</span>
+                  <span>{change.change_type}</span>
+                  {change.created_at && <span>{formatTime(change.created_at)}</span>}
+                </div>
+              </div>
+              <span className={`shrink-0 text-xs px-2 py-1 rounded ${getStateChangeStatusColor(change.status)}`}>
+                {getStateChangeStatusLabel(change.status)}
+              </span>
+            </div>
+
+            {change.summary && <p className="text-sm text-gray-600 mb-1">{change.summary}</p>}
+            {change.reason && <p className="text-xs text-gray-500 mb-2">原因: {change.reason}</p>}
+
+            <div className="flex flex-wrap gap-2 text-xs text-gray-400">
+              {change.workflow_execution_id && <span>执行: {change.workflow_execution_id}</span>}
+              {change.node_id && <span>节点: {change.node_id}</span>}
+              {change.agent_type && <span>Agent: {change.agent_type}</span>}
+              {change.chapter_id && <span>章节: {change.chapter_id}</span>}
+            </div>
+
+            {renderJsonDetail('变更前', change.before_state)}
+            {renderJsonDetail('变更后', change.after_state)}
+            {renderJsonDetail('差异', change.diff)}
+
+            {(change.status === 'proposed' || change.status === 'confirmed') && (
+              <div className="mt-3 flex gap-2">
+                {change.status === 'proposed' && (
+                  <>
+                    <button
+                      disabled={actionLoadingId === change.id}
+                      onClick={() => handleStateChangeAction(change.id, 'confirm')}
+                      className="px-3 py-1 bg-blue-500 text-white text-xs rounded hover:bg-blue-600 disabled:opacity-50"
+                    >
+                      确认
+                    </button>
+                    <button
+                      disabled={actionLoadingId === change.id}
+                      onClick={() => handleStateChangeAction(change.id, 'reject')}
+                      className="px-3 py-1 bg-gray-500 text-white text-xs rounded hover:bg-gray-600 disabled:opacity-50"
+                    >
+                      拒绝
+                    </button>
+                  </>
+                )}
+                {change.status === 'confirmed' && (
+                  <button
+                    disabled={actionLoadingId === change.id}
+                    onClick={() => handleStateChangeAction(change.id, 'apply')}
+                    className="px-3 py-1 bg-green-500 text-white text-xs rounded hover:bg-green-600 disabled:opacity-50"
+                  >
+                    应用
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+        ))}
+        {stateChanges.length === 0 && !loading && (
+          <div className="text-center text-gray-400 py-8">暂无剧情状态变更</div>
+        )}
+      </div>
+    </div>
+  );
+
   return (
     <div className="bg-white rounded-lg shadow-md p-6">
       <h3 className="text-lg font-bold text-gray-800 mb-4">记忆系统</h3>
 
       {/* 标签页 */}
-      <div className="flex border-b mb-4">
+      <div className="flex border-b mb-4 overflow-x-auto">
         <button
           onClick={() => setActiveTab('memories')}
-          className={`px-4 py-2 font-medium ${
+          className={`px-4 py-2 font-medium whitespace-nowrap ${
             activeTab === 'memories'
               ? 'text-blue-600 border-b-2 border-blue-600'
               : 'text-gray-500 hover:text-gray-700'
@@ -339,7 +555,7 @@ const MemoryViewer: React.FC<MemoryViewerProps> = ({ projectId, currentChapter =
         </button>
         <button
           onClick={() => setActiveTab('snapshot')}
-          className={`px-4 py-2 font-medium ${
+          className={`px-4 py-2 font-medium whitespace-nowrap ${
             activeTab === 'snapshot'
               ? 'text-blue-600 border-b-2 border-blue-600'
               : 'text-gray-500 hover:text-gray-700'
@@ -349,13 +565,23 @@ const MemoryViewer: React.FC<MemoryViewerProps> = ({ projectId, currentChapter =
         </button>
         <button
           onClick={() => setActiveTab('foreshadowing')}
-          className={`px-4 py-2 font-medium ${
+          className={`px-4 py-2 font-medium whitespace-nowrap ${
             activeTab === 'foreshadowing'
               ? 'text-blue-600 border-b-2 border-blue-600'
               : 'text-gray-500 hover:text-gray-700'
           }`}
         >
           伏笔追踪
+        </button>
+        <button
+          onClick={() => setActiveTab('stateChanges')}
+          className={`px-4 py-2 font-medium whitespace-nowrap ${
+            activeTab === 'stateChanges'
+              ? 'text-blue-600 border-b-2 border-blue-600'
+              : 'text-gray-500 hover:text-gray-700'
+          }`}
+        >
+          剧情变化
         </button>
       </div>
 
@@ -374,6 +600,7 @@ const MemoryViewer: React.FC<MemoryViewerProps> = ({ projectId, currentChapter =
           {activeTab === 'memories' && renderMemoryList()}
           {activeTab === 'snapshot' && renderSnapshot()}
           {activeTab === 'foreshadowing' && renderForeshadowing()}
+          {activeTab === 'stateChanges' && renderStateChanges()}
         </>
       )}
     </div>

@@ -86,6 +86,8 @@ class Entity:
         # 状态管理
         self.status = EntityStatus.ACTIVE
         self.current_location: Optional[str] = None
+        self.current_region_id: Optional[str] = None
+        self.current_location_reason: Optional[str] = None
         self.current_action: Optional[Action] = None
         self.current_goal: Optional[Goal] = None
 
@@ -187,7 +189,7 @@ class CharacterEntity(Entity):
 
         # 性格特质
         self.personality_traits: Dict[str, float] = {
-            trait.trait_name: trait.trait_value
+            trait.name: trait.value
             for trait in character.personality_traits
         }
 
@@ -202,6 +204,8 @@ class CharacterEntity(Entity):
 
         # 设定相关
         self.current_location = character.current_location
+        self.current_region_id = character.current_region_id
+        self.current_location_reason = character.current_location_reason
         self.attributes["description"] = character.description
         self.attributes["background"] = character.background_story
         self.attributes["goals"] = character.goals
@@ -621,8 +625,23 @@ class EntitySystem:
 
     def create_character_from_data(self, character_data: Dict[str, Any]) -> CharacterEntity:
         """从数据创建角色实体"""
+        normalized_data = dict(character_data)
+        normalized_traits = []
+        for trait in normalized_data.get("personality_traits") or []:
+            if isinstance(trait, dict):
+                normalized_trait = dict(trait)
+                if "name" not in normalized_trait and "trait_name" in normalized_trait:
+                    normalized_trait["name"] = normalized_trait.pop("trait_name")
+                if "value" not in normalized_trait and "trait_value" in normalized_trait:
+                    normalized_trait["value"] = normalized_trait.pop("trait_value")
+                normalized_traits.append(normalized_trait)
+            else:
+                normalized_traits.append(trait)
+        if normalized_traits:
+            normalized_data["personality_traits"] = normalized_traits
+
         # 创建Character对象
-        character = Character(**character_data)
+        character = Character(**normalized_data)
 
         # 创建CharacterEntity
         character_entity = CharacterEntity(character, self.config)

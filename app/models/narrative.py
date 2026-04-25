@@ -33,6 +33,102 @@ class TemporalScope(str, Enum):
     FUTURE = "future"  # 未来计划
 
 
+class NarrativeStateEntityType(str, Enum):
+    """剧情状态变更目标实体类型"""
+
+    CHARACTER = "character"
+    REGION = "region"
+    HOOK = "hook"
+    RELATIONSHIP = "relationship"
+    WORLD = "world"
+    PLOT = "plot"
+    CUSTOM = "custom"
+
+
+class NarrativeStateChangeType(str, Enum):
+    """剧情状态变更类型"""
+
+    STATUS_CHANGE = "status_change"
+    DEATH = "death"
+    RESURRECTION = "resurrection"
+    LOCATION_CHANGE = "location_change"
+    HOOK_TRIGGERED = "hook_triggered"
+    HOOK_RESOLVED = "hook_resolved"
+    HOOK_DROPPED = "hook_dropped"
+    REGION_STATE_CHANGE = "region_state_change"
+    REGION_DESTROYED = "region_destroyed"
+    RELATIONSHIP_CHANGE = "relationship_change"
+    WORLD_STATE_CHANGE = "world_state_change"
+    CUSTOM = "custom"
+
+
+class NarrativeStateChangeStatus(str, Enum):
+    """剧情状态变更确认/应用状态"""
+
+    PROPOSED = "proposed"
+    CONFIRMED = "confirmed"
+    APPLIED = "applied"
+    REJECTED = "rejected"
+
+
+class NarrativeStateChange(BaseModel):
+    """统一剧情状态变更日志。"""
+
+    id: Optional[str] = Field(None, description="状态变更 ID")
+    project_id: str = Field(..., description="所属项目 ID")
+
+    entity_type: NarrativeStateEntityType = Field(..., description="目标实体类型")
+    entity_id: Optional[str] = Field(None, description="目标实体 ID")
+    entity_name: Optional[str] = Field(None, description="目标实体名称")
+
+    change_type: NarrativeStateChangeType = Field(..., description="变更类型")
+    status: NarrativeStateChangeStatus = Field(
+        default=NarrativeStateChangeStatus.PROPOSED,
+        description="变更状态",
+    )
+    confirmation_required: bool = Field(default=True, description="是否需要用户确认")
+
+    title: str = Field(default="", description="变更标题")
+    summary: str = Field(default="", description="变更摘要")
+    reason: str = Field(default="", description="剧情内原因或触发理由")
+    before_state: Dict[str, Any] = Field(default_factory=dict, description="变更前状态")
+    after_state: Dict[str, Any] = Field(default_factory=dict, description="变更后状态")
+    diff: Dict[str, Any] = Field(default_factory=dict, description="结构化差异")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="扩展元数据")
+
+    workflow_execution_id: Optional[str] = Field(None, description="来源工作流执行 ID")
+    workflow_id: Optional[str] = Field(None, description="来源工作流 ID")
+    node_id: Optional[str] = Field(None, description="来源节点 ID")
+    agent_type: Optional[str] = Field(None, description="来源 Agent 类型")
+    chapter_id: Optional[str] = Field(None, description="关联章节 ID")
+    discussion_id: Optional[str] = Field(None, description="关联讨论 ID")
+    source_text: Optional[str] = Field(None, description="触发变更的原始文本")
+
+    fingerprint: Optional[str] = Field(None, description="幂等指纹")
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    confirmed_at: Optional[datetime] = None
+    applied_at: Optional[datetime] = None
+    rejected_at: Optional[datetime] = None
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "project_id": "proj_001",
+                "entity_type": "character",
+                "entity_id": "char_001",
+                "entity_name": "张三",
+                "change_type": "death",
+                "status": "proposed",
+                "title": "张三阵亡",
+                "summary": "张三在青石镇伏击中死亡",
+                "reason": "为保护同伴挡下致命一击",
+                "before_state": {"status": "active"},
+                "after_state": {"status": "dead"},
+            }
+        }
+    )
+
+
 class NarrativeEntry(BaseModel):
     """叙事条目模型"""
 

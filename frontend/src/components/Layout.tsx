@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { NavLink, useNavigate, useLocation } from 'react-router-dom'
 import {
-  LayoutDashboard, Users, Globe, BookOpen, BookMarked, Sliders, FileText, Settings, Flag, GitCompare, ShieldAlert, Eye, Network, Mic2, CheckCircle2, FolderOpen, ChevronDown, Plus, Layers, MessageSquare, Bot, PenTool, Sparkles, Sun, Moon, Database, Server, AlertCircle, CheckCircle, XCircle, Clapperboard, Play, ListTree
+  LayoutDashboard, Users, Globe, BookOpen, BookMarked, FileText, Settings, Flag, GitCompare, ShieldAlert, Eye, Network, Mic2, CheckCircle2, FolderOpen, ChevronDown, Plus, Layers, MessageSquare, Bot, PenTool, Sparkles, Sun, Moon, Database, Server, AlertCircle, CheckCircle, XCircle, Clapperboard, Play, ListTree, MapPin
 } from 'lucide-react'
 import { useProject } from '@/contexts/ProjectContext'
 import { useTheme } from '@/contexts/ThemeContext'
@@ -20,6 +20,7 @@ const navItems: NavItem[] = [
   { path: '/characters', icon: <Users size={20} />, label: '角色管理' },
   { path: '/character-voice', icon: <Mic2 size={20} />, label: '角色声音' },
   { path: '/worlds', icon: <Globe size={20} />, label: '世界管理' },
+  { path: '/world-map', icon: <MapPin size={20} />, label: '地图管理' },
   { path: '/lore', icon: <BookMarked size={20} />, label: '设定库' },
   { path: '/plots', icon: <BookOpen size={20} />, label: '剧情管理' },
   { path: '/outlines', icon: <ListTree size={20} />, label: '章节大纲' },
@@ -36,6 +37,8 @@ const navItems: NavItem[] = [
   { path: '/diff', icon: <GitCompare size={20} />, label: '版本对比' },
   { path: '/settings', icon: <Settings size={20} />, label: '系统设置' },
 ]
+
+const icpNumber = (import.meta as { env?: { VITE_ICP_NUMBER?: string } }).env?.VITE_ICP_NUMBER
 
 export default function Layout({ children }: { children: React.ReactNode }) {
   const { currentProject, projects, setCurrentProject, loading } = useProject()
@@ -294,6 +297,17 @@ export default function Layout({ children }: { children: React.ReactNode }) {
 
         {/* 底部信息 */}
         <div className={`p-4 border-t text-xs ${isDark ? 'border-gray-700 text-gray-500' : 'border-gray-200 text-gray-400'}`}>
+          {icpNumber && (
+            <a
+              href="https://beian.miit.gov.cn/"
+              target="_blank"
+              rel="noopener noreferrer"
+              className={`mb-2 block truncate transition-colors ${isDark ? 'hover:text-gray-300' : 'hover:text-gray-600'}`}
+              title={icpNumber}
+            >
+              {icpNumber}
+            </a>
+          )}
           <div className="flex items-center justify-between">
             <span>v7.0.0</span>
             <div className="flex items-center gap-2">

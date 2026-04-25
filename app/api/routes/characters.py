@@ -59,6 +59,28 @@ def _derive_role_from_tier(importance_tier: str) -> str:
     return "supporting"
 
 
+async def _validate_character_region_link(postgres_db: Any, char_data: Dict[str, Any]) -> Dict[str, Any]:
+    """校验角色当前区域与所属世界的一致性。"""
+    current_region_id = char_data.get("current_region_id")
+    if not current_region_id:
+        return char_data
+
+    region = await postgres_db.get_region(current_region_id)
+    if not region:
+        raise HTTPException(status_code=404, detail="当前所在区域不存在")
+
+    region_world_id = str(region.get("world_id")) if region.get("world_id") else None
+    character_world_id = str(char_data.get("world_id")) if char_data.get("world_id") else None
+
+    if character_world_id and region_world_id and character_world_id != region_world_id:
+        raise HTTPException(status_code=400, detail="角色所属世界与当前所在区域不一致")
+
+    if not character_world_id and region_world_id:
+        char_data["world_id"] = region_world_id
+
+    return char_data
+
+
 @router.get("", response_model=List[Dict[str, Any]])
 async def list_characters(
     project_id: Optional[str] = Query(None, description="按项目 ID 过滤"),
@@ -163,6 +185,8 @@ async def create_character(character: Character):
         char_data['has_agent'] = False
     if char_data.get('agent_enabled') is None:
         char_data['agent_enabled'] = True
+
+    char_data = await _validate_character_region_link(postgres_db, char_data)
 
     # 自动配置角色 Agent（基于 importance_tier）
     char_data = await _auto_configure_character_agent(char_data)
@@ -543,6 +567,8 @@ async def update_character(character_id: str, character: Character):
         role = char_data.get("role", "supporting")
         if role in ["main", "antagonist", "supporting"] and char_data.get("has_agent"):
             char_data = await _auto_configure_character_agent(char_data)
+
+    char_data = await _validate_character_region_link(postgres_db, char_data)
 
     try:
         await postgres_db.save_character(char_data)

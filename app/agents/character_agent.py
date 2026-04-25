@@ -73,6 +73,8 @@ class CharacterAgent(BaseAgent):
             "lexicon": ", ".join(char.lexicon) if char.lexicon else "无限制",
             "forbidden_words": ", ".join(char.forbidden_words) if char.forbidden_words else "无禁止",
             "current_location": char.current_location or "未知",
+            "current_region_id": char.current_region_id or "未知",
+            "current_location_reason": char.current_location_reason or "未记录",
             "goals": ", ".join(char.goals) if char.goals else "无特定目标",
             "inventory": ", ".join(char.inventory) if char.inventory else "无",
         }
@@ -107,6 +109,8 @@ class CharacterAgent(BaseAgent):
 
 【当前状态】
 - 位置：{char.current_location or '未知'}
+- 地图区域 ID：{char.current_region_id or '未知'}
+- 来到此地原因：{char.current_location_reason or '未记录'}
 - 目标：{', '.join(char.goals) if char.goals else '无特定目标'}
 - 物品：{', '.join(char.inventory) if char.inventory else '无'}
 

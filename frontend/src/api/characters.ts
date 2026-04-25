@@ -152,6 +152,10 @@ export interface Character {
   status: 'active' | 'inactive' | 'dead' | 'paused' | 'ghost' | 'resurrected'
   description: string
   project_id?: string
+  world_id?: string
+  current_location?: string
+  current_region_id?: string
+  current_location_reason?: string
 
   // 角色层级系统（核心分类字段）
   importance_tier?: CharacterImportanceTier
@@ -202,6 +206,10 @@ export interface CreateCharacterDTO {
   status: Character['status']
   description: string
   project_id?: string
+  world_id?: string
+  current_location?: string
+  current_region_id?: string
+  current_location_reason?: string
 
   // 角色层级系统
   importance_tier?: CharacterImportanceTier

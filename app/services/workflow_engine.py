@@ -4279,6 +4279,21 @@ class WorkflowEngine:
             "lore_candidates": ("lore_candidates", "lores", "new_lores", "设定", "世界观设定"),
             "region_candidates": ("region_candidates", "regions", "new_regions", "map_candidates", "地点", "地图地点"),
             "character_candidates": ("character_candidates", "new_characters", "characters_to_create", "角色"),
+            "character_location_updates": (
+                "character_location_updates",
+                "location_updates",
+                "character_locations",
+                "角色位置更新",
+                "角色位置",
+            ),
+            "state_changes": (
+                "state_changes",
+                "narrative_state_changes",
+                "state_change_candidates",
+                "剧情状态变更",
+                "状态变更",
+                "剧情变化",
+            ),
         }
 
         for candidate in candidates:
@@ -4318,6 +4333,8 @@ class WorkflowEngine:
         lore_candidates = bundle.get("lore_candidates", [])
         region_candidates = bundle.get("region_candidates", [])
         character_candidates = bundle.get("character_candidates", [])
+        character_location_updates = bundle.get("character_location_updates", [])
+        state_changes = bundle.get("state_changes", [])
         source_metadata = bundle.get("source_metadata", {})
 
         return {
@@ -4328,11 +4345,15 @@ class WorkflowEngine:
             "lore_count": len(lore_candidates),
             "region_count": len(region_candidates),
             "character_count": len(character_candidates),
+            "character_location_update_count": len(character_location_updates),
+            "state_change_count": len(state_changes),
             "plot_update_titles": _labels(plot_updates),
             "hook_titles": _labels(hooks),
             "lore_titles": _labels(lore_candidates),
             "region_titles": _labels(region_candidates),
             "character_titles": _labels(character_candidates),
+            "character_location_update_titles": _labels(character_location_updates),
+            "state_change_titles": _labels(state_changes),
         }
 
     def _build_discussion_asset_bundle(
@@ -4382,6 +4403,18 @@ class WorkflowEngine:
             "lore_candidates": [*raw_lore_candidates, *classified_location_lores],
             "region_candidates": classified_regions,
             "character_candidates": self._collect_discussion_assets(discussion_result, "character_candidates", "new_characters", "characters_to_create"),
+            "character_location_updates": self._collect_discussion_assets(
+                discussion_result,
+                "character_location_updates",
+                "location_updates",
+                "character_locations",
+            ),
+            "state_changes": self._collect_discussion_assets(
+                discussion_result,
+                "state_changes",
+                "narrative_state_changes",
+                "state_change_candidates",
+            ),
             "persistence_preview": {},
             "source_metadata": {
                 "node_id": node_id,
@@ -4418,6 +4451,8 @@ class WorkflowEngine:
             "lore_count": len(bundle.get("lore_candidates", [])),
             "region_count": len(bundle.get("region_candidates", [])),
             "character_count": len(bundle.get("character_candidates", [])),
+            "character_location_update_count": len(bundle.get("character_location_updates", [])),
+            "state_change_count": len(bundle.get("state_changes", [])),
         }
 
         discussion_result["discussion_assets"] = bundle
@@ -4617,6 +4652,166 @@ class WorkflowEngine:
         )
         return has_narrative_role and has_core_detail
 
+    def _extract_character_location_reason(self, candidate: Dict[str, Any]) -> str:
+        """提取角色到达当前位置的原因，兼容 Agent 输出别名。"""
+        for key in (
+            "current_location_reason",
+            "location_reason",
+            "arrival_reason",
+            "reason_for_arrival",
+            "movement_reason",
+        ):
+            value = candidate.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    async def _validate_discussion_character_location_update(
+        self,
+        update_data: Dict[str, Any],
+        existing_character: Dict[str, Any],
+        db=None,
+    ) -> Optional[str]:
+        """校验讨论输出中的角色位置更新，返回错误原因或 None。"""
+        current_region_id = update_data.get("current_region_id") or update_data.get("region_id")
+        if not current_region_id:
+            return None
+
+        if not db or not hasattr(db, "get_region"):
+            return None
+
+        region = await db.get_region(current_region_id)
+        if not region:
+            return "当前所在区域不存在"
+
+        region_world_id = str(region.get("world_id")) if region.get("world_id") else None
+        character_world_id = str(
+            update_data.get("world_id")
+            or existing_character.get("world_id")
+            or ""
+        ).strip() or None
+
+        if character_world_id and region_world_id and character_world_id != region_world_id:
+            return "角色所属世界与当前所在区域不一致"
+
+        if not update_data.get("world_id") and not existing_character.get("world_id") and region_world_id:
+            update_data["world_id"] = region_world_id
+
+        if not update_data.get("current_location") and region.get("name"):
+            update_data["current_location"] = region.get("name")
+
+        return None
+
+    async def _resolve_discussion_character_location_target(
+        self,
+        execution: "WorkflowExecution",
+        update_data: Dict[str, Any],
+        db=None,
+    ) -> Optional[Dict[str, Any]]:
+        """按 character_id 优先、character_name/name 兜底解析要更新的角色。"""
+        character_id = str(update_data.get("character_id") or update_data.get("id") or "").strip()
+        if character_id and db and hasattr(db, "get_character"):
+            character = await db.get_character(character_id)
+            if character:
+                return dict(character)
+
+        character_name = str(update_data.get("character_name") or update_data.get("name") or "").strip()
+        if character_name and db and hasattr(db, "get_character_by_project_and_name"):
+            character = await db.get_character_by_project_and_name(execution.project_id, character_name)
+            if character:
+                return dict(character)
+
+        if character_name and db and hasattr(db, "get_all_characters"):
+            characters = await db.get_all_characters(project_id=execution.project_id, limit=500)
+            for character in characters or []:
+                if str(character.get("name") or "").strip().lower() == character_name.lower():
+                    return dict(character)
+
+        return None
+
+    async def _persist_discussion_character_location_updates(
+        self,
+        execution: "WorkflowExecution",
+        character_location_updates: List[Any],
+        db=None,
+    ) -> Dict[str, Any]:
+        """保存讨论输出中针对已有角色的当前位置更新。"""
+        result = {"updated": [], "skipped": [], "errors": []}
+        if not character_location_updates:
+            return result
+        if not db:
+            result["errors"].append("数据库连接不存在，无法保存角色位置更新")
+            return result
+
+        for raw_update in character_location_updates:
+            update_data = self._discussion_asset_to_dict(raw_update, default_key="character_name")
+            if not update_data:
+                continue
+
+            character_name = str(update_data.get("character_name") or update_data.get("name") or "").strip()
+            character_id = str(update_data.get("character_id") or update_data.get("id") or "").strip()
+
+            try:
+                existing_character = await self._resolve_discussion_character_location_target(
+                    execution,
+                    update_data,
+                    db,
+                )
+                if not existing_character:
+                    result["skipped"].append({
+                        "character_id": character_id or None,
+                        "character_name": character_name or None,
+                        "reason": "未找到要更新的角色",
+                    })
+                    continue
+
+                validation_error = await self._validate_discussion_character_location_update(
+                    update_data,
+                    existing_character,
+                    db,
+                )
+                if validation_error:
+                    result["skipped"].append({
+                        "id": existing_character.get("id"),
+                        "name": existing_character.get("name") or character_name,
+                        "reason": validation_error,
+                    })
+                    continue
+
+                reason = self._extract_character_location_reason(update_data)
+                merged_character = dict(existing_character)
+                merged_character["id"] = existing_character.get("id") or character_id
+                merged_character["name"] = existing_character.get("name") or character_name
+
+                if update_data.get("world_id"):
+                    merged_character["world_id"] = update_data.get("world_id")
+                if update_data.get("current_region_id") or update_data.get("region_id"):
+                    merged_character["current_region_id"] = update_data.get("current_region_id") or update_data.get("region_id")
+                if update_data.get("current_location") or update_data.get("location"):
+                    merged_character["current_location"] = update_data.get("current_location") or update_data.get("location")
+                if reason:
+                    merged_character["current_location_reason"] = reason
+
+                merged_character["updated_at"] = datetime.now()
+                await db.save_character(merged_character)
+                result["updated"].append({
+                    "id": merged_character.get("id"),
+                    "name": merged_character.get("name"),
+                    "current_region_id": merged_character.get("current_region_id"),
+                    "current_location": merged_character.get("current_location"),
+                    "current_location_reason": merged_character.get("current_location_reason") or "",
+                })
+                logger.info(f"保存角色位置更新: {merged_character.get('name')}")
+            except Exception as e:
+                logger.error(f"保存角色位置更新失败: {character_name or character_id or raw_update}: {e}")
+                result["errors"].append({
+                    "character_id": character_id or None,
+                    "character_name": character_name or None,
+                    "error": str(e),
+                })
+
+        return result
+
     async def _persist_discussion_characters(
         self,
         execution: "WorkflowExecution",
@@ -4682,6 +4877,15 @@ class WorkflowEngine:
                     "goals": goals,
                     "inventory": candidate.get("inventory") or [],
                     "current_location": candidate.get("current_location") or candidate.get("location"),
+                    "current_region_id": candidate.get("current_region_id") or candidate.get("region_id"),
+                    "current_location_reason": (
+                        candidate.get("current_location_reason")
+                        or candidate.get("location_reason")
+                        or candidate.get("arrival_reason")
+                        or candidate.get("reason_for_arrival")
+                        or candidate.get("movement_reason")
+                        or ""
+                    ),
                     "agent_goals": candidate.get("agent_goals") or [],
                     "agent_memory": candidate.get("agent_memory") or [],
                     "has_agent": candidate.get("has_agent"),
@@ -4708,6 +4912,65 @@ class WorkflowEngine:
 
         return result
 
+    async def _persist_discussion_state_changes(
+        self,
+        execution: "WorkflowExecution",
+        state_changes: List[Any],
+        source_metadata: Dict[str, Any],
+        db=None,
+    ) -> Dict[str, Any]:
+        """保存并应用讨论输出中的剧情状态变更。"""
+        result = {"created": [], "applied": [], "errors": []}
+        if not state_changes:
+            return result
+        if not db:
+            result["errors"].append("数据库连接不存在")
+            return result
+
+        from app.services.narrative_state_change_service import NarrativeStateChangeService
+
+        service = NarrativeStateChangeService(db)
+        source_context = {
+            "workflow_execution_id": source_metadata.get("execution_id") or execution.id,
+            "workflow_id": execution.workflow_id,
+            "node_id": source_metadata.get("node_id"),
+            "agent_type": source_metadata.get("leader_type") or source_metadata.get("leader"),
+            "chapter_id": execution.context.get("chapter_id"),
+            "discussion_id": source_metadata.get("discussion_id") or f"{execution.id}:{source_metadata.get('node_id', 'discussion')}",
+            "source_text": execution.context.get("discussion_summary") or execution.context.get("last_discussion_summary"),
+        }
+
+        for raw_change in state_changes:
+            change_payload = self._discussion_asset_to_dict(raw_change, default_key="title")
+            if not change_payload:
+                continue
+            if not change_payload.get("project_id"):
+                change_payload["project_id"] = execution.project_id
+
+            try:
+                change = await service.create_change(change_payload, source_context=source_context)
+                result["created"].append({
+                    "id": change.get("id"),
+                    "entity_type": change.get("entity_type"),
+                    "entity_id": change.get("entity_id"),
+                    "change_type": change.get("change_type"),
+                    "status": change.get("status"),
+                    "title": change.get("title"),
+                })
+
+                confirmed = await service.confirm_change(change["id"])
+                applied = await service.apply_change(confirmed["id"])
+                applied_change = applied.get("change") or {}
+                result["applied"].append({
+                    "id": applied_change.get("id") or change.get("id"),
+                    "projection": applied.get("projection"),
+                })
+            except Exception as e:
+                logger.error(f"保存讨论剧情状态变更失败: {change_payload}: {e}")
+                result["errors"].append({"title": change_payload.get("title"), "error": str(e)})
+
+        return result
+
     async def _persist_discussion_assets(
         self,
         execution: "WorkflowExecution",
@@ -4724,6 +4987,8 @@ class WorkflowEngine:
             "lores": {"created": [], "updated": []},
             "regions": {"saved": []},
             "characters": {"created": [], "skipped": [], "errors": []},
+            "character_location_updates": {"updated": [], "skipped": [], "errors": []},
+            "state_changes": {"created": [], "applied": [], "errors": []},
             "errors": [],
         }
 
@@ -4766,6 +5031,19 @@ class WorkflowEngine:
                     bundle.get("character_candidates", []),
                     db,
                 )
+
+                state["character_location_updates"] = await self._persist_discussion_character_location_updates(
+                    execution,
+                    bundle.get("character_location_updates", []),
+                    db,
+                )
+
+                state["state_changes"] = await self._persist_discussion_state_changes(
+                    execution,
+                    bundle.get("state_changes", []),
+                    bundle.get("source_metadata", {}),
+                    db,
+                )
             else:
                 state["errors"].append("数据库连接不存在，讨论资产仅写入执行上下文")
 
@@ -4774,6 +5052,21 @@ class WorkflowEngine:
                 "lores": state.get("lores", {}).get("created", []),
                 "regions": state.get("regions", {}).get("saved", []),
                 "characters": [c.get("id") for c in state.get("characters", {}).get("created", []) if c.get("id")],
+                "character_location_updates": [
+                    c.get("id")
+                    for c in state.get("character_location_updates", {}).get("updated", [])
+                    if c.get("id")
+                ],
+                "state_changes": [
+                    c.get("id")
+                    for c in state.get("state_changes", {}).get("created", [])
+                    if c.get("id")
+                ],
+                "applied_state_changes": [
+                    c.get("id")
+                    for c in state.get("state_changes", {}).get("applied", [])
+                    if c.get("id")
+                ],
             }
             state["committed"] = True
             state["persisted_asset_refs"] = persisted_refs
@@ -4785,6 +5078,9 @@ class WorkflowEngine:
             execution.context["discussion_created_lores"] = persisted_refs["lores"]
             execution.context["discussion_created_regions"] = persisted_refs["regions"]
             execution.context["discussion_created_characters"] = state.get("characters", {}).get("created", [])
+            execution.context["discussion_character_location_updates"] = state.get("character_location_updates", {}).get("updated", [])
+            execution.context["discussion_state_changes"] = state.get("state_changes", {}).get("created", [])
+            execution.context["discussion_applied_state_changes"] = state.get("state_changes", {}).get("applied", [])
 
             await self._broadcast_status(execution.id, "discussion_assets_persisted", self._make_json_safe(state))
             return state

@@ -247,7 +247,8 @@ class LocationSystem:
         self,
         character_id: str,
         target_location_id: str,
-        entity_system = None
+        entity_system = None,
+        reason: Optional[str] = None,
     ) -> bool:
         """移动角色到新地点
 
@@ -255,6 +256,7 @@ class LocationSystem:
             character_id: 角色ID
             target_location_id: 目标地点ID
             entity_system: 实体系统（用于验证）
+            reason: 角色来到目标地点的理由概述
 
         Returns:
             bool: 是否成功移动
@@ -300,6 +302,8 @@ class LocationSystem:
             entity = entity_system.get_entity(character_id)
             if entity:
                 entity.current_location = target_location_id
+                entity.current_region_id = target_location_id
+                entity.current_location_reason = reason or ""
 
         return True
 

@@ -111,8 +111,8 @@ class WorldSimulationEngine:
         # self.intervention_system = InterventionSystem()
 
         # 注册时间更新回调
-        async def time_update_callback(result: TimeUpdateResult):
-            await self._handle_time_update(result)
+        def time_update_callback(result: TimeUpdateResult):
+            asyncio.create_task(self._handle_time_update(result))
 
         self.time_system.register_time_update_callback(time_update_callback)
 
@@ -255,7 +255,8 @@ class WorldSimulationEngine:
 
         try:
             # 1. 推进时间
-            time_delta = await self.time_system.advance()
+            time_update = await self.time_system.advance()
+            time_delta = time_update.time_delta
             self.current_tick += 1
             self.total_ticks += 1
 

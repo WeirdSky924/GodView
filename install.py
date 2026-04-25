@@ -615,9 +615,15 @@ CREATE INDEX idx_chapters_status ON chapters(status);
 CREATE TABLE IF NOT EXISTS characters (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    world_id UUID REFERENCES worlds(id) ON DELETE SET NULL,
     name VARCHAR(255) NOT NULL,
     role VARCHAR(100),  -- 主角、配角、反派等
     description TEXT,
+    current_location TEXT,
+    current_region_id UUID REFERENCES regions(id) ON DELETE SET NULL,
+    current_location_reason TEXT DEFAULT '',
+    death_detail JSONB,
+    available_presence_types JSONB DEFAULT '["present"]'::jsonb,
     traits JSONB DEFAULT '{}',
     voice_settings JSONB DEFAULT '{}',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
@@ -625,6 +631,8 @@ CREATE TABLE IF NOT EXISTS characters (
 );
 
 CREATE INDEX idx_characters_project ON characters(project_id);
+CREATE INDEX idx_characters_world_id ON characters(world_id);
+CREATE INDEX idx_characters_current_region_id ON characters(current_region_id);
 
 -- ================== 世界设定表 ==================
 CREATE TABLE IF NOT EXISTS world_settings (
@@ -797,6 +805,9 @@ CREATE TABLE IF NOT EXISTS regions (
     encounters JSONB DEFAULT '[]',
     connections JSONB DEFAULT '[]',
     local_rules JSONB DEFAULT '[]',
+    state TEXT DEFAULT 'normal',
+    state_summary TEXT,
+    destroyed_at TIMESTAMP WITH TIME ZONE,
     is_generated BOOLEAN DEFAULT FALSE,
     visit_count INTEGER DEFAULT 0,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
@@ -805,6 +816,42 @@ CREATE TABLE IF NOT EXISTS regions (
 
 CREATE INDEX idx_regions_world ON regions(world_id);
 CREATE INDEX idx_regions_project ON regions(project_id);
+
+-- ================== 剧情状态变更表 ==================
+CREATE TABLE IF NOT EXISTS narrative_state_changes (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT,
+    entity_name TEXT,
+    change_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'proposed',
+    confirmation_required BOOLEAN NOT NULL DEFAULT TRUE,
+    title TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    before_state JSONB NOT NULL DEFAULT '{}',
+    after_state JSONB NOT NULL DEFAULT '{}',
+    diff JSONB NOT NULL DEFAULT '{}',
+    metadata JSONB NOT NULL DEFAULT '{}',
+    workflow_execution_id TEXT,
+    workflow_id TEXT,
+    node_id TEXT,
+    agent_type TEXT,
+    chapter_id UUID REFERENCES chapters(id) ON DELETE SET NULL,
+    discussion_id TEXT,
+    source_text TEXT,
+    fingerprint TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    confirmed_at TIMESTAMP WITH TIME ZONE,
+    applied_at TIMESTAMP WITH TIME ZONE,
+    rejected_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE INDEX idx_narrative_state_changes_project_created ON narrative_state_changes(project_id, created_at DESC);
+CREATE INDEX idx_narrative_state_changes_entity ON narrative_state_changes(project_id, entity_type, entity_id);
+CREATE INDEX idx_narrative_state_changes_status ON narrative_state_changes(project_id, status);
+CREATE UNIQUE INDEX idx_narrative_state_changes_fingerprint ON narrative_state_changes(project_id, fingerprint) WHERE fingerprint IS NOT NULL;
 
 -- ================== 章节大纲表 ==================
 CREATE TABLE IF NOT EXISTS chapter_outlines (

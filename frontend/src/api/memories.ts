@@ -5,6 +5,22 @@
 
 import { api as apiClient } from './client';
 
+function unwrap<T>(response: T | { data: T }): T {
+  if (response && typeof response === 'object' && 'data' in response) {
+    return (response as { data: T }).data;
+  }
+  return response as T;
+}
+
+function unwrapListResponse<T>(response: T[] | { data: T[] } | { memories: T[] } | { data: { memories: T[] } }): T[] {
+  const unwrapped = unwrap(response as T[] | { memories: T[] } | { data: T[] } | { data: { memories: T[] } });
+  if (Array.isArray(unwrapped)) return unwrapped;
+  if (unwrapped && typeof unwrapped === 'object' && 'memories' in unwrapped) {
+    return (unwrapped as { memories: T[] }).memories;
+  }
+  return [];
+}
+
 // ==================== 类型定义 ====================
 
 export type MemoryType = 'short_term' | 'medium_term' | 'long_term';
@@ -112,32 +128,32 @@ export async function getMemories(projectId: string, params?: {
       if (value !== undefined) searchParams.append(key, String(value));
     });
   }
-  const response = await apiClient.get(`/memories?${searchParams.toString()}`);
-  return response.data;
+  const response = await apiClient.get<MemoryEntry[] | { data: MemoryEntry[] } | { memories: MemoryEntry[] } | { data: { memories: MemoryEntry[] } }>(`/memories?${searchParams.toString()}`);
+  return unwrapListResponse(response);
 }
 
 /**
  * 创建记忆
  */
 export async function createMemory(data: CreateMemoryRequest): Promise<MemoryEntry> {
-  const response = await apiClient.post('/memories', data);
-  return response.data;
+  const response = await apiClient.post<MemoryEntry | { data: MemoryEntry }>('/memories', data);
+  return unwrap(response);
 }
 
 /**
  * 获取记忆详情
  */
 export async function getMemory(memoryId: string): Promise<MemoryEntry> {
-  const response = await apiClient.get(`/memories/${memoryId}`);
-  return response.data;
+  const response = await apiClient.get<MemoryEntry | { data: MemoryEntry }>(`/memories/${memoryId}`);
+  return unwrap(response);
 }
 
 /**
  * 更新记忆
  */
 export async function updateMemory(memoryId: string, data: Partial<CreateMemoryRequest>): Promise<MemoryEntry> {
-  const response = await apiClient.put(`/memories/${memoryId}`, data);
-  return response.data;
+  const response = await apiClient.put<MemoryEntry | { data: MemoryEntry }>(`/memories/${memoryId}`, data);
+  return unwrap(response);
 }
 
 /**
@@ -151,8 +167,14 @@ export async function deleteMemory(memoryId: string): Promise<void> {
  * 搜索记忆
  */
 export async function searchMemories(data: SearchMemoryRequest): Promise<SearchMemoryResult> {
-  const response = await apiClient.post('/memories/search', data);
-  return response.data;
+  const response = await apiClient.post<SearchMemoryResult | { data: SearchMemoryResult } | { results: Array<{ memory: MemoryEntry; relevance_score?: number }>; total: number }>('/memories/search', data);
+  const result = unwrap(response);
+  const typedResult = result as SearchMemoryResult | { results: Array<MemoryEntry | { memory: MemoryEntry }>; total: number; query?: string };
+  return {
+    ...typedResult,
+    query: typedResult.query || data.query,
+    results: typedResult.results.map((item: MemoryEntry | { memory: MemoryEntry }) => ('memory' in item ? item.memory : item)),
+  };
 }
 
 /**
@@ -161,49 +183,49 @@ export async function searchMemories(data: SearchMemoryRequest): Promise<SearchM
 export async function getSnapshot(projectId: string, chapterNumber?: number): Promise<MemorySnapshot> {
   const params = new URLSearchParams({ project_id: projectId });
   if (chapterNumber) params.append('chapter', String(chapterNumber));
-  const response = await apiClient.get(`/memories/snapshot?${params.toString()}`);
-  return response.data;
+  const response = await apiClient.get<MemorySnapshot | { data: MemorySnapshot }>(`/memories/snapshot?${params.toString()}`);
+  return unwrap(response);
 }
 
 /**
  * 构建记忆快照
  */
 export async function buildSnapshot(projectId: string, chapterNumber: number): Promise<MemorySnapshot> {
-  const response = await apiClient.post('/memories/snapshot/build', {
+  const response = await apiClient.post<MemorySnapshot | { data: MemorySnapshot }>('/memories/snapshot/build', {
     project_id: projectId,
     chapter_number: chapterNumber,
   });
-  return response.data;
+  return unwrap(response);
 }
 
 /**
  * 获取角色记忆状态
  */
 export async function getCharacterMemoryState(projectId: string, characterId: string): Promise<CharacterMemoryState> {
-  const response = await apiClient.get(`/memories/character/${characterId}`, {
+  const response = await apiClient.get<CharacterMemoryState | { data: CharacterMemoryState }>(`/memories/character/${characterId}`, {
     params: { project_id: projectId },
   });
-  return response.data;
+  return unwrap(response);
 }
 
 /**
  * 获取待回收伏笔
  */
 export async function getPendingForeshadowings(projectId: string): Promise<Foreshadowing[]> {
-  const response = await apiClient.get('/memories/foreshadowing', {
+  const response = await apiClient.get<Foreshadowing[] | { data: Foreshadowing[] }>('/memories/foreshadowing', {
     params: { project_id: projectId },
   });
-  return response.data;
+  return unwrap(response);
 }
 
 /**
  * 标记伏笔已揭示
  */
 export async function revealForeshadowing(foreshadowingId: string, chapterNumber: number): Promise<Foreshadowing> {
-  const response = await apiClient.post(`/memories/foreshadowing/${foreshadowingId}/reveal`, {
+  const response = await apiClient.post<Foreshadowing | { data: Foreshadowing }>(`/memories/foreshadowing/${foreshadowingId}/reveal`, {
     reveal_chapter: chapterNumber,
   });
-  return response.data;
+  return unwrap(response);
 }
 
 export default {

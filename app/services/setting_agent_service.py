@@ -1584,7 +1584,10 @@ class SettingAgentService:
             "plot_priority",
             "has_agent",
             "agent_enabled",
+            "world_id",
             "current_location",
+            "current_region_id",
+            "current_location_reason",
         ]
 
         for field in scalar_fields:

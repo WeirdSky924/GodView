@@ -13,6 +13,7 @@ interface Location {
   type?: string
   x: number
   y: number
+  connections?: string[]
   characters?: CharacterPosition[]
   environment?: EnvironmentCondition
 }
@@ -21,6 +22,7 @@ interface CharacterPosition {
   id: string
   name: string
   location_id: string
+  location_reason?: string
 }
 
 interface EnvironmentCondition {
@@ -115,17 +117,29 @@ export default function MapView({
   }
 
   const drawConnections = (ctx: CanvasRenderingContext2D, locations: Location[]) => {
+    const locationById = new Map(locations.map(location => [location.id, location]))
+    const drawnConnections = new Set<string>()
+
     ctx.strokeStyle = '#d1d5db'
     ctx.lineWidth = 1
     ctx.setLineDash([5, 5])
 
-    // 简单连接相邻地点
-    for (let i = 0; i < locations.length - 1; i++) {
-      ctx.beginPath()
-      ctx.moveTo(locations[i].x, locations[i].y)
-      ctx.lineTo(locations[i + 1].x, locations[i + 1].y)
-      ctx.stroke()
-    }
+    locations.forEach(location => {
+      location.connections?.forEach(targetId => {
+        const target = locationById.get(targetId)
+        if (!target) return
+
+        const connectionKey = [location.id, targetId].sort().join(':')
+        if (drawnConnections.has(connectionKey)) return
+        drawnConnections.add(connectionKey)
+
+        ctx.beginPath()
+        ctx.moveTo(location.x, location.y)
+        ctx.lineTo(target.x, target.y)
+        ctx.stroke()
+      })
+    })
+
     ctx.setLineDash([])
   }
 
@@ -144,6 +158,13 @@ export default function MapView({
       port: '#06b6d4',
       danger: '#ef4444',
       hidden: '#8b5cf6',
+      custom: '#6b7280',
+      building: '#f97316',
+      village: '#84cc16',
+      wilderness: '#a16207',
+      dungeon: '#7c2d12',
+      water: '#0ea5e9',
+      mountain: '#78716c',
       default: '#6b7280'
     }
     ctx.fillStyle = colors[type || 'default'] || colors.default
@@ -259,10 +280,14 @@ export default function MapView({
   const getLocationTypeInfo = (type?: string): { label: string; color: string } => {
     const types: Record<string, { label: string; color: string }> = {
       city: { label: '城市', color: 'bg-blue-100 text-blue-800' },
+      village: { label: '村庄', color: 'bg-lime-100 text-lime-800' },
+      wilderness: { label: '荒野', color: 'bg-amber-100 text-amber-800' },
+      dungeon: { label: '秘境', color: 'bg-orange-100 text-orange-800' },
+      building: { label: '建筑', color: 'bg-orange-100 text-orange-800' },
+      water: { label: '水域', color: 'bg-sky-100 text-sky-800' },
+      mountain: { label: '山脉', color: 'bg-stone-100 text-stone-800' },
       forest: { label: '森林', color: 'bg-green-100 text-green-800' },
-      port: { label: '港口', color: 'bg-cyan-100 text-cyan-800' },
-      danger: { label: '危险区', color: 'bg-red-100 text-red-800' },
-      hidden: { label: '隐秘地', color: 'bg-purple-100 text-purple-800' },
+      custom: { label: '自定义', color: 'bg-gray-100 text-gray-800' },
     }
     return types[type || ''] || { label: '未知', color: 'bg-gray-100 text-gray-800' }
   }

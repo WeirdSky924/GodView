@@ -15,6 +15,7 @@ import Director from './pages/Director'
 import NovelView from './pages/NovelView'
 import Settings from './pages/Settings'
 import DiffTool from './pages/DiffTool'
+import WorldMap from './pages/WorldMap'
 import WorldView from './pages/WorldView'
 import Bootstrap from './pages/Bootstrap'
 import ProjectSetup from './pages/ProjectSetup'
@@ -43,6 +44,7 @@ function App() {
         <Route path="/director" element={<Director />} />
         <Route path="/novel" element={<NovelView />} />
         <Route path="/diff" element={<DiffTool />} />
+        <Route path="/world-map" element={<WorldMap />} />
         <Route path="/world-view" element={<WorldView />} />
         <Route path="/settings" element={<Settings />} />
         <Route path="/bootstrap" element={<Bootstrap />} />

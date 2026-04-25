@@ -194,6 +194,11 @@ class Region(BaseModel):
     # 区域规则（可覆盖世界规则）
     local_rules: List[str] = Field(default_factory=list, description="本地规则 ID 列表")
 
+    # 当前剧情状态
+    state: Optional[str] = Field(default="normal", description="当前区域状态：normal/destroyed/sealed/occupied 等")
+    state_summary: Optional[str] = Field(None, description="当前区域状态概述")
+    destroyed_at: Optional[datetime] = Field(None, description="区域被毁时间")
+
     # 状态
     is_generated: bool = Field(default=False, description="是否为程序生成")
     visit_count: int = Field(default=0, description="访问次数")

@@ -24,9 +24,10 @@ import type {
   CharacterVoiceSampleSearchResult,
   CharacterAgentPrompt,
 } from '@/api/characters'
-import { Plus, Edit, Trash2, User, Mic, Search, RefreshCw, FolderOpen, Bot, Target, Brain, Eye, Sparkles, Crown, Star, Users, Zap, MessageSquare, Heart, Shield, Sword, Ghost, Settings, FileText, ChevronRight } from 'lucide-react'
+import { Plus, Edit, Trash2, User, Mic, Search, RefreshCw, FolderOpen, Bot, Target, Brain, Eye, Sparkles, Crown, Star, Users, Zap, MessageSquare, Heart, Shield, Sword, Ghost, Settings, FileText, ChevronRight, MapPin } from 'lucide-react'
 import { useProject } from '@/contexts/ProjectContext'
 import { useTheme } from '@/contexts/ThemeContext'
+import { getRegions, getWorlds, type Region, type World } from '@/api/worlds'
 import { motion, AnimatePresence } from 'framer-motion'
 
 function splitCsvInput(value: string) {
@@ -95,14 +96,20 @@ export default function Characters() {
   const [agentPromptLoading, setAgentPromptLoading] = useState(false)
   const [batchEnabling, setBatchEnabling] = useState(false)
   const [generatingPersonality, setGeneratingPersonality] = useState(false)
+  const [worlds, setWorlds] = useState<World[]>([])
+  const [regions, setRegions] = useState<Region[]>([])
 
   // 编辑窗口的标签页
-  const [activeTab, setActiveTab] = useState<'basic' | 'appearance' | 'voice' | 'agent'>('basic')
+  const [activeTab, setActiveTab] = useState<'basic' | 'location' | 'appearance' | 'voice' | 'agent'>('basic')
 
   const [formData, setFormData] = useState<CreateCharacterDTO>({
     name: '',
     status: 'active',
     description: '',
+    world_id: '',
+    current_location: '',
+    current_region_id: '',
+    current_location_reason: '',
     importance_tier: CharacterImportanceTier.NPC,
     narrative_weight: undefined,
     story_arc_role: undefined,
@@ -138,6 +145,36 @@ export default function Characters() {
     }
   }, [currentProject?.id])
 
+  const loadWorlds = useCallback(async () => {
+    if (!currentProject?.id) {
+      setWorlds([])
+      return
+    }
+
+    try {
+      const data = await getWorlds(currentProject.id)
+      setWorlds(data)
+    } catch (error) {
+      console.error('Failed to load worlds:', error)
+      setWorlds([])
+    }
+  }, [currentProject?.id])
+
+  const loadRegions = useCallback(async (worldId?: string) => {
+    if (!worldId) {
+      setRegions([])
+      return
+    }
+
+    try {
+      const data = await getRegions(worldId)
+      setRegions(data)
+    } catch (error) {
+      console.error('Failed to load regions:', error)
+      setRegions([])
+    }
+  }, [])
+
   const loadVoiceSamples = useCallback(async (characterId: string) => {
     if (!characterId) {
       setVoiceSamples([])
@@ -161,6 +198,14 @@ export default function Characters() {
   }, [loadCharacters])
 
   useEffect(() => {
+    loadWorlds()
+  }, [loadWorlds])
+
+  useEffect(() => {
+    loadRegions(formData.world_id)
+  }, [formData.world_id, loadRegions])
+
+  useEffect(() => {
     if (selectedCharacterId) {
       loadVoiceSamples(selectedCharacterId)
       setVoiceSearchResults([])
@@ -173,6 +218,10 @@ export default function Characters() {
       name: '',
       status: 'active',
       description: '',
+      world_id: '',
+      current_location: '',
+      current_region_id: '',
+      current_location_reason: '',
       importance_tier: CharacterImportanceTier.NPC,
       personality: '',
       appearance: '',
@@ -202,6 +251,10 @@ export default function Characters() {
       name: character.name,
       status: character.status,
       description: character.description,
+      world_id: character.world_id || '',
+      current_location: character.current_location || '',
+      current_region_id: character.current_region_id || '',
+      current_location_reason: character.current_location_reason || '',
       importance_tier: character.importance_tier || CharacterImportanceTier.NPC,
       narrative_weight: character.narrative_weight,
       story_arc_role: character.story_arc_role,
@@ -229,8 +282,13 @@ export default function Characters() {
 
   const saveCharacter = async () => {
     try {
+      const selectedRegion = regions.find(region => region.id === formData.current_region_id)
       const normalizedData: CreateCharacterDTO = {
         ...formData,
+        world_id: formData.world_id || undefined,
+        current_region_id: formData.current_region_id || undefined,
+        current_location: (formData.current_location || selectedRegion?.name || '').trim(),
+        current_location_reason: formData.current_location_reason?.trim() || '',
         lexicon: splitCsvInput(lexiconInput),
         forbidden_words: splitCsvInput(forbiddenWordsInput),
         voice_samples: splitCsvInput(voiceSamplesInput),
@@ -549,8 +607,18 @@ export default function Characters() {
                             </div>
                           )}
 
+                          {/* 当前位置 */}
+                          {(char.current_location || char.current_location_reason) && (
+                            <div>
+                              <span className={`text-xs font-medium ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>位置：</span>
+                              <p className={`text-sm line-clamp-2 ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
+                                {char.current_location || '未命名地点'}{char.current_location_reason ? ` · ${char.current_location_reason}` : ''}
+                              </p>
+                            </div>
+                          )}
+
                           {/* 如果没有详细信息 */}
-                          {!char.description && !char.appearance && !char.personality && (
+                          {!char.description && !char.appearance && !char.personality && !char.current_location && !char.current_location_reason && (
                             <p className={`text-sm italic ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
                               暂无详细设定
                             </p>
@@ -645,7 +713,8 @@ export default function Characters() {
                     )}
                   </div>
                   <div className="mt-1"><span className="font-medium">说话风格：</span>{selectedCharacter.speech_pattern || '未设置'}</div>
-                  <div className="mt-1"><span className="font-medium">性格：</span>{selectedCharacter.personality || '未设置'}</div>
+                  <div className="mt-1"><span className="font-medium">当前位置：</span>{selectedCharacter.current_location || '未设置'}</div>
+                  <div className="mt-1"><span className="font-medium">到达原因：</span>{selectedCharacter.current_location_reason || '未填写原因'}</div>
                   {selectedCharacter.has_agent && (
                     <div className="mt-2 flex items-center gap-2">
                       <span className={`inline-flex items-center px-2 py-0.5 text-xs rounded ${isDark ? 'bg-purple-900 text-purple-300' : 'bg-purple-100 text-purple-700'}`}>
@@ -795,6 +864,7 @@ export default function Characters() {
           <div className={`flex border-b ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
             {[
               { key: 'basic', label: '基础信息', icon: User },
+              { key: 'location', label: '位置地图', icon: MapPin },
               { key: 'appearance', label: '外观性格', icon: Heart },
               { key: 'voice', label: '语言风格', icon: MessageSquare },
               { key: 'agent', label: 'Agent 配置', icon: Bot },
@@ -924,6 +994,83 @@ export default function Characters() {
                   value={formData.background_story || ''}
                   onChange={(e) => setFormData({ ...formData, background_story: e.target.value })}
                   placeholder="角色的背景故事、经历..."
+                  rows={4}
+                />
+              </div>
+            )}
+
+            {/* 位置地图 Tab */}
+            {activeTab === 'location' && (
+              <div className="space-y-4">
+                <div className={`p-4 rounded-lg ${isDark ? 'bg-blue-900/20 border border-blue-700/30' : 'bg-blue-50 border border-blue-100'}`}>
+                  <div className={`flex items-start gap-2 text-sm ${isDark ? 'text-blue-200' : 'text-blue-700'}`}>
+                    <MapPin size={16} className="mt-0.5 flex-shrink-0" />
+                    <p>记录角色当前所在地图区域，以及“为什么来到这里”的简短因果概述，供后续剧情和工作流节点追踪位置逻辑。</p>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+                      所属世界
+                    </label>
+                    <select
+                      className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'bg-white border-gray-300 text-gray-800'}`}
+                      value={formData.world_id || ''}
+                      onChange={(e) => setFormData({
+                        ...formData,
+                        world_id: e.target.value,
+                        current_region_id: '',
+                        current_location: '',
+                      })}
+                    >
+                      <option value="">未关联世界</option>
+                      {worlds.map((world) => (
+                        <option key={world.id} value={world.id}>{world.name}</option>
+                      ))}
+                    </select>
+                    <p className={`mt-1 text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+                      如选择区域，后端会校验区域必须属于该世界。
+                    </p>
+                  </div>
+
+                  <div>
+                    <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+                      当前所在区域
+                    </label>
+                    <select
+                      className={`w-full px-3 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-60 ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'bg-white border-gray-300 text-gray-800'}`}
+                      value={formData.current_region_id || ''}
+                      disabled={!formData.world_id}
+                      onChange={(e) => {
+                        const nextRegion = regions.find(region => region.id === e.target.value)
+                        setFormData({
+                          ...formData,
+                          current_region_id: e.target.value,
+                          current_location: nextRegion?.name || '',
+                        })
+                      }}
+                    >
+                      <option value="">{formData.world_id ? '未选择区域' : '请先选择世界'}</option>
+                      {regions.map((region) => (
+                        <option key={region.id} value={region.id}>{region.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                <Input
+                  label="当前位置文本"
+                  value={formData.current_location || ''}
+                  onChange={(e) => setFormData({ ...formData, current_location: e.target.value })}
+                  placeholder="可作为展示名或旧数据兼容字段；选择区域后会自动填入区域名"
+                />
+
+                <TextArea
+                  label="来到这里的理由概述"
+                  value={formData.current_location_reason || ''}
+                  onChange={(e) => setFormData({ ...formData, current_location_reason: e.target.value })}
+                  placeholder="简短说明角色为何来到此地，例如：追踪线索、躲避追杀、履行约定"
                   rows={4}
                 />
               </div>

@@ -399,6 +399,8 @@ class Character(BaseModel):
 
     # 位置信息
     current_location: Optional[str] = Field(None, description="当前位置 ID")
+    current_region_id: Optional[str] = Field(None, description="当前所在地图区域 ID")
+    current_location_reason: Optional[str] = Field(None, description="来到当前位置的理由概述")
 
     # 死亡相关
     death_detail: Optional[DeathDetail] = Field(None, description="死亡详情（仅死亡状态时有效）")

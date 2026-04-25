@@ -51,6 +51,7 @@ class TimeUpdateResult:
     season: Season
     triggered_events: List[Dict[str, Any]]
     time_scale: float
+    tick_count: int
 
 
 class TimeSystem:
@@ -119,7 +120,8 @@ class TimeSystem:
             hour=self.current_time.hour,
             season=self._get_season(),
             triggered_events=triggered,
-            time_scale=self.time_scale
+            time_scale=self.time_scale,
+            tick_count=self.tick_count
         )
 
         # 通知注册的回调函数
@@ -379,7 +381,8 @@ class TimeSystem:
             hour=self.current_time.hour,
             season=self._get_season(),
             triggered_events=[],
-            time_scale=self.time_scale
+            time_scale=self.time_scale,
+            tick_count=self.tick_count
         )
 
         # 通知注册的回调函数
