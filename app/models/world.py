@@ -6,7 +6,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class RegionType(str, Enum):
@@ -60,8 +60,8 @@ class WorldRule(BaseModel):
     conditions: Optional[Dict[str, Any]] = Field(None, description="触发条件")
     effects: Optional[Dict[str, Any]] = Field(None, description="规则效果")
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "id": "rule_001",
                 "name": "重力法则",
@@ -71,6 +71,7 @@ class WorldRule(BaseModel):
                 "is_absolute": True,
             }
         }
+    )
 
 
 class World(BaseModel):
@@ -107,8 +108,8 @@ class World(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "id": "world_001",
                 "name": "九霄大陆",
@@ -122,6 +123,7 @@ class World(BaseModel):
                 "technology_level": "古代冷兵器",
             }
         }
+    )
 
 
 class Encounter(BaseModel):
@@ -142,8 +144,8 @@ class Encounter(BaseModel):
     weight: float = Field(default=1.0, ge=0, description="出现权重")
     is_once: bool = Field(default=False, description="是否一次性遭遇")
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "id": "enc_001",
                 "type": "monster",
@@ -157,6 +159,7 @@ class Encounter(BaseModel):
                 "weight": 0.8,
             }
         }
+    )
 
 
 class Region(BaseModel):
@@ -199,8 +202,8 @@ class Region(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "id": "region_001",
                 "name": "青石镇",
@@ -220,3 +223,4 @@ class Region(BaseModel):
                 ],
             }
         }
+    )

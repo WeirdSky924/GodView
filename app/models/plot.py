@@ -6,7 +6,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class HookStatus(str, Enum):
@@ -66,8 +66,8 @@ class Hook(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     resolved_at: Optional[datetime] = Field(None, description="回收时间")
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "id": "hook_001",
                 "title": "神秘的玉佩",
@@ -79,6 +79,7 @@ class Hook(BaseModel):
                 "priority": 3,
             }
         }
+    )
 
 
 class EventType(str, Enum):
@@ -124,8 +125,8 @@ class EventSummary(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     order: int = Field(default=0, description="在章节中的顺序")
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "id": "event_001",
                 "chapter_id": "chapter_001",
@@ -141,6 +142,7 @@ class EventSummary(BaseModel):
                 "info_gain_score": 0.7,
             }
         }
+    )
 
 
 class ChapterStatus(str, Enum):
@@ -188,8 +190,8 @@ class Chapter(BaseModel):
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     completed_at: Optional[datetime] = Field(None, description="完成时间")
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "id": "chapter_001",
                 "title": "第一章：初入江湖",
@@ -200,6 +202,7 @@ class Chapter(BaseModel):
                 "main_plot_progress": 0.1,
             }
         }
+    )
 
 
 class CreateChapterDTO(BaseModel):
@@ -257,8 +260,8 @@ class Plot(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "id": "plot_001",
                 "title": "主角成长线",
@@ -268,3 +271,4 @@ class Plot(BaseModel):
                 "progress": 0.33,
             }
         }
+    )

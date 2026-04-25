@@ -9,7 +9,7 @@ import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain_core.language_models import BaseLanguageModel
 
@@ -34,8 +34,7 @@ class AgentResponse(BaseModel):
     structured_data: Optional[Any] = Field(default=None, description="结构化输出")
     text_output: Optional[str] = Field(default=None, description="文本输出")
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     @model_validator(mode="after")
     def _sync_legacy_and_contract_fields(self):

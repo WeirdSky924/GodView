@@ -7,7 +7,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 LEGACY_LORE_PRIORITY_MAP = {
@@ -141,8 +141,8 @@ class LoreEntry(BaseModel):
     def normalize_priority(cls, value: Any) -> LorePriority:
         return normalize_lore_priority(value)
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "id": "lore_001",
                 "project_id": "proj_001",
@@ -157,6 +157,7 @@ class LoreEntry(BaseModel):
                 "forbidden_actions": ["禁止越级挑战超过两个大境界"],
             }
         }
+    )
 
 
 class LoreReference(BaseModel):
@@ -202,8 +203,8 @@ class LoreConflict(BaseModel):
 
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "id": "conflict_001",
                 "project_id": "proj_001",
@@ -215,6 +216,7 @@ class LoreConflict(BaseModel):
                 "status": "unresolved",
             }
         }
+    )
 
 
 class LoreSearchResult(BaseModel):

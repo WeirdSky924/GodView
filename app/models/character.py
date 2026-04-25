@@ -6,7 +6,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class CharacterStatus(str, Enum):
@@ -380,9 +380,6 @@ class Character(BaseModel):
     )
     background_story: Optional[str] = Field(None, alias="background", description="背景故事")
 
-    class Config:
-        populate_by_name = True  # 允许通过别名填充
-
     # 语言风格
     speech_pattern: Optional[str] = Field(None, description="说话风格描述")
     lexicon: List[str] = Field(default_factory=list, description="常用词汇表")
@@ -504,8 +501,9 @@ class Character(BaseModel):
         }
         return weight_instructions.get(self.narrative_weight, "")
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        populate_by_name=True,
+        json_schema_extra={
             "example": {
                 "id": "char_001",
                 "name": "张三",
@@ -529,7 +527,8 @@ class Character(BaseModel):
                 "relationships": ["protagonist"],
                 "key_relationships": {"char_002": "师妹", "char_003": "宿敌"},
             }
-        }
+        },
+    )
 
 
 class CharacterVoiceSample(BaseModel):
@@ -543,8 +542,8 @@ class CharacterVoiceSample(BaseModel):
     embedding: Optional[List[float]] = Field(None, description="向量嵌入")
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "id": "sample_001",
                 "character_id": "char_001",
@@ -552,7 +551,8 @@ class CharacterVoiceSample(BaseModel):
                 "text": "路见不平，岂能袖手旁观！",
                 "context": "看到恶霸欺负老人时所说",
             }
-        }
+        },
+    )
 
 
 class RelationshipType(str, Enum):
@@ -589,8 +589,8 @@ class Relationship(BaseModel):
     last_interaction: Optional[datetime] = Field(None, description="最后互动时间")
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "id": "rel_001",
                 "character_id_1": "char_001",
@@ -600,4 +600,5 @@ class Relationship(BaseModel):
                 "description": "张三和李四是结拜兄弟",
                 "history": ["在酒馆相识", "共同对抗敌人", "结拜为兄弟"],
             }
-        }
+        },
+    )

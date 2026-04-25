@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional, Callable, Union
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, ConfigDict, Field, validator
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +32,7 @@ class RuleCondition(BaseModel):
     value: Any
     logical_op: Optional[str] = "and"  # 逻辑操作符：and, or
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
 class RuleAction(BaseModel):
@@ -61,8 +60,7 @@ class CustomRule(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     @validator("priority")
     def validate_priority(cls, v):
@@ -81,8 +79,7 @@ class RuleEvaluationContext(BaseModel):
     time_info: Dict[str, Any] = Field(default_factory=dict)
     custom_data: Dict[str, Any] = Field(default_factory=dict)
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
 class CustomRulesSystem:

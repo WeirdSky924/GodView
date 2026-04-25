@@ -13,6 +13,35 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+def _normalize_region_data(region: Region, world_id: str, region_id: Optional[str] = None) -> Dict[str, Any]:
+    """转换区域模型为数据库保存格式。"""
+    import uuid
+
+    region_data = region.model_dump(mode="json")
+    region_data["world_id"] = world_id
+
+    if region_id:
+        region_data["id"] = region_id
+    elif not region_data.get("id"):
+        region_data["id"] = str(uuid.uuid4())
+
+    if region_data.get("area_size") is None:
+        region_data["area_size"] = 0.0
+    if region_data.get("atmosphere") is None:
+        region_data["atmosphere"] = ""
+    if region_data.get("coordinates") is None:
+        region_data["coordinates"] = {}
+
+    return region_data
+
+
+async def _get_region_for_world(postgres_db: Any, world_id: str, region_id: str) -> Dict[str, Any]:
+    """获取区域并校验归属世界。"""
+    region = await postgres_db.get_region(region_id)
+    if not region or str(region.get("world_id")) != world_id:
+        raise HTTPException(status_code=404, detail="区域不存在")
+    return region
+
 
 @router.get("", response_model=List[Dict[str, Any]])
 async def list_worlds(
@@ -183,30 +212,11 @@ async def create_region(world_id: str, region: Region):
         Dict: 创建结果
     """
     from app.api.app import postgres_db
-    import uuid
 
     if not postgres_db:
         raise HTTPException(status_code=503, detail="数据库未连接")
 
-    region_data = region.model_dump(mode="json")
-    region_data["world_id"] = world_id
-
-    # 确保所有字段都有值（数据库需要）
-    if region_data.get("area_size") is None:
-        region_data["area_size"] = 0.0
-    if region_data.get("atmosphere") is None:
-        region_data["atmosphere"] = ""
-    if region_data.get("coordinates") is None:
-        region_data["coordinates"] = {}
-
-    # 确保 encounters 被序列化为 JSON 字符串
-    if "encounters" in region_data and isinstance(region_data["encounters"], list):
-        import json
-        region_data["encounters"] = json.dumps(region_data["encounters"])
-
-    # 自动生成 ID（如果未提供）
-    if not region_data.get("id"):
-        region_data["id"] = str(uuid.uuid4())
+    region_data = _normalize_region_data(region, world_id)
 
     logger.info(f"Region data keys: {list(region_data.keys())}")
 
@@ -220,6 +230,56 @@ async def create_region(world_id: str, region: Region):
     except Exception as e:
         logger.error(f"创建区域失败：{e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{world_id}/regions/{region_id}", response_model=Dict[str, Any])
+async def get_region(world_id: str, region_id: str):
+    """获取区域详情"""
+    from app.api.app import postgres_db
+
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+
+    return await _get_region_for_world(postgres_db, world_id, region_id)
+
+
+@router.put("/{world_id}/regions/{region_id}", response_model=Dict[str, Any])
+async def update_region(world_id: str, region_id: str, region: Region):
+    """更新区域"""
+    from app.api.app import postgres_db
+    from datetime import datetime
+
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+
+    existing = await _get_region_for_world(postgres_db, world_id, region_id)
+    region_data = _normalize_region_data(region, world_id, region_id)
+
+    if existing.get("created_at"):
+        region_data["created_at"] = existing["created_at"]
+    region_data["updated_at"] = datetime.now()
+
+    try:
+        await postgres_db.save_region(region_data)
+        return {"success": True, "id": region_id, "message": f"区域 '{region.name}' 更新成功"}
+    except Exception as e:
+        logger.error(f"更新区域失败：{e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/{world_id}/regions/{region_id}", response_model=Dict[str, Any])
+async def delete_region(world_id: str, region_id: str):
+    """删除区域"""
+    from app.api.app import postgres_db
+
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+
+    await _get_region_for_world(postgres_db, world_id, region_id)
+    deleted = await postgres_db.delete_region(region_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="区域不存在")
+    return {"success": True, "id": region_id, "message": f"区域 {region_id} 已删除"}
 
 
 @router.get("/{world_id}/snapshots", response_model=List[Dict[str, Any]])

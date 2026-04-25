@@ -5,7 +5,7 @@
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class SnapshotType(str, Enum):
@@ -64,8 +64,8 @@ class WorldSnapshot(BaseModel):
     is_branch: bool = Field(default=False, description="是否为分支快照")
     branch_reason: Optional[str] = Field(None, description="分支原因（用户干预等）")
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "id": "snapshot_001",
                 "world_id": "world_001",
@@ -79,6 +79,7 @@ class WorldSnapshot(BaseModel):
                 },
             }
         }
+    )
 
 
 class InterventionLog(BaseModel):
@@ -113,8 +114,8 @@ class InterventionLog(BaseModel):
     # 元数据
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "id": "intervention_001",
                 "snapshot_id": "snapshot_001",
@@ -128,6 +129,7 @@ class InterventionLog(BaseModel):
                 "affected_hooks": ["hook_001"],
             }
         }
+    )
 
 
 class VersionDiff(BaseModel):

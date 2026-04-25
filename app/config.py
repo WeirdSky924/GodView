@@ -6,7 +6,7 @@ import os
 from typing import List, Optional
 
 from dotenv import load_dotenv
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 
 # 显式加载 .env 文件，override=True 确保 .env 文件值覆盖系统环境变量
@@ -374,10 +374,11 @@ class Settings(BaseSettings):
         description="允许的 CORS 来源",
     )
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
-        extra = "allow"
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        case_sensitive=True,
+        extra="allow",
+    )
 
     def get_llm_config(self, provider: str) -> dict:
         """获取指定 LLM provider 的配置"""

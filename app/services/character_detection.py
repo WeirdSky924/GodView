@@ -8,6 +8,7 @@
 4. 为晋升的角色创建 CharacterAgent 并初始化记忆
 """
 
+import json
 import logging
 import re
 import uuid
@@ -22,6 +23,56 @@ else:
     from app.models.character import CharacterImportanceTier
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_text_content(value: Any) -> str:
+    """将 LLM 内容块或结构化内容归一化为文本。"""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: List[str] = []
+        for item in value:
+            text = _normalize_text_content(item)
+            if text:
+                parts.append(text)
+        return "\n".join(parts)
+    if isinstance(value, dict):
+        for key in ("text", "content", "summary", "full_content"):
+            text = value.get(key)
+            if isinstance(text, (str, list, dict)):
+                normalized = _normalize_text_content(text)
+                if normalized:
+                    return normalized
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except Exception:
+            return str(value)
+    return str(value)
+
+
+def _extract_json_object(text: str) -> Dict[str, Any]:
+    """从 LLM 响应中提取首个 JSON object，允许后面跟随说明文本。"""
+    decoder = json.JSONDecoder()
+    candidates: List[str] = []
+
+    for match in re.finditer(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE):
+        candidates.append(match.group(1).strip())
+    candidates.append(text.strip())
+
+    for candidate in candidates:
+        for index, char in enumerate(candidate):
+            if char != "{":
+                continue
+            try:
+                result, _ = decoder.raw_decode(candidate[index:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(result, dict):
+                return result
+
+    raise ValueError("未能从 LLM 响应中解析 JSON 对象")
 
 
 @dataclass
@@ -96,6 +147,8 @@ class CharacterDetectionService:
         Returns:
             List[DetectedCharacter]: 检测到的新角色列表
         """
+        content = _normalize_text_content(content)
+
         existing_names = set()
         if existing_characters:
             existing_names = {c.get("name") for c in existing_characters if c.get("name")}
@@ -295,7 +348,9 @@ class CharacterPromotionManager:
                 if result.get("success"):
                     promoted.append(result)
                     # 从候选列表中移除
-                    del self._candidates[project_id][name]
+                    promoted_name = candidate.get("name")
+                    if promoted_name:
+                        self._candidates[project_id].pop(promoted_name, None)
             except Exception as e:
                 logger.error(f"角色晋升失败: {e}")
 
@@ -337,6 +392,7 @@ class CharacterPromotionManager:
             existing_names_str = ", ".join(existing_names) if existing_names else "无"
 
             # 截取内容（避免过长）
+            content = _normalize_text_content(content)
             content_to_analyze = content[:3000] if len(content) > 3000 else content
 
             prompt = f"""请从以下章节内容中检测和提取所有出现的角色。
@@ -382,16 +438,9 @@ class CharacterPromotionManager:
 只输出 JSON，不要有其他内容。"""
 
             response = await llm_model.ainvoke([HumanMessage(content=prompt)])
-            response_text = response.content
+            response_text = _normalize_text_content(response.content)
 
-            # 解析 JSON
-            # 尝试提取 JSON 部分
-            import re
-            json_match = re.search(r'\{[\s\S]*\}', response_text)
-            if json_match:
-                result = json.loads(json_match.group())
-            else:
-                result = json.loads(response_text)
+            result = _extract_json_object(response_text)
 
             # 提取新角色
             new_characters = result.get("new_characters", [])

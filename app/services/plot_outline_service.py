@@ -1751,7 +1751,7 @@ class PlotOutlineService:
             outline_result = await self._db.execute_query('''
                 SELECT MAX(chapter_number) as max_outline
                 FROM chapter_outlines
-                WHERE project_id = CAST(:project_id AS UUID)
+                WHERE project_id = :project_id
                   AND status IN ('approved', 'completed')
             ''', {"project_id": project_id})
 

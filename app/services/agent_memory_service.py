@@ -88,6 +88,29 @@ class AgentMemoryService:
         hash_val = hashlib.md5(key.encode()).hexdigest()[:12]
         return f"memory_{hash_val}"
 
+    def _parse_json_field(self, value: Any) -> Any:
+        """解析数据库返回的 JSON/JSONB 字段。"""
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except Exception:
+                return value
+        return value
+
+    def _ensure_dict_field(self, value: Any) -> Dict[str, Any]:
+        """确保数据库 JSON 字段为 dict。"""
+        value = self._parse_json_field(value)
+        return value if isinstance(value, dict) else {}
+
+    def _ensure_list_field(self, value: Any) -> List[Any]:
+        """确保数据库 JSON 字段为 list。"""
+        value = self._parse_json_field(value)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        return []
+
     async def _load_from_db(
         self,
         project_id: str,
@@ -119,15 +142,15 @@ class AgentMemoryService:
             )
 
             if results and len(results) > 0:
-                row = results[0]
+                row = dict(results[0])
                 memory = AgentMemory(
                     id=row["id"],
                     project_id=str(row["project_id"]),
                     agent_type=row["agent_type"],
                     agent_id=row.get("agent_id"),
                     memories=self._parse_memories(row.get("memories", [])),
-                    knowledge=AgentKnowledge(**row.get("knowledge", {})),
-                    working_memory=row.get("working_memory", {}),
+                    knowledge=AgentKnowledge(**self._ensure_dict_field(row.get("knowledge"))),
+                    working_memory=self._ensure_dict_field(row.get("working_memory")),
                     total_memories=row.get("total_memories", 0),
                     last_execution=row.get("last_execution"),
                     execution_count=row.get("execution_count", 0),
@@ -146,14 +169,13 @@ class AgentMemoryService:
         if not memories_data:
             return []
 
-        if isinstance(memories_data, str):
-            try:
-                memories_data = json.loads(memories_data)
-            except:
-                return []
+        memories_data = self._ensure_list_field(memories_data)
 
         entries = []
         for item in memories_data:
+            if not isinstance(item, dict):
+                logger.warning(f"跳过非对象记忆条目: {type(item).__name__}")
+                continue
             try:
                 entry = MemoryEntry(
                     id=item.get("id", str(datetime.now().timestamp())),
@@ -164,10 +186,10 @@ class AgentMemoryService:
                     importance=MemoryImportance(item.get("importance", "medium")),
                     content=item.get("content", ""),
                     summary=item.get("summary"),
-                    context=item.get("context", {}),
-                    tags=item.get("tags", []),
+                    context=self._ensure_dict_field(item.get("context")),
+                    tags=self._ensure_list_field(item.get("tags")),
                     related_chapter=item.get("related_chapter"),
-                    related_characters=item.get("related_characters", []),
+                    related_characters=self._ensure_list_field(item.get("related_characters")),
                     access_count=item.get("access_count", 0),
                     last_accessed=item.get("last_accessed"),
                 )
@@ -347,12 +369,14 @@ class AgentMemoryService:
         # 添加决策记忆
         if decisions:
             for decision in decisions:
+                if not isinstance(decision, dict):
+                    continue
                 memory.add_memory(
                     content=decision.get("content", ""),
                     memory_type=MemoryType.DECISION,
                     importance=MemoryImportance.HIGH,
-                    context=decision.get("context", {}),
-                    tags=decision.get("tags", []),
+                    context=self._ensure_dict_field(decision.get("context")),
+                    tags=self._ensure_list_field(decision.get("tags")),
                 )
 
         await self.save_memory(memory)

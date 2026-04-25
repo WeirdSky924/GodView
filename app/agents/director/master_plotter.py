@@ -44,6 +44,25 @@ class MasterPlotterAgent(BaseAgent):
             project_id=project_id,
         )
 
+    def _as_list(self, value: Any) -> List[Any]:
+        if value in (None, ""):
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        return [value]
+
+    def _as_dict(self, value: Any) -> Dict[str, Any]:
+        return value if isinstance(value, dict) else {}
+
+    def _as_text(self, value: Any, fallback: str = "") -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (int, float, bool)):
+            return str(value)
+        return fallback
+
     def _get_default_variables(self) -> Dict[str, Any]:
         """获取默认变量（MasterPlotter 特定）"""
         return {
@@ -137,6 +156,75 @@ class MasterPlotterAgent(BaseAgent):
             return legacy_summary.strip()
         return str(legacy_summary) if legacy_summary else ""
 
+    def _extract_discussion_asset_context(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        """提取已确认讨论资产，兼容直接字段与 group_discussion 嵌套字段。"""
+        group_discussion = input_data.get("group_discussion") or {}
+        if not isinstance(group_discussion, dict):
+            group_discussion = {}
+
+        assets = input_data.get("discussion_assets") or group_discussion.get("discussion_assets") or {}
+        digest = input_data.get("discussion_asset_digest") or group_discussion.get("discussion_asset_digest") or {}
+        persisted_refs = input_data.get("persisted_asset_refs") or {}
+        committed = bool(input_data.get("discussion_assets_committed") or persisted_refs)
+
+        return {
+            "discussion_assets": assets if isinstance(assets, dict) else {},
+            "discussion_asset_digest": digest if isinstance(digest, dict) else {},
+            "persisted_asset_refs": persisted_refs if isinstance(persisted_refs, dict) else {},
+            "discussion_assets_committed": committed,
+        }
+
+    def _format_discussion_asset_context(self, asset_context: Dict[str, Any]) -> str:
+        """将讨论资产压缩为剧情规划可用摘要。"""
+        assets = asset_context.get("discussion_assets") or {}
+        digest = asset_context.get("discussion_asset_digest") or {}
+        persisted_refs = asset_context.get("persisted_asset_refs") or {}
+        if not assets and not digest and not persisted_refs:
+            return ""
+
+        def _labels(items: Any) -> List[str]:
+            if not isinstance(items, list):
+                return []
+            labels: List[str] = []
+            for item in items[:8]:
+                if isinstance(item, dict):
+                    label = item.get("title") or item.get("name") or item.get("id") or item.get("summary")
+                    if label:
+                        labels.append(str(label)[:100])
+                elif item not in (None, ""):
+                    labels.append(str(item)[:100])
+            return labels
+
+        lines = []
+        topic = digest.get("topic") or assets.get("source_metadata", {}).get("topic")
+        if topic:
+            lines.append(f"讨论主题：{topic}")
+        if asset_context.get("discussion_assets_committed"):
+            lines.append("状态：已确认并提交，应作为后续剧情规划事实使用")
+        elif assets:
+            lines.append("状态：讨论资产提案，仅在已确认上下文中作为规划依据")
+
+        sections = [
+            ("剧情加码", _labels(assets.get("plot_updates"))),
+            ("新增/待埋伏笔", _labels(assets.get("hooks"))),
+            ("设定/世界观", _labels(assets.get("lore_candidates"))),
+            ("地图/地点", _labels(assets.get("region_candidates"))),
+            ("角色", _labels(assets.get("character_candidates"))),
+        ]
+        for title, labels in sections:
+            if labels:
+                lines.append(f"{title}：" + "；".join(labels))
+
+        ref_lines = []
+        for key, value in persisted_refs.items():
+            if value:
+                count = len(value) if isinstance(value, list) else 1
+                ref_lines.append(f"{key}={count}")
+        if ref_lines:
+            lines.append("已持久化引用：" + "，".join(ref_lines))
+
+        return "\n".join(lines)
+
     async def execute(self, input_data: Dict[str, Any]) -> AgentResponse:
         """
         执行主线剧情评估或规划
@@ -166,9 +254,9 @@ class MasterPlotterAgent(BaseAgent):
 
             # 默认：剧情推进评估
             main_plot_progress = input_data.get("main_plot_progress", 0.0)
-            pending_hooks = input_data.get("pending_hooks", [])
-            chapter_goal = input_data.get("chapter_goal", "")
-            recent_events = input_data.get("recent_events", [])
+            pending_hooks = self._as_list(input_data.get("pending_hooks", []))
+            chapter_goal = self._as_text(input_data.get("chapter_goal", ""))
+            recent_events = self._as_list(input_data.get("recent_events", []))
             interaction_turns = input_data.get("interaction_turns", 0)
             max_turns_threshold = input_data.get("max_turns_threshold", 5)
 
@@ -225,14 +313,16 @@ class MasterPlotterAgent(BaseAgent):
         Returns:
             AgentResponse: 剧情规划结果
         """
-        initial_plot = input_data.get("initial_plot", "")
+        initial_plot = self._as_text(input_data.get("initial_plot", ""))
         chapter_count = input_data.get("chapter_count", 3)
-        characters = input_data.get("characters", [])
-        world_info = input_data.get("world_info", {})
+        characters = self._as_list(input_data.get("characters", []))
+        world_info = self._as_dict(input_data.get("world_info", {}))
         main_plot_progress = input_data.get("main_plot_progress", 0.0)
-        recent_discussions = input_data.get("recent_discussions", [])
+        recent_discussions = self._as_list(input_data.get("recent_discussions", []))
         last_discussion_summary = self._resolve_latest_discussion_summary(input_data)
-        existing_hooks = input_data.get("existing_hooks", [])
+        discussion_asset_context = self._extract_discussion_asset_context(input_data)
+        discussion_asset_section = self._format_discussion_asset_context(discussion_asset_context)
+        existing_hooks = self._as_list(input_data.get("existing_hooks", []))
 
         # 构建世界观部分（关键信息）
         world_section = ""
@@ -258,7 +348,7 @@ class MasterPlotterAgent(BaseAgent):
                 for rule in rules:
                     world_section += f"- {rule}\n"
 
-            themes = world_info.get("themes", [])
+            themes = self._as_list(world_info.get("themes", []))
             if themes:
                 world_section += f"\n【核心主题】\n{chr(10).join([f'- {t}' for t in themes])}\n"
         else:
@@ -289,16 +379,27 @@ class MasterPlotterAgent(BaseAgent):
         # 构建伏笔部分
         hooks_section = ""
         if existing_hooks:
+            hook_lines = []
+            for hook in existing_hooks:
+                if isinstance(hook, dict):
+                    hook_lines.append(f"- {hook.get('title', hook.get('id', '未知'))}: {hook.get('description', '')}")
+                elif hook not in (None, ""):
+                    hook_lines.append(f"- {hook}")
             hooks_section = f"""
 【已有伏笔】
-{chr(10).join([f"- {h.get('title', h.get('id', '未知'))}: {h.get('description', '')}" for h in existing_hooks])}
-"""
+{chr(10).join(hook_lines)}
+""" if hook_lines else ""
 
         # 构建讨论历史部分
         discussion_section = ""
         if recent_discussions:
             discussion_summaries = []
             for i, d in enumerate(recent_discussions[-2:]):  # 最近2次讨论
+                if not isinstance(d, dict):
+                    summary_text = self._as_text(d).strip()
+                    if summary_text:
+                        discussion_summaries.append(f"- 讨论{i+1}: {summary_text}")
+                    continue
                 topic = d.get("topic", f"讨论{i+1}")
                 summary_text = self._extract_discussion_summary(d)
                 if summary_text:
@@ -310,6 +411,18 @@ class MasterPlotterAgent(BaseAgent):
 
 【最新讨论共识】
 {last_discussion_summary if last_discussion_summary else '暂无'}
+"""
+        elif last_discussion_summary:
+            discussion_section = f"""
+【最新讨论共识】
+{last_discussion_summary}
+"""
+
+        if discussion_asset_section:
+            discussion_section += f"""
+【已确认讨论资产】
+{discussion_asset_section}
+请在剧情规划中优先承接这些已确认的剧情加码、伏笔、地点、设定和角色信息；涉及已持久化资产时不要随意改名或改设定。
 """
 
         prompt = f"""你是一位资深网文编剧，现在需要根据以下信息规划一部小说的整体剧情大纲。
@@ -446,7 +559,12 @@ class MasterPlotterAgent(BaseAgent):
         #  pending 伏笔
         if pending_hooks:
             hooks_text = "\n".join(
-                [f"- {h.get('id')}: {h.get('title', '无标题')} (优先级：{h.get('priority', 1)})" for h in pending_hooks]
+                [
+                    f"- {h.get('id')}: {h.get('title', '无标题')} (优先级：{h.get('priority', 1)})"
+                    if isinstance(h, dict)
+                    else f"- {h}"
+                    for h in pending_hooks
+                ]
             )
             message_parts.append(f"【已埋设未回收伏笔】\n{hooks_text}")
 

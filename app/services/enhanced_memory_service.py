@@ -66,6 +66,64 @@ class EnhancedMemoryService:
     def _agent_id_filter_sql(self) -> str:
         return "AND (agent_id = :agent_id OR (agent_id IS NULL AND :agent_id IS NULL))"
 
+    def _parse_json_config(self, value: Any) -> Any:
+        """解析数据库返回的 JSON/JSONB 配置字段。"""
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except Exception:
+                return value
+        return value
+
+    def _ensure_dict_config(self, value: Any) -> Dict[str, Any]:
+        """确保配置字段为 dict。"""
+        value = self._parse_json_config(value)
+        return value if isinstance(value, dict) else {}
+
+    def _ensure_list_config(self, value: Any) -> List[Any]:
+        """确保配置字段为 list。"""
+        value = self._parse_json_config(value)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        return []
+
+    def _ensure_context_dict(self, value: Any) -> Dict[str, Any]:
+        """确保运行期上下文/记忆上下文为 dict。"""
+        value = self._parse_json_config(value)
+        return value if isinstance(value, dict) else {}
+
+    def _ensure_rule_dict(self, value: Any) -> Dict[str, Any]:
+        """确保衰减规则为 dict。"""
+        value = self._parse_json_config(value)
+        return dict(value) if isinstance(value, dict) else {}
+
+    def _ensure_int_config(self, value: Any, default: int) -> int:
+        """确保配置字段为 int。"""
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _ensure_float_config(self, value: Any, default: float) -> float:
+        """确保配置字段为 float。"""
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _ensure_row_dict(self, value: Any) -> Dict[str, Any]:
+        """确保数据库行可安全使用 dict/get 访问。"""
+        value = self._parse_json_config(value)
+        if isinstance(value, dict):
+            return dict(value)
+        try:
+            return dict(value)
+        except Exception:
+            return {}
+
+
     # ==================== 语义记忆检索 ====================
 
     async def get_semantic_memories(
@@ -151,14 +209,14 @@ class EnhancedMemoryService:
                 # 使用 pgvector 的余弦相似度搜索
                 query = f"""
                     SELECT memory_id, content, memory_type, importance, tags,
-                           1 - (embedding_vec <=> :embedding::vector) as similarity
+                           1 - (embedding_vec <=> CAST(:embedding AS vector)) as similarity
                     FROM memory_embeddings
                     WHERE project_id = CAST(:project_id AS UUID)
                       AND agent_type = :agent_type
                       {self._agent_id_filter_sql()}
                       AND decay_factor > 0.1
                       AND embedding_vec IS NOT NULL
-                    ORDER BY embedding_vec <=> :embedding::vector
+                    ORDER BY embedding_vec <=> CAST(:embedding AS vector)
                     LIMIT :limit
                 """
             else:
@@ -180,13 +238,16 @@ class EnhancedMemoryService:
             )
 
             memories = []
-            for row in (results or []):
+            for raw_row in (results or []):
+                row = self._ensure_row_dict(raw_row)
+                if not row:
+                    continue
                 entry = MemoryEntry(
                     id=row.get("memory_id", ""),
                     type=MemoryType(row.get("memory_type", "observation")),
                     importance=MemoryImportance(row.get("importance", "medium")),
                     content=row.get("content", ""),
-                    tags=row.get("tags", []),
+                    tags=self._ensure_list_config(row.get("tags")),
                     timestamp=datetime.now(),
                 )
                 similarity = row.get("similarity", 0.0)
@@ -219,7 +280,8 @@ class EnhancedMemoryService:
                 )
             """)
 
-            self._pgvector_available = bool(result and result[0].get("exists", False))
+            exists_row = self._ensure_row_dict(result[0]) if result else {}
+            self._pgvector_available = bool(exists_row.get("exists", False))
             return self._pgvector_available
 
         except Exception:
@@ -240,8 +302,10 @@ class EnhancedMemoryService:
 
         scored = []
         for entry in memory.memories:
+            entry.tags = self._ensure_list_config(entry.tags)
+            entry.context = self._ensure_context_dict(entry.context)
             content_words = set(entry.content.lower().split())
-            tag_words = set(t.lower() for t in entry.tags)
+            tag_words = set(t.lower() for t in entry.tags if isinstance(t, str))
 
             score = len(query_words & content_words) + len(query_words & tag_words) * 2
 
@@ -290,6 +354,8 @@ class EnhancedMemoryService:
         Returns:
             List[MemoryEntry]: 选中的记忆列表
         """
+        current_context = self._ensure_context_dict(current_context)
+
         # 1. 加载上下文配置
         config = await self._load_context_config(task_type, agent_type)
 
@@ -298,10 +364,17 @@ class EnhancedMemoryService:
             return await self._default_memory_selection(project_id, agent_type, agent_id=agent_id)
 
         strategy = config.get("selection_strategy", MemorySelectionStrategy.HYBRID)
-        max_memories = config.get("max_memories", 10)
-        type_weights = config.get("type_weights", {})
-        required_tags = config.get("required_tags", [])
-        excluded_tags = config.get("excluded_tags", [])
+        if strategy not in {
+            MemorySelectionStrategy.RECENT,
+            MemorySelectionStrategy.IMPORTANT,
+            MemorySelectionStrategy.RELEVANT,
+            MemorySelectionStrategy.HYBRID,
+        }:
+            strategy = MemorySelectionStrategy.HYBRID
+        max_memories = self._ensure_int_config(config.get("max_memories"), 10)
+        type_weights = self._ensure_dict_config(config.get("type_weights"))
+        required_tags = self._ensure_list_config(config.get("required_tags"))
+        excluded_tags = self._ensure_list_config(config.get("excluded_tags"))
 
         # 2. 获取基础记忆
         memory = await self.base_service.get_memory(project_id, agent_type, agent_id)
@@ -325,8 +398,8 @@ class EnhancedMemoryService:
             )
 
         # 4. 应用时间衰减
-        time_decay_days = config.get("time_decay_days", 30)
-        time_decay_factor = config.get("time_decay_factor", 0.5)
+        time_decay_days = self._ensure_int_config(config.get("time_decay_days"), 30)
+        time_decay_factor = self._ensure_float_config(config.get("time_decay_factor"), 0.5)
         selected = self._apply_time_decay(selected, time_decay_days, time_decay_factor)
 
         # 5. 记录使用
@@ -374,9 +447,10 @@ class EnhancedMemoryService:
             )
 
             if results:
-                config = dict(results[0])
-                self._config_cache[cache_key] = config
-                return config
+                config = self._ensure_row_dict(results[0])
+                if config:
+                    self._config_cache[cache_key] = config
+                    return config
 
         except Exception as e:
             logger.warning(f"加载上下文配置失败: {e}")
@@ -396,6 +470,8 @@ class EnhancedMemoryService:
         scored_memories = []
 
         for entry in memory.memories:
+            entry.tags = self._ensure_list_config(entry.tags)
+            entry.context = self._ensure_context_dict(entry.context)
             # 检查必需标签
             if required_tags and not any(t in entry.tags for t in required_tags):
                 continue
@@ -596,7 +672,9 @@ class EnhancedMemoryService:
                         "avg_relevance": row.get("avg_relevance"),
                         "unique_memories": row.get("unique_memories"),
                     }
-                    for row in (results or [])
+                    for raw_row in (results or [])
+                    for row in [self._ensure_row_dict(raw_row)]
+                    if row
                 ],
             }
 
@@ -634,7 +712,9 @@ class EnhancedMemoryService:
             now = datetime.now()
 
             for entry in memory.memories:
-                old_factor = entry.context.get("decay_factor", 1.0)
+                old_context = self._ensure_context_dict(entry.context)
+                entry.context = old_context
+                old_factor = old_context.get("decay_factor", 1.0)
                 if old_factor <= 0.1:
                     continue  # 已经衰减到最小
 
@@ -666,7 +746,12 @@ class EnhancedMemoryService:
         try:
             query = "SELECT * FROM memory_decay_rules WHERE is_active = TRUE"
             results = await self._db.execute_query(query)
-            return [dict(r) for r in (results or [])]
+            rules = []
+            for raw_rule in (results or []):
+                rule = self._ensure_rule_dict(raw_rule)
+                if rule:
+                    rules.append(rule)
+            return rules
         except Exception:
             return []
 
@@ -677,11 +762,15 @@ class EnhancedMemoryService:
         now: datetime,
     ) -> float:
         """计算单个记忆的衰减因子"""
+        entry.context = self._ensure_context_dict(entry.context)
         current_factor = entry.context.get("decay_factor", 1.0)
 
         # 查找匹配的规则
         matching_rules = []
-        for rule in rules:
+        for raw_rule in rules:
+            rule = self._ensure_rule_dict(raw_rule)
+            if not rule:
+                continue
             type_match = not rule.get("memory_type") or rule.get("memory_type") == entry.type.value
             importance_match = not rule.get("importance") or rule.get("importance") == entry.importance.value
 
@@ -749,8 +838,8 @@ class EnhancedMemoryService:
                         memory_type, importance, tags
                     ) VALUES (
                         :memory_id, CAST(:project_id AS UUID), :agent_type, :agent_id,
-                        :content, :content_hash, :embedding::jsonb, :embedding_vec::vector,
-                        :memory_type, :importance, :tags::jsonb
+                        :content, :content_hash, CAST(:embedding AS jsonb), CAST(:embedding_vec AS vector),
+                        :memory_type, :importance, CAST(:tags AS jsonb)
                     )
                     ON CONFLICT (memory_id, project_id, agent_type, agent_id) DO UPDATE SET
                         content = EXCLUDED.content,
@@ -781,8 +870,8 @@ class EnhancedMemoryService:
                         memory_type, importance, tags
                     ) VALUES (
                         :memory_id, CAST(:project_id AS UUID), :agent_type, :agent_id,
-                        :content, :content_hash, :embedding::jsonb,
-                        :memory_type, :importance, :tags::jsonb
+                        :content, :content_hash, CAST(:embedding AS jsonb),
+                        :memory_type, :importance, CAST(:tags AS jsonb)
                     )
                     ON CONFLICT (memory_id, project_id, agent_type, agent_id) DO UPDATE SET
                         content = EXCLUDED.content,

@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 from collections import defaultdict, deque
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Set
@@ -2258,16 +2259,21 @@ class WorkflowEngine:
 
                 # ========== 关键：从剧情规划提取写作意图 ==========
                 # 从 chapter_outline 或 chapter_goals 中提取当前章节的写作意图
-                chapter_outline = execution.context.get("chapter_outline", {})
-                chapter_goals = execution.context.get("chapter_goals", [])
-                plot_outline = execution.context.get("plot_outline", [])
+                raw_chapter_outline = execution.context.get("chapter_outline", {})
+                chapter_outline = self._ensure_context_dict(raw_chapter_outline)
+                chapter_goals = self._ensure_context_list(execution.context.get("chapter_goals", []))
+                plot_outline = self._ensure_context_list(execution.context.get("plot_outline", []))
 
                 # 获取当前章节号
                 chapter_num = context.get("chapter_num", 1)
 
                 # 提取写作意图
                 intents = []
-                if chapter_outline:
+                if raw_chapter_outline and not chapter_outline:
+                    outline_text = self._coerce_context_text(raw_chapter_outline).strip()
+                    if outline_text:
+                        intents.append(outline_text)
+                elif chapter_outline:
                     # 从章节大纲中提取意图
                     current_chapter = chapter_outline.get(str(chapter_num), chapter_outline)
                     if isinstance(current_chapter, dict):
@@ -2294,8 +2300,9 @@ class WorkflowEngine:
                 if not intents and plot_outline:
                     # 从剧情大纲中提取意图
                     for node in plot_outline:
-                        if node.get("event"):
-                            intents.append(node["event"])
+                        event = self._extract_context_item_text(node, "event", "summary", "description", "content")
+                        if event:
+                            intents.append(event)
 
                 if intents:
                     context["intents"] = intents
@@ -2310,19 +2317,24 @@ class WorkflowEngine:
                         writing_guide = current_chapter.get("writing_guide")
                 if writing_guide:
                     context["writing_guide"] = writing_guide
-                    logger.info(f"为 Writer 加载写作指导: {writing_guide.get('description', '')}")
+                    if isinstance(writing_guide, dict):
+                        guide_description = writing_guide.get("description", "")
+                    else:
+                        guide_description = self._coerce_context_text(writing_guide)
+                    logger.info(f"为 Writer 加载写作指导: {guide_description}")
 
                 # 提取角色情绪状态（从多个来源合并）
-                characters_data = context.get("characters", [])
-                character_states = execution.context.get("character_states", {})
-                character_moods = execution.context.get("character_moods", {})  # 从角色 Agent 获取的情绪
+                characters_data = self._ensure_context_list(context.get("characters", []))
+                character_states = self._ensure_context_dict(execution.context.get("character_states", {}))
+                raw_character_moods = execution.context.get("character_moods", {})
+                character_moods = self._ensure_context_dict(raw_character_moods)
 
                 for char in characters_data:
                     if isinstance(char, dict):
                         char_name = char.get("name", "")
                         if char_name and char_name not in character_moods:
                             # 从角色状态获取情绪
-                            state = character_states.get(char_name, {})
+                            state = self._ensure_context_dict(character_states.get(char_name, {}))
                             if state.get("mood"):
                                 character_moods[char_name] = state["mood"]
                             elif state.get("emotion"):
@@ -2337,9 +2349,9 @@ class WorkflowEngine:
                 # 提取环境描述（从多个来源）
                 environment = ""
                 # 1. 从世界数据获取
-                world_data = execution.context.get("world_data", {})
+                world_data = self._ensure_context_dict(execution.context.get("world_data", {}))
                 if world_data:
-                    current_location = world_data.get("current_location", {})
+                    current_location = self._ensure_context_dict(world_data.get("current_location", {}))
                     if current_location:
                         environment = current_location.get("description", "")
 
@@ -2376,6 +2388,21 @@ class WorkflowEngine:
                         context["discussion_summary"] = discussion_summary
                     if "last_discussion_summary" not in context:
                         context["last_discussion_summary"] = discussion_summary
+
+                discussion_assets = execution.context.get("discussion_assets")
+                if discussion_assets and "discussion_assets" not in context:
+                    context["discussion_assets"] = discussion_assets
+
+                discussion_asset_digest = execution.context.get("discussion_asset_digest")
+                if discussion_asset_digest and "discussion_asset_digest" not in context:
+                    context["discussion_asset_digest"] = discussion_asset_digest
+
+                persisted_asset_refs = execution.context.get("persisted_asset_refs")
+                if persisted_asset_refs and "persisted_asset_refs" not in context:
+                    context["persisted_asset_refs"] = persisted_asset_refs
+
+                if execution.context.get("discussion_assets_committed") and "discussion_assets_committed" not in context:
+                    context["discussion_assets_committed"] = execution.context.get("discussion_assets_committed")
 
                 # ========== 关键：设置字数要求 ==========
                 # 从 execution.context 获取 target_word_count，映射到 word_count
@@ -2476,25 +2503,42 @@ class WorkflowEngine:
                         logger.info(f"加载 {len(hooks)} 个伏笔到编剧上下文（plotter）")
 
                 # 讨论历史：从执行上下文获取之前的讨论记录
-                discussion_history = execution.context.get("discussion_history", [])
+                discussion_history = self._ensure_context_list(execution.context.get("discussion_history", []))
                 if discussion_history:
                     context["recent_discussions"] = discussion_history
                     # 提取最后一次讨论的总结
                     last_discussion = discussion_history[-1]
-                    last_summary = last_discussion.get("summary", "") or last_discussion.get("full_content", "")
-                    if not last_summary:
-                        messages = last_discussion.get("messages", [])
-                        if isinstance(messages, list):
-                            for message in reversed(messages):
-                                if isinstance(message, dict) and message.get("content"):
-                                    last_summary = message["content"]
-                                    break
+                    if isinstance(last_discussion, dict):
+                        last_summary = last_discussion.get("summary", "") or last_discussion.get("full_content", "")
+                        if not last_summary:
+                            messages = last_discussion.get("messages", [])
+                            if isinstance(messages, list):
+                                for message in reversed(messages):
+                                    if isinstance(message, dict) and message.get("content"):
+                                        last_summary = message["content"]
+                                        break
+                    else:
+                        last_summary = self._coerce_context_text(last_discussion)
                     if last_summary:
                         context["discussion_summary"] = last_summary
                         context["last_discussion_summary"] = last_summary
-                    logger.info(f"加载 {len(discussion_history)} 条讨论记录到编剧上下文（plotter）")
 
-            # ===== ProcGen/World Agent：需要已有区域 =====
+                    discussion_assets = execution.context.get("discussion_assets")
+                    if discussion_assets and "discussion_assets" not in context:
+                        context["discussion_assets"] = discussion_assets
+
+                    discussion_asset_digest = execution.context.get("discussion_asset_digest")
+                    if discussion_asset_digest and "discussion_asset_digest" not in context:
+                        context["discussion_asset_digest"] = discussion_asset_digest
+
+                    persisted_asset_refs = execution.context.get("persisted_asset_refs")
+                    if persisted_asset_refs and "persisted_asset_refs" not in context:
+                        context["persisted_asset_refs"] = persisted_asset_refs
+
+                    if execution.context.get("discussion_assets_committed") and "discussion_assets_committed" not in context:
+                        context["discussion_assets_committed"] = execution.context.get("discussion_assets_committed")
+
+                    logger.info(f"加载 {len(discussion_history)} 条讨论记录到编剧上下文（plotter）")
             if agent_type in ["procgen", "proc_gen", "world_map_manager", "event_generator", "dungeon_generator"]:
                 # 加载已有区域
                 if "existing_regions" not in context:
@@ -2514,7 +2558,7 @@ class WorkflowEngine:
                 # exploration_direction: 从章节目标或剧情规划中提取
                 if "exploration_direction" not in context:
                     chapter_goal = execution.context.get("chapter_goal", "")
-                    plot_outline = execution.context.get("plot_outline", [])
+                    plot_outline = self._ensure_context_list(execution.context.get("plot_outline", []))
                     world_info = context.get("world_info", {})
 
                     # 构建探索方向
@@ -2523,9 +2567,17 @@ class WorkflowEngine:
                     elif plot_outline:
                         # 从剧情大纲提取最近的探索方向
                         latest_plot = plot_outline[-1] if plot_outline else {}
-                        context["exploration_direction"] = latest_plot.get("event", "扩展世界内容")
+                        latest_direction = self._extract_context_item_text(
+                            latest_plot,
+                            "event",
+                            "summary",
+                            "description",
+                            "content",
+                        )
+                        context["exploration_direction"] = latest_direction or "扩展世界内容"
                     elif world_info:
-                        context["exploration_direction"] = f"探索 {world_info.get('name', '未知世界')} 的新区域"
+                        world_name = world_info.get("name", "未知世界") if isinstance(world_info, dict) else "未知世界"
+                        context["exploration_direction"] = f"探索 {world_name} 的新区域"
                     else:
                         context["exploration_direction"] = "随机探索"
 
@@ -3062,30 +3114,42 @@ class WorkflowEngine:
             query_parts.append(f"第{chapter_num}章")
 
         # 提取角色相关
-        characters = context.get("characters", [])
+        characters = self._ensure_context_list(context.get("characters", []))
         if characters:
-            char_names = [c.get("name", "") for c in characters if c.get("name")]
+            char_names = []
+            for character in characters:
+                if isinstance(character, dict):
+                    name = character.get("name") or character.get("character_name") or character.get("display_name")
+                else:
+                    name = self._coerce_context_text(character).strip()
+                if name:
+                    char_names.append(str(name))
             if char_names:
                 query_parts.append(f"角色: {', '.join(char_names)}")
 
         # 提取章节目标
         chapter_goal = context.get("chapter_goal", context.get("goal"))
         if chapter_goal:
-            query_parts.append(chapter_goal)
+            query_parts.append(self._coerce_context_text(chapter_goal, str(chapter_goal)))
 
         # 提取大纲要点
         outline = context.get("chapter_outline", {})
         if isinstance(outline, dict):
             summary = outline.get("summary", outline.get("goal"))
             if summary:
-                query_parts.append(summary)
+                query_parts.append(self._coerce_context_text(summary, str(summary)))
+        else:
+            outline_text = self._coerce_context_text(outline).strip()
+            if outline_text:
+                query_parts.append(outline_text)
 
         # 提取用户干预
         user_guidance = context.get("user_guidance")
         if user_guidance:
-            query_parts.append(user_guidance)
+            query_parts.append(self._coerce_context_text(user_guidance, str(user_guidance)))
 
-        return " ".join(query_parts) if query_parts else f"{agent_type} 任务"
+        query_text = " ".join(part for part in query_parts if isinstance(part, str) and part.strip())
+        return query_text if query_text else f"{agent_type} 任务"
 
     async def _save_chapter_from_writer(
         self,
@@ -3246,7 +3310,7 @@ class WorkflowEngine:
         """
         if not db:
             logger.warning("数据库连接不存在，无法保存伏笔")
-            return
+            return {"planted": [], "resolved": [], "updated": [], "errors": ["数据库连接不存在，无法保存伏笔"]}
 
         import uuid
         from datetime import datetime
@@ -3267,7 +3331,7 @@ class WorkflowEngine:
                     "hook_type": hook_data.get("hook_type", "foreshadow"),
                     "status": "planted",
                     "related_characters": hook_data.get("related_characters", []),
-                    "related_locations": [],
+                    "related_locations": hook_data.get("related_locations", []),
                     "related_objects": hook_data.get("related_objects", []),
                     "plant_context": execution.context.get("chapter_title", ""),
                     "plant_chapter": execution.context.get("chapter_id"),
@@ -3309,9 +3373,17 @@ class WorkflowEngine:
                 "updated_count": len(hooks_status_updates),
             })
 
+            return {
+                "planted": planted_ids,
+                "resolved": [h.get("id") for h in hooks_to_resolve if h.get("id")],
+                "updated": [h.get("id") for h in hooks_status_updates if h.get("id")],
+                "errors": [],
+            }
+
         except Exception as e:
             logger.error(f"保存伏笔失败: {e}")
             execution.context["hook_save_error"] = str(e)
+            return {"planted": [], "resolved": [], "updated": [], "errors": [str(e)]}
 
     async def _save_lore_from_setting(
         self,
@@ -3329,7 +3401,7 @@ class WorkflowEngine:
         """
         if not db:
             logger.warning("数据库连接不存在，无法保存设定")
-            return
+            return {"created": [], "updated": [], "validated": [], "errors": ["数据库连接不存在，无法保存设定"]}
 
         import uuid
         from datetime import datetime
@@ -3398,6 +3470,7 @@ class WorkflowEngine:
                 logger.info(f"保存新设定: {lore_data.get('title', '未命名')} (ID: {lore_id})")
 
             # 更新现有设定
+            updated_ids = []
             for lore_data in updated_lores:
                 lore_id = lore_data.get("id")
                 if not lore_id:
@@ -3438,6 +3511,7 @@ class WorkflowEngine:
                     params["id"] = lore_id
                     query = f"UPDATE lore_entries SET {', '.join(update_fields)} WHERE id = CAST(:id AS UUID)"
                     await db.execute_write(query, params)
+                    updated_ids.append(lore_id)
                     logger.info(f"更新设定: {lore_id}")
 
             # 更新执行上下文
@@ -3465,9 +3539,24 @@ class WorkflowEngine:
                 except Exception as e:
                     logger.warning(f"重新加载设定列表失败: {e}")
 
+            if created_ids or updated_lores:
+                try:
+                    from app.api.routes.lore import _invalidate_plot_outline_context
+                    _invalidate_plot_outline_context(execution.project_id)
+                except Exception as e:
+                    logger.warning(f"Plot Outline 缓存失效失败: {e}")
+
+            return {
+                "created": created_ids,
+                "updated": updated_ids,
+                "validated": [l.get("id") for l in validated_lores if isinstance(l, dict) and l.get("id")],
+                "errors": [],
+            }
+
         except Exception as e:
             logger.error(f"保存设定失败: {e}")
             execution.context["lore_save_error"] = str(e)
+            return {"created": [], "updated": [], "validated": [], "errors": [str(e)]}
 
     async def _save_world_data_from_procgen(
         self,
@@ -3485,7 +3574,7 @@ class WorkflowEngine:
         """
         if not db:
             logger.warning("数据库连接不存在，无法保存世界数据")
-            return
+            return {"saved": [], "events": [], "locations": [], "errors": ["数据库连接不存在，无法保存世界数据"]}
 
         import uuid
         from datetime import datetime
@@ -3507,13 +3596,17 @@ class WorkflowEngine:
                     "region_type": region_data.get("region_type", "custom"),
                     "terrain_type": region_data.get("terrain_type", "custom"),
                     "atmosphere": region_data.get("atmosphere", ""),
+                    "coordinates": region_data.get("coordinates", {}),
+                    "area_size": region_data.get("area_size", 0.0),
                     "terrain_features": region_data.get("terrain_features", []),
                     "landmarks": region_data.get("landmarks", []),
                     "encounters": region_data.get("encounters", []),
+                    "connections": region_data.get("connections") or region_data.get("neighbors", []),
                     "local_rules": region_data.get("local_rules", []),
                     "is_generated": True,
                     "visit_count": 0,
                     "created_at": datetime.now(),
+                    "updated_at": datetime.now(),
                 }
 
                 # 如果有 world_id，添加到记录中
@@ -3544,9 +3637,17 @@ class WorkflowEngine:
                 "locations_count": len(locations),
             })
 
+            return {
+                "saved": saved_regions,
+                "events": events,
+                "locations": locations,
+                "errors": [],
+            }
+
         except Exception as e:
             logger.error(f"保存世界数据失败: {e}")
             execution.context["world_data_save_error"] = str(e)
+            return {"saved": [], "events": [], "locations": [], "errors": [str(e)]}
 
     async def _save_summary_from_summarizer(
         self,
@@ -3990,6 +4091,13 @@ class WorkflowEngine:
                 "timestamp": datetime.now().isoformat(),
             })
 
+            performance_summary = self._extract_discussion_summary_text(performance_result)
+            performance_result.setdefault("summary", performance_summary)
+            performance_result.setdefault("topic", f"《{scene_directions.get('main_scene', default_scene_name or node.label)}》角色演绎")
+            performance_result.setdefault("discussion_topic", performance_result.get("topic"))
+            performance_result.setdefault("leader", "场景协调器")
+            performance_result.setdefault("leader_type", "scene_coordinator")
+
             execution.context["performance_result"] = performance_result
             execution.context["dialogues"] = performance_messages
             execution.context["last_performance_content"] = performance_result.get("full_content", "")
@@ -4052,6 +4160,641 @@ class WorkflowEngine:
     # 等待用户确认的超时时间（秒）
     USER_CONFIRMATION_TIMEOUT = 60
 
+    def _ensure_discussion_asset_list(self, value: Any) -> List[Any]:
+        """将 discussion asset 字段归一化为列表。"""
+        if value in (None, ""):
+            return []
+        if isinstance(value, list):
+            return list(value)
+        if isinstance(value, tuple):
+            return list(value)
+        return [value]
+
+    def _ensure_context_dict(self, value: Any) -> Dict[str, Any]:
+        """将运行期上下文字段归一化为 dict，避免对字符串/列表调用 .get。"""
+        if isinstance(value, dict):
+            return value
+        return {}
+
+    def _ensure_context_list(self, value: Any) -> List[Any]:
+        """将运行期上下文字段归一化为 list。"""
+        if value in (None, ""):
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        return [value]
+
+    def _coerce_context_text(self, value: Any, fallback: str = "") -> str:
+        """将上下文字段安全转为文本。"""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (int, float, bool)):
+            return str(value)
+        return fallback
+
+    def _extract_context_item_text(self, item: Any, *keys: str) -> str:
+        """从 dict 或文本项中提取用于上下文的文本。"""
+        if isinstance(item, dict):
+            for key in keys:
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+                if isinstance(value, list):
+                    text_parts = [str(part).strip() for part in value if part not in (None, "")]
+                    if text_parts:
+                        return "；".join(text_parts)
+            return ""
+        return self._coerce_context_text(item).strip()
+
+    def _extract_discussion_summary_text(self, discussion: Optional[Dict[str, Any]]) -> str:
+        """提取讨论摘要文本，兼容 meeting/performance 两种输出。"""
+        if not isinstance(discussion, dict):
+            return ""
+
+        for key in ("summary", "full_content"):
+            value = discussion.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+        performance_result = discussion.get("performance_result")
+        if isinstance(performance_result, dict):
+            for key in ("summary", "full_content"):
+                value = performance_result.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+
+        messages = discussion.get("messages", [])
+        if isinstance(messages, list):
+            for message in reversed(messages):
+                if isinstance(message, dict):
+                    content = message.get("content", "")
+                    if isinstance(content, str) and content.strip():
+                        return content.strip()
+
+        return ""
+
+    def _collect_discussion_assets(self, discussion_result: Dict[str, Any], *keys: str) -> List[Any]:
+        """从多个候选字段中收集资产列表。"""
+        assets: List[Any] = []
+        for key in keys:
+            assets.extend(self._ensure_discussion_asset_list(discussion_result.get(key)))
+        return assets
+
+    def _extract_discussion_assets_from_text(self, discussion_result: Dict[str, Any]) -> Dict[str, List[Any]]:
+        """从讨论文本中的结构化 JSON 区块提取资产提案。"""
+        text_parts: List[str] = []
+        for key in ("summary", "full_content"):
+            value = discussion_result.get(key)
+            if isinstance(value, str) and value.strip():
+                text_parts.append(value)
+
+        for message in discussion_result.get("messages", []) or []:
+            if isinstance(message, dict):
+                content = message.get("content")
+                if isinstance(content, str) and content.strip():
+                    text_parts.append(content)
+
+        text = "\n".join(text_parts)
+        if not text:
+            return {}
+
+        candidates: List[str] = []
+        for match in re.finditer(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text, re.IGNORECASE):
+            candidates.append(match.group(1))
+
+        marker_patterns = [
+            r"讨论资产提案\s*[:：]\s*(\{[\s\S]*?\})(?:\n\s*(?:请确认|是否同意|$))",
+            r"discussion_assets\s*[:：]?\s*(\{[\s\S]*?\})(?:\n\s*(?:请确认|是否同意|$))",
+        ]
+        for pattern in marker_patterns:
+            for match in re.finditer(pattern, text, re.IGNORECASE):
+                candidates.append(match.group(1))
+
+        extracted: Dict[str, List[Any]] = {}
+        field_aliases = {
+            "plot_updates": ("plot_updates", "剧情加码", "剧情更新"),
+            "hooks": ("hooks", "hook_candidates", "hooks_to_plant", "伏笔"),
+            "lore_candidates": ("lore_candidates", "lores", "new_lores", "设定", "世界观设定"),
+            "region_candidates": ("region_candidates", "regions", "new_regions", "map_candidates", "地点", "地图地点"),
+            "character_candidates": ("character_candidates", "new_characters", "characters_to_create", "角色"),
+        }
+
+        for candidate in candidates:
+            try:
+                payload = json.loads(candidate)
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+
+            asset_payload = payload.get("discussion_assets") if isinstance(payload.get("discussion_assets"), dict) else payload
+            for target_key, aliases in field_aliases.items():
+                for alias in aliases:
+                    if alias in asset_payload:
+                        extracted.setdefault(target_key, []).extend(
+                            self._ensure_discussion_asset_list(asset_payload.get(alias))
+                        )
+                        break
+
+        return extracted
+
+    def _build_discussion_asset_preview(self, bundle: Dict[str, Any]) -> Dict[str, Any]:
+        """构建用于前端确认与下游消费的讨论资产预览。"""
+        def _labels(items: List[Any]) -> List[str]:
+            labels: List[str] = []
+            for item in items[:5]:
+                if isinstance(item, dict):
+                    label = item.get("title") or item.get("name") or item.get("id")
+                    if label:
+                        labels.append(str(label))
+                elif item not in (None, ""):
+                    labels.append(str(item))
+            return labels
+
+        plot_updates = bundle.get("plot_updates", [])
+        hooks = bundle.get("hooks", [])
+        lore_candidates = bundle.get("lore_candidates", [])
+        region_candidates = bundle.get("region_candidates", [])
+        character_candidates = bundle.get("character_candidates", [])
+        source_metadata = bundle.get("source_metadata", {})
+
+        return {
+            "topic": source_metadata.get("topic", ""),
+            "mode": source_metadata.get("mode", "meeting"),
+            "plot_update_count": len(plot_updates),
+            "hook_count": len(hooks),
+            "lore_count": len(lore_candidates),
+            "region_count": len(region_candidates),
+            "character_count": len(character_candidates),
+            "plot_update_titles": _labels(plot_updates),
+            "hook_titles": _labels(hooks),
+            "lore_titles": _labels(lore_candidates),
+            "region_titles": _labels(region_candidates),
+            "character_titles": _labels(character_candidates),
+        }
+
+    def _build_discussion_asset_bundle(
+        self,
+        execution: "WorkflowExecution",
+        discussion_result: Dict[str, Any],
+        node_id: str,
+        discussion_mode: str,
+    ) -> Dict[str, Any]:
+        """构建统一的 discussion asset bundle。"""
+        summary = self._extract_discussion_summary_text(discussion_result)
+        extracted_assets = self._extract_discussion_assets_from_text(discussion_result)
+        for key, assets in extracted_assets.items():
+            if assets and not discussion_result.get(key):
+                discussion_result[key] = assets
+
+        plot_updates = self._collect_discussion_assets(discussion_result, "plot_updates")
+        if summary:
+            plot_updates = [{
+                "type": "discussion_summary",
+                "topic": discussion_result.get("discussion_topic") or discussion_result.get("topic") or execution.context.get("chapter_title", "当前章节"),
+                "summary": summary,
+                "mode": discussion_mode,
+                "scene": discussion_result.get("scene", ""),
+                "source": "group_discussion",
+            }, *plot_updates]
+
+        raw_lore_candidates = self._collect_discussion_assets(
+            discussion_result,
+            "lore_candidates",
+            "lores",
+            "new_lores",
+            "setting_candidates",
+        )
+        raw_region_candidates = self._collect_discussion_assets(
+            discussion_result,
+            "region_candidates",
+            "regions",
+            "new_regions",
+            "map_candidates",
+        )
+        classified_regions, classified_location_lores = self._split_discussion_location_assets(raw_region_candidates)
+
+        bundle = {
+            "plot_updates": plot_updates,
+            "hooks": self._collect_discussion_assets(discussion_result, "hooks", "hook_candidates", "hooks_to_plant", "new_hooks"),
+            "lore_candidates": [*raw_lore_candidates, *classified_location_lores],
+            "region_candidates": classified_regions,
+            "character_candidates": self._collect_discussion_assets(discussion_result, "character_candidates", "new_characters", "characters_to_create"),
+            "persistence_preview": {},
+            "source_metadata": {
+                "node_id": node_id,
+                "execution_id": execution.id,
+                "project_id": execution.project_id,
+                "mode": discussion_mode,
+                "topic": discussion_result.get("discussion_topic") or discussion_result.get("topic") or execution.context.get("chapter_title", "当前章节"),
+                "chapter_title": execution.context.get("chapter_title", ""),
+                "leader": discussion_result.get("leader", ""),
+                "leader_type": discussion_result.get("leader_type", ""),
+                "participants": discussion_result.get("participants", []),
+                "timestamp": discussion_result.get("timestamp") or datetime.now().isoformat(),
+                "status": discussion_result.get("status", "completed"),
+            },
+        }
+        bundle["persistence_preview"] = self._build_discussion_asset_preview(bundle)
+        return bundle
+
+    def _apply_discussion_asset_bundle(
+        self,
+        execution: "WorkflowExecution",
+        discussion_result: Dict[str, Any],
+        bundle: Dict[str, Any],
+        discussion_mode: str,
+    ) -> Dict[str, Any]:
+        """将 discussion bundle 写回上下文与讨论结果。"""
+        discussion_summary = self._extract_discussion_summary_text(discussion_result)
+        digest = {
+            "topic": bundle.get("source_metadata", {}).get("topic", ""),
+            "mode": discussion_mode,
+            "summary": discussion_summary[:280],
+            "plot_update_count": len(bundle.get("plot_updates", [])),
+            "hook_count": len(bundle.get("hooks", [])),
+            "lore_count": len(bundle.get("lore_candidates", [])),
+            "region_count": len(bundle.get("region_candidates", [])),
+            "character_count": len(bundle.get("character_candidates", [])),
+        }
+
+        discussion_result["discussion_assets"] = bundle
+        discussion_result["discussion_asset_digest"] = digest
+
+        existing_group_discussion = execution.context.get("group_discussion")
+        if isinstance(existing_group_discussion, dict):
+            existing_group_discussion["discussion_assets"] = bundle
+            existing_group_discussion["discussion_asset_digest"] = digest
+            if discussion_summary and not existing_group_discussion.get("summary"):
+                existing_group_discussion["summary"] = discussion_summary
+
+        if discussion_mode == "performance" or not isinstance(existing_group_discussion, dict):
+            normalized_discussion = {
+                "mode": discussion_mode,
+                "topic": discussion_result.get("topic") or discussion_result.get("discussion_topic") or execution.context.get("chapter_title", "当前章节"),
+                "discussion_topic": discussion_result.get("discussion_topic") or discussion_result.get("topic") or execution.context.get("chapter_title", "当前章节"),
+                "leader": discussion_result.get("leader", ""),
+                "leader_type": discussion_result.get("leader_type", "master_plotter"),
+                "participants": discussion_result.get("participants", []),
+                "messages": discussion_result.get("messages", []),
+                "characters": discussion_result.get("characters", []),
+                "full_content": discussion_result.get("full_content", ""),
+                "summary": discussion_summary,
+                "timestamp": discussion_result.get("timestamp") or datetime.now().isoformat(),
+                "status": discussion_result.get("status", "waiting_confirmation"),
+                "discussion_assets": bundle,
+                "discussion_asset_digest": digest,
+            }
+            execution.context["group_discussion"] = normalized_discussion
+
+            discussion_history = execution.context.get("discussion_history", [])
+            if not discussion_history or discussion_history[-1] != normalized_discussion:
+                discussion_history.append(normalized_discussion)
+                execution.context["discussion_history"] = discussion_history
+
+        execution.context["discussion_assets"] = bundle
+        execution.context["discussion_asset_digest"] = digest
+        execution.context["discussion_assets_committed"] = False
+        execution.context.setdefault("discussion_asset_history", []).append(bundle)
+
+        if discussion_summary:
+            execution.context["discussion_summary"] = discussion_summary
+            execution.context["last_discussion_summary"] = discussion_summary
+
+        return digest
+
+    def _discussion_asset_to_dict(self, asset: Any, default_key: str = "title") -> Dict[str, Any]:
+        """将讨论资产归一化为 dict，便于分类和持久化。"""
+        if isinstance(asset, dict):
+            return dict(asset)
+        if asset in (None, ""):
+            return {}
+        return {default_key: str(asset), "description": str(asset)}
+
+    def _discussion_asset_has_geo_shape(self, asset: Dict[str, Any]) -> bool:
+        """判断讨论资产是否具备可作为 Region 的地理实体特征。"""
+        if not asset.get("name") and not asset.get("title"):
+            return False
+
+        explicit_type = str(
+            asset.get("asset_type")
+            or asset.get("type")
+            or asset.get("kind")
+            or asset.get("category")
+            or ""
+        ).lower()
+        if explicit_type in {"region", "location", "place", "map", "geography", "区域", "地点", "地图"}:
+            return True
+
+        geo_fields = {
+            "connections",
+            "terrain_features",
+            "landmarks",
+            "atmosphere",
+            "encounters",
+            "region_type",
+            "terrain_type",
+            "local_rules",
+            "coordinates",
+            "neighbors",
+        }
+        return any(asset.get(field) for field in geo_fields)
+
+    def _discussion_asset_has_lore_shape(self, asset: Dict[str, Any]) -> bool:
+        """判断讨论资产是否具备应进入 LoreEntry 的背景设定特征。"""
+        explicit_type = str(
+            asset.get("asset_type")
+            or asset.get("type")
+            or asset.get("kind")
+            or asset.get("category")
+            or ""
+        ).lower()
+        if explicit_type in {
+            "lore",
+            "world_rule",
+            "history",
+            "culture",
+            "faction",
+            "rule",
+            "setting",
+            "传说",
+            "历史",
+            "文化",
+            "规则",
+            "设定",
+        }:
+            return True
+
+        lore_fields = {
+            "content",
+            "summary",
+            "history",
+            "culture",
+            "rules",
+            "taboos",
+            "factions",
+            "myth",
+            "legend",
+            "constraints",
+            "forbidden_actions",
+        }
+        return any(asset.get(field) for field in lore_fields)
+
+    def _split_discussion_location_assets(
+        self,
+        assets: List[Any],
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """将地图/地点类讨论资产拆分为 Region 与 LoreEntry 候选。"""
+        region_candidates: List[Dict[str, Any]] = []
+        lore_candidates: List[Dict[str, Any]] = []
+
+        for raw_asset in assets:
+            asset = self._discussion_asset_to_dict(raw_asset, default_key="name")
+            if not asset:
+                continue
+
+            is_region = self._discussion_asset_has_geo_shape(asset)
+            is_lore = self._discussion_asset_has_lore_shape(asset)
+
+            if is_region:
+                region_candidates.append(asset)
+
+            if is_lore or not is_region:
+                title = asset.get("lore_title") or asset.get("title") or asset.get("name") or "未命名设定"
+                content = (
+                    asset.get("content")
+                    or asset.get("lore")
+                    or asset.get("history")
+                    or asset.get("description")
+                    or asset.get("summary")
+                    or str(asset)
+                )
+                lore_asset = {
+                    **asset,
+                    "title": title,
+                    "content": content,
+                    "category": asset.get("lore_category") or asset.get("category") or "geography",
+                    "related_locations": asset.get("related_locations") or [asset.get("name") or title],
+                    "source": asset.get("source") or "group_discussion",
+                }
+                if is_region:
+                    lore_asset.setdefault("metadata", {})
+                    if isinstance(lore_asset["metadata"], dict):
+                        lore_asset["metadata"]["dual_write_region_name"] = asset.get("name") or title
+                lore_candidates.append(lore_asset)
+
+        return region_candidates, lore_candidates
+
+    def _is_persistable_discussion_character(self, candidate: Dict[str, Any]) -> bool:
+        """判断讨论中提到的角色是否足够明确，可提前持久化。"""
+        name = str(candidate.get("name") or candidate.get("title") or "").strip()
+        if not name:
+            return False
+
+        vague_markers = ["某", "一名", "一个", "神秘", "路人", "士兵", "商人", "长老", "守卫"]
+        if any(marker in name for marker in vague_markers) and not candidate.get("importance_tier"):
+            return False
+
+        has_narrative_role = any(
+            candidate.get(field)
+            for field in ("importance_tier", "role", "character_type", "story_arc_role", "narrative_role")
+        )
+        has_core_detail = any(
+            candidate.get(field)
+            for field in (
+                "personality",
+                "appearance",
+                "background",
+                "background_story",
+                "relationship",
+                "relationships",
+                "motivation",
+                "goals",
+                "description",
+            )
+        )
+        return has_narrative_role and has_core_detail
+
+    async def _persist_discussion_characters(
+        self,
+        execution: "WorkflowExecution",
+        character_candidates: List[Any],
+        db=None,
+    ) -> Dict[str, Any]:
+        """保存讨论阶段已经明确的重要新角色。"""
+        result = {"created": [], "skipped": [], "errors": []}
+        if not db:
+            result["errors"].append("数据库连接不存在，无法保存讨论角色")
+            return result
+
+        import uuid
+        from app.api.routes.characters import _auto_configure_character_agent, _derive_role_from_tier
+        from app.models.character import CharacterImportanceTier
+
+        valid_tiers = {tier.value for tier in CharacterImportanceTier}
+
+        for raw_candidate in character_candidates:
+            candidate = self._discussion_asset_to_dict(raw_candidate, default_key="name")
+            name = str(candidate.get("name") or candidate.get("title") or "").strip()
+            if not self._is_persistable_discussion_character(candidate):
+                if name:
+                    result["skipped"].append({"name": name, "reason": "角色信息不够明确，暂不提前落库"})
+                continue
+
+            try:
+                if hasattr(db, "get_character_by_project_and_name"):
+                    existing = await db.get_character_by_project_and_name(execution.project_id, name)
+                    if existing:
+                        result["skipped"].append({"name": name, "reason": "角色已存在", "id": existing.get("id")})
+                        continue
+
+                importance_tier = str(candidate.get("importance_tier") or candidate.get("tier") or CharacterImportanceTier.RECURRING.value)
+                if importance_tier not in valid_tiers:
+                    importance_tier = CharacterImportanceTier.RECURRING.value
+
+                goals = candidate.get("goals") or candidate.get("agent_goals") or []
+                if isinstance(goals, str):
+                    goals = [goals]
+
+                char_data = {
+                    "id": str(uuid.uuid4()),
+                    "name": name,
+                    "project_id": execution.project_id,
+                    "world_id": candidate.get("world_id") or execution.context.get("world_id"),
+                    "description": candidate.get("description") or candidate.get("summary") or "",
+                    "status": candidate.get("status") or "active",
+                    "importance_tier": importance_tier,
+                    "role": _derive_role_from_tier(importance_tier),
+                    "appearance": candidate.get("appearance"),
+                    "personality": candidate.get("personality"),
+                    "background_story": candidate.get("background_story") or candidate.get("background"),
+                    "speech_pattern": candidate.get("speech_pattern"),
+                    "personality_traits": candidate.get("personality_traits") or [],
+                    "relationships": candidate.get("relationships") or [],
+                    "key_relationships": candidate.get("key_relationships") or {},
+                    "age": candidate.get("age"),
+                    "gender": candidate.get("gender"),
+                    "lexicon": candidate.get("lexicon") or [],
+                    "voice_samples": candidate.get("voice_samples") or [],
+                    "attributes": candidate.get("attributes") or {},
+                    "goals": goals,
+                    "inventory": candidate.get("inventory") or [],
+                    "current_location": candidate.get("current_location") or candidate.get("location"),
+                    "agent_goals": candidate.get("agent_goals") or [],
+                    "agent_memory": candidate.get("agent_memory") or [],
+                    "has_agent": candidate.get("has_agent"),
+                    "agent_enabled": candidate.get("agent_enabled"),
+                    "created_at": datetime.now(),
+                    "updated_at": datetime.now(),
+                }
+                if isinstance(char_data["attributes"], dict):
+                    char_data["attributes"].setdefault("source", "group_discussion")
+                    char_data["attributes"].setdefault("discussion_node_id", execution.context.get("discussion_assets", {}).get("source_metadata", {}).get("node_id"))
+
+                if char_data.get("has_agent") is None:
+                    char_data["has_agent"] = False
+                if char_data.get("agent_enabled") is None:
+                    char_data["agent_enabled"] = True
+
+                char_data = await _auto_configure_character_agent(char_data)
+                await db.save_character(char_data)
+                result["created"].append({"id": char_data["id"], "name": name})
+                logger.info(f"保存讨论新角色: {name}")
+            except Exception as e:
+                logger.error(f"保存讨论角色失败: {name or raw_candidate}: {e}")
+                result["errors"].append({"name": name, "error": str(e)})
+
+        return result
+
+    async def _persist_discussion_assets(
+        self,
+        execution: "WorkflowExecution",
+        bundle: Dict[str, Any],
+        db=None,
+        confirmation_mode: str = "user_confirm",
+    ) -> Dict[str, Any]:
+        """在讨论结果被确认后，将 discussion assets 写入持久层并回填上下文。"""
+        state = {
+            "committed": False,
+            "confirmation_mode": confirmation_mode,
+            "persisted_at": datetime.now().isoformat(),
+            "hooks": {"planted": [], "resolved": [], "updated": []},
+            "lores": {"created": [], "updated": []},
+            "regions": {"saved": []},
+            "characters": {"created": [], "skipped": [], "errors": []},
+            "errors": [],
+        }
+
+        if not bundle:
+            execution.context["discussion_persistence_state"] = state
+            return state
+
+        try:
+            plot_updates = bundle.get("plot_updates", [])
+            if plot_updates:
+                execution.context.setdefault("discussion_plot_updates", []).extend(plot_updates)
+
+            if db:
+                hook_result = await self._save_hooks_from_manager(
+                    execution,
+                    {"hooks_to_plant": bundle.get("hooks", [])},
+                    db,
+                )
+                if isinstance(hook_result, dict):
+                    state["hooks"] = hook_result
+
+                lore_result = await self._save_lore_from_setting(
+                    execution,
+                    {"new_lores": bundle.get("lore_candidates", [])},
+                    db,
+                )
+                if isinstance(lore_result, dict):
+                    state["lores"] = lore_result
+
+                region_result = await self._save_world_data_from_procgen(
+                    execution,
+                    {"regions": bundle.get("region_candidates", [])},
+                    db,
+                )
+                if isinstance(region_result, dict):
+                    state["regions"] = region_result
+
+                state["characters"] = await self._persist_discussion_characters(
+                    execution,
+                    bundle.get("character_candidates", []),
+                    db,
+                )
+            else:
+                state["errors"].append("数据库连接不存在，讨论资产仅写入执行上下文")
+
+            persisted_refs = {
+                "hooks": state.get("hooks", {}).get("planted", []),
+                "lores": state.get("lores", {}).get("created", []),
+                "regions": state.get("regions", {}).get("saved", []),
+                "characters": [c.get("id") for c in state.get("characters", {}).get("created", []) if c.get("id")],
+            }
+            state["committed"] = True
+            state["persisted_asset_refs"] = persisted_refs
+
+            execution.context["discussion_assets_committed"] = True
+            execution.context["discussion_persistence_state"] = state
+            execution.context["persisted_asset_refs"] = persisted_refs
+            execution.context["discussion_created_hooks"] = persisted_refs["hooks"]
+            execution.context["discussion_created_lores"] = persisted_refs["lores"]
+            execution.context["discussion_created_regions"] = persisted_refs["regions"]
+            execution.context["discussion_created_characters"] = state.get("characters", {}).get("created", [])
+
+            await self._broadcast_status(execution.id, "discussion_assets_persisted", self._make_json_safe(state))
+            return state
+        except Exception as e:
+            logger.error(f"持久化讨论资产失败: {e}", exc_info=True)
+            state["errors"].append(str(e))
+            execution.context["discussion_persistence_state"] = state
+            await self._broadcast_status(execution.id, "discussion_assets_persist_failed", self._make_json_safe(state))
+            return state
+
     async def _execute_group_discussion_node(
         self,
         node: WorkflowNode,
@@ -4089,8 +4832,24 @@ class WorkflowEngine:
         else:
             result = await self._execute_meeting_discussion(node, execution, db)
 
+        if result.get("status") in {"completed", "waiting_confirmation"}:
+            discussion_bundle = self._build_discussion_asset_bundle(
+                execution=execution,
+                discussion_result=result,
+                node_id=node.id,
+                discussion_mode=discussion_mode,
+            )
+            discussion_digest = self._apply_discussion_asset_bundle(
+                execution=execution,
+                discussion_result=result,
+                bundle=discussion_bundle,
+                discussion_mode=discussion_mode,
+            )
+            result["discussion_assets"] = discussion_bundle
+            result["discussion_asset_digest"] = discussion_digest
+
         # 如果需要用户确认，暂停工作流
-        if require_user_confirmation and result.get("status") == "completed":
+        if require_user_confirmation and result.get("status") in {"completed", "waiting_confirmation"}:
             logger.info(f"集体讨论节点完成，暂停等待用户确认（超时 {confirmation_timeout} 秒）...")
 
             # 广播等待用户确认事件
@@ -4099,6 +4858,8 @@ class WorkflowEngine:
                 "node_type": "group_discussion",
                 "discussion_mode": discussion_mode,
                 "discussion_result": result,
+                "discussion_assets": result.get("discussion_assets", {}),
+                "discussion_asset_digest": result.get("discussion_asset_digest", {}),
                 "timeout_seconds": confirmation_timeout,
                 "message": f"讨论已完成，请在 {confirmation_timeout} 秒内确认，否则自动接受",
             })
@@ -4107,6 +4868,8 @@ class WorkflowEngine:
             execution.context["waiting_confirmation"] = {
                 "node_id": node.id,
                 "discussion_result": result,
+                "discussion_assets": result.get("discussion_assets", {}),
+                "discussion_asset_digest": result.get("discussion_asset_digest", {}),
                 "timestamp": datetime.now().isoformat(),
                 "timeout_seconds": confirmation_timeout,
             }
@@ -4123,8 +4886,8 @@ class WorkflowEngine:
                 )
             )
 
-            # 更新结果状态
-            result["waiting_confirmation"] = True
+            # 更新结果状态。不要写入 waiting_confirmation，避免通用 context 合并覆盖确认详情 dict。
+            result["waiting_user_confirmation"] = True
             result["timeout_seconds"] = confirmation_timeout
             result["message"] = f"等待用户确认（{confirmation_timeout}秒后自动接受）"
 
@@ -4178,9 +4941,9 @@ class WorkflowEngine:
             # 超时自动接受
             logger.info(f"用户确认超时（{timeout_seconds}秒），自动接受讨论结果: {execution_id}")
 
-            # 标记已确认，防止重复确认
-            waiting_confirmation["confirmed"] = True
+            # 标记自动确认元数据，实际 confirmed 状态由 confirm_discussion 统一设置
             waiting_confirmation["auto_confirmed"] = True
+            waiting_confirmation["confirmation_mode"] = "timeout_auto_confirm"
 
             # 广播超时事件
             await self._broadcast_status(execution_id, "confirmation_timeout", {
@@ -4723,9 +5486,21 @@ class WorkflowEngine:
 1. 总结本次讨论的主要观点
 2. 归纳达成的共识和分歧
 3. 提出后续创作建议
-4. 最后明确询问用户是否同意
+4. 给出一个可落库的讨论资产提案 JSON，必须放在 ```json 代码块中，顶层字段为 discussion_assets
+5. 最后明确询问用户是否同意
 
-直接输出内容。"""
+讨论资产提案 JSON 结构如下，没有内容的数组可为空：
+{{
+  "discussion_assets": {{
+    "plot_updates": [{{"title": "剧情加码标题", "summary": "后续剧情要承接的变化", "source": "group_discussion"}}],
+    "hooks": [{{"title": "伏笔标题", "description": "伏笔说明", "status": "planted", "related_locations": []}}],
+    "lore_candidates": [{{"title": "设定标题", "content": "设定内容", "category": "world_rule", "priority": "standard"}}],
+    "region_candidates": [{{"name": "地点名称", "description": "地点说明", "region_type": "location", "terrain_type": "unknown", "landmarks": [], "connections": []}}],
+    "character_candidates": [{{"name": "角色名", "importance_tier": "supporting", "description": "角色定位", "appearance": "外貌", "personality": "性格", "background_story": "背景", "goals": []}}]
+  }}
+}}
+
+只把本次讨论已经明确达成共识、适合后续剧情承接的内容写进 JSON；不要虚构讨论中没有依据的资产。"""
 
             if hasattr(agent, 'model') and agent.model:
                 content = await self._get_model_response_text(agent.model, prompt)
@@ -6521,6 +7296,9 @@ class WorkflowEngine:
             return {"success": False, "error": "讨论结果已被确认"}
 
         # 标记已确认
+        confirmation_mode = waiting_confirmation.get("confirmation_mode") or (
+            "timeout_auto_confirm" if waiting_confirmation.get("auto_confirmed") else "user_confirm"
+        )
         waiting_confirmation["confirmed"] = True
         waiting_confirmation["user_approved"] = approved
 
@@ -6557,8 +7335,20 @@ class WorkflowEngine:
         })
 
         if approved:
-            # 用户同意，恢复工作流继续执行
+            # 用户同意，先持久化讨论资产，再恢复工作流继续执行
             logger.info(f"用户同意讨论结果，继续执行工作流: {execution_id}")
+
+            discussion_bundle = (
+                waiting_confirmation.get("discussion_assets")
+                or execution.context.get("discussion_assets")
+                or {}
+            )
+            persistence_state = await self._persist_discussion_assets(
+                execution=execution,
+                bundle=discussion_bundle,
+                db=db,
+                confirmation_mode=confirmation_mode,
+            )
 
             execution.context.pop("waiting_confirmation", None)
             execution.status = WorkflowStatus.RUNNING
@@ -6567,6 +7357,9 @@ class WorkflowEngine:
 
             await self._broadcast_status(execution_id, "discussion_confirmed", {
                 "approved": True,
+                "confirmation_mode": confirmation_mode,
+                "discussion_persistence_state": self._make_json_safe(persistence_state),
+                "persisted_asset_refs": self._make_json_safe(persistence_state.get("persisted_asset_refs", {})),
                 "message": "用户同意讨论结果，工作流继续执行",
             })
 
@@ -6577,6 +7370,8 @@ class WorkflowEngine:
             return {
                 "success": True,
                 "approved": True,
+                "confirmation_mode": confirmation_mode,
+                "discussion_persistence_state": self._make_json_safe(persistence_state),
                 "message": "工作流继续执行",
             }
 

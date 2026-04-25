@@ -7,7 +7,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class NarrativeEntryType(str, Enum):
@@ -74,8 +74,8 @@ class NarrativeEntry(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     embedding_id: Optional[str] = Field(None, description="Qdrant 向量 ID")
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "id": "narr_001",
                 "project_id": "proj_001",
@@ -90,6 +90,7 @@ class NarrativeEntry(BaseModel):
                 "emotional_intensity": 0.7,
             }
         }
+    )
 
 
 class CharacterState(BaseModel):
@@ -124,8 +125,8 @@ class CharacterState(BaseModel):
     inventory: List[str] = Field(default_factory=list, description="物品清单")
     equipped_items: List[str] = Field(default_factory=list, description="装备物品")
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "id": "state_001",
                 "character_id": "char_001",
@@ -138,6 +139,7 @@ class CharacterState(BaseModel):
                 "relationship_states": {"char_002": -0.3},
             }
         }
+    )
 
 
 class WorldSnapshot(BaseModel):
@@ -185,8 +187,8 @@ class WorldSnapshot(BaseModel):
     is_branch: bool = Field(default=False, description="是否为分支")
     branch_reason: Optional[str] = Field(None, description="分支原因")
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "id": "snap_001",
                 "project_id": "proj_001",
@@ -198,6 +200,7 @@ class WorldSnapshot(BaseModel):
                 "hooks_planted": ["hook_001", "hook_002"],
             }
         }
+    )
 
 
 class NarrativeContext(BaseModel):

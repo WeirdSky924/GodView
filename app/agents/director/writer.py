@@ -42,6 +42,25 @@ class WriterAgent(BaseAgent):
     AGENT_TYPE = AgentType.WRITER
     WRITER_OUTPUT_CONTRACT = DEFAULT_AGENT_OUTPUT_CONTRACT_REGISTRY.get("writer.workflow_output")
 
+    def _as_list(self, value: Any) -> List[Any]:
+        if value in (None, ""):
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        return [value]
+
+    def _as_dict(self, value: Any) -> Dict[str, Any]:
+        return value if isinstance(value, dict) else {}
+
+    def _as_text(self, value: Any, fallback: str = "") -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (int, float, bool)):
+            return str(value)
+        return fallback
+
     def _ensure_chapter_content(self, result: Dict[str, Any]) -> Dict[str, Any]:
         """统一正文文本字段，兼容旧 content 与新 chapter_content。"""
         chapter_content = result.get("chapter_content") or result.get("content") or ""
@@ -56,6 +75,33 @@ class WriterAgent(BaseAgent):
         if "text_output" not in result:
             result["text_output"] = rewritten_text
         return result
+
+    def _normalize_workflow_output_fields(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """补齐 writer.workflow_output 契约要求的顶层字段。"""
+        result = self._ensure_chapter_content(result)
+
+        style_check = result.get("style_check")
+        if hasattr(style_check, "model_dump"):
+            style_check = style_check.model_dump()
+        if not isinstance(style_check, dict):
+            style_check = {}
+        result["style_check"] = {
+            "action_ratio": style_check.get("action_ratio", 0.0),
+            "expression_ratio": style_check.get("expression_ratio", 0.0),
+            "dialogue_ratio": style_check.get("dialogue_ratio", 0.0),
+        }
+
+        for field_name in ("hooks_embedded", "future_setup", "climax_points"):
+            value = result.get(field_name)
+            if isinstance(value, list):
+                result[field_name] = value
+            elif value in (None, ""):
+                result[field_name] = []
+            else:
+                result[field_name] = [str(value)]
+
+        return result
+
     def __init__(
         self,
         model: Optional[BaseLanguageModel] = None,
@@ -157,6 +203,75 @@ class WriterAgent(BaseAgent):
             return legacy_summary.strip()
         return str(legacy_summary) if legacy_summary else ""
 
+    def _extract_discussion_asset_context(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        """提取已确认讨论资产，兼容直接字段与 group_discussion 嵌套字段。"""
+        group_discussion = input_data.get("group_discussion") or {}
+        if not isinstance(group_discussion, dict):
+            group_discussion = {}
+
+        assets = input_data.get("discussion_assets") or group_discussion.get("discussion_assets") or {}
+        digest = input_data.get("discussion_asset_digest") or group_discussion.get("discussion_asset_digest") or {}
+        persisted_refs = input_data.get("persisted_asset_refs") or {}
+        committed = bool(input_data.get("discussion_assets_committed") or persisted_refs)
+
+        return {
+            "discussion_assets": assets if isinstance(assets, dict) else {},
+            "discussion_asset_digest": digest if isinstance(digest, dict) else {},
+            "persisted_asset_refs": persisted_refs if isinstance(persisted_refs, dict) else {},
+            "discussion_assets_committed": committed,
+        }
+
+    def _format_discussion_asset_context(self, asset_context: Dict[str, Any]) -> str:
+        """将讨论资产压缩为可放入 prompt 的摘要。"""
+        assets = asset_context.get("discussion_assets") or {}
+        digest = asset_context.get("discussion_asset_digest") or {}
+        persisted_refs = asset_context.get("persisted_asset_refs") or {}
+        if not assets and not digest and not persisted_refs:
+            return ""
+
+        def _labels(items: Any) -> List[str]:
+            if not isinstance(items, list):
+                return []
+            labels: List[str] = []
+            for item in items[:6]:
+                if isinstance(item, dict):
+                    label = item.get("title") or item.get("name") or item.get("id") or item.get("summary")
+                    if label:
+                        labels.append(str(label)[:80])
+                elif item not in (None, ""):
+                    labels.append(str(item)[:80])
+            return labels
+
+        lines = []
+        topic = digest.get("topic") or assets.get("source_metadata", {}).get("topic")
+        if topic:
+            lines.append(f"讨论主题：{topic}")
+        if asset_context.get("discussion_assets_committed"):
+            lines.append("状态：已确认并提交，可作为本章写作事实使用")
+        elif assets:
+            lines.append("状态：讨论资产提案，请优先体现已确认上下文，避免擅自扩写为长期事实")
+
+        sections = [
+            ("剧情加码", _labels(assets.get("plot_updates"))),
+            ("新增/待埋伏笔", _labels(assets.get("hooks"))),
+            ("设定/世界观", _labels(assets.get("lore_candidates"))),
+            ("地图/地点", _labels(assets.get("region_candidates"))),
+            ("角色", _labels(assets.get("character_candidates"))),
+        ]
+        for title, labels in sections:
+            if labels:
+                lines.append(f"{title}：" + "；".join(labels))
+
+        ref_lines = []
+        for key, value in persisted_refs.items():
+            if value:
+                count = len(value) if isinstance(value, list) else 1
+                ref_lines.append(f"{key}={count}")
+        if ref_lines:
+            lines.append("已持久化引用：" + "，".join(ref_lines))
+
+        return "\n".join(lines)
+
     def _build_writing_rule_context(
         self,
         *,
@@ -242,18 +357,18 @@ class WriterAgent(BaseAgent):
         await self.load_skills()
 
         try:
-            intents = input_data.get("intents", [])
-            environment = input_data.get("environment", "")
-            character_moods = input_data.get("character_moods", {})
-            hooks = input_data.get("hooks", [])
-            previous_style = input_data.get("previous_style", "")
+            intents = self._as_list(input_data.get("intents", []))
+            environment = self._as_text(input_data.get("environment", ""))
+            character_moods = self._as_dict(input_data.get("character_moods", {}))
+            hooks = self._as_list(input_data.get("hooks", []))
+            previous_style = self._as_text(input_data.get("previous_style", ""))
             word_count = input_data.get("word_count", 500)
-            auto_write_mode = input_data.get("auto_write_mode", False)
-            writing_prompt = input_data.get("writing_prompt", "")
+            auto_write_mode = bool(input_data.get("auto_write_mode", False))
+            writing_prompt = self._as_text(input_data.get("writing_prompt", ""))
             discussion_summary = self._extract_discussion_summary(input_data)
             chapter_num = input_data.get("chapter_num", 1)
             total_chapters = input_data.get("total_chapters", 10)
-            world_info = input_data.get("world_info")  # 世界观设定
+            world_info = self._as_dict(input_data.get("world_info"))  # 世界观设定
 
             # 重试相关上下文
             is_retry = input_data.get("is_retry", False)
@@ -349,17 +464,19 @@ class WriterAgent(BaseAgent):
         """
         单次生成流程（适用于较小字数需求）
         """
-        intents = input_data.get("intents", [])
-        environment = input_data.get("environment", "")
-        character_moods = input_data.get("character_moods", {})
-        hooks = input_data.get("hooks", [])
-        previous_style = input_data.get("previous_style", "")
-        auto_write_mode = input_data.get("auto_write_mode", False)
-        writing_prompt = input_data.get("writing_prompt", "")
+        intents = self._as_list(input_data.get("intents", []))
+        environment = self._as_text(input_data.get("environment", ""))
+        character_moods = self._as_dict(input_data.get("character_moods", {}))
+        hooks = self._as_list(input_data.get("hooks", []))
+        previous_style = self._as_text(input_data.get("previous_style", ""))
+        auto_write_mode = bool(input_data.get("auto_write_mode", False))
+        writing_prompt = self._as_text(input_data.get("writing_prompt", ""))
         discussion_summary = self._extract_discussion_summary(input_data)
+        discussion_asset_context = self._extract_discussion_asset_context(input_data)
+        discussion_asset_digest = self._format_discussion_asset_context(discussion_asset_context)
         chapter_num = input_data.get("chapter_num", 1)
         total_chapters = input_data.get("total_chapters", 10)
-        world_info = input_data.get("world_info")
+        world_info = self._as_dict(input_data.get("world_info"))
 
         rule_context = self._build_writing_rule_context(
             chapter_num=chapter_num,
@@ -370,6 +487,7 @@ class WriterAgent(BaseAgent):
             hooks=hooks,
             character_moods=character_moods,
             world_info=world_info,
+            extra={"discussion_asset_digest": discussion_asset_context.get("discussion_asset_digest")},
         )
         writing_rules_guidance = await self._retrieve_writing_rule_guidance(
             context=rule_context,
@@ -395,6 +513,7 @@ class WriterAgent(BaseAgent):
                 total_chapters=total_chapters,
                 world_info=world_info,
                 writing_rules_guidance=writing_rules_guidance,
+                discussion_asset_digest=discussion_asset_digest,
             )
 
         # 调用 LLM (structured)
@@ -418,8 +537,6 @@ class WriterAgent(BaseAgent):
                 "content": response_text,
                 "word_count": len(response_text),
             }
-
-        result = self._ensure_chapter_content(result)
 
         # 进行字数统计验证
         content = result.get("chapter_content", "")
@@ -486,7 +603,7 @@ class WriterAgent(BaseAgent):
         result["max_retry_count"] = max_retry_count
         result["generation_strategy"] = "single"
 
-        return result
+        return self._normalize_workflow_output_fields(result)
 
     async def _execute_segmented(
         self,
@@ -503,15 +620,17 @@ class WriterAgent(BaseAgent):
         3. 汇总并检查字数
         4. 必要时补充内容
         """
-        intents = input_data.get("intents", [])
-        environment = input_data.get("environment", "")
-        character_moods = input_data.get("character_moods", {})
-        hooks = input_data.get("hooks", [])
-        previous_style = input_data.get("previous_style", "")
+        intents = self._as_list(input_data.get("intents", []))
+        environment = self._as_text(input_data.get("environment", ""))
+        character_moods = self._as_dict(input_data.get("character_moods", {}))
+        hooks = self._as_list(input_data.get("hooks", []))
+        previous_style = self._as_text(input_data.get("previous_style", ""))
         discussion_summary = self._extract_discussion_summary(input_data)
+        discussion_asset_context = self._extract_discussion_asset_context(input_data)
+        discussion_asset_digest = self._format_discussion_asset_context(discussion_asset_context)
         chapter_num = input_data.get("chapter_num", 1)
         total_chapters = input_data.get("total_chapters", 10)
-        world_info = input_data.get("world_info")
+        world_info = self._as_dict(input_data.get("world_info"))
 
         chapter_rule_context = self._build_writing_rule_context(
             chapter_num=chapter_num,
@@ -522,6 +641,7 @@ class WriterAgent(BaseAgent):
             hooks=hooks,
             character_moods=character_moods,
             world_info=world_info,
+            extra={"discussion_asset_digest": discussion_asset_context.get("discussion_asset_digest")},
         )
         chapter_writing_rules_guidance = await self._retrieve_writing_rule_guidance(
             context=chapter_rule_context,
@@ -544,6 +664,7 @@ class WriterAgent(BaseAgent):
             chapter_num=chapter_num,
             total_chapters=total_chapters,
             world_info=world_info,
+            discussion_asset_digest=discussion_asset_digest,
         )
 
         # ========== 第二阶段：逐段生成 ==========
@@ -551,7 +672,8 @@ class WriterAgent(BaseAgent):
         total_words = 0
         segment_results = []
 
-        for i, segment_info in enumerate(segment_plan.get("segments", [])):
+        for i, raw_segment_info in enumerate(segment_plan.get("segments", [])):
+            segment_info = raw_segment_info if isinstance(raw_segment_info, dict) else {"focus": str(raw_segment_info)}
             segment_num = i + 1
             logger.info(f"生成第 {segment_num}/{segment_count} 段...")
 
@@ -566,6 +688,7 @@ class WriterAgent(BaseAgent):
                 world_info=world_info,
                 segment_focus=segment_info.get("focus"),
                 segment_elements=segment_info.get("key_elements"),
+                extra={"discussion_asset_digest": discussion_asset_context.get("discussion_asset_digest")},
             )
             segment_writing_rules_guidance = await self._retrieve_writing_rule_guidance(
                 context=segment_rule_context,
@@ -584,6 +707,7 @@ class WriterAgent(BaseAgent):
                 world_info=world_info,
                 previous_style=previous_style if i == 0 else None,
                 writing_rules_guidance=segment_writing_rules_guidance,
+                discussion_asset_digest=discussion_asset_digest,
             )
 
             # 生成该段 (structured)
@@ -668,7 +792,7 @@ class WriterAgent(BaseAgent):
             else:
                 actual_word_count = await self._count_words_async(full_content)
 
-        return {
+        return self._normalize_workflow_output_fields({
             "content": full_content,
             "chapter_content": full_content,
             "word_count": actual_word_count,
@@ -678,7 +802,7 @@ class WriterAgent(BaseAgent):
             "segment_count": segment_count,
             "segment_results": segment_results,
             "segment_plan": segment_plan,
-        }
+        })
 
     async def _plan_segments(
         self,
@@ -690,6 +814,7 @@ class WriterAgent(BaseAgent):
         chapter_num: int,
         total_chapters: int,
         world_info: Optional[Dict[str, Any]] = None,
+        discussion_asset_digest: str = "",
     ) -> Dict[str, Any]:
         """
         规划分段结构
@@ -712,6 +837,15 @@ class WriterAgent(BaseAgent):
 
 【角色状态】
 {chr(10).join([f"- {k}: {v}" for k, v in character_moods.items()]) if character_moods else "无特定状态"}
+"""
+        if discussion_asset_digest:
+            prompt += f"""
+
+【已确认讨论资产】
+{discussion_asset_digest}
+请在分段结构中显式承接这些已确认的剧情、伏笔、地点、设定或角色信息，不要与其冲突。
+"""
+        prompt += f"""
 
 【规划要求】
 1. 每段应该有明确的叙事焦点
@@ -770,6 +904,7 @@ class WriterAgent(BaseAgent):
         world_info: Optional[Dict[str, Any]] = None,
         previous_style: Optional[str] = None,
         writing_rules_guidance: str = "",
+        discussion_asset_digest: str = "",
     ) -> str:
         """构建分段生成提示"""
         parts = []
@@ -780,15 +915,21 @@ class WriterAgent(BaseAgent):
 - 目标字数: 约 {target_words} 字（最低 {int(target_words * 0.8)} 字）
 - 情感基调: {segment_info.get('tone', '平稳')}""")
 
-        key_elements = segment_info.get('key_elements', [])
+        key_elements = self._as_list(segment_info.get('key_elements', []))
         if key_elements:
-            parts.append(f"\n【本段关键元素】\n{chr(10).join(['- ' + e for e in key_elements])}")
+            parts.append(f"\n【本段关键元素】\n{chr(10).join(['- ' + str(e) for e in key_elements])}")
 
         if writing_rules_guidance:
             parts.append(f"\n{writing_rules_guidance}")
 
         if world_info:
             parts.append(f"\n【世界观参考】\n名称：{world_info.get('name', '未知')}\n类型：{world_info.get('world_type', '奇幻')}")
+
+        if discussion_asset_digest:
+            parts.append(
+                f"\n【已确认讨论资产】\n{discussion_asset_digest}\n"
+                "本段需要承接这些已确认的剧情资产；如涉及新增角色、地点、设定或伏笔，按已确认信息写作，不要随意改名或改设定。"
+            )
 
         if previous_content:
             parts.append(f"\n【前一段落结尾】\n{previous_content}")
@@ -976,6 +1117,7 @@ class WriterAgent(BaseAgent):
         total_chapters: int = 10,
         world_info: Optional[Dict[str, Any]] = None,
         writing_rules_guidance: str = "",
+        discussion_asset_digest: str = "",
     ) -> str:
         """构建用户消息"""
         message_parts = []
@@ -1011,12 +1153,18 @@ class WriterAgent(BaseAgent):
                 world_section += f"\n\n【世界规则】\n{rules_text}"
             themes = world_info.get('themes', [])
             if themes:
-                world_section += f"\n\n【核心主题】\n{', '.join(themes)}"
+                world_section += f"\n\n【核心主题】\n{', '.join(str(theme) for theme in themes)}"
             message_parts.append(world_section)
 
         # 团队讨论共识（如果有）
         if discussion_summary:
             message_parts.append(f"【团队讨论共识】\n{discussion_summary}\n请在写作中体现以上讨论达成的共识。")
+
+        if discussion_asset_digest:
+            message_parts.append(
+                f"【已确认讨论资产】\n{discussion_asset_digest}\n"
+                "这些资产来自已确认的集体讨论，可作为本章写作事实使用；请承接其中的剧情加码、伏笔、设定、地点和角色信息，不要与其冲突。"
+            )
 
         # 环境描写
         if environment:
@@ -1024,7 +1172,7 @@ class WriterAgent(BaseAgent):
 
         # 需要表达的意图
         if intents:
-            message_parts.append(f"【需要表达的意图】\n{chr(10).join(intents)}")
+            message_parts.append(f"【需要表达的意图】\n{chr(10).join(str(intent) for intent in intents)}")
 
         # 角色情绪
         if character_moods:
@@ -1036,7 +1184,12 @@ class WriterAgent(BaseAgent):
         # 伏笔处理
         if hooks:
             hooks_text = "\n".join(
-                [f"- {h.get('id')}: {h.get('type', 'plant')} - {h.get('description', '')}" for h in hooks]
+                [
+                    f"- {h.get('id')}: {h.get('type', 'plant')} - {h.get('description', '')}"
+                    if isinstance(h, dict)
+                    else f"- {h}"
+                    for h in hooks
+                ]
             )
             message_parts.append(f"【伏笔处理】\n{hooks_text}")
 

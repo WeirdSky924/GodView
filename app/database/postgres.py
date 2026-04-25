@@ -809,8 +809,14 @@ class PostgresDatabase:
             uuid.UUID(world_id)
         except (ValueError, TypeError):
             return []
-        query = "SELECT * FROM regions WHERE world_id = CAST(:world_id AS UUID)"
+        query = "SELECT * FROM regions WHERE world_id = CAST(:world_id AS UUID) ORDER BY created_at ASC, name ASC"
         return await self.execute_query(query, {"world_id": world_id})
+
+    async def delete_region(self, region_id: str) -> bool:
+        """删除区域"""
+        query = "DELETE FROM regions WHERE id = CAST(:id AS UUID)"
+        rowcount = await self.execute_write(query, {"id": region_id})
+        return rowcount > 0
 
     # ==================== 伏笔相关操作 ====================
 
