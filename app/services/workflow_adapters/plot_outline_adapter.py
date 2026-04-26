@@ -11,28 +11,58 @@ class PlotOutlineWorkflowAdapter:
         context = execution.context.copy()
 
         chapter_number = await self._resolve_chapter_number(service, execution.project_id, context)
-        outline_result = await service.generate_outline(
-            project_id=execution.project_id,
-            chapter_number=chapter_number,
-            context=self._build_runtime_context(context, chapter_number),
-            previous_events=self._build_previous_events(context),
-        )
 
-        outline = outline_result.outline
-        outline_payload = outline.model_dump(mode="json")
+        outline_payload = self._normalize_outline_payload(
+            context.get("chapter_outline"),
+            chapter_number=chapter_number,
+            context=context,
+        )
+        suggestions: list[str] = []
+        warnings: list[str] = []
+        outline_source = "context"
+
+        if outline_payload is None:
+            stored_outline = await service.get_chapter_outline_for_workflow(
+                execution.project_id,
+                chapter_number=chapter_number,
+            )
+            outline_payload = self._normalize_outline_payload(
+                stored_outline,
+                chapter_number=chapter_number,
+                context=context,
+            )
+            outline_source = "database"
+
+        if outline_payload is None:
+            outline_result = await service.generate_outline(
+                project_id=execution.project_id,
+                chapter_number=chapter_number,
+                context=self._build_runtime_context(context, chapter_number),
+                previous_events=self._build_previous_events(context),
+            )
+            outline_payload = self._normalize_outline_payload(
+                outline_result.outline,
+                chapter_number=chapter_number,
+                context=context,
+            )
+            suggestions = list(outline_result.suggestions or [])
+            warnings = list(outline_result.warnings or [])
+            outline_source = "generated"
+
         scene_directions = self._build_scene_directions(outline_payload)
 
         return {
-            "chapter_number": outline.chapter_number,
-            "chapter_title": outline.title,
+            "chapter_number": outline_payload.get("chapter_number", chapter_number),
+            "chapter_title": outline_payload.get("title") or f"第{chapter_number}章",
             "chapter_outline": outline_payload,
-            "chapter_summary": outline.summary,
-            "chapter_goals": outline.chapter_goals,
+            "chapter_summary": outline_payload.get("summary") or "",
+            "chapter_goals": outline_payload.get("chapter_goals") or [],
             "scene_directions": scene_directions,
-            "outline_id": outline.id,
+            "outline_id": outline_payload.get("id"),
             "saved_outline": outline_payload,
-            "suggestions": outline_result.suggestions,
-            "warnings": outline_result.warnings,
+            "suggestions": suggestions,
+            "warnings": warnings,
+            "outline_source": outline_source,
         }
 
     async def _resolve_chapter_number(
@@ -48,6 +78,39 @@ class PlotOutlineWorkflowAdapter:
             except (TypeError, ValueError):
                 pass
         return await service.get_next_chapter_number(project_id)
+
+    def _normalize_outline_payload(
+        self,
+        outline: Any,
+        *,
+        chapter_number: int,
+        context: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if outline is None:
+            return None
+
+        if isinstance(outline, dict):
+            payload = dict(outline)
+        elif hasattr(outline, "model_dump"):
+            payload = outline.model_dump(mode="json")
+        else:
+            return None
+
+        payload["chapter_number"] = payload.get("chapter_number") or chapter_number
+        payload["title"] = payload.get("title") or context.get("chapter_title") or f"第{chapter_number}章"
+        payload["summary"] = payload.get("summary") or context.get("chapter_summary") or ""
+
+        chapter_goals = payload.get("chapter_goals")
+        if isinstance(chapter_goals, list):
+            payload["chapter_goals"] = chapter_goals
+        elif chapter_goals:
+            payload["chapter_goals"] = [chapter_goals]
+        else:
+            payload["chapter_goals"] = list(context.get("chapter_goals") or [])
+
+        scenes = payload.get("scenes")
+        payload["scenes"] = scenes if isinstance(scenes, list) else []
+        return payload
 
     def _build_runtime_context(self, context: Dict[str, Any], chapter_number: int) -> Optional[str]:
         parts: list[str] = [f"当前工作流目标章节：第{chapter_number}章"]

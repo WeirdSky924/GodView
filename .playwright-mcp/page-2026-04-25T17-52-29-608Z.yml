@@ -1,0 +1,190 @@
+- generic [ref=e3]:
+  - complementary [ref=e4]:
+    - generic [ref=e5]:
+      - generic [ref=e7]:
+        - generic [ref=e8]:
+          - img [ref=e10]
+          - generic [ref=e12]:
+            - heading "GodView" [level=1] [ref=e13]
+            - paragraph [ref=e14]: AI 小说生成系统
+        - button "切换到黑暗模式" [ref=e15] [cursor=pointer]:
+          - img [ref=e16]
+      - button "加载中..." [disabled] [ref=e20]:
+        - generic [ref=e21]:
+          - img [ref=e22]
+          - generic [ref=e24]: 加载中...
+        - img [ref=e26]
+      - button "上帝模式 ✨ 一键生成章节" [ref=e29] [cursor=pointer]:
+        - generic [ref=e39]:
+          - generic [ref=e40]:
+            - img [ref=e42]
+            - generic [ref=e47]:
+              - generic [ref=e48]:
+                - text: 上帝模式
+                - generic [ref=e49]: ✨
+              - generic [ref=e50]: 一键生成章节
+          - img [ref=e52]
+    - navigation [ref=e54]:
+      - link "仪表盘" [ref=e55] [cursor=pointer]:
+        - /url: /
+        - generic [ref=e56]:
+          - img [ref=e58]
+          - generic [ref=e63]: 仪表盘
+      - link "角色管理" [ref=e64] [cursor=pointer]:
+        - /url: /characters
+        - generic [ref=e65]:
+          - img [ref=e67]
+          - generic [ref=e72]: 角色管理
+      - link "角色声音" [ref=e73] [cursor=pointer]:
+        - /url: /character-voice
+        - generic [ref=e74]:
+          - img [ref=e76]
+          - generic [ref=e80]: 角色声音
+      - link "世界管理" [ref=e81] [cursor=pointer]:
+        - /url: /worlds
+        - generic [ref=e82]:
+          - img [ref=e84]
+          - generic [ref=e87]: 世界管理
+      - link "地图管理" [ref=e88] [cursor=pointer]:
+        - /url: /world-map
+        - generic [ref=e89]:
+          - img [ref=e91]
+          - generic [ref=e94]: 地图管理
+      - link "设定库" [ref=e95] [cursor=pointer]:
+        - /url: /lore
+        - generic [ref=e96]:
+          - img [ref=e98]
+          - generic [ref=e101]: 设定库
+      - link "剧情管理" [ref=e102] [cursor=pointer]:
+        - /url: /plots
+        - generic [ref=e103]:
+          - img [ref=e105]
+          - generic [ref=e107]: 剧情管理
+      - link "章节大纲" [ref=e108] [cursor=pointer]:
+        - /url: /outlines
+        - generic [ref=e109]:
+          - img [ref=e111]
+          - generic [ref=e114]: 章节大纲
+      - link "伏笔管理" [ref=e115] [cursor=pointer]:
+        - /url: /hooks
+        - generic [ref=e116]:
+          - img [ref=e118]
+          - generic [ref=e120]: 伏笔管理
+      - link "干预日志" [ref=e121] [cursor=pointer]:
+        - /url: /interventions
+        - generic [ref=e122]:
+          - img [ref=e124]
+          - generic [ref=e126]: 干预日志
+      - link "读者模拟" [ref=e127] [cursor=pointer]:
+        - /url: /simulator
+        - generic [ref=e128]:
+          - img [ref=e130]
+          - generic [ref=e133]: 读者模拟
+      - link "可视化工作台" [ref=e134] [cursor=pointer]:
+        - /url: /visualize
+        - generic [ref=e135]:
+          - img [ref=e137]
+          - generic [ref=e142]: 可视化工作台
+      - link "章节判定器" [ref=e143] [cursor=pointer]:
+        - /url: /chapter-evaluator
+        - generic [ref=e144]:
+          - img [ref=e146]
+          - generic [ref=e149]: 章节判定器
+      - link "小说编辑器" [ref=e150] [cursor=pointer]:
+        - /url: /novel
+        - generic [ref=e151]:
+          - img [ref=e153]
+          - generic [ref=e156]: 小说编辑器
+      - link "Agent Skills" [ref=e157] [cursor=pointer]:
+        - /url: /skills
+        - generic [ref=e158]:
+          - img [ref=e160]
+          - generic [ref=e164]: Agent Skills
+      - link "Prompt 库" [ref=e165] [cursor=pointer]:
+        - /url: /prompts
+        - generic [ref=e166]:
+          - img [ref=e168]
+          - generic [ref=e170]: Prompt 库
+      - link "Agent 模板" [ref=e171] [cursor=pointer]:
+        - /url: /agent-templates
+        - generic [ref=e172]:
+          - img [ref=e174]
+          - generic [ref=e177]: Agent 模板
+      - link "写作规则" [ref=e178] [cursor=pointer]:
+        - /url: /writing-rules
+        - generic [ref=e179]:
+          - img [ref=e181]
+          - generic [ref=e186]: 写作规则
+      - link "版本对比" [ref=e187] [cursor=pointer]:
+        - /url: /diff
+        - generic [ref=e188]:
+          - img [ref=e190]
+          - generic [ref=e195]: 版本对比
+      - link "系统设置" [ref=e196] [cursor=pointer]:
+        - /url: /settings
+        - generic [ref=e197]:
+          - img [ref=e199]
+          - generic [ref=e202]: 系统设置
+    - generic [ref=e203]:
+      - link "浙ICP备2026026836号-1" [ref=e204] [cursor=pointer]:
+        - /url: https://beian.miit.gov.cn/
+      - generic [ref=e205]:
+        - generic [ref=e206]: v7.0.0
+        - generic [ref=e207]:
+          - img [ref=e210] [cursor=pointer]
+          - generic [ref=e215]: ☀️
+  - main [ref=e216]:
+    - generic [ref=e218]:
+      - generic [ref=e219]:
+        - heading "仪表盘" [level=1] [ref=e220]
+        - paragraph [ref=e221]: 全局统计数据，选择项目查看详细信息
+      - generic [ref=e222]:
+        - generic [ref=e226]:
+          - img [ref=e228]
+          - generic [ref=e230]:
+            - paragraph [ref=e231]: 项目数量
+            - paragraph [ref=e232]: ...
+        - generic [ref=e237]:
+          - img [ref=e239]
+          - generic [ref=e244]:
+            - paragraph [ref=e245]: 角色数量
+            - paragraph [ref=e246]: ...
+        - generic [ref=e251]:
+          - img [ref=e253]
+          - generic [ref=e256]:
+            - paragraph [ref=e257]: 世界设定
+            - paragraph [ref=e258]: ...
+        - generic [ref=e263]:
+          - img [ref=e265]
+          - generic [ref=e267]:
+            - paragraph [ref=e268]: 已生成章节
+            - paragraph [ref=e269]: ...
+      - generic [ref=e272]:
+        - heading "📊 Token 消耗统计" [level=2] [ref=e273]:
+          - generic [ref=e274]: 📊
+          - text: Token 消耗统计
+        - paragraph [ref=e276]: 加载中...
+      - generic [ref=e277]:
+        - generic [ref=e281]:
+          - generic [ref=e282]:
+            - img [ref=e283]
+            - heading "开始创作" [level=2] [ref=e285]
+          - paragraph [ref=e286]: 进入上帝模式，让 AI 协助你创作小说
+          - link "进入上帝模式 →" [ref=e287] [cursor=pointer]:
+            - /url: /director
+        - generic [ref=e291]:
+          - generic [ref=e292]:
+            - img [ref=e293]
+            - heading "配置系统" [level=2] [ref=e294]
+          - paragraph [ref=e295]: 设置 AI 模型、Embedding 服务和其他选项
+          - link "系统设置 →" [ref=e296] [cursor=pointer]:
+            - /url: /settings
+      - generic [ref=e297]:
+        - heading "系统 Agent" [level=2] [ref=e300]:
+          - img [ref=e301]
+          - text: 系统 Agent
+        - generic [ref=e305]:
+          - heading "角色 Agent" [level=2] [ref=e306]:
+            - img [ref=e307]
+            - text: 角色 Agent
+          - paragraph [ref=e310]: 选择项目后查看角色 Agent 状态

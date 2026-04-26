@@ -718,7 +718,7 @@ class DirectorSystem:
         char_dict = dict(char_data)
 
         # UUID 转 string - 处理所有可能的 UUID 字段
-        uuid_fields = ["id", "project_id", "world_id", "current_location"]
+        uuid_fields = ["id", "project_id", "world_id", "current_location", "current_region_id"]
         for field in uuid_fields:
             if field in char_dict and char_dict[field] is not None and not isinstance(char_dict[field], str):
                 char_dict[field] = str(char_dict[field])

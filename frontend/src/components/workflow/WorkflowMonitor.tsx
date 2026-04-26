@@ -3,10 +3,10 @@
  * v8 Agent协作可视化工作台
  */
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useTheme } from '@/contexts/ThemeContext'
-import type { WorkflowExecution, NodeExecutionState } from '@/api/workflows'
-import { getExecution } from '@/api/workflows'
+import type { WorkflowExecution, NodeExecutionState, WorkflowEventMessage } from '@/api/workflows'
+import { createWorkflowExecutionEventSource, getExecution } from '@/api/workflows'
 import {
   Activity,
   Clock,
@@ -73,35 +73,149 @@ export default function WorkflowMonitor({ executionId, onRefresh }: WorkflowMoni
   const [execution, setExecution] = useState<WorkflowExecution | null>(null)
   const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set())
   const [loading, setLoading] = useState(false)
+  const onRefreshRef = useRef(onRefresh)
 
-  // 轮询执行状态
+  useEffect(() => {
+    onRefreshRef.current = onRefresh
+  }, [onRefresh])
+
+  const applyExecutionSnapshot = (snapshot: WorkflowExecution) => {
+    setExecution(snapshot)
+    onRefreshRef.current?.()
+  }
+
+  const applyWorkflowEvent = (payload: WorkflowEventMessage) => {
+    if (payload.type === 'execution_snapshot') {
+      applyExecutionSnapshot(payload.data as unknown as WorkflowExecution)
+      return
+    }
+
+    setExecution((current) => {
+      if (!current || current.id !== payload.execution_id) return current
+
+      const next: WorkflowExecution = {
+        ...current,
+        context: { ...current.context },
+        node_states: { ...current.node_states },
+      }
+      const data = payload.data || {}
+
+      if (payload.type === 'workflow_started') {
+        next.status = 'running'
+      } else if (payload.type === 'workflow_completed') {
+        const status = data.status
+        if (status === 'completed' || status === 'failed' || status === 'cancelled' || status === 'paused') {
+          next.status = status
+        }
+        if (typeof data.error === 'string') next.error = data.error
+      } else if (payload.type === 'workflow_paused') {
+        next.status = 'paused'
+      } else if (payload.type === 'workflow_resumed') {
+        next.status = 'running'
+      } else if (payload.type === 'workflow_cancelled') {
+        next.status = 'cancelled'
+      } else if (payload.type === 'waiting_user_confirmation') {
+        next.status = 'paused'
+        next.context.waiting_confirmation = data
+      } else if (payload.type === 'discussion_confirmed') {
+        next.status = 'running'
+        next.context.waiting_confirmation = {
+          ...(typeof next.context.waiting_confirmation === 'object' && next.context.waiting_confirmation
+            ? next.context.waiting_confirmation
+            : {}),
+          confirmed: true,
+        }
+      } else if (payload.type === 'discussion_assets_persisted') {
+        next.context.discussion_assets_committed = true
+        next.context.discussion_persistence_state = data
+        if (data.persisted_asset_refs) {
+          next.context.persisted_asset_refs = data.persisted_asset_refs
+        }
+      } else if (payload.type === 'node_started' || payload.type === 'node_completed') {
+        const nodeId = typeof data.node_id === 'string' ? data.node_id : null
+        if (nodeId) {
+          const previousState = next.node_states[nodeId]
+          next.node_states[nodeId] = {
+            node_id: nodeId,
+            status: payload.type === 'node_started' ? 'running' : (data.status as NodeExecutionState['status']) || 'completed',
+            input_data: (data.input as Record<string, any>) || previousState?.input_data || {},
+            output_data: (data.output as Record<string, any>) || previousState?.output_data || {},
+            output_contract_id: (data.output_contract_id as string | undefined) || previousState?.output_contract_id,
+            output_mode: (data.output_mode as NodeExecutionState['output_mode']) || previousState?.output_mode,
+            output_schema_name: (data.output_schema_name as string | undefined) || previousState?.output_schema_name,
+            output_schema_version: (data.output_schema_version as string | undefined) || previousState?.output_schema_version,
+            error: (data.error as string | undefined) || previousState?.error,
+            duration_ms: (data.duration_ms as number | undefined) || previousState?.duration_ms,
+          }
+          next.current_node = payload.type === 'node_started' ? nodeId : next.current_node
+          if (payload.type === 'node_completed') {
+            const contextUpdates = Array.isArray(data.context_updates) ? data.context_updates : []
+            for (const key of contextUpdates) {
+              if (typeof key === 'string' && key in next.node_states[nodeId].output_data) {
+                next.context[key] = next.node_states[nodeId].output_data[key]
+              }
+            }
+          }
+        }
+      }
+
+      return next
+    })
+    onRefreshRef.current?.()
+  }
+
+  // 通过 SSE 订阅执行状态，避免每秒 REST 轮询刷屏
   useEffect(() => {
     if (!executionId) {
       setExecution(null)
       return
     }
 
+    let active = true
+    let eventSource: EventSource | null = null
+    let fallbackInterval: ReturnType<typeof setInterval> | null = null
+
     const fetchExecution = async () => {
       setLoading(true)
       try {
         const data = await getExecution(executionId)
-        setExecution(data)
-        onRefresh?.()
+        if (!active) return
+        applyExecutionSnapshot(data)
       } catch (error) {
-        console.error('Failed to fetch execution:', error)
+        if (active) console.error('Failed to fetch execution:', error)
       } finally {
-        setLoading(false)
+        if (active) setLoading(false)
       }
     }
 
-    fetchExecution()
-
-    const shouldPoll = !execution || execution.status === 'running' || execution.status === 'paused'
-    if (shouldPoll) {
-      const interval = setInterval(fetchExecution, 1000)
-      return () => clearInterval(interval)
+    const startFallbackPolling = () => {
+      if (fallbackInterval) return
+      fallbackInterval = setInterval(fetchExecution, 15000)
     }
-  }, [executionId, execution?.status, onRefresh])
+
+    void fetchExecution()
+    eventSource = createWorkflowExecutionEventSource(executionId)
+
+    eventSource.addEventListener('workflow_event', ((event: MessageEvent<string>) => {
+      try {
+        const payload = JSON.parse(event.data) as WorkflowEventMessage
+        if (active) applyWorkflowEvent(payload)
+      } catch (error) {
+        console.error('Failed to parse workflow SSE message:', error)
+      }
+    }) as EventListener)
+
+    eventSource.onerror = () => {
+      if (!active) return
+      startFallbackPolling()
+    }
+
+    return () => {
+      active = false
+      if (fallbackInterval) clearInterval(fallbackInterval)
+      if (eventSource) eventSource.close()
+    }
+  }, [executionId])
 
   const toggleNode = (nodeId: string) => {
     const newExpanded = new Set(expandedNodes)

@@ -1,0 +1,279 @@
+- generic [ref=e3]:
+  - complementary [ref=e4]:
+    - generic [ref=e5]:
+      - generic [ref=e7]:
+        - generic [ref=e8]:
+          - img [ref=e10]
+          - generic [ref=e12]:
+            - heading "GodView" [level=1] [ref=e13]
+            - paragraph [ref=e14]: AI 小说生成系统
+        - button "切换到黑暗模式" [ref=e15] [cursor=pointer]:
+          - img [ref=e16]
+      - button "forced discussion asset validation" [ref=e20] [cursor=pointer]:
+        - generic [ref=e21]:
+          - img [ref=e22]
+          - generic [ref=e24]: forced discussion asset validation
+        - img [ref=e26]
+      - button "上帝模式 ✨ 一键生成章节" [ref=e29] [cursor=pointer]:
+        - generic [ref=e39]:
+          - generic [ref=e40]:
+            - img [ref=e42]
+            - generic [ref=e47]:
+              - generic [ref=e48]:
+                - text: 上帝模式
+                - generic [ref=e49]: ✨
+              - generic [ref=e50]: 一键生成章节
+          - img [ref=e52]
+    - navigation [ref=e54]:
+      - link "仪表盘" [ref=e55] [cursor=pointer]:
+        - /url: /
+        - generic [ref=e56]:
+          - img [ref=e58]
+          - generic [ref=e63]: 仪表盘
+      - link "角色管理" [ref=e64] [cursor=pointer]:
+        - /url: /characters
+        - generic [ref=e65]:
+          - img [ref=e67]
+          - generic [ref=e72]: 角色管理
+      - link "角色声音" [ref=e73] [cursor=pointer]:
+        - /url: /character-voice
+        - generic [ref=e74]:
+          - img [ref=e76]
+          - generic [ref=e80]: 角色声音
+      - link "世界管理" [ref=e81] [cursor=pointer]:
+        - /url: /worlds
+        - generic [ref=e82]:
+          - img [ref=e84]
+          - generic [ref=e87]: 世界管理
+      - link "地图管理" [ref=e88] [cursor=pointer]:
+        - /url: /world-map
+        - generic [ref=e89]:
+          - img [ref=e91]
+          - generic [ref=e94]: 地图管理
+      - link "设定库" [ref=e95] [cursor=pointer]:
+        - /url: /lore
+        - generic [ref=e96]:
+          - img [ref=e98]
+          - generic [ref=e101]: 设定库
+      - link "剧情管理" [ref=e102] [cursor=pointer]:
+        - /url: /plots
+        - generic [ref=e103]:
+          - img [ref=e105]
+          - generic [ref=e107]: 剧情管理
+      - link "章节大纲" [ref=e108] [cursor=pointer]:
+        - /url: /outlines
+        - generic [ref=e109]:
+          - img [ref=e111]
+          - generic [ref=e114]: 章节大纲
+      - link "伏笔管理" [ref=e115] [cursor=pointer]:
+        - /url: /hooks
+        - generic [ref=e116]:
+          - img [ref=e118]
+          - generic [ref=e120]: 伏笔管理
+      - link "干预日志" [ref=e121] [cursor=pointer]:
+        - /url: /interventions
+        - generic [ref=e122]:
+          - img [ref=e124]
+          - generic [ref=e126]: 干预日志
+      - link "读者模拟" [ref=e127] [cursor=pointer]:
+        - /url: /simulator
+        - generic [ref=e128]:
+          - img [ref=e130]
+          - generic [ref=e133]: 读者模拟
+      - link "可视化工作台" [ref=e134] [cursor=pointer]:
+        - /url: /visualize
+        - generic [ref=e135]:
+          - img [ref=e137]
+          - generic [ref=e142]: 可视化工作台
+      - link "章节判定器" [ref=e143] [cursor=pointer]:
+        - /url: /chapter-evaluator
+        - generic [ref=e144]:
+          - img [ref=e146]
+          - generic [ref=e149]: 章节判定器
+      - link "小说编辑器" [ref=e150] [cursor=pointer]:
+        - /url: /novel
+        - generic [ref=e151]:
+          - img [ref=e153]
+          - generic [ref=e156]: 小说编辑器
+      - link "Agent Skills" [ref=e157] [cursor=pointer]:
+        - /url: /skills
+        - generic [ref=e158]:
+          - img [ref=e160]
+          - generic [ref=e164]: Agent Skills
+      - link "Prompt 库" [ref=e165] [cursor=pointer]:
+        - /url: /prompts
+        - generic [ref=e166]:
+          - img [ref=e168]
+          - generic [ref=e170]: Prompt 库
+      - link "Agent 模板" [ref=e171] [cursor=pointer]:
+        - /url: /agent-templates
+        - generic [ref=e172]:
+          - img [ref=e174]
+          - generic [ref=e177]: Agent 模板
+      - link "写作规则" [ref=e178] [cursor=pointer]:
+        - /url: /writing-rules
+        - generic [ref=e179]:
+          - img [ref=e181]
+          - generic [ref=e186]: 写作规则
+      - link "版本对比" [ref=e187] [cursor=pointer]:
+        - /url: /diff
+        - generic [ref=e188]:
+          - img [ref=e190]
+          - generic [ref=e195]: 版本对比
+      - link "系统设置" [ref=e196] [cursor=pointer]:
+        - /url: /settings
+        - generic [ref=e197]:
+          - img [ref=e199]
+          - generic [ref=e202]: 系统设置
+    - generic [ref=e204]:
+      - generic [ref=e205]: v7.0.0
+      - generic [ref=e206]:
+        - img [ref=e209] [cursor=pointer]
+        - generic [ref=e214]: ☀️
+  - main [ref=e215]:
+    - generic [ref=e217]:
+      - generic [ref=e220]:
+        - generic [ref=e221]:
+          - heading "世界地图" [level=1] [ref=e222]
+          - paragraph [ref=e223]: 管理世界中的区域、地点与连接关系
+        - button "新建区域" [ref=e225] [cursor=pointer]:
+          - img [ref=e226]
+          - text: 新建区域
+      - generic [ref=e227]:
+        - generic [ref=e228]:
+          - generic [ref=e229]:
+            - combobox [ref=e230]:
+              - option "强制验证世界" [selected]
+            - generic [ref=e231]:
+              - img [ref=e232]
+              - textbox "搜索区域名称、描述或氛围" [ref=e235]
+            - combobox [ref=e236]:
+              - option "全部区域类型" [selected]
+              - option "自定义"
+              - option "城市"
+              - option "村庄"
+              - option "荒野"
+              - option "副本/秘境"
+              - option "建筑"
+              - option "水域"
+              - option "山脉"
+              - option "森林"
+            - combobox [ref=e237]:
+              - option "全部地形" [selected]
+              - option "自定义"
+              - option "平原"
+              - option "丘陵"
+              - option "山地"
+              - option "沙漠"
+              - option "沼泽"
+              - option "冰原"
+              - option "火山"
+          - generic [ref=e238]:
+            - complementary [ref=e239]:
+              - generic [ref=e240]: 区域列表
+              - button "强制验证雾港观测塔 landmark · coastal_city 用于验证讨论阶段地图地点资产能否保存为 Region 的可进入地标。" [ref=e242] [cursor=pointer]:
+                - generic [ref=e243]: 强制验证雾港观测塔
+                - generic [ref=e244]: landmark · coastal_city
+                - generic [ref=e245]: 用于验证讨论阶段地图地点资产能否保存为 Region 的可进入地标。
+            - main [ref=e246]:
+              - generic:
+                - generic [ref=e247]:
+                  - generic [ref=e248]:
+                    - generic [ref=e249]: "缩放: 100%"
+                    - button "重置" [ref=e250] [cursor=pointer]
+                  - generic [ref=e252]: 滚轮缩放 · 拖拽移动
+                - generic [ref=e253]:
+                  - generic [ref=e254]: 图例
+                  - generic [ref=e255]:
+                    - generic [ref=e256]: 城市
+                    - generic [ref=e257]: 森林
+                    - generic [ref=e258]: 港口
+                    - generic [ref=e259]: 危险区
+            - complementary [ref=e260]:
+              - generic [ref=e261]:
+                - generic [ref=e262]:
+                  - generic [ref=e263]:
+                    - heading "强制验证雾港观测塔" [level=2] [ref=e264]
+                    - paragraph [ref=e265]: landmark · coastal_city
+                  - generic [ref=e266]:
+                    - button "编辑" [ref=e267] [cursor=pointer]:
+                      - img [ref=e268]
+                    - button "删除" [ref=e270] [cursor=pointer]:
+                      - img [ref=e271]
+                - generic [ref=e274]:
+                  - heading "描述" [level=3] [ref=e275]
+                  - paragraph [ref=e276]: 用于验证讨论阶段地图地点资产能否保存为 Region 的可进入地标。
+                - generic [ref=e277]:
+                  - heading "氛围" [level=3] [ref=e278]
+                  - paragraph [ref=e279]: 海雾与旧钟声交织
+                - generic [ref=e280]:
+                  - heading "坐标" [level=3] [ref=e281]
+                  - paragraph [ref=e282]: "x: 12 · y: 7"
+                - generic [ref=e283]:
+                  - heading "已连接区域" [level=3] [ref=e284]:
+                    - img [ref=e285]
+                    - text: 已连接区域
+                  - generic [ref=e288]:
+                    - generic [ref=e289]: 旧港
+                    - generic [ref=e290]: 潮汐街
+                - generic [ref=e291]:
+                  - heading "地形特征" [level=3] [ref=e292]
+                  - paragraph [ref=e293]: 暂无
+                - generic [ref=e294]:
+                  - heading "地标" [level=3] [ref=e295]
+                  - paragraph [ref=e296]: 暂无
+        - generic [ref=e298]:
+          - heading "新建区域" [level=2] [ref=e300]
+          - generic [ref=e301]:
+            - generic [ref=e302]:
+              - generic [ref=e303]: 名称
+              - textbox "名称" [ref=e304]: 运行验证南门
+            - generic [ref=e305]:
+              - generic [ref=e306]: 区域类型
+              - combobox "区域类型" [ref=e307]:
+                - option "自定义"
+                - option "城市" [selected]
+                - option "村庄"
+                - option "荒野"
+                - option "副本/秘境"
+                - option "建筑"
+                - option "水域"
+                - option "山脉"
+                - option "森林"
+            - generic [ref=e308]:
+              - generic [ref=e309]: 地形类型
+              - combobox "地形类型" [ref=e310]:
+                - option "自定义"
+                - option "平原" [selected]
+                - option "丘陵"
+                - option "山地"
+                - option "沙漠"
+                - option "沼泽"
+                - option "冰原"
+                - option "火山"
+            - generic [ref=e311]:
+              - generic [ref=e312]: 坐标 X
+              - spinbutton "坐标 X" [ref=e313]: "260"
+            - generic [ref=e314]:
+              - generic [ref=e315]: 坐标 Y
+              - spinbutton "坐标 Y" [ref=e316]: "360"
+            - generic [ref=e317]:
+              - generic [ref=e318]: 描述
+              - textbox "描述" [ref=e319]: 用于运行时验证地图管理 CRUD 的南门区域。
+            - generic [ref=e320]:
+              - generic [ref=e321]: 氛围
+              - textbox "氛围" [ref=e322]: 灯火与城墙阴影交错
+            - generic [ref=e323]:
+              - generic [ref=e324]: 连接区域
+              - listbox "连接区域 按住 Ctrl/Command 可多选" [ref=e325]:
+                - option "强制验证雾港观测塔" [ref=e326]
+              - paragraph [ref=e327]: 按住 Ctrl/Command 可多选
+            - generic [ref=e328]:
+              - generic [ref=e329]: 地形特征（每行一项）
+              - textbox "地形特征（每行一项）" [ref=e330]: 石质城墙 护城河
+            - generic [ref=e331]:
+              - generic [ref=e332]: 地标（每行一项）
+              - textbox "地标（每行一项）" [active] [ref=e333]: 南门钟楼
+          - generic [ref=e334]:
+            - button "取消" [ref=e335] [cursor=pointer]
+            - button "保存" [ref=e336] [cursor=pointer]

@@ -40,7 +40,7 @@ _PROFILES: dict[str, WorkflowNodeExecutionProfile] = {
     ),
     "setting": WorkflowNodeExecutionProfile(
         agent_type="setting",
-        kind="direct_agent",
+        kind="service_adapter",
     ),
     "event_generator": WorkflowNodeExecutionProfile(
         agent_type="event_generator",
@@ -94,5 +94,12 @@ def get_workflow_node_adapter(agent_type: Optional[str]):
         )
 
         return get_plot_outline_workflow_adapter()
+
+    if profile.agent_type == "setting":
+        from app.services.workflow_adapters.setting_adapter import (
+            get_setting_workflow_adapter,
+        )
+
+        return get_setting_workflow_adapter()
 
     return None

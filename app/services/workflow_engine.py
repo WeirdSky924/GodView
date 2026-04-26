@@ -2999,8 +2999,13 @@ class WorkflowEngine:
         if node.agent_type == "hook_manager" and result.success and output_data:
             await self._save_hooks_from_manager(execution, output_data, db)
 
-        # 如果是设定 Agent，保存设定到 lore_entries 表
-        if node.agent_type == "setting" and result.success and output_data:
+        # 如果是设定 Agent，保存设定到 lore_entries 表；workflow 只读 adapter 不落库
+        if (
+            node.agent_type == "setting"
+            and result.success
+            and output_data
+            and output_data.get("setting_read_only") is not True
+        ):
             await self._save_lore_from_setting(execution, output_data, db)
 
         # 如果是世界生成 Agent，保存区域到数据库
@@ -3603,6 +3608,9 @@ class WorkflowEngine:
                     "encounters": region_data.get("encounters", []),
                     "connections": region_data.get("connections") or region_data.get("neighbors", []),
                     "local_rules": region_data.get("local_rules", []),
+                    "state": region_data.get("state", "normal"),
+                    "state_summary": region_data.get("state_summary", ""),
+                    "destroyed_at": region_data.get("destroyed_at"),
                     "is_generated": True,
                     "visit_count": 0,
                     "created_at": datetime.now(),

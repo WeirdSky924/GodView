@@ -1,0 +1,223 @@
+- generic [ref=e3]:
+  - complementary [ref=e4]:
+    - generic [ref=e5]:
+      - generic [ref=e7]:
+        - generic [ref=e8]:
+          - img [ref=e10]
+          - generic [ref=e12]:
+            - heading "GodView" [level=1] [ref=e13]
+            - paragraph [ref=e14]: AI 小说生成系统
+        - button "切换到黑暗模式" [ref=e15] [cursor=pointer]:
+          - img [ref=e16]
+      - button "示例项目" [ref=e303] [cursor=pointer]:
+        - generic [ref=e21]:
+          - img [ref=e22]
+          - generic [ref=e24]: 示例项目
+        - img [ref=e26]
+      - button "上帝模式 ✨ 一键生成章节" [ref=e29] [cursor=pointer]:
+        - generic [ref=e39]:
+          - generic [ref=e40]:
+            - img [ref=e42]
+            - generic [ref=e47]:
+              - generic [ref=e48]:
+                - text: 上帝模式
+                - generic [ref=e49]: ✨
+              - generic [ref=e50]: 一键生成章节
+          - img [ref=e52]
+    - navigation [ref=e54]:
+      - link "仪表盘" [ref=e55] [cursor=pointer]:
+        - /url: /
+        - generic [ref=e56]:
+          - img [ref=e58]
+          - generic [ref=e63]: 仪表盘
+      - link "角色管理" [ref=e64] [cursor=pointer]:
+        - /url: /characters
+        - generic [ref=e65]:
+          - img [ref=e67]
+          - generic [ref=e72]: 角色管理
+      - link "角色声音" [ref=e73] [cursor=pointer]:
+        - /url: /character-voice
+        - generic [ref=e74]:
+          - img [ref=e76]
+          - generic [ref=e80]: 角色声音
+      - link "世界管理" [ref=e81] [cursor=pointer]:
+        - /url: /worlds
+        - generic [ref=e82]:
+          - img [ref=e84]
+          - generic [ref=e87]: 世界管理
+      - link "设定库" [ref=e88] [cursor=pointer]:
+        - /url: /lore
+        - generic [ref=e89]:
+          - img [ref=e91]
+          - generic [ref=e94]: 设定库
+      - link "剧情管理" [ref=e95] [cursor=pointer]:
+        - /url: /plots
+        - generic [ref=e96]:
+          - img [ref=e98]
+          - generic [ref=e100]: 剧情管理
+      - link "章节大纲" [ref=e101] [cursor=pointer]:
+        - /url: /outlines
+        - generic [ref=e102]:
+          - img [ref=e104]
+          - generic [ref=e107]: 章节大纲
+      - link "伏笔管理" [ref=e108] [cursor=pointer]:
+        - /url: /hooks
+        - generic [ref=e109]:
+          - img [ref=e111]
+          - generic [ref=e113]: 伏笔管理
+      - link "干预日志" [ref=e114] [cursor=pointer]:
+        - /url: /interventions
+        - generic [ref=e115]:
+          - img [ref=e117]
+          - generic [ref=e119]: 干预日志
+      - link "读者模拟" [ref=e120] [cursor=pointer]:
+        - /url: /simulator
+        - generic [ref=e121]:
+          - img [ref=e123]
+          - generic [ref=e126]: 读者模拟
+      - link "可视化工作台" [active] [ref=e127] [cursor=pointer]:
+        - /url: /visualize
+        - generic [ref=e128]:
+          - img [ref=e130]
+          - generic [ref=e135]: 可视化工作台
+      - link "章节判定器" [ref=e136] [cursor=pointer]:
+        - /url: /chapter-evaluator
+        - generic [ref=e137]:
+          - img [ref=e139]
+          - generic [ref=e142]: 章节判定器
+      - link "小说编辑器" [ref=e143] [cursor=pointer]:
+        - /url: /novel
+        - generic [ref=e144]:
+          - img [ref=e146]
+          - generic [ref=e149]: 小说编辑器
+      - link "Agent Skills" [ref=e150] [cursor=pointer]:
+        - /url: /skills
+        - generic [ref=e151]:
+          - img [ref=e153]
+          - generic [ref=e157]: Agent Skills
+      - link "Prompt 库" [ref=e158] [cursor=pointer]:
+        - /url: /prompts
+        - generic [ref=e159]:
+          - img [ref=e161]
+          - generic [ref=e163]: Prompt 库
+      - link "Agent 模板" [ref=e164] [cursor=pointer]:
+        - /url: /agent-templates
+        - generic [ref=e165]:
+          - img [ref=e167]
+          - generic [ref=e170]: Agent 模板
+      - link "写作规则" [ref=e171] [cursor=pointer]:
+        - /url: /writing-rules
+        - generic [ref=e172]:
+          - img [ref=e174]
+          - generic [ref=e179]: 写作规则
+      - link "版本对比" [ref=e180] [cursor=pointer]:
+        - /url: /diff
+        - generic [ref=e181]:
+          - img [ref=e183]
+          - generic [ref=e188]: 版本对比
+      - link "系统设置" [ref=e189] [cursor=pointer]:
+        - /url: /settings
+        - generic [ref=e190]:
+          - img [ref=e192]
+          - generic [ref=e195]: 系统设置
+    - generic [ref=e197]:
+      - generic [ref=e198]: v7.0.0
+      - generic [ref=e199]:
+        - img [ref=e202] [cursor=pointer]
+        - generic [ref=e207]: ☀️
+  - main [ref=e208]:
+    - generic [ref=e537]:
+      - generic [ref=e538]:
+        - generic [ref=e540]:
+          - generic [ref=e541]:
+            - heading "可视化工作台" [level=1] [ref=e542]
+            - paragraph [ref=e543]: 可视化展示工作流、剧情树和版本树
+          - generic [ref=e545]:
+            - textbox "工作流名称" [ref=e546]: 新工作流
+            - button "保存" [ref=e547] [cursor=pointer]:
+              - img [ref=e548]
+              - text: 保存
+            - button "帮助" [ref=e552] [cursor=pointer]:
+              - img [ref=e553]
+              - text: 帮助
+            - generic [ref=e556]:
+              - generic [ref=e557]: 世界
+              - combobox [ref=e558]:
+                - option "选择世界..."
+                - option "神明网络神曲" [selected]
+                - option "神明网络"
+                - option "神明网络"
+                - option "神明网络神曲 / The God-Net"
+                - option "息壤（The Breathing Earth）"
+        - generic [ref=e560]:
+          - button "工作流" [ref=e561] [cursor=pointer]:
+            - img [ref=e562]
+            - text: 工作流
+          - button "剧情树" [ref=e567] [cursor=pointer]:
+            - img [ref=e568]
+            - text: 剧情树
+          - button "版本树" [ref=e573] [cursor=pointer]:
+            - img [ref=e574]
+            - text: 版本树
+      - generic [ref=e579]:
+        - generic [ref=e580]:
+          - generic [ref=e582]:
+            - generic [ref=e583]:
+              - heading "工作流" [level=3] [ref=e584]
+              - generic [ref=e585]:
+                - button "新建" [ref=e586] [cursor=pointer]:
+                  - img [ref=e587]
+                  - text: 新建
+                - button "标准全节点" [ref=e588] [cursor=pointer]
+            - generic [ref=e589]:
+              - generic [ref=e590] [cursor=pointer]:
+                - generic [ref=e591]:
+                  - generic [ref=e592]: 全内置节点标准流程
+                  - generic [ref=e593]: 模板
+                - generic [ref=e594]: 只读
+              - generic [ref=e595] [cursor=pointer]:
+                - generic [ref=e596]:
+                  - generic [ref=e597]: 快速对话流程
+                  - generic [ref=e598]: 模板
+                - generic [ref=e599]: 只读
+              - generic [ref=e600] [cursor=pointer]:
+                - generic [ref=e601]:
+                  - generic [ref=e602]: 小说创作标准流程
+                  - generic [ref=e603]: 模板
+                - generic [ref=e604]: 只读
+          - generic [ref=e606]:
+            - heading "可用节点" [level=3] [ref=e607]
+            - generic [ref=e608]:
+              - paragraph [ref=e609]: 系统 Agent
+              - generic [ref=e610]:
+                - button "设定 Agent" [ref=e611] [cursor=pointer]
+                - button "作家 Agent" [ref=e612] [cursor=pointer]
+                - button "总编剧 Agent" [ref=e613] [cursor=pointer]
+                - button "编剧 Agent" [ref=e614] [cursor=pointer]
+                - button "摘要 Agent" [ref=e615] [cursor=pointer]
+                - button "评估 Agent" [ref=e616] [cursor=pointer]
+                - button "伏笔 Agent" [ref=e617] [cursor=pointer]
+                - button "事件 Agent" [ref=e618] [cursor=pointer]
+                - button "地图 Agent" [ref=e619] [cursor=pointer]
+                - button "章节大纲 Agent" [ref=e620] [cursor=pointer]
+            - generic [ref=e621]:
+              - paragraph [ref=e622]: 交互节点
+              - generic [ref=e623]:
+                - button "用户输入" [ref=e624] [cursor=pointer]
+                - button "集体讨论" [ref=e625] [cursor=pointer]
+                - button "场景演绎" [ref=e626] [cursor=pointer]
+            - generic [ref=e627]:
+              - paragraph [ref=e628]: 控制节点
+              - generic [ref=e629]:
+                - button "条件分支" [ref=e630] [cursor=pointer]
+                - button "并行执行" [ref=e631] [cursor=pointer]
+          - button "执行" [disabled] [ref=e634]:
+            - img [ref=e635]
+            - text: 执行
+        - generic [ref=e637]:
+          - generic [ref=e638]:
+            - generic:
+              - img
+              - paragraph [ref=e643]: 点击“新建工作流”开始创建
+              - paragraph [ref=e644]: 或使用“标准全节点”直接加载一个可执行工作流
+          - paragraph [ref=e647]: 启动工作流以查看执行状态
