@@ -27,7 +27,8 @@ import type {
 import { Plus, Edit, Trash2, User, Mic, Search, RefreshCw, FolderOpen, Bot, Target, Brain, Eye, Sparkles, Crown, Star, Users, Zap, MessageSquare, Heart, Shield, Sword, Ghost, Settings, FileText, ChevronRight, MapPin } from 'lucide-react'
 import { useProject } from '@/contexts/ProjectContext'
 import { useTheme } from '@/contexts/ThemeContext'
-import { getRegions, getWorlds, type Region, type World } from '@/api/worlds'
+import { getRegions, type Region } from '@/api/worlds'
+import { useProjectWorlds } from '@/hooks/useProjectWorlds'
 import { motion, AnimatePresence } from 'framer-motion'
 
 function splitCsvInput(value: string) {
@@ -96,8 +97,8 @@ export default function Characters() {
   const [agentPromptLoading, setAgentPromptLoading] = useState(false)
   const [batchEnabling, setBatchEnabling] = useState(false)
   const [generatingPersonality, setGeneratingPersonality] = useState(false)
-  const [worlds, setWorlds] = useState<World[]>([])
   const [regions, setRegions] = useState<Region[]>([])
+  const { worlds, formatWorldLabel } = useProjectWorlds(currentProject?.id, currentProject?.world_id)
 
   // 编辑窗口的标签页
   const [activeTab, setActiveTab] = useState<'basic' | 'location' | 'appearance' | 'voice' | 'agent'>('basic')
@@ -145,21 +146,6 @@ export default function Characters() {
     }
   }, [currentProject?.id])
 
-  const loadWorlds = useCallback(async () => {
-    if (!currentProject?.id) {
-      setWorlds([])
-      return
-    }
-
-    try {
-      const data = await getWorlds(currentProject.id)
-      setWorlds(data)
-    } catch (error) {
-      console.error('Failed to load worlds:', error)
-      setWorlds([])
-    }
-  }, [currentProject?.id])
-
   const loadRegions = useCallback(async (worldId?: string) => {
     if (!worldId) {
       setRegions([])
@@ -196,10 +182,6 @@ export default function Characters() {
   useEffect(() => {
     loadCharacters()
   }, [loadCharacters])
-
-  useEffect(() => {
-    loadWorlds()
-  }, [loadWorlds])
 
   useEffect(() => {
     loadRegions(formData.world_id)
@@ -1026,7 +1008,7 @@ export default function Characters() {
                     >
                       <option value="">未关联世界</option>
                       {worlds.map((world) => (
-                        <option key={world.id} value={world.id}>{world.name}</option>
+                        <option key={world.id} value={world.id}>{formatWorldLabel(world)}</option>
                       ))}
                     </select>
                     <p className={`mt-1 text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>

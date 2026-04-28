@@ -20,6 +20,10 @@ router = APIRouter()
 @router.get("/hooks", response_model=List[Dict[str, Any]])
 async def list_hooks(
     project_id: Optional[str] = Query(None, description="按项目 ID 过滤"),
+    world_id: Optional[str] = Query(None, description="按世界 ID 过滤"),
+    include_inherited: bool = Query(False, description="是否包含父级世界/项目级伏笔"),
+    scope_type: Optional[str] = Query(None, description="按伏笔作用域过滤"),
+    character_id: Optional[str] = Query(None, description="按角色 ID 过滤"),
     status: Optional[str] = None,
     hook_type: Optional[str] = None,
     limit: int = Query(default=100, le=1000),
@@ -43,6 +47,10 @@ async def list_hooks(
 
     hooks = await postgres_db.get_all_hooks(
         project_id=project_id,
+        world_id=world_id,
+        include_inherited=include_inherited,
+        scope_type=scope_type,
+        character_id=character_id,
         status=status,
         limit=limit,
     )
@@ -102,6 +110,13 @@ async def create_hook(hook: Hook):
     if not hook_data.get("id"):
         hook_data["id"] = str(uuid.uuid4())
 
+    if hook_data.get("project_id") and hook_data.get("world_id"):
+        belongs = await postgres_db.assert_world_belongs_to_project(str(hook_data["world_id"]), str(hook_data["project_id"]))
+        if not belongs:
+            raise HTTPException(status_code=400, detail="伏笔所属世界不属于当前项目")
+    if not hook_data.get("scope_type"):
+        hook_data["scope_type"] = "world" if hook_data.get("world_id") else "project"
+
     # 设置默认值和时间戳（使用 datetime 对象）
     now = datetime.now()
     if not hook_data.get("status"):
@@ -115,7 +130,7 @@ async def create_hook(hook: Hook):
         await enqueue_graph_projection_best_effort("hook", hook_data)
         return {
             "success": True,
-            "id": hook.id,
+            "id": hook_data["id"],
             "message": f"伏笔 '{hook.title}' 创建成功",
         }
     except Exception as e:
@@ -179,11 +194,17 @@ async def list_chapters(
         raise HTTPException(status_code=503, detail="数据库未连接")
 
     if project_id:
-        chapters = await postgres_db.get_chapters_by_project(
-            project_id=project_id,
-            status=status,
-            limit=limit,
-        )
+        if world_id:
+            chapters = await postgres_db.get_chapters_by_world(world_id)
+            chapters = [c for c in chapters if str(c.get("project_id")) == str(project_id)]
+            if status and chapters:
+                chapters = [c for c in chapters if c.get("status") == status]
+        else:
+            chapters = await postgres_db.get_chapters_by_project(
+                project_id=project_id,
+                status=status,
+                limit=limit,
+            )
     elif world_id:
         chapters = await postgres_db.get_chapters_by_world(world_id)
         if status and chapters:
@@ -458,7 +479,11 @@ async def get_visualization_data(world_id: str):
     chapters = await postgres_db.get_chapters_by_world(world_id)
     snapshots = await postgres_db.get_snapshots_by_world(world_id)
     project_id = world.get("project_id")
-    hooks = await postgres_db.get_all_hooks(project_id=str(project_id) if project_id else None)
+    hooks = await postgres_db.get_all_hooks(
+        project_id=str(project_id) if project_id else None,
+        world_id=world_id,
+        include_inherited=True,
+    )
 
     workflow_nodes = [
         {"id": "director", "label": "Director"},
@@ -599,6 +624,12 @@ async def update_hook(hook_id: str, hook: Hook):
         raise HTTPException(status_code=404, detail="伏笔不存在")
 
     hook_data = hook.model_dump(mode="json")
+    if hook_data.get("project_id") and hook_data.get("world_id"):
+        belongs = await postgres_db.assert_world_belongs_to_project(str(hook_data["world_id"]), str(hook_data["project_id"]))
+        if not belongs:
+            raise HTTPException(status_code=400, detail="伏笔所属世界不属于当前项目")
+    if not hook_data.get("scope_type"):
+        hook_data["scope_type"] = "world" if hook_data.get("world_id") else "project"
 
     # 确保使用正确的 ID 和保留原有的创建时间
     hook_data["id"] = hook_id

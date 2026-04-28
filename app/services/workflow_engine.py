@@ -557,6 +557,16 @@ class WorkflowEngine:
 
     # ==================== 前驱图执行逻辑 ====================
 
+    def _is_completed_status(self, status: Any) -> bool:
+        """兼容枚举和持久化字符串的 completed 状态判断。"""
+        value = status.value if hasattr(status, "value") else status
+        return value == NodeStatus.COMPLETED.value
+
+    def _is_running_status(self, status: Any) -> bool:
+        """兼容枚举和持久化字符串的 running 状态判断。"""
+        value = status.value if hasattr(status, "value") else status
+        return value == NodeStatus.RUNNING.value
+
     def _build_predecessor_graph(self, workflow: WorkflowDefinition) -> Dict[str, List[str]]:
         """
         构建前驱图：每个节点映射到其所有前驱节点的列表
@@ -569,6 +579,7 @@ class WorkflowEngine:
         """
         # 获取所有节点 ID
         all_node_ids = {node.id for node in workflow.nodes}
+        node_order = {node.id: index for index, node in enumerate(workflow.nodes)}
         logger.info(f"工作流包含 {len(all_node_ids)} 个节点: {all_node_ids}")
 
         predecessors = {node.id: [] for node in workflow.nodes}
@@ -587,6 +598,13 @@ class WorkflowEngine:
 
             logger.info(f"  边: {edge.source} -> {edge.target}")
             if edge.target in predecessors:
+                edge_condition = edge.condition or {}
+                if edge_condition.get("result") and node_order.get(edge.target, 0) < node_order.get(edge.source, 0):
+                    logger.info(
+                        f"  条件回边不加入前驱依赖: {edge.source} -> {edge.target} "
+                        f"({edge_condition})"
+                    )
+                    continue
                 predecessors[edge.target].append(edge.source)
                 valid_edge_count += 1
 
@@ -652,9 +670,8 @@ class WorkflowEngine:
                 logger.debug(f"  节点 {node.id} 已完成，跳过")
                 continue
 
-            # 跳过正在执行或已完成的节点（检查状态）
             node_state = execution.node_states.get(node.id)
-            if node_state and node_state.status in [NodeStatus.RUNNING, NodeStatus.COMPLETED]:
+            if node_state and self._is_running_status(node_state.status):
                 logger.debug(f"  节点 {node.id} 状态为 {node_state.status}，跳过")
                 continue
 
@@ -739,12 +756,13 @@ class WorkflowEngine:
         if not validation.valid:
             raise ValueError(f"工作流验证失败: {validation.errors}")
 
-        # 初始化上下文
-        context = initial_context or {}
+        # 初始化上下文；不要在 request_payload/hash 构建前注入隐式默认 world，保持旧请求幂等语义
+        context = dict(initial_context or {})
+        explicit_world_id = context.get("world_id")
         request_payload = {
             "workflow_id": workflow_id,
             "project_id": project_id,
-            "initial_context": context,
+            "initial_context": context.copy(),
             "workflow_updated_at": workflow.updated_at.isoformat() if workflow.updated_at else None,
         }
         operation_result = None
@@ -771,6 +789,34 @@ class WorkflowEngine:
                 )
                 if existing_execution_id:
                     return existing_execution_id
+
+        # 显式 world_id 参与幂等；隐式默认 world 只写入执行上下文和 trace，不改变旧请求 hash
+        world_scope: Dict[str, Any] = {}
+        if db:
+            try:
+                world = None
+                if explicit_world_id and hasattr(db, "get_world"):
+                    world = await db.get_world(str(explicit_world_id))
+                    if world and world.get("project_id") and str(world.get("project_id")) != str(project_id):
+                        raise ValueError("工作流 world_id 不属于当前项目")
+                elif hasattr(db, "get_default_world"):
+                    world = await db.get_default_world(project_id)
+                if world:
+                    context["world_id"] = str(world.get("id"))
+                    world_scope = {
+                        "world_id": str(world.get("id")),
+                        "scope_type": world.get("scope_type"),
+                        "parent_world_id": str(world.get("parent_world_id")) if world.get("parent_world_id") else None,
+                        "is_explicit": bool(explicit_world_id),
+                    }
+                    context["world_scope"] = world_scope
+                    if hasattr(db, "get_world_ancestor_ids"):
+                        ancestor_ids = await db.get_world_ancestor_ids(str(world.get("id")))
+                        context["world_hierarchy_path"] = [*ancestor_ids, str(world.get("id"))]
+            except Exception as exc:
+                if explicit_world_id:
+                    raise
+                logger.warning("解析默认 workflow world scope 失败: %s", exc)
 
         # ========== 自动章节序号确定 ==========
         chapter_number = context.get("chapter_num")
@@ -836,9 +882,17 @@ class WorkflowEngine:
                 root_input_summary={
                     "chapter_num": context.get("chapter_num"),
                     "chapter_title": context.get("chapter_title"),
+                    "world_id": context.get("world_id"),
+                    "world_hierarchy_path": context.get("world_hierarchy_path"),
                     "context_keys": sorted([str(k) for k in context.keys() if k != "_trace"]),
                 },
-                metadata={"node_count": len(workflow.nodes), "edge_count": len(workflow.edges)},
+                metadata={
+                    "node_count": len(workflow.nodes),
+                    "edge_count": len(workflow.edges),
+                    "world_id": context.get("world_id"),
+                    "scope_type": world_scope.get("scope_type"),
+                    "world_hierarchy_path": context.get("world_hierarchy_path"),
+                },
                 trace_id=trace_id,
             )
 
@@ -862,6 +916,7 @@ class WorkflowEngine:
             "chapter_number": context.get("chapter_num"),
             "request_id": execution.request_id,
             "trace_id": execution.trace_id,
+            "world_id": context.get("world_id"),
         })
 
         # 异步执行工作流
@@ -985,10 +1040,28 @@ class WorkflowEngine:
             start_node_id = list(start_node_ids)[0]
             logger.info(f"使用起始节点: {start_node_id}")
 
+            # 恢复执行时，进程重启前处于 RUNNING 的节点没有本地任务可等待，需重新排队执行。
+            for node_state in execution.node_states.values():
+                if self._is_running_status(node_state.status):
+                    logger.warning(f"恢复执行时重置未完成运行节点: {node_state.node_id}")
+                    if db and execution.trace_id and hasattr(db, "finish_running_trace_spans_for_node"):
+                        await db.finish_running_trace_spans_for_node(
+                            workflow_execution_id=execution.id,
+                            node_id=node_state.node_id,
+                            trace_id=execution.trace_id,
+                            status="interrupted",
+                            error="执行进程中断，节点已重新排队执行",
+                            attributes={"requeued": True},
+                        )
+                    node_state.status = NodeStatus.PENDING
+                    node_state.completed_at = None
+                    node_state.output_data = {}
+                    node_state.error = None
+
             # 已完成的节点集合（从执行状态恢复）
             completed_nodes: Set[str] = set()
             for node_id, node_state in execution.node_states.items():
-                if node_state.status == NodeStatus.COMPLETED:
+                if self._is_completed_status(node_state.status):
                     completed_nodes.add(node_id)
                     logger.debug(f"节点 {node_id} 已完成，跳过重复执行")
 
@@ -1281,8 +1354,25 @@ class WorkflowEngine:
 
             # ========== 完成 ==========
             if execution.status == WorkflowStatus.RUNNING:
-                execution.status = WorkflowStatus.COMPLETED
-                execution.completed_at = datetime.now()
+                failed_nodes = [
+                    state for state in execution.node_states.values()
+                    if state.status == NodeStatus.FAILED
+                ]
+                pending_nodes = [
+                    state for state in execution.node_states.values()
+                    if not self._is_completed_status(state.status) and state.status != NodeStatus.FAILED
+                ]
+                if failed_nodes:
+                    execution.status = WorkflowStatus.FAILED
+                    execution.error = failed_nodes[0].error or f"节点 {failed_nodes[0].node_id} 执行失败"
+                    execution.completed_at = datetime.now()
+                elif pending_nodes:
+                    execution.status = WorkflowStatus.FAILED
+                    execution.error = f"工作流提前结束，仍有未完成节点: {', '.join(state.node_id for state in pending_nodes)}"
+                    execution.completed_at = datetime.now()
+                else:
+                    execution.status = WorkflowStatus.COMPLETED
+                    execution.completed_at = datetime.now()
 
         except Exception as e:
             logger.error(f"工作流执行失败: {e}")
@@ -1547,29 +1637,51 @@ class WorkflowEngine:
                 return chars
 
             elif data_type == "world" or data_type == "world_info":
-                # 从项目获取 world_id
-                project = await db.get_project(project_id) if hasattr(db, 'get_project') else None
-                if project and project.get("world_id"):
-                    world = await db.get_world(project["world_id"]) if hasattr(db, 'get_world') else None
-                    if world:
-                        return {
-                            "id": world.get("id", ""),
-                            "name": world.get("name", "未知世界"),
-                            "world_type": world.get("world_type", "奇幻"),
-                            "description": world.get("description", ""),
-                            "background": world.get("background", ""),
-                            "rules": world.get("rules", {}),
-                            "themes": world.get("themes", []),
-                            "tone": world.get("tone", "正剧"),
-                            "target_audience": world.get("target_audience", "大众"),
-                        }
+                world_id = context.get("world_id")
+                world = None
+                if world_id and hasattr(db, 'get_world'):
+                    world = await db.get_world(str(world_id))
+                elif hasattr(db, 'get_default_world'):
+                    world = await db.get_default_world(project_id)
+                else:
+                    project = await db.get_project(project_id) if hasattr(db, 'get_project') else None
+                    if project and project.get("world_id") and hasattr(db, 'get_world'):
+                        world = await db.get_world(project["world_id"])
+                if world:
+                    return {
+                        "id": world.get("id", ""),
+                        "name": world.get("name", "未知世界"),
+                        "project_id": world.get("project_id"),
+                        "parent_world_id": world.get("parent_world_id"),
+                        "scope_type": world.get("scope_type", "root"),
+                        "inherit_rules": world.get("inherit_rules", True),
+                        "world_type": world.get("world_type", "奇幻"),
+                        "description": world.get("description", ""),
+                        "background": world.get("background", ""),
+                        "rules": world.get("rules", {}),
+                        "themes": world.get("themes", []),
+                        "tone": world.get("tone", "正剧"),
+                        "target_audience": world.get("target_audience", "大众"),
+                    }
                 return None
 
             elif data_type == "hooks" or data_type == "existing_hooks":
+                world_id = context.get("world_id")
+                if hasattr(db, 'get_all_hooks'):
+                    return await db.get_all_hooks(
+                        project_id=project_id,
+                        world_id=str(world_id) if world_id else None,
+                        include_inherited=bool(world_id),
+                        limit=200,
+                    )
                 hooks = await db.get_hooks(project_id) if hasattr(db, 'get_hooks') else []
                 return hooks
 
             elif data_type == "chapters" or data_type == "previous_chapters":
+                world_id = context.get("world_id")
+                if world_id and hasattr(db, 'get_chapters_by_world'):
+                    chapters = await db.get_chapters_by_world(str(world_id))
+                    return [chapter for chapter in chapters if str(chapter.get("project_id")) == str(project_id)]
                 chapters = await db.get_chapters_by_project(project_id) if hasattr(db, 'get_chapters_by_project') else []
                 return chapters
 
@@ -1601,6 +1713,8 @@ class WorkflowEngine:
                         include_world=bool(request.get("include_world", True)),
                         include_region=bool(request.get("include_region", True)),
                         include_hooks=bool(request.get("include_hooks", True)),
+                        world_id=str(request.get("world_id") or context.get("world_id")) if (request.get("world_id") or context.get("world_id")) else None,
+                        include_inherited=bool(request.get("include_inherited", True)),
                         allow_fallback=bool(request.get("allow_fallback", True)),
                         source=GraphContextSource(request.get("source") or "auto"),
                     )
@@ -2505,6 +2619,7 @@ class WorkflowEngine:
                 "anchor_type": policy.get("anchor_type") or "character",
                 "anchor_id": anchor_id,
                 "source": policy.get("source") or "auto",
+                "world_id": policy.get("world_id") or context.get("world_id") or execution.context.get("world_id"),
             })
 
             options = GraphContextOptions(
@@ -2513,6 +2628,8 @@ class WorkflowEngine:
                 include_world=self._coerce_graph_context_bool(policy.get("include_world"), True),
                 include_region=self._coerce_graph_context_bool(policy.get("include_region"), True),
                 include_hooks=self._coerce_graph_context_bool(policy.get("include_hooks"), True),
+                world_id=str(policy.get("world_id") or context.get("world_id") or execution.context.get("world_id")) if (policy.get("world_id") or context.get("world_id") or execution.context.get("world_id")) else None,
+                include_inherited=self._coerce_graph_context_bool(policy.get("include_inherited"), True),
                 allow_fallback=self._coerce_graph_context_bool(policy.get("allow_fallback"), True),
                 source=GraphContextSource(policy.get("source") or "auto"),
             )
@@ -2534,6 +2651,7 @@ class WorkflowEngine:
                 "relationship_count": len(graph_context_data.get("relationships") or []),
                 "partial": bool(graph_context_data.get("partial", False)),
                 "warnings": graph_context_data.get("warnings") or [],
+                "world_id": graph_context_data.get("metadata", {}).get("world_id"),
             })
             compact = self._compact_graph_context(graph_context_data, max_nodes=options.max_nodes)
             execution.context["graph_context_candidate"] = graph_context_data
@@ -2712,25 +2830,11 @@ class WorkflowEngine:
             # ========== 核心信息：世界观设定（所有 Agent 都需要）==========
             # 如果 start 节点已经加载，这里会跳过
             if "world_info" not in context:
-                # 从项目获取 world_id
-                project = await db.get_project(project_id) if hasattr(db, 'get_project') else None
-                if project and project.get("world_id"):
-                    world = await db.get_world(project["world_id"]) if hasattr(db, 'get_world') else None
-                    if world:
-                        world_info = {
-                            "id": world.get("id", ""),
-                            "name": world.get("name", "未知世界"),
-                            "world_type": world.get("world_type", "奇幻"),
-                            "description": world.get("description", ""),
-                            "background": world.get("background", ""),
-                            "rules": world.get("rules", {}),
-                            "themes": world.get("themes", []),
-                            "tone": world.get("tone", "正剧"),
-                            "target_audience": world.get("target_audience", "大众"),
-                        }
-                        context["world_info"] = world_info
-                        execution.context["world_info"] = world_info
-                        logger.info(f"加载世界观设定（{agent_type}）: {world_info.get('name')} ({world_info.get('world_type')})")
+                world_info = await self._load_data_from_database("world_info", project_id, db, context)
+                if world_info:
+                    context["world_info"] = world_info
+                    execution.context["world_info"] = world_info
+                    logger.info(f"加载世界观设定（{agent_type}）: {world_info.get('name')} ({world_info.get('world_type')})")
 
             # ===== 需要角色的 Agent 类型 =====
             character_requiring_agents = ["plotter", "master_plotter", "writer", "character", "evaluator", "hook_manager", "summarizer", "plot_outline"]
@@ -2746,7 +2850,7 @@ class WorkflowEngine:
             # ===== HookManager Agent：需要已有伏笔 =====
             if agent_type == "hook_manager":
                 if "existing_hooks" not in context:
-                    hooks = await db.get_hooks(project_id) if hasattr(db, 'get_hooks') else []
+                    hooks = await self._load_data_from_database("existing_hooks", project_id, db, context) or []
                     if hooks:
                         context["existing_hooks"] = hooks
                         execution.context["existing_hooks"] = hooks
@@ -2757,7 +2861,7 @@ class WorkflowEngine:
             if agent_type == "writer":
                 # 已有章节
                 if "previous_chapters" not in context:
-                    chapters = await db.get_chapters_by_project(project_id) if hasattr(db, 'get_chapters_by_project') else []
+                    chapters = await self._load_data_from_database("previous_chapters", project_id, db, context) or []
                     if chapters:
                         context["previous_chapters"] = chapters
                         context["all_chapters"] = chapters
@@ -2771,7 +2875,7 @@ class WorkflowEngine:
 
                 # 已有伏笔（需要处理的伏笔）- 转换为 Writer 需要的格式
                 if "hooks" not in context:
-                    hooks = await db.get_hooks(project_id) if hasattr(db, 'get_hooks') else []
+                    hooks = await self._load_data_from_database("existing_hooks", project_id, db, context) or []
                     if hooks:
                         # 只获取未回收的伏笔
                         pending_hooks = [h for h in hooks if h.get("status") not in ["resolved", "dropped"]]
@@ -3711,7 +3815,7 @@ class WorkflowEngine:
 
         try:
             # 获取章节正文内容
-            content = writer_output.get("content", "")
+            content = writer_output.get("content") or writer_output.get("chapter_content") or ""
             if not content:
                 logger.warning("Writer 输出没有内容，跳过保存")
                 return
@@ -3731,6 +3835,7 @@ class WorkflowEngine:
                 "id": chapter_id,
                 "title": chapter_title,
                 "project_id": execution.project_id,
+                "world_id": execution.context.get("world_id"),
                 "summary": "",  # 摘要可以后续由 Summarizer Agent 生成
                 "content": content,  # 只保存正文
                 "word_count": word_count,
@@ -3760,6 +3865,7 @@ class WorkflowEngine:
                 "title": chapter_title,
                 "content_chars": len(content),
                 "word_count": word_count,
+                "world_id": execution.context.get("world_id"),
             })
 
             # 广播章节保存事件
@@ -3767,6 +3873,7 @@ class WorkflowEngine:
                 "chapter_id": chapter_id,
                 "title": chapter_title,
                 "word_count": word_count,
+                "world_id": execution.context.get("world_id"),
             })
 
         except Exception as e:
@@ -4363,7 +4470,7 @@ class WorkflowEngine:
 
         completed_nodes = [
             (node_id, state) for node_id, state in execution.node_states.items()
-            if state.status == "completed"
+            if self._is_completed_status(state.status)
         ]
         if not completed_nodes:
             return {}

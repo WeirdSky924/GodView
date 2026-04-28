@@ -49,9 +49,14 @@ class NarrativeStateChangeService:
                 "chapter_id",
                 "discussion_id",
                 "source_text",
+                "world_id",
+                "scope_type",
             ]:
                 if data.get(key) is None and source_context.get(key) is not None:
                     data[key] = source_context[key]
+
+        if data.get("world_id") and not data.get("scope_type"):
+            data["scope_type"] = "world"
 
         data["status"] = _enum_value(data.get("status") or default_status)
         data["entity_type"] = _enum_value(data.get("entity_type") or NarrativeStateEntityType.CUSTOM.value)
@@ -163,6 +168,10 @@ class NarrativeStateChangeService:
             "node_id": data.get("node_id"),
             "discussion_id": data.get("discussion_id"),
         }
+        if data.get("world_id"):
+            source["world_id"] = data.get("world_id")
+        if data.get("scope_type"):
+            source["scope_type"] = data.get("scope_type")
         serialized = json.dumps(source, ensure_ascii=False, sort_keys=True, default=str)
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
@@ -213,6 +222,8 @@ class StateChangeApplier:
         character = await self.db.get_character(entity_id)
         if not character:
             raise ValueError("角色不存在，无法应用状态变更")
+        if change.get("world_id") and character.get("world_id") and str(character.get("world_id")) != str(change.get("world_id")):
+            raise ValueError("角色不属于状态变更指定世界")
 
         after_state = _as_dict(change.get("after_state"))
         metadata = _as_dict(change.get("metadata"))
@@ -268,6 +279,8 @@ class StateChangeApplier:
         hook = await self.db.get_hook(entity_id)
         if not hook:
             raise ValueError("伏笔不存在，无法应用状态变更")
+        if change.get("world_id") and hook.get("world_id") and str(hook.get("world_id")) != str(change.get("world_id")):
+            raise ValueError("伏笔不属于状态变更指定世界")
 
         after_state = _as_dict(change.get("after_state"))
         change_type = _enum_value(change.get("change_type"))
@@ -302,6 +315,8 @@ class StateChangeApplier:
         region = await self.db.get_region(entity_id)
         if not region:
             raise ValueError("区域不存在，无法应用状态变更")
+        if change.get("world_id") and region.get("world_id") and str(region.get("world_id")) != str(change.get("world_id")):
+            raise ValueError("区域不属于状态变更指定世界")
 
         after_state = _as_dict(change.get("after_state"))
         change_type = _enum_value(change.get("change_type"))

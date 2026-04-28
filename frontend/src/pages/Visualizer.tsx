@@ -32,7 +32,9 @@ import {
   pauseExecution,
   resumeExecution,
   cancelExecution,
+  confirmDiscussion,
   type WorkflowDefinition,
+  type WorkflowExecution,
   type WorkflowNode as WfNode,
   type WorkflowEdge as WfEdge,
   type NodeInputConfig,
@@ -718,6 +720,7 @@ export default function Visualizer() {
   const [executing, setExecuting] = useState(false)
   const [currentExecutionId, setCurrentExecutionId] = useState<string | null>(null)
   const [currentExecutionStatus, setCurrentExecutionStatus] = useState<string | null>(null)
+  const [currentExecution, setCurrentExecution] = useState<WorkflowExecution | null>(null)
   const [rightWorkflowPanel, setRightWorkflowPanel] = useState<'monitor' | 'trace'>('monitor')
 
   useEffect(() => {
@@ -821,6 +824,7 @@ export default function Visualizer() {
     setWorkflowName(buildWorkflowDisplayName(workflow, origin))
     setNodes(workflowToCanvasNodes(workflow))
     setEdges(workflowToCanvasEdges(workflow))
+    setCurrentExecution(null)
     setCurrentExecutionId(null)
     setCurrentExecutionStatus(null)
   }
@@ -834,7 +838,9 @@ export default function Visualizer() {
       { id: 'end', type: 'end', position: { x: 250, y: 400 }, data: { label: '结束' } },
     ])
     setEdges([])
+    setCurrentExecution(null)
     setCurrentExecutionId(null)
+    setCurrentExecutionStatus(null)
   }
 
   const handleLoadStandardWorkflow = () => {
@@ -845,7 +851,9 @@ export default function Visualizer() {
     setWorkflowName(workflow.name)
     setNodes(workflowToCanvasNodes(workflow))
     setEdges(workflowToCanvasEdges(workflow))
+    setCurrentExecution(null)
     setCurrentExecutionId(null)
+    setCurrentExecutionStatus(null)
   }
 
   const handleAddNode = (nodeInfo: NodeTypeInfo) => {
@@ -891,6 +899,19 @@ export default function Visualizer() {
     return result.workflow
   }, [currentProject, nodes, edges, workflowName, selectedWorkflow, workflowSelectionMode])
 
+  const applyExecutionState = (execution: WorkflowExecution) => {
+    setCurrentExecution(execution)
+    setCurrentExecutionId(execution.id)
+    setCurrentExecutionStatus(execution.status)
+  }
+
+  const hasPendingDiscussionConfirmation = currentExecutionStatus === 'paused'
+    && Boolean(currentExecution?.context?.waiting_confirmation)
+
+  const isInputPause = currentExecutionStatus === 'paused'
+    && currentExecution?.current_node === 'input'
+    && !currentExecution?.context?.waiting_confirmation
+
   const handleSaveWorkflow = async () => {
     if (!currentProject) return
     setSaving(true)
@@ -917,19 +938,44 @@ export default function Visualizer() {
   }
 
   useEffect(() => {
+    loadWorkflows()
+  }, [currentProject])
+
+  useEffect(() => {
+    if (!currentProject || !workflows.length) return
+
+    const params = new URLSearchParams(window.location.search)
+    const urlExecutionId = params.get('execution_id')
+    if (!urlExecutionId || selectedWorkflow) return
+
+    const restoreWorkflowFromUrl = async () => {
+      try {
+        const execution = await getExecution(urlExecutionId)
+        const workflow = workflows.find((item) => item.id === execution.workflow_id)
+        if (!workflow) return
+        handleSelectWorkflow(workflow)
+        applyExecutionState(execution)
+        localStorage.setItem(executionStorageKey(currentProject.id, workflow.id), execution.id)
+      } catch (error) {
+        console.warn('Failed to restore workflow from URL execution:', error)
+      }
+    }
+
+    void restoreWorkflowFromUrl()
+  }, [currentProject, workflows, selectedWorkflow])
+
+  useEffect(() => {
     if (!currentProject || !selectedWorkflow) return
 
     const restoreExecution = async () => {
       const params = new URLSearchParams(window.location.search)
       const urlExecutionId = params.get('execution_id')
       const storedExecutionId = localStorage.getItem(executionStorageKey(currentProject.id, selectedWorkflow.id))
-      const candidateExecutionId = urlExecutionId || storedExecutionId
 
       try {
         if (urlExecutionId) {
           const execution = await getExecution(urlExecutionId)
-          setCurrentExecutionId(execution.id)
-          setCurrentExecutionStatus(execution.status)
+          applyExecutionState(execution)
           localStorage.setItem(executionStorageKey(currentProject.id, selectedWorkflow.id), execution.id)
           return
         }
@@ -937,8 +983,7 @@ export default function Visualizer() {
         if (storedExecutionId) {
           const execution = await getExecution(storedExecutionId)
           if (isActiveExecutionStatus(execution.status)) {
-            setCurrentExecutionId(execution.id)
-            setCurrentExecutionStatus(execution.status)
+            applyExecutionState(execution)
             localStorage.setItem(executionStorageKey(currentProject.id, selectedWorkflow.id), execution.id)
             return
           }
@@ -947,8 +992,7 @@ export default function Visualizer() {
 
         const active = await getActiveWorkflowExecution(currentProject.id, selectedWorkflow.id)
         if (active.execution && isActiveExecutionStatus(active.execution.status)) {
-          setCurrentExecutionId(active.execution.id)
-          setCurrentExecutionStatus(active.execution.status)
+          applyExecutionState(active.execution)
           localStorage.setItem(executionStorageKey(currentProject.id, selectedWorkflow.id), active.execution.id)
         }
       } catch (error) {
@@ -984,9 +1028,11 @@ export default function Visualizer() {
         currentProject.id,
         {
           chapter_num: workflow.variables?.chapter_num || 1,
+          ...(selectedWorldId ? { world_id: selectedWorldId } : {}),
         },
         { requestId, forceNew },
       )
+      setCurrentExecution(null)
       setCurrentExecutionId(result.execution_id)
       setCurrentExecutionStatus(result.status || 'running')
       localStorage.setItem(executionStorageKey(currentProject.id, workflow.id), result.execution_id)
@@ -1006,6 +1052,7 @@ export default function Visualizer() {
     if (!currentExecutionId) return
     try {
       await pauseExecution(currentExecutionId)
+      setCurrentExecution(null)
       setCurrentExecutionStatus('paused')
     } catch (error) {
       console.error('Failed to pause execution:', error)
@@ -1017,6 +1064,7 @@ export default function Visualizer() {
     if (!currentExecutionId) return
     try {
       await resumeExecution(currentExecutionId)
+      setCurrentExecution(null)
       setCurrentExecutionStatus('running')
     } catch (error) {
       console.error('Failed to resume execution:', error)
@@ -1029,6 +1077,7 @@ export default function Visualizer() {
     if (!confirm('确定要取消当前工作流执行吗？')) return
     try {
       await cancelExecution(currentExecutionId)
+      setCurrentExecution(null)
       setCurrentExecutionStatus('cancelled')
       if (currentProject && selectedWorkflow) {
         localStorage.removeItem(executionStorageKey(currentProject.id, selectedWorkflow.id))
@@ -1036,6 +1085,21 @@ export default function Visualizer() {
     } catch (error) {
       console.error('Failed to cancel execution:', error)
       alert('取消失败')
+    }
+  }
+
+  const handleConfirmDiscussion = async (approved: boolean) => {
+    if (!currentExecutionId) return
+    const feedback = approved ? undefined : window.prompt('请输入返工反馈')
+    if (!approved && !feedback) return
+
+    try {
+      await confirmDiscussion(currentExecutionId, approved, feedback || undefined)
+      setCurrentExecution(null)
+      setCurrentExecutionStatus('running')
+    } catch (error) {
+      console.error('Failed to confirm discussion:', error)
+      alert('讨论确认失败')
     }
   }
 
@@ -1060,8 +1124,9 @@ export default function Visualizer() {
         setNodes([])
         setEdges([])
         setWorkflowName('新工作流')
+        setCurrentExecution(null)
         setCurrentExecutionId(null)
-      setCurrentExecutionStatus(null)
+        setCurrentExecutionStatus(null)
       }
       await loadWorkflows()
     } catch (error) {
@@ -1364,6 +1429,30 @@ export default function Visualizer() {
                       <Square size={12} /> 取消
                     </button>
                   </div>
+                  {hasPendingDiscussionConfirmation && (
+                    <div className="rounded border border-indigo-200 bg-indigo-50 p-2 text-indigo-700">
+                      <div className="mb-2 font-medium">集体讨论已完成，请确认讨论结果后继续流程。</div>
+                      <div className="grid grid-cols-2 gap-1">
+                        <button
+                          onClick={() => handleConfirmDiscussion(true)}
+                          className="px-2 py-1 rounded bg-indigo-600 text-white hover:bg-indigo-700"
+                        >
+                          同意讨论
+                        </button>
+                        <button
+                          onClick={() => handleConfirmDiscussion(false)}
+                          className="px-2 py-1 rounded bg-white text-indigo-700 border border-indigo-200 hover:bg-indigo-100"
+                        >
+                          返工讨论
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                  {isInputPause && (
+                    <div className="rounded border border-blue-200 bg-blue-50 p-2 text-blue-700">
+                      当前暂停在用户输入节点；点击“恢复”继续后续节点。
+                    </div>
+                  )}
                   <button
                     onClick={handleForceNewExecution}
                     disabled={executing || !selectedWorkflow}

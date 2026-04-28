@@ -50,6 +50,25 @@ class GraphProjectionService:
         raw = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True, default=str)
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
+    @staticmethod
+    def _projection_scope(data: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "world_id": data.get("world_id"),
+            "scope_type": data.get("scope_type"),
+            "parent_world_id": data.get("parent_world_id"),
+        }
+
+    @staticmethod
+    def _scope_key(payload: Dict[str, Any]) -> str:
+        scope = payload.get("projection_scope") or {}
+        world_id = scope.get("world_id")
+        scope_type = scope.get("scope_type")
+        if world_id:
+            return f"world:{world_id}"
+        if scope_type:
+            return f"scope:{scope_type}"
+        return "project"
+
     async def enqueue_projection_job(
         self,
         *,
@@ -73,8 +92,9 @@ class GraphProjectionService:
             logger.warning("关系图投影任务入队失败: source_entity_id 为空")
             return {"status": "failed", "reason": "missing_source_entity_id"}
 
-        idempotency_key = f"{source_entity_type}:{source_entity_id}:{projection_type}:{operation}"
         job_payload = dict(payload or {})
+        scope_key = self._scope_key(job_payload)
+        idempotency_key = f"{source_entity_type}:{source_entity_id}:{scope_key}:{projection_type}:{operation}"
         if request_id:
             job_payload.setdefault("request_id", request_id)
         content_hash = self._content_hash(job_payload)
@@ -134,7 +154,8 @@ class GraphProjectionService:
         project_id = character_data.get("project_id")
         payload = {
             "character": character_data,
-            "projection_schema_version": 1,
+            "projection_schema_version": 2,
+            "projection_scope": self._projection_scope(character_data),
         }
         return await self.enqueue_projection_job(
             project_id=project_id,
@@ -159,7 +180,11 @@ class GraphProjectionService:
             source_entity_id=world_id,
             projection_type="world_profile",
             operation="upsert",
-            payload={"world": world_data, "projection_schema_version": 1},
+            payload={
+                "world": world_data,
+                "projection_schema_version": 2,
+                "projection_scope": self._projection_scope(world_data),
+            },
             request_id=request_id,
         )
 
@@ -176,7 +201,11 @@ class GraphProjectionService:
             source_entity_id=region_id,
             projection_type="region_profile",
             operation="upsert",
-            payload={"region": region_data, "projection_schema_version": 1},
+            payload={
+                "region": region_data,
+                "projection_schema_version": 2,
+                "projection_scope": self._projection_scope(region_data),
+            },
             request_id=request_id,
         )
 
@@ -193,6 +222,10 @@ class GraphProjectionService:
             source_entity_id=hook_id,
             projection_type="hook_profile",
             operation="upsert",
-            payload={"hook": hook_data, "projection_schema_version": 1},
+            payload={
+                "hook": hook_data,
+                "projection_schema_version": 2,
+                "projection_scope": self._projection_scope(hook_data),
+            },
             request_id=request_id,
         )

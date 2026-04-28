@@ -7,6 +7,12 @@ export interface World {
   world_type?: string
   tone?: string
   project_id?: string
+  parent_world_id?: string | null
+  scope_type?: string
+  is_default?: boolean
+  inherit_rules?: boolean
+  order_index?: number
+  metadata?: Record<string, any>
   rules?: string[]
   power_system?: string
   technology_level?: string
@@ -52,6 +58,12 @@ export interface CreateWorldDTO {
   world_type?: string
   tone?: string
   project_id?: string
+  parent_world_id?: string | null
+  scope_type?: string
+  is_default?: boolean
+  inherit_rules?: boolean
+  order_index?: number
+  metadata?: Record<string, any>
   // 多选标签字段
   content_styles?: string[]
   protagonist_types?: string[]
@@ -65,6 +77,12 @@ export interface UpdateWorldDTO {
   world_type?: string
   tone?: string
   project_id?: string
+  parent_world_id?: string | null
+  scope_type?: string
+  is_default?: boolean
+  inherit_rules?: boolean
+  order_index?: number
+  metadata?: Record<string, any>
   // 多选标签字段
   content_styles?: string[]
   protagonist_types?: string[]

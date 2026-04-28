@@ -93,10 +93,23 @@ export async function simulateReader(id: string) {
   return await api.post<ReaderSimulationResult>(`/plots/chapters/${id}/reader-simulate`)
 }
 
-export async function getHooks(projectId?: string, status?: string) {
-  const params: Record<string, string> = {}
+export async function getHooks(
+  projectId?: string,
+  status?: string,
+  options?: {
+    worldId?: string
+    includeInherited?: boolean
+    scopeType?: string
+    characterId?: string
+  },
+) {
+  const params: Record<string, string | boolean> = {}
   if (projectId) params.project_id = projectId
   if (status) params.status = status
+  if (options?.worldId) params.world_id = options.worldId
+  if (options?.includeInherited !== undefined) params.include_inherited = options.includeInherited
+  if (options?.scopeType) params.scope_type = options.scopeType
+  if (options?.characterId) params.character_id = options.characterId
   return await api.get<any[]>('/plots/hooks', { params })
 }
 
@@ -107,6 +120,8 @@ export async function createHook(data: {
   related_characters?: string[]
   priority?: number
   project_id?: string
+  world_id?: string | null
+  scope_type?: string
 }) {
   return await api.post<any>('/plots/hooks', data)
 }
@@ -125,6 +140,8 @@ export async function updateHook(hookId: string, data: {
   priority?: number
   project_id?: string
   status?: string
+  world_id?: string | null
+  scope_type?: string
 }) {
   return await api.put<any>(`/plots/hooks/${hookId}`, data)
 }

@@ -242,7 +242,14 @@ class SettingAgentService:
     @staticmethod
     def _fingerprint_payload(payload: Dict[str, Any]) -> str:
         """生成 pending item 幂等指纹。"""
-        raw = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True, default=str)
+        scoped_payload = dict(payload or {})
+        scope = scoped_payload.get("world_scope")
+        if isinstance(scope, dict):
+            if scope.get("world_id") and not scoped_payload.get("world_id"):
+                scoped_payload["world_id"] = scope.get("world_id")
+            if scope.get("scope_type") and not scoped_payload.get("scope_type"):
+                scoped_payload["scope_type"] = scope.get("scope_type")
+        raw = json.dumps(scoped_payload, ensure_ascii=False, sort_keys=True, default=str)
         return str(uuid.uuid5(uuid.NAMESPACE_URL, raw))
 
     async def _persist_pending_items(
@@ -512,12 +519,19 @@ class SettingAgentService:
                 session.cached_pending_characters = []
                 break
 
-    def _clear_cached_pending_hooks(self, project_id: str):
-        """清除指定项目 session 中缓存的 pending_hooks"""
+    def _clear_cached_pending_hooks(self, project_id: str, world_id: Optional[str] = None):
+        """清除指定项目 session 中缓存的 pending_hooks。传 world_id 时只清理同 scope 项。"""
         for session in self._management_sessions.values():
-            if session.project_id == project_id and session.is_active:
+            if session.project_id != project_id or not session.is_active:
+                continue
+            if world_id:
+                session.cached_pending_hooks = [
+                    item for item in (session.cached_pending_hooks or [])
+                    if str(item.get("world_id") or "") != str(world_id)
+                ]
+            else:
                 session.cached_pending_hooks = []
-                break
+            break
 
     def invalidate_context_cache(self, project_id: str):
         """失效指定项目 session 的上下文缓存"""
@@ -1526,11 +1540,19 @@ class SettingAgentService:
         hooks: List[Dict[str, Any]],
         session_id: Optional[str] = None,
         request_id: Optional[str] = None,
+        world_id: Optional[str] = None,
+        scope_type: Optional[str] = None,
     ) -> int:
         """保存用户确认的伏笔到数据库"""
         from app.api.app import postgres_db
         if not postgres_db:
             return 0
+
+        effective_scope_type = scope_type or ("world" if world_id else "project")
+        if world_id and hasattr(postgres_db, "assert_world_belongs_to_project"):
+            belongs = await postgres_db.assert_world_belongs_to_project(str(world_id), str(project_id))
+            if not belongs:
+                raise ValueError("伏笔所属世界不属于当前项目")
 
         saved_count = 0
         session = await self.get_or_create_session(project_id, session_id=session_id) if session_id else None
@@ -1548,7 +1570,12 @@ class SettingAgentService:
         for hook_data in hooks:
             if not hook_data.get("title"):
                 continue
-            if await self._should_skip_saved_pending_item(postgres_db, session, "hook", hook_data):
+            scoped_hook_data = {
+                **hook_data,
+                "world_id": hook_data.get("world_id") or world_id,
+                "scope_type": hook_data.get("scope_type") or effective_scope_type,
+            }
+            if await self._should_skip_saved_pending_item(postgres_db, session, "hook", scoped_hook_data):
                 continue
 
             hook_entry = {
@@ -1556,7 +1583,12 @@ class SettingAgentService:
                 "project_id": project_id,
                 "title": hook_data.get("title", ""),
                 "description": hook_data.get("description", ""),
-                "world_id": None,
+                "world_id": hook_data.get("world_id") or world_id,
+                "scope_type": hook_data.get("scope_type") or effective_scope_type,
+                "character_id": hook_data.get("character_id"),
+                "parent_hook_id": hook_data.get("parent_hook_id"),
+                "promoted_from_hook_id": hook_data.get("promoted_from_hook_id"),
+                "visibility": hook_data.get("visibility") or "global",
                 "hook_type": self._normalize_hook_type(hook_data.get("hook_type")),
                 "status": self._normalize_hook_status(hook_data.get("status")),
                 "related_characters": hook_data.get("related_characters", []) or [],
@@ -1580,7 +1612,7 @@ class SettingAgentService:
                     await postgres_db.mark_setting_agent_pending_item_saved(
                         session.id,
                         "hook",
-                        self._fingerprint_payload(hook_data),
+                        self._fingerprint_payload(scoped_hook_data),
                         hook_entry["id"],
                     )
                 saved_count += 1
@@ -1589,7 +1621,7 @@ class SettingAgentService:
                 logger.error(f"保存伏笔失败: {e}")
 
         if saved_count > 0:
-            self._clear_cached_pending_hooks(project_id)
+            self._clear_cached_pending_hooks(project_id, world_id=world_id)
             self.invalidate_context_cache(project_id)
         await self._complete_save_operation(postgres_db, operation, saved_count)
 

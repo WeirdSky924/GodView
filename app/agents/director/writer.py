@@ -539,7 +539,7 @@ class WriterAgent(BaseAgent):
             }
 
         # 进行字数统计验证
-        content = result.get("chapter_content", "")
+        content = result.get("chapter_content") or result.get("content", "")
         actual_word_count = await self._count_words_async(content)
 
         # 如果LLM报告的字数与实际统计差距较大，使用实际统计

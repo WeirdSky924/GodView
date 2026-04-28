@@ -5,15 +5,14 @@ import PageLayout from '@/components/PageLayout'
 import MapView from '@/components/world/MapView'
 import { useProject } from '@/contexts/ProjectContext'
 import { getCharacters, type Character } from '@/api/characters'
+import { useProjectWorlds } from '@/hooks/useProjectWorlds'
 import {
   createRegion,
   deleteRegion,
   getRegions,
-  getWorlds,
   updateRegion,
   type CreateRegionDTO,
   type Region,
-  type World,
 } from '@/api/worlds'
 
 const REGION_TYPES = [
@@ -101,8 +100,12 @@ const stringifyItems = (items?: Array<Record<string, unknown>>) =>
 
 export default function WorldMap() {
   const { currentProject } = useProject()
-  const [worlds, setWorlds] = useState<World[]>([])
-  const [selectedWorldId, setSelectedWorldId] = useState('')
+  const {
+    worlds,
+    selectedWorldId,
+    setSelectedWorldId,
+    formatWorldLabel,
+  } = useProjectWorlds(currentProject?.id, currentProject?.world_id)
   const [regions, setRegions] = useState<Region[]>([])
   const [characters, setCharacters] = useState<Character[]>([])
   const [selectedRegionId, setSelectedRegionId] = useState<string>('')
@@ -113,18 +116,6 @@ export default function WorldMap() {
   const [showModal, setShowModal] = useState(false)
   const [editingRegion, setEditingRegion] = useState<Region | null>(null)
   const [formData, setFormData] = useState<RegionFormState>(emptyForm)
-
-  const loadWorlds = useCallback(async () => {
-    if (!currentProject) {
-      setWorlds([])
-      setSelectedWorldId('')
-      return
-    }
-
-    const data = await getWorlds(currentProject.id)
-    setWorlds(data)
-    setSelectedWorldId(prev => (prev && data.some(world => world.id === prev) ? prev : data[0]?.id || ''))
-  }, [currentProject])
 
   const loadRegions = useCallback(async () => {
     if (!selectedWorldId) {
@@ -160,10 +151,6 @@ export default function WorldMap() {
       setCharacters([])
     }
   }, [currentProject?.id])
-
-  useEffect(() => {
-    loadWorlds().catch(error => console.error('Failed to load worlds:', error))
-  }, [loadWorlds])
 
   useEffect(() => {
     loadRegions()
@@ -340,7 +327,7 @@ export default function WorldMap() {
               className="px-3 py-2 border border-gray-300 rounded-lg"
             >
               {worlds.map(world => (
-                <option key={world.id} value={world.id}>{world.name}</option>
+                <option key={world.id} value={world.id}>{formatWorldLabel(world)}</option>
               ))}
             </select>
             <div className="relative flex-1 min-w-[220px]">

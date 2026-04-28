@@ -781,6 +781,14 @@ class BaseAgent(ABC):
             elif "OpenAI" in model_str or "ChatOpenAI" in model_str:
                 provider = "openai"
 
+            metadata = {}
+            trace_id = TraceService.current_trace_id()
+            span_id = TraceService.current_span_id()
+            if trace_id:
+                metadata["trace_id"] = trace_id
+            if span_id:
+                metadata["span_id"] = span_id
+
             # 异步记录 token 使用（lazy import 避免循环依赖）
             from app.services.token_tracker import token_tracker
             asyncio.create_task(
@@ -792,6 +800,7 @@ class BaseAgent(ABC):
                     model=model,
                     category=category,
                     agent_name=self.name,
+                    metadata=metadata or None,
                 )
             )
         except Exception as e:

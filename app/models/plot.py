@@ -40,6 +40,11 @@ class Hook(BaseModel):
     # 项目归属
     project_id: Optional[str] = Field(None, description="所属项目ID")
     world_id: Optional[str] = Field(None, description="所属世界ID")
+    scope_type: str = Field(default="project", description="作用域：project/world/character/arc")
+    character_id: Optional[str] = Field(None, description="人物级伏笔关联角色 ID")
+    parent_hook_id: Optional[str] = Field(None, description="父级伏笔 ID")
+    promoted_from_hook_id: Optional[str] = Field(None, description="提升来源伏笔 ID")
+    visibility: str = Field(default="global", description="可见性：global/local")
 
     # 伏笔类型
     hook_type: HookType = Field(default=HookType.CUSTOM, description="伏笔类型")

@@ -83,6 +83,14 @@ class World(BaseModel):
     # 项目归属
     project_id: Optional[str] = Field(None, description="所属项目ID")
 
+    # 世界观层级
+    parent_world_id: Optional[str] = Field(None, description="父级世界/总世界观 ID")
+    scope_type: str = Field(default="root", description="世界作用域：root/plane/arc_world/instance/region_world")
+    is_default: bool = Field(default=False, description="是否为项目默认世界")
+    inherit_rules: bool = Field(default=True, description="是否继承父级世界观规则")
+    order_index: int = Field(default=0, description="同级排序")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="扩展元数据")
+
     # 基础设定
     description: Optional[str] = Field(None, description="世界描述")
     world_type: str = Field(default="fantasy", description="世界类型：fantasy/scifi/wuxia/etc")

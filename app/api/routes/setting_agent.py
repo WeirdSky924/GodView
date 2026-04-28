@@ -73,6 +73,8 @@ class SavePendingHooksRequest(BaseModel):
     hooks: List[Dict[str, Any]]
     session_id: Optional[str] = None
     request_id: Optional[str] = None
+    world_id: Optional[str] = None
+    scope_type: Optional[str] = None
 
 
 class ExecuteLoreModificationRequest(BaseModel):
@@ -229,6 +231,8 @@ async def save_pending_hooks(request: SavePendingHooksRequest):
             hooks=request.hooks,
             session_id=request.session_id,
             request_id=request.request_id,
+            world_id=request.world_id,
+            scope_type=request.scope_type,
         )
         return {
             "success": True,

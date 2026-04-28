@@ -76,6 +76,8 @@ class NarrativeStateChange(BaseModel):
 
     id: Optional[str] = Field(None, description="状态变更 ID")
     project_id: str = Field(..., description="所属项目 ID")
+    world_id: Optional[str] = Field(None, description="所属世界 ID")
+    scope_type: Optional[str] = Field(None, description="作用域：project/world/character/arc")
 
     entity_type: NarrativeStateEntityType = Field(..., description="目标实体类型")
     entity_id: Optional[str] = Field(None, description="目标实体 ID")

@@ -286,6 +286,7 @@ export async function executeWorkflow(
   workflow_id: string
   status?: WorkflowStatus
   trace_id?: string
+  world_id?: string
   deduplicated?: boolean
 }> {
   const response = await axios.post(
@@ -400,6 +401,17 @@ export async function resumeExecution(
   executionId: string,
 ): Promise<{ success: boolean; message: string }> {
   const response = await axios.post(`${API_BASE}/workflows/executions/${executionId}/resume`)
+  return response.data
+}
+
+export async function confirmDiscussion(
+  executionId: string,
+  approved: boolean,
+  feedback?: string,
+): Promise<{ success: boolean; message?: string; [key: string]: any }> {
+  const response = await axios.post(`${API_BASE}/workflows/executions/${executionId}/confirm-discussion`, null, {
+    params: { approved, feedback },
+  })
   return response.data
 }
 

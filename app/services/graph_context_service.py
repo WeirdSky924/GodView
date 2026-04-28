@@ -1,6 +1,7 @@
 """关系图上下文读取服务。"""
 
 import logging
+import inspect
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.models.graph_context import (
@@ -69,13 +70,28 @@ class GraphContextService:
                 metadata={"anchor_type": anchor_type, "anchor_id": anchor_id, "project_id": project_id},
             )
 
+        effective_world_id = await self._resolve_effective_world_id(anchor_type, anchor_id, anchor_data, opts)
+        if opts.world_id and project_id and hasattr(self.postgres_db, "assert_world_belongs_to_project"):
+            try:
+                belongs = await self.postgres_db.assert_world_belongs_to_project(str(opts.world_id), str(project_id))
+                if not belongs:
+                    return GraphContextResponse(
+                        source=GraphContextSource.UNAVAILABLE,
+                        partial=True,
+                        warnings=["world_id 不属于指定项目"],
+                        metadata={"anchor_type": anchor_type, "anchor_id": anchor_id, "project_id": project_id, "world_id": opts.world_id},
+                    )
+            except Exception as exc:
+                logger.warning("校验 graph_context world 归属失败: %s", exc)
+
         anchor = self._entity_to_node(anchor_type, anchor_data)
         if opts.source != GraphContextSource.POSTGRES:
             nebula_context = await self._load_from_nebula(anchor_type, anchor_id, anchor, opts)
             if nebula_context and (nebula_context.nodes or nebula_context.edges or not opts.allow_fallback):
                 if nebula_context.partial and opts.allow_fallback:
-                    fallback = await self._load_postgres_fallback(anchor_type, anchor_data, opts)
+                    fallback = await self._load_postgres_fallback(anchor_type, anchor_data, opts, effective_world_id)
                     return self._merge_contexts(nebula_context, fallback, [*nebula_context.warnings, "NebulaGraph 结果不完整，已合并 Postgres fallback"])
+                nebula_context.metadata["world_id"] = effective_world_id
                 return nebula_context
             if opts.source == GraphContextSource.NEBULA and not opts.allow_fallback:
                 return GraphContextResponse(
@@ -83,12 +99,12 @@ class GraphContextService:
                     partial=True,
                     warnings=["NebulaGraph 未返回可用图上下文"],
                     anchor=anchor,
-                    metadata={"anchor_type": anchor_type, "anchor_id": anchor_id},
+                    metadata={"anchor_type": anchor_type, "anchor_id": anchor_id, "world_id": effective_world_id},
                 )
             warnings.append("NebulaGraph 未返回可用图上下文，使用 Postgres fallback")
 
         if opts.allow_fallback or opts.source == GraphContextSource.POSTGRES:
-            fallback = await self._load_postgres_fallback(anchor_type, anchor_data, opts)
+            fallback = await self._load_postgres_fallback(anchor_type, anchor_data, opts, effective_world_id)
             fallback.warnings = [*warnings, *fallback.warnings]
             return fallback
 
@@ -99,6 +115,21 @@ class GraphContextService:
             anchor=anchor,
             metadata={"anchor_type": anchor_type, "anchor_id": anchor_id},
         )
+
+    async def _resolve_effective_world_id(
+        self,
+        anchor_type: str,
+        anchor_id: str,
+        anchor_data: Dict[str, Any],
+        options: GraphContextOptions,
+    ) -> Optional[str]:
+        if options.world_id:
+            return str(options.world_id)
+        if anchor_data.get("world_id"):
+            return str(anchor_data.get("world_id"))
+        if anchor_type == "world":
+            return str(anchor_id)
+        return None
 
     async def _load_anchor_from_postgres(self, anchor_type: str, anchor_id: str) -> Optional[Dict[str, Any]]:
         if anchor_type == "character" and hasattr(self.postgres_db, "get_character"):
@@ -191,10 +222,56 @@ class GraphContextService:
         anchor_type: str,
         anchor_data: Dict[str, Any],
         options: GraphContextOptions,
+        world_id: Optional[str] = None,
     ) -> GraphContextResponse:
         if anchor_type != "character":
             anchor = self._entity_to_node(anchor_type, anchor_data)
-            return self._build_response(GraphContextSource.POSTGRES, anchor, [anchor], [], [], [f"暂未实现 {anchor_type} 的 Postgres 图上下文 fallback"])
+            nodes: Dict[str, GraphNode] = {anchor.id: anchor}
+            edges: List[GraphEdge] = []
+            relationships: List[Dict[str, Any]] = []
+            project_id = anchor_data.get("project_id")
+
+            if anchor_type == "world":
+                world_id = str(anchor_data.get("id"))
+                if options.include_world:
+                    await self._add_parent_world_fallback(anchor_data, nodes, edges)
+                if options.include_region:
+                    await self._add_world_regions_fallback(anchor_data, nodes, edges, options.max_nodes)
+                if options.include_hooks:
+                    await self._add_scoped_hooks_fallback(
+                        project_id,
+                        world_id,
+                        nodes,
+                        edges,
+                        options.max_nodes,
+                        source_id=anchor.id,
+                        include_inherited=options.include_inherited,
+                    )
+            elif anchor_type == "region":
+                world_id = world_id or (str(anchor_data.get("world_id")) if anchor_data.get("world_id") else None)
+                if options.include_world and world_id:
+                    await self._add_world_node_by_id(world_id, nodes, edges, source_id=anchor.id, edge_type="located_in_world", label="所属世界")
+                if options.include_hooks:
+                    await self._add_scoped_hooks_fallback(
+                        project_id,
+                        world_id,
+                        nodes,
+                        edges,
+                        options.max_nodes,
+                        source_id=anchor.id,
+                        related_location_id=anchor.id,
+                        include_inherited=options.include_inherited,
+                    )
+            elif anchor_type == "hook":
+                world_id = world_id or (str(anchor_data.get("world_id")) if anchor_data.get("world_id") else None)
+                if options.include_world and world_id:
+                    await self._add_world_node_by_id(world_id, nodes, edges, source_id=anchor.id, edge_type="scoped_to_world", label="所属世界")
+                await self._add_hook_related_characters(anchor_data, nodes, edges, options.max_nodes)
+
+            limited_nodes = list(nodes.values())[: options.max_nodes]
+            allowed_ids = {node.id for node in limited_nodes}
+            limited_edges = [edge for edge in edges if edge.source in allowed_ids and edge.target in allowed_ids]
+            return self._build_response(GraphContextSource.POSTGRES, anchor, limited_nodes, limited_edges, relationships, [])
 
         anchor = self._entity_to_node("character", anchor_data)
         nodes: Dict[str, GraphNode] = {anchor.id: anchor}
@@ -203,11 +280,11 @@ class GraphContextService:
 
         await self._add_character_relationship_fallback(anchor_data, nodes, edges, relationships, options.max_nodes)
         if options.include_world:
-            await self._add_world_fallback(anchor_data, nodes, edges)
+            await self._add_world_fallback(anchor_data, nodes, edges, world_id)
         if options.include_region:
-            await self._add_region_fallback(anchor_data, nodes, edges)
+            await self._add_region_fallback(anchor_data, nodes, edges, world_id)
         if options.include_hooks:
-            await self._add_hook_fallback(anchor_data, nodes, edges, options.max_nodes)
+            await self._add_hook_fallback(anchor_data, nodes, edges, options.max_nodes, world_id, options.include_inherited)
 
         limited_nodes = list(nodes.values())[: options.max_nodes]
         allowed_ids = {node.id for node in limited_nodes}
@@ -265,23 +342,64 @@ class GraphContextService:
                 if len(nodes) >= max_nodes:
                     break
 
-    async def _add_world_fallback(self, character: Dict[str, Any], nodes: Dict[str, GraphNode], edges: List[GraphEdge]) -> None:
-        world_id = character.get("world_id")
-        if not world_id or not hasattr(self.postgres_db, "get_world"):
+    async def _add_world_fallback(
+        self,
+        character: Dict[str, Any],
+        nodes: Dict[str, GraphNode],
+        edges: List[GraphEdge],
+        world_id: Optional[str] = None,
+    ) -> None:
+        target_world_id = world_id or character.get("world_id")
+        if not target_world_id:
             return
+        await self._add_world_node_by_id(str(target_world_id), nodes, edges, source_id=str(character.get("id")), edge_type="belongs_to", label="所属世界")
+
+    async def _add_world_node_by_id(
+        self,
+        world_id: str,
+        nodes: Dict[str, GraphNode],
+        edges: List[GraphEdge],
+        source_id: str,
+        edge_type: str,
+        label: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not world_id or not hasattr(self.postgres_db, "get_world"):
+            return None
         world = await self.postgres_db.get_world(str(world_id))
         if not world:
-            return
+            return None
         node = self._entity_to_node("world", world)
         nodes[node.id] = node
-        edges.append(GraphEdge(source=str(character.get("id")), target=node.id, type="belongs_to", label="所属世界"))
+        edges.append(GraphEdge(source=source_id, target=node.id, type=edge_type, label=label))
+        return world
 
-    async def _add_region_fallback(self, character: Dict[str, Any], nodes: Dict[str, GraphNode], edges: List[GraphEdge]) -> None:
+    async def _add_parent_world_fallback(self, world: Dict[str, Any], nodes: Dict[str, GraphNode], edges: List[GraphEdge]) -> None:
+        parent_world_id = world.get("parent_world_id")
+        if not parent_world_id:
+            return
+        await self._add_world_node_by_id(
+            str(parent_world_id),
+            nodes,
+            edges,
+            source_id=str(world.get("id")),
+            edge_type="inherits_from",
+            label="父级世界观",
+        )
+
+    async def _add_region_fallback(
+        self,
+        character: Dict[str, Any],
+        nodes: Dict[str, GraphNode],
+        edges: List[GraphEdge],
+        world_id: Optional[str] = None,
+    ) -> None:
         region_id = character.get("current_region_id")
         if not region_id or not hasattr(self.postgres_db, "get_region"):
             return
         region = await self.postgres_db.get_region(str(region_id))
         if not region:
+            return
+        if world_id and region.get("world_id") and str(region.get("world_id")) != str(world_id):
             return
         node = self._entity_to_node("region", region)
         nodes[node.id] = node
@@ -292,27 +410,116 @@ class GraphContextService:
             label=character.get("current_location_reason") or "当前位置",
         ))
 
+    async def _add_world_regions_fallback(
+        self,
+        world: Dict[str, Any],
+        nodes: Dict[str, GraphNode],
+        edges: List[GraphEdge],
+        max_nodes: int,
+    ) -> None:
+        if not hasattr(self.postgres_db, "get_regions_by_world"):
+            return
+        world_id = str(world.get("id"))
+        for region in await self.postgres_db.get_regions_by_world(world_id):
+            if len(nodes) >= max_nodes:
+                break
+            node = self._entity_to_node("region", region)
+            nodes[node.id] = node
+            edges.append(GraphEdge(source=node.id, target=world_id, type="located_in_world", label="属于世界"))
+
     async def _add_hook_fallback(
         self,
         character: Dict[str, Any],
         nodes: Dict[str, GraphNode],
         edges: List[GraphEdge],
         max_nodes: int,
+        world_id: Optional[str] = None,
+        include_inherited: bool = True,
+    ) -> None:
+        character_id = str(character.get("id"))
+        project_id = character.get("project_id")
+        await self._add_scoped_hooks_fallback(
+            project_id,
+            world_id or (str(character.get("world_id")) if character.get("world_id") else None),
+            nodes,
+            edges,
+            max_nodes,
+            source_id=character_id,
+            character_id=character_id,
+            include_inherited=include_inherited,
+        )
+
+    async def _add_scoped_hooks_fallback(
+        self,
+        project_id: Optional[str],
+        world_id: Optional[str],
+        nodes: Dict[str, GraphNode],
+        edges: List[GraphEdge],
+        max_nodes: int,
+        source_id: str,
+        character_id: Optional[str] = None,
+        related_location_id: Optional[str] = None,
+        include_inherited: bool = True,
     ) -> None:
         if not hasattr(self.postgres_db, "get_all_hooks"):
             return
-        character_id = str(character.get("id"))
-        project_id = character.get("project_id")
-        hooks = await self.postgres_db.get_all_hooks(project_id=project_id, limit=200)
+        get_all_hooks = self.postgres_db.get_all_hooks
+        hook_kwargs = {
+            "project_id": project_id,
+            "limit": 200,
+        }
+        try:
+            signature = inspect.signature(get_all_hooks)
+            if "world_id" in signature.parameters:
+                hook_kwargs["world_id"] = world_id
+            if "include_inherited" in signature.parameters:
+                hook_kwargs["include_inherited"] = bool(world_id and include_inherited)
+        except (TypeError, ValueError):
+            hook_kwargs.update({
+                "world_id": world_id,
+                "include_inherited": bool(world_id and include_inherited),
+            })
+        hooks = await get_all_hooks(**hook_kwargs)
         for hook in hooks:
             if len(nodes) >= max_nodes:
                 break
             related_characters = [str(item) for item in _as_list(hook.get("related_characters"))]
-            if character_id not in related_characters:
+            related_locations = [str(item) for item in _as_list(hook.get("related_locations"))]
+            hook_character_id = str(hook.get("character_id")) if hook.get("character_id") else None
+            if character_id and character_id not in related_characters and hook_character_id != character_id:
+                continue
+            if related_location_id and related_location_id not in related_locations:
                 continue
             node = self._entity_to_node("hook", hook)
             nodes[node.id] = node
-            edges.append(GraphEdge(source=node.id, target=character_id, type="involves_character", label="相关角色"))
+            if character_id:
+                edges.append(GraphEdge(source=node.id, target=source_id, type="involves_character", label="相关角色"))
+            elif related_location_id:
+                edges.append(GraphEdge(source=node.id, target=source_id, type="involves_location", label="相关地点"))
+            else:
+                edges.append(GraphEdge(source=node.id, target=source_id, type="scoped_to", label="作用域伏笔"))
+
+    async def _add_hook_related_characters(
+        self,
+        hook: Dict[str, Any],
+        nodes: Dict[str, GraphNode],
+        edges: List[GraphEdge],
+        max_nodes: int,
+    ) -> None:
+        if not hasattr(self.postgres_db, "get_character"):
+            return
+        related_ids = [str(item) for item in _as_list(hook.get("related_characters"))]
+        if hook.get("character_id"):
+            related_ids.append(str(hook.get("character_id")))
+        for character_id in dict.fromkeys(related_ids):
+            if len(nodes) >= max_nodes:
+                break
+            character = await self.postgres_db.get_character(character_id)
+            if not character:
+                continue
+            node = self._entity_to_node("character", character)
+            nodes[node.id] = node
+            edges.append(GraphEdge(source=str(hook.get("id")), target=node.id, type="involves_character", label="相关角色"))
 
     def _merge_contexts(
         self,

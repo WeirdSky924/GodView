@@ -5,6 +5,7 @@ import { getHooks, createHook, updateHook, updateHookStatus, deleteHook as delet
 import { Plus, Flag, CheckCircle, Clock, XCircle, Trash2, Edit, FolderOpen } from 'lucide-react'
 import { useProject } from '@/contexts/ProjectContext'
 import { useTheme } from '@/contexts/ThemeContext'
+import { useProjectWorlds } from '@/hooks/useProjectWorlds'
 
 interface Hook {
   id?: string
@@ -12,6 +13,9 @@ interface Hook {
   description?: string
   hook_type?: string
   status: 'planted' | 'triggered' | 'resolved' | 'dropped'
+  world_id?: string | null
+  scope_type?: 'project' | 'world' | 'character' | 'arc' | string
+  visibility?: string
   related_characters?: string[]
   related_locations?: string[]
   related_objects?: string[]
@@ -31,18 +35,28 @@ interface CreateHookDTO {
   related_characters?: string[]
   priority?: number
   project_id?: string
+  world_id?: string
+  scope_type?: string
 }
 
 export default function Hooks() {
   const { currentProject } = useProject()
   const { theme } = useTheme()
   const isDark = theme === 'dark'
+  const {
+    worlds,
+    selectedWorldId,
+    setSelectedWorldId,
+    formatWorldLabel,
+  } = useProjectWorlds(currentProject?.id, currentProject?.world_id)
 
   const [hooks, setHooks] = useState<Hook[]>([])
   const [showModal, setShowModal] = useState(false)
   const [editingHook, setEditingHook] = useState<Hook | null>(null)
   const [loading, setLoading] = useState(true)
   const [filterStatus, setFilterStatus] = useState<string>('all')
+  const [scopeFilter, setScopeFilter] = useState<'all' | 'project' | 'world'>('all')
+  const [includeInherited, setIncludeInherited] = useState(true)
   const [openDropdownId, setOpenDropdownId] = useState<string | null>(null)
 
   const [formData, setFormData] = useState<CreateHookDTO>({
@@ -60,14 +74,22 @@ export default function Hooks() {
     }
     setLoading(true)
     try {
-      const data = await getHooks(currentProject.id, filterStatus === 'all' ? undefined : filterStatus)
+      const data = await getHooks(
+        currentProject.id,
+        filterStatus === 'all' ? undefined : filterStatus,
+        {
+          worldId: scopeFilter === 'world' ? selectedWorldId : undefined,
+          includeInherited: scopeFilter === 'world' ? includeInherited : undefined,
+          scopeType: scopeFilter === 'project' ? 'project' : undefined,
+        },
+      )
       setHooks(data)
     } catch (error) {
       console.error('Failed to load hooks:', error)
     } finally {
       setLoading(false)
     }
-  }, [currentProject, filterStatus])
+  }, [currentProject, filterStatus, scopeFilter, selectedWorldId, includeInherited])
 
   useEffect(() => {
     loadHooks()
@@ -84,7 +106,15 @@ export default function Hooks() {
 
   const openCreateModal = () => {
     setEditingHook(null)
-    setFormData({ title: '', description: '', hook_type: 'custom', priority: 1 })
+    const defaultWorldId = selectedWorldId || worlds.find(world => world.is_default)?.id || worlds[0]?.id || ''
+    setFormData({
+      title: '',
+      description: '',
+      hook_type: 'custom',
+      priority: 1,
+      scope_type: defaultWorldId ? 'world' : 'project',
+      world_id: defaultWorldId || undefined,
+    })
     setShowModal(true)
   }
 
@@ -93,8 +123,10 @@ export default function Hooks() {
     setFormData({
       title: hook.title,
       description: hook.description || '',
-      hook_type: hook.hook_type || 'custom',
       priority: hook.priority || 1,
+      hook_type: hook.hook_type || 'custom',
+      world_id: hook.world_id || undefined,
+      scope_type: hook.scope_type || (hook.world_id ? 'world' : 'project'),
     })
     setShowModal(true)
   }
@@ -102,17 +134,23 @@ export default function Hooks() {
   const saveHook = async () => {
     if (!formData.title || !currentProject) return
 
+    const payload = {
+      ...formData,
+      project_id: currentProject.id,
+      scope_type: formData.scope_type || (formData.world_id ? 'world' : 'project'),
+      world_id: formData.scope_type === 'project' ? null : formData.world_id,
+    }
+
     try {
       if (editingHook?.id) {
         // 编辑模式：更新现有伏笔
         await updateHook(editingHook.id, {
-          ...formData,
-          project_id: currentProject.id,
+          ...payload,
           status: editingHook.status,
         })
       } else {
         // 新建模式：创建伏笔
-        await createHook({ ...formData, project_id: currentProject.id })
+        await createHook(payload)
       }
       await loadHooks()
       setShowModal(false)
@@ -252,6 +290,37 @@ export default function Hooks() {
             ))}
           </div>
 
+          <div className={`flex flex-wrap items-center gap-3 flex-shrink-0 mb-4 rounded-lg p-3 ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
+            <select
+              value={scopeFilter}
+              onChange={(e) => setScopeFilter(e.target.value as typeof scopeFilter)}
+              className={`px-3 py-2 border rounded-lg text-sm ${isDark ? 'bg-gray-900 border-gray-700 text-white' : 'bg-white border-gray-300'}`}
+            >
+              <option value="all">全部项目伏笔</option>
+              <option value="project">仅项目级</option>
+              <option value="world">当前世界</option>
+            </select>
+            <select
+              value={selectedWorldId}
+              onChange={(e) => setSelectedWorldId(e.target.value)}
+              disabled={worlds.length === 0 || scopeFilter !== 'world'}
+              className={`px-3 py-2 border rounded-lg text-sm disabled:opacity-60 ${isDark ? 'bg-gray-900 border-gray-700 text-white' : 'bg-white border-gray-300'}`}
+            >
+              {worlds.map(world => (
+                <option key={world.id} value={world.id}>{formatWorldLabel(world)}</option>
+              ))}
+            </select>
+            <label className={`flex items-center gap-2 text-sm ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
+              <input
+                type="checkbox"
+                checked={includeInherited}
+                disabled={scopeFilter !== 'world'}
+                onChange={(e) => setIncludeInherited(e.target.checked)}
+              />
+              包含项目级/父世界继承
+            </label>
+          </div>
+
           {/* 列表区域 - 填满剩余空间 */}
           {loading ? (
             <div className="flex items-center justify-center py-20 flex-shrink-0">
@@ -289,6 +358,11 @@ export default function Hooks() {
                                 高优先级
                               </span>
                             )}
+                            <span className={`text-xs px-2 py-0.5 rounded ${isDark ? 'bg-gray-700 text-gray-300' : 'bg-gray-100 text-gray-600'}`}>
+                              {hook.scope_type === 'project' || !hook.world_id
+                                ? '项目级'
+                                : `世界：${worlds.find(world => world.id === hook.world_id)?.name || hook.world_id}`}
+                            </span>
                           </div>
                           <p className={`text-sm mt-2 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>{hook.description}</p>
                           <div className={`flex items-center gap-4 mt-3 text-xs ${isDark ? 'text-gray-500' : 'text-gray-500'}`}>
@@ -376,6 +450,39 @@ export default function Hooks() {
                 placeholder="如：神秘的黑衣人身份"
                 autoFocus
               />
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>作用域</label>
+                  <select
+                    className={`w-full px-3 py-2 border rounded-lg ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
+                    value={formData.scope_type || 'project'}
+                    onChange={(e) => setFormData({
+                      ...formData,
+                      scope_type: e.target.value,
+                      world_id: e.target.value === 'project' ? undefined : (formData.world_id || selectedWorldId || worlds[0]?.id),
+                    })}
+                  >
+                    <option value="project">项目级/全局</option>
+                    <option value="world">世界级</option>
+                    <option value="character">角色级</option>
+                    <option value="arc">篇章级</option>
+                  </select>
+                </div>
+                <div>
+                  <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>所属世界</label>
+                  <select
+                    className={`w-full px-3 py-2 border rounded-lg disabled:opacity-60 ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
+                    value={formData.world_id || ''}
+                    disabled={!formData.scope_type || formData.scope_type === 'project'}
+                    onChange={(e) => setFormData({ ...formData, world_id: e.target.value })}
+                  >
+                    <option value="">不绑定世界</option>
+                    {worlds.map(world => (
+                      <option key={world.id} value={world.id}>{formatWorldLabel(world)}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>伏笔类型</label>

@@ -43,6 +43,21 @@ async def _get_region_for_world(postgres_db: Any, world_id: str, region_id: str)
     return region
 
 
+async def _validate_world_parent(postgres_db: Any, world_data: Dict[str, Any], world_id: Optional[str] = None) -> None:
+    """校验父级世界归属，避免跨项目和自引用。"""
+    parent_world_id = world_data.get("parent_world_id")
+    project_id = world_data.get("project_id")
+    if not parent_world_id:
+        return
+    if world_id and str(parent_world_id) == str(world_id):
+        raise HTTPException(status_code=400, detail="父级世界不能是自身")
+    parent = await postgres_db.get_world(str(parent_world_id))
+    if not parent:
+        raise HTTPException(status_code=404, detail="父级世界不存在")
+    if project_id and parent.get("project_id") and str(parent.get("project_id")) != str(project_id):
+        raise HTTPException(status_code=400, detail="父级世界必须属于同一项目")
+
+
 @router.get("", response_model=List[Dict[str, Any]])
 async def list_worlds(
     project_id: Optional[str] = Query(None, description="按项目 ID 过滤"),
@@ -85,6 +100,8 @@ async def update_world(world_id: str, world: World):
 
     world_data = world.model_dump(mode="json")
     logger.info(f"[Worlds] 更新数据: content_styles={world_data.get('content_styles')}, protagonist_types={world_data.get('protagonist_types')}, power_types={world_data.get('power_types')}")
+
+    await _validate_world_parent(postgres_db, world_data, world_id)
 
     # 确保使用正确的 ID 和时间戳
     world_data["id"] = world_id
@@ -160,6 +177,7 @@ async def create_world(world: World):
         raise HTTPException(status_code=503, detail="数据库未连接")
 
     world_data = world.model_dump(mode="json")
+    await _validate_world_parent(postgres_db, world_data)
 
     # 自动生成 ID（如果未提供）
     if not world_data.get("id"):

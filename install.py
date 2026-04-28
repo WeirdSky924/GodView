@@ -592,6 +592,12 @@ CREATE TABLE IF NOT EXISTS projects (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     name VARCHAR(255) NOT NULL,
     description TEXT,
+    user_id TEXT,
+    status TEXT DEFAULT 'draft',
+    world_id UUID,
+    total_tokens INTEGER DEFAULT 0,
+    total_cost DOUBLE PRECISION DEFAULT 0,
+    metadata JSONB DEFAULT '{}',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
@@ -611,6 +617,39 @@ CREATE TABLE IF NOT EXISTS chapters (
 
 CREATE INDEX idx_chapters_project ON chapters(project_id);
 CREATE INDEX idx_chapters_status ON chapters(status);
+
+-- ================== 世界表 ==================
+CREATE TABLE IF NOT EXISTS worlds (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    parent_world_id UUID REFERENCES worlds(id) ON DELETE SET NULL,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    scope_type TEXT NOT NULL DEFAULT 'root',
+    is_default BOOLEAN NOT NULL DEFAULT FALSE,
+    inherit_rules BOOLEAN NOT NULL DEFAULT TRUE,
+    order_index INTEGER NOT NULL DEFAULT 0,
+    world_type VARCHAR(50) DEFAULT 'fantasy',
+    tone VARCHAR(50) DEFAULT 'serious',
+    content_styles JSONB DEFAULT '[]',
+    protagonist_types JSONB DEFAULT '[]',
+    character_archetypes JSONB DEFAULT '[]',
+    power_types JSONB DEFAULT '[]',
+    rules JSONB DEFAULT '[]',
+    power_system TEXT,
+    technology_level TEXT,
+    history TEXT,
+    geography TEXT,
+    factions JSONB DEFAULT '[]',
+    metadata JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_worlds_project ON worlds(project_id);
+CREATE INDEX idx_worlds_project_parent ON worlds(project_id, parent_world_id);
+CREATE INDEX idx_worlds_project_default ON worlds(project_id, is_default);
+CREATE INDEX idx_worlds_scope_type ON worlds(scope_type);
 
 -- ================== 角色表 ==================
 CREATE TABLE IF NOT EXISTS characters (
@@ -668,18 +707,40 @@ CREATE INDEX idx_plot_project ON plot_lines(project_id);
 -- ================== 钩子表 ==================
 CREATE TABLE IF NOT EXISTS hooks (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    title VARCHAR(500) NOT NULL DEFAULT '',
     project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    world_id UUID REFERENCES worlds(id) ON DELETE SET NULL,
+    scope_type TEXT NOT NULL DEFAULT 'project',
+    character_id UUID REFERENCES characters(id) ON DELETE SET NULL,
+    parent_hook_id UUID REFERENCES hooks(id) ON DELETE SET NULL,
+    promoted_from_hook_id UUID REFERENCES hooks(id) ON DELETE SET NULL,
+    visibility TEXT NOT NULL DEFAULT 'global',
     chapter_id UUID REFERENCES chapters(id) ON DELETE CASCADE,
-    hook_type VARCHAR(100),  -- 悬念、伏笔、转折
+    hook_type VARCHAR(100) DEFAULT 'custom',
     description TEXT,
+    status VARCHAR(50) DEFAULT 'planted',
+    related_characters JSONB DEFAULT '[]',
+    related_locations JSONB DEFAULT '[]',
+    related_objects JSONB DEFAULT '[]',
+    plant_context TEXT,
+    plant_chapter UUID REFERENCES chapters(id) ON DELETE SET NULL,
+    resolution_hint TEXT,
+    resolution_context TEXT,
+    resolution_chapter UUID REFERENCES chapters(id) ON DELETE SET NULL,
     resolved BOOLEAN DEFAULT FALSE,
     resolved_chapter_id UUID,
-    importance INTEGER DEFAULT 5,  -- 1-10
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    priority INTEGER DEFAULT 5,
+    importance INTEGER DEFAULT 5,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    resolved_at TIMESTAMP WITH TIME ZONE
 );
 
 CREATE INDEX idx_hooks_project ON hooks(project_id);
 CREATE INDEX idx_hooks_chapter ON hooks(chapter_id);
+CREATE INDEX idx_hooks_world ON hooks(world_id);
+CREATE INDEX idx_hooks_project_world ON hooks(project_id, world_id);
+CREATE INDEX idx_hooks_scope ON hooks(project_id, scope_type);
+CREATE INDEX idx_hooks_character_id ON hooks(character_id);
 
 -- ================== 干预记录表 ==================
 CREATE TABLE IF NOT EXISTS interventions (
@@ -765,34 +826,10 @@ CREATE TABLE IF NOT EXISTS embedding_cache (
 
 CREATE INDEX idx_embedding_entity ON embedding_cache(entity_type, entity_id);
 
--- ================== 世界表 ==================
-CREATE TABLE IF NOT EXISTS worlds (
-    id VARCHAR(64) PRIMARY KEY,
-    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
-    name VARCHAR(255) NOT NULL,
-    description TEXT,
-    world_type VARCHAR(50) DEFAULT 'fantasy',
-    tone VARCHAR(50) DEFAULT 'serious',
-    content_styles JSONB DEFAULT '[]',
-    protagonist_types JSONB DEFAULT '[]',
-    character_archetypes JSONB DEFAULT '[]',
-    power_types JSONB DEFAULT '[]',
-    rules JSONB DEFAULT '[]',
-    power_system TEXT,
-    technology_level TEXT,
-    history TEXT,
-    geography TEXT,
-    factions JSONB DEFAULT '[]',
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX idx_worlds_project ON worlds(project_id);
-
 -- ================== 区域表 ==================
 CREATE TABLE IF NOT EXISTS regions (
-    id VARCHAR(64) PRIMARY KEY,
-    world_id VARCHAR(64),
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    world_id UUID REFERENCES worlds(id) ON DELETE CASCADE,
     project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
     name VARCHAR(255) NOT NULL,
     region_type VARCHAR(50) DEFAULT 'custom',
@@ -822,6 +859,8 @@ CREATE INDEX idx_regions_project ON regions(project_id);
 CREATE TABLE IF NOT EXISTS narrative_state_changes (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    world_id UUID REFERENCES worlds(id) ON DELETE SET NULL,
+    scope_type TEXT,
     entity_type TEXT NOT NULL,
     entity_id TEXT,
     entity_name TEXT,
@@ -852,6 +891,7 @@ CREATE TABLE IF NOT EXISTS narrative_state_changes (
 CREATE INDEX idx_narrative_state_changes_project_created ON narrative_state_changes(project_id, created_at DESC);
 CREATE INDEX idx_narrative_state_changes_entity ON narrative_state_changes(project_id, entity_type, entity_id);
 CREATE INDEX idx_narrative_state_changes_status ON narrative_state_changes(project_id, status);
+CREATE INDEX idx_narrative_state_changes_project_world_status ON narrative_state_changes(project_id, world_id, status);
 CREATE UNIQUE INDEX idx_narrative_state_changes_fingerprint ON narrative_state_changes(project_id, fingerprint) WHERE fingerprint IS NOT NULL;
 
 -- ================== 章节大纲表 ==================
@@ -1518,6 +1558,7 @@ CREATE TABLE IF NOT EXISTS operation_requests (
     resource_type TEXT,
     resource_id TEXT,
     request_hash TEXT NOT NULL,
+    trace_id UUID,
     status TEXT NOT NULL DEFAULT 'pending',
     response_payload JSONB DEFAULT '{}',
     error TEXT,
@@ -1558,6 +1599,7 @@ CREATE TABLE IF NOT EXISTS workflow_executions (
     workflow_id VARCHAR(64) REFERENCES workflow_definitions(id) ON DELETE CASCADE,
     project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
     operation_id UUID REFERENCES operation_requests(id) ON DELETE SET NULL,
+    trace_id UUID,
     request_id TEXT,
     request_hash TEXT,
     status VARCHAR(50) DEFAULT 'pending',
@@ -1581,6 +1623,82 @@ CREATE INDEX idx_workflow_executions_project ON workflow_executions(project_id);
 CREATE INDEX idx_workflow_executions_status ON workflow_executions(status);
 CREATE INDEX idx_workflow_executions_project_workflow_status ON workflow_executions(project_id, workflow_id, status);
 CREATE INDEX idx_workflow_executions_request ON workflow_executions(request_id);
+CREATE INDEX idx_workflow_executions_trace ON workflow_executions(trace_id);
+
+-- ================== Trace 表 ==================
+CREATE TABLE IF NOT EXISTS execution_traces (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    project_id UUID REFERENCES projects(id) ON DELETE SET NULL,
+    operation_id UUID REFERENCES operation_requests(id) ON DELETE SET NULL,
+    request_id TEXT,
+    workflow_id TEXT,
+    workflow_execution_id TEXT,
+    trace_type TEXT NOT NULL,
+    root_name TEXT,
+    status TEXT NOT NULL DEFAULT 'running',
+    root_input_summary JSONB DEFAULT '{}',
+    metadata JSONB DEFAULT '{}',
+    started_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    ended_at TIMESTAMP WITH TIME ZONE,
+    duration_ms INTEGER,
+    error TEXT
+);
+
+CREATE INDEX idx_execution_traces_execution ON execution_traces(workflow_execution_id);
+CREATE INDEX idx_execution_traces_project_started ON execution_traces(project_id, started_at DESC);
+CREATE INDEX idx_execution_traces_operation ON execution_traces(operation_id);
+
+CREATE TABLE IF NOT EXISTS execution_trace_spans (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    trace_id UUID NOT NULL REFERENCES execution_traces(id) ON DELETE CASCADE,
+    parent_span_id UUID REFERENCES execution_trace_spans(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running',
+    workflow_id TEXT,
+    workflow_execution_id TEXT,
+    node_id TEXT,
+    agent_type TEXT,
+    attributes JSONB DEFAULT '{}',
+    started_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    ended_at TIMESTAMP WITH TIME ZONE,
+    duration_ms INTEGER,
+    error TEXT
+);
+
+CREATE INDEX idx_execution_trace_spans_trace ON execution_trace_spans(trace_id, started_at ASC);
+CREATE INDEX idx_execution_trace_spans_parent ON execution_trace_spans(parent_span_id);
+
+CREATE TABLE IF NOT EXISTS execution_trace_events (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    trace_id UUID NOT NULL REFERENCES execution_traces(id) ON DELETE CASCADE,
+    span_id UUID REFERENCES execution_trace_spans(id) ON DELETE SET NULL,
+    sequence BIGSERIAL,
+    event_type TEXT NOT NULL,
+    severity TEXT DEFAULT 'info',
+    payload JSONB DEFAULT '{}',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_execution_trace_events_trace_sequence ON execution_trace_events(trace_id, sequence ASC);
+CREATE INDEX idx_execution_trace_events_span ON execution_trace_events(span_id, created_at ASC);
+
+CREATE TABLE IF NOT EXISTS execution_trace_artifacts (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    trace_id UUID NOT NULL REFERENCES execution_traces(id) ON DELETE CASCADE,
+    span_id UUID REFERENCES execution_trace_spans(id) ON DELETE SET NULL,
+    kind TEXT NOT NULL,
+    content_type TEXT DEFAULT 'json',
+    content JSONB,
+    text_content TEXT,
+    content_hash TEXT,
+    size_bytes INTEGER,
+    redaction_status TEXT DEFAULT 'none',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_execution_trace_artifacts_trace ON execution_trace_artifacts(trace_id, created_at ASC);
+CREATE INDEX idx_execution_trace_artifacts_span ON execution_trace_artifacts(span_id, created_at ASC);
 
 -- ================== 工作流执行事件表 ==================
 CREATE TABLE IF NOT EXISTS workflow_execution_events (
@@ -1668,6 +1786,58 @@ CREATE TABLE IF NOT EXISTS setting_agent_pending_items (
 
 CREATE INDEX idx_setting_agent_pending_items_session ON setting_agent_pending_items(session_id, status);
 CREATE UNIQUE INDEX idx_setting_agent_pending_items_fingerprint ON setting_agent_pending_items(session_id, item_type, fingerprint);
+
+-- ================== 关系图投影任务表 ==================
+CREATE TABLE IF NOT EXISTS graph_projection_jobs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    idempotency_key TEXT NOT NULL UNIQUE,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    source_entity_type TEXT NOT NULL,
+    source_entity_id TEXT NOT NULL,
+    projection_type TEXT NOT NULL,
+    operation TEXT NOT NULL DEFAULT 'upsert',
+    payload JSONB NOT NULL DEFAULT '{}',
+    content_hash TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    available_at TIMESTAMP WITH TIME ZONE,
+    worker_id TEXT,
+    claimed_at TIMESTAMP WITH TIME ZONE,
+    lease_expires_at TIMESTAMP WITH TIME ZONE,
+    next_attempt_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    processed_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE INDEX idx_graph_projection_jobs_status_created ON graph_projection_jobs(status, created_at);
+CREATE INDEX idx_graph_projection_jobs_project_status ON graph_projection_jobs(project_id, status);
+CREATE INDEX idx_graph_projection_jobs_entity ON graph_projection_jobs(source_entity_type, source_entity_id);
+
+-- ================== 角色世界身份表 ==================
+CREATE TABLE IF NOT EXISTS character_world_profiles (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    character_id UUID NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+    world_id UUID NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+    local_name TEXT,
+    local_identity TEXT,
+    local_role TEXT,
+    local_status TEXT,
+    local_abilities JSONB DEFAULT '[]',
+    local_relationships JSONB DEFAULT '{}',
+    current_region_id UUID REFERENCES regions(id) ON DELETE SET NULL,
+    entry_chapter_id UUID REFERENCES chapters(id) ON DELETE SET NULL,
+    exit_chapter_id UUID REFERENCES chapters(id) ON DELETE SET NULL,
+    memory_state JSONB DEFAULT '{}',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(character_id, world_id)
+);
+
+CREATE INDEX idx_character_world_profiles_project ON character_world_profiles(project_id);
+CREATE INDEX idx_character_world_profiles_world ON character_world_profiles(world_id);
 
 -- ================== 更新时间触发器 ==================
 CREATE OR REPLACE FUNCTION update_updated_at()
@@ -3300,7 +3470,7 @@ class GodViewInstaller:
 
         env_content = """# ======================== 应用配置 ========================
 APP_NAME=Godview
-APP_VERSION=1.0.0
+APP_VERSION=1.1.0
 DEBUG=True
 LOG_LEVEL=INFO
 

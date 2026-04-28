@@ -9,23 +9,25 @@ import TimeControlPanel from '@/components/time/TimeControlPanel'
 import SimulationControlPanel from '@/components/simulation/SimulationControlPanel'
 import { useTimeControl } from '@/hooks/useTimeWebSocket'
 import { useTimeHistory } from '@/hooks/useTimeWebSocket'
-import { getWorlds, type World } from '@/api/worlds'
+import { useProject } from '@/contexts/ProjectContext'
+import { useProjectWorlds } from '@/hooks/useProjectWorlds'
 import { SimulationStatus } from '@/api/simulation'
 
 export default function WorldView() {
-  const [worlds, setWorlds] = useState<World[]>([])
-  const [selectedWorldId, setSelectedWorldId] = useState('')
-  const [loading, setLoading] = useState(true)
+  const { currentProject } = useProject()
+  const {
+    worlds,
+    selectedWorldId,
+    setSelectedWorldId,
+    selectedWorld,
+    loading,
+    formatWorldLabel,
+  } = useProjectWorlds(currentProject?.id, currentProject?.world_id)
   const [simulationStatus, setSimulationStatus] = useState<SimulationStatus | null>(null)
   const [selectedTab, setSelectedTab] = useState<'time' | 'simulation' | 'entities' | 'events'>('simulation')
 
   const timeControl = useTimeControl(selectedWorldId)
   const timeHistory = useTimeHistory(selectedWorldId)
-
-  // 加载世界列表
-  useEffect(() => {
-    loadWorlds()
-  }, [])
 
   // 当选择世界时，初始化时间系统
   useEffect(() => {
@@ -34,23 +36,17 @@ export default function WorldView() {
     }
   }, [selectedWorldId])
 
-  const loadWorlds = async () => {
-    try {
-      const result = await getWorlds()
-      setWorlds(result)
-      if (result.length > 0 && !selectedWorldId && result[0]?.id) {
-        setSelectedWorldId(result[0].id)
-      }
-    } catch (error) {
-      console.error('Failed to load worlds:', error)
-    } finally {
-      setLoading(false)
-    }
-  }
-
   const initializeTimeSystem = async () => {
     // 这里可以调用API来初始化时间系统
     console.log('Initializing time system for world:', selectedWorldId)
+  }
+
+  if (!currentProject) {
+    return (
+      <div className="h-screen flex items-center justify-center">
+        <div className="text-gray-500">请先选择一个项目</div>
+      </div>
+    )
   }
 
   if (loading) {
@@ -68,8 +64,6 @@ export default function WorldView() {
       </div>
     )
   }
-
-  const selectedWorld = worlds.find(w => w.id === selectedWorldId)
 
   return (
     <div className="h-screen bg-gray-50 flex flex-col">
@@ -93,7 +87,7 @@ export default function WorldView() {
             >
               {worlds.map((world) => (
                 <option key={world.id} value={world.id}>
-                  {world.name || world.id}
+                  {formatWorldLabel(world)}
                 </option>
               ))}
             </select>

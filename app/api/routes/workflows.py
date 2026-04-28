@@ -156,6 +156,21 @@ async def create_workflow(request: WorkflowDefinitionCreate):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/executions/active", response_model=Dict[str, Any])
+async def get_active_execution(
+    project_id: str = Query(..., description="项目ID"),
+    workflow_id: Optional[str] = Query(None, description="工作流ID"),
+):
+    """获取项目/工作流当前活跃执行，用于前端刷新恢复。"""
+    db = get_db()
+    if not db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+    row = await db.get_active_workflow_execution(project_id=project_id, workflow_id=workflow_id)
+    if not row:
+        return {"success": True, "execution": None}
+    return {"success": True, "execution": row}
+
+
 @router.get("/executions/{execution_id}", response_model=Dict[str, Any])
 async def get_execution(execution_id: str):
     """
@@ -393,21 +408,6 @@ async def list_executions(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/executions/active", response_model=Dict[str, Any])
-async def get_active_execution(
-    project_id: str = Query(..., description="项目ID"),
-    workflow_id: Optional[str] = Query(None, description="工作流ID"),
-):
-    """获取项目/工作流当前活跃执行，用于前端刷新恢复。"""
-    db = get_db()
-    if not db:
-        raise HTTPException(status_code=503, detail="数据库未连接")
-    row = await db.get_active_workflow_execution(project_id=project_id, workflow_id=workflow_id)
-    if not row:
-        return {"success": True, "execution": None}
-    return {"success": True, "execution": row}
-
-
 @router.get("/{workflow_id}", response_model=Dict[str, Any])
 async def get_workflow(workflow_id: str):
     """
@@ -617,6 +617,7 @@ async def execute_workflow(
             "request_id": execution.request_id if execution else request_id,
             "status": execution.status.value if execution else None,
             "trace_id": execution.trace_id if execution else None,
+            "world_id": (execution.context or {}).get("world_id") if execution else (initial_context or {}).get("world_id"),
             "deduplicated": bool(execution and request_id and execution.request_id == request_id and execution.id == execution_id),
         }
     except ValueError as e:
@@ -666,6 +667,10 @@ async def resume_execution(execution_id: str):
     engine = get_workflow_engine()
     db = get_db()
 
+    execution = await engine.get_execution_state(execution_id, db)
+    if execution:
+        await _setup_agent_provider_for_execution(execution.project_id)
+
     success = await engine.resume_workflow(execution_id, db)
     if not success:
         raise HTTPException(status_code=400, detail="无法恢复工作流（可能不在暂停状态）")
@@ -695,6 +700,10 @@ async def confirm_discussion(execution_id: str, approved: bool = Query(...), fee
     """
     engine = get_workflow_engine()
     db = get_db()
+
+    execution = await engine.get_execution_state(execution_id, db)
+    if execution:
+        await _setup_agent_provider_for_execution(execution.project_id)
 
     if not approved and not feedback:
         raise HTTPException(status_code=400, detail="不同意讨论结果时必须提供反馈意见（feedback 参数）")
