@@ -451,10 +451,14 @@ async def get_visualization_data(world_id: str):
     if not postgres_db:
         raise HTTPException(status_code=503, detail="数据库未连接")
 
+    world = await postgres_db.get_world(world_id)
+    if not world:
+        raise HTTPException(status_code=404, detail="世界不存在")
+
     chapters = await postgres_db.get_chapters_by_world(world_id)
     snapshots = await postgres_db.get_snapshots_by_world(world_id)
-    worlds = [await postgres_db.get_world(world_id)]
-    hooks = await postgres_db.get_all_hooks()
+    project_id = world.get("project_id")
+    hooks = await postgres_db.get_all_hooks(project_id=str(project_id) if project_id else None)
 
     workflow_nodes = [
         {"id": "director", "label": "Director"},
@@ -497,7 +501,7 @@ async def get_visualization_data(world_id: str):
     ]
 
     return {
-        "world": worlds[0] if worlds else None,
+        "world": world,
         "hooks": hooks,
         "workflow": {"nodes": workflow_nodes, "edges": workflow_edges},
         "plot_tree": {"nodes": plot_nodes, "edges": plot_edges},

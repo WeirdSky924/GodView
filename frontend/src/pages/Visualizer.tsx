@@ -737,17 +737,20 @@ export default function Visualizer() {
   }
 
   useEffect(() => {
-    loadWorlds()
-  }, [])
-
-  useEffect(() => {
     if (currentProject) {
-      loadWorkflows()
+      loadWorlds()
+    } else {
+      setWorlds([])
+      setSelectedWorldId('')
+      setData(null)
     }
   }, [currentProject])
 
   useEffect(() => {
-    if (!selectedWorldId) return
+    if (!selectedWorldId) {
+      setData(null)
+      return
+    }
     loadData(selectedWorldId)
   }, [selectedWorldId])
 
@@ -765,10 +768,16 @@ export default function Visualizer() {
   }, [setNodes, setEdges])
 
   const loadWorlds = async () => {
+    if (!currentProject) return
     try {
-      const result = await getWorlds()
+      const result = await getWorlds(currentProject.id)
       setWorlds(result)
-      setSelectedWorldId((current) => current || result[0]?.id || '')
+      setSelectedWorldId((current) => {
+        if (current && result.some((world) => world.id === current)) {
+          return current
+        }
+        return result[0]?.id || ''
+      })
     } catch (error) {
       console.error('Failed to load worlds:', error)
     }
