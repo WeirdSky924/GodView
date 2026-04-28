@@ -16,6 +16,9 @@ from app.database.postgres import PostgresDatabase
 from app.database.nebulagraph import NebulaGraphDatabase
 from app.database.qdrant import QdrantDatabase
 from app.services.embedding_service import EmbeddingService, create_embedding_service
+from app.services.graph_projection_service import GraphProjectionService, set_graph_projection_service
+from app.services.graph_projection_worker import GraphProjectionWorker
+from app.services.redis_service import redis_service
 
 # 配置日志
 logging.basicConfig(
@@ -30,6 +33,8 @@ postgres_db: Optional[PostgresDatabase] = None
 nebula_db: Optional[NebulaGraphDatabase] = None
 qdrant_db: Optional[QdrantDatabase] = None
 _embedding_service: Optional[EmbeddingService] = None
+graph_projection_service: Optional[GraphProjectionService] = None
+graph_projection_worker: Optional[GraphProjectionWorker] = None
 
 
 def get_embedding_service() -> Optional[EmbeddingService]:
@@ -54,7 +59,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     Yields:
         None
     """
-    global postgres_db, nebula_db, qdrant_db, _embedding_service
+    global postgres_db, nebula_db, qdrant_db, _embedding_service, graph_projection_service, graph_projection_worker
 
     # 启动时初始化
     logger.info("正在初始化数据库连接...")
@@ -65,12 +70,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
             postgres_db = PostgresDatabase(settings.database_url)
             await postgres_db.connect()
             await postgres_db.init_tables()
+            graph_projection_service = GraphProjectionService(postgres_db)
+            set_graph_projection_service(graph_projection_service)
+            logger.info("关系图投影服务初始化完成")
             logger.info("PostgreSQL 初始化完成")
         except Exception as e:
             logger.warning(f"PostgreSQL 连接失败：{e}")
             postgres_db = None
     else:
         logger.info("PostgreSQL 未配置，跳过初始化")
+
+    # Redis（热协调层，可失败降级）
+    await redis_service.connect()
 
     # NebulaGraph
     if settings.nebula_host:
@@ -89,6 +100,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
             nebula_db = None
     else:
         logger.info("NebulaGraph 未配置，跳过初始化")
+
+    if settings.graph_projection_worker_enabled and postgres_db and nebula_db:
+        graph_projection_worker = GraphProjectionWorker(postgres_db, nebula_db)
+        await graph_projection_worker.start()
+    elif settings.graph_projection_worker_enabled and not nebula_db:
+        logger.warning("关系图投影 worker 未启动：NebulaGraph 未连接，投影任务将保留在 outbox 中")
 
     # Embedding Service - 使用分 provider 配置
     embedding_config = settings.get_embedding_config(settings.embedding_provider)
@@ -203,8 +220,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     # 关闭时清理
     logger.info("正在关闭数据库连接...")
 
+    if graph_projection_worker:
+        await graph_projection_worker.stop()
     if postgres_db:
         await postgres_db.disconnect()
+    await redis_service.disconnect()
     if nebula_db:
         await nebula_db.disconnect()
     if qdrant_db:

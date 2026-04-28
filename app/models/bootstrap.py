@@ -87,6 +87,7 @@ class StartBootstrapRequest(BaseModel):
     initial_message: Optional[str] = Field(
         None, description="初始消息（可选，用于直接开始对话）"
     )
+    request_id: Optional[str] = Field(None, description="幂等请求ID")
 
 
 class SendMessageRequest(BaseModel):
@@ -116,6 +117,7 @@ class RunBootstrapRequest(BaseModel):
     """执行 Bootstrap 请求"""
 
     session_id: str = Field(..., description="会话ID")
+    request_id: Optional[str] = Field(None, description="幂等请求ID")
 
 
 class ReviseSeedRequest(BaseModel):

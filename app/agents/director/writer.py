@@ -149,7 +149,7 @@ class WriterAgent(BaseAgent):
 5. 对话要符合角色性格和口癖
 
 【字数要求】
-- 必须达到目标字数的 80% 以上
+- 必须达到目标字数
 - 如果字数不足，系统会要求你继续写作
 - 你会在一次生成中完成足够字数的内容
 
@@ -376,7 +376,7 @@ class WriterAgent(BaseAgent):
             retry_message = input_data.get("retry_message", "")
 
             # 计算最低字数要求
-            min_word_count = int(word_count * 0.8)
+            min_word_count = int(word_count)
 
             # ========== 决定生成策略 ==========
             use_segmented = word_count >= SEGMENT_THRESHOLD
@@ -912,7 +912,7 @@ class WriterAgent(BaseAgent):
         parts.append(f"""【分段写作任务】
 - 当前是第 {segment_num}/{total_segments} 段
 - 本段焦点: {segment_info.get('focus', '自由发挥')}
-- 目标字数: 约 {target_words} 字（最低 {int(target_words * 0.8)} 字）
+- 目标字数: 约 {target_words} 字（最低 {target_words} 字）
 - 情感基调: {segment_info.get('tone', '平稳')}""")
 
         key_elements = self._as_list(segment_info.get('key_elements', []))

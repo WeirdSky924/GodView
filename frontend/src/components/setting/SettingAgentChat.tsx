@@ -13,6 +13,8 @@ import {
   PendingCharacter,
   PendingHook,
   ImprovementSuggestion,
+  createOrGetSession,
+  getChatHistory,
 } from '@/api/settingAgent'
 
 interface Message {
@@ -75,19 +77,57 @@ export default function SettingAgentChat({
   const [improvementSuggestions, setImprovementSuggestions] = useState<ImprovementSuggestion[]>([])
   const [showImprovementModal, setShowImprovementModal] = useState(false)
   const [executingSuggestion, setExecutingSuggestion] = useState<string | null>(null)
+  const [sessionId, setSessionId] = useState<string | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
-  // 初始欢迎消息
+  // 初始化或恢复持久化会话
   useEffect(() => {
-    setMessages([
-      {
-        id: 'welcome',
-        role: 'assistant',
-        content: '你好！我是设定管理者 Agent。我可以帮助你维护世界观设定的一致性，检测和处理设定冲突。请问有什么需要我帮助的吗？',
-        timestamp: new Date(),
-      },
-    ])
-  }, [])
+    const hydrateSession = async () => {
+      const storageKey = `settingAgentSession:${projectId}:management`
+      const storedSessionId = localStorage.getItem(storageKey) || undefined
+      try {
+        const session = await createOrGetSession(projectId, 'management', storedSessionId)
+        setSessionId(session.session_id)
+        localStorage.setItem(storageKey, session.session_id)
+        const history = await getChatHistory(projectId, session.session_id)
+        const historyMessages: Array<{
+          role: 'user' | 'assistant'
+          content: string
+          timestamp?: string
+          created_at?: string
+        }> = history.messages || history.history || []
+        const restored: Message[] = historyMessages
+          .filter((msg) => msg.role === 'user' || msg.role === 'assistant')
+          .map((msg, index) => {
+            const timestamp = msg.created_at || msg.timestamp
+            return {
+              id: `restored_${index}_${timestamp || Date.now()}`,
+              role: msg.role,
+              content: msg.content,
+              timestamp: new Date(timestamp || Date.now()),
+            }
+          })
+        if (restored.length > 0) {
+          setMessages(restored)
+        } else {
+          setMessages([
+            {
+              id: 'welcome',
+              role: 'assistant',
+              content: '你好！我是设定管理者 Agent。我可以帮助你维护世界观设定的一致性，检测和处理设定冲突。请问有什么需要我帮助的吗？',
+              timestamp: new Date(),
+            },
+          ])
+        }
+        setPendingLores(history.pending_lores || session.pending_lores || [])
+        setPendingCharacters(history.pending_characters || session.pending_characters || [])
+        setPendingHooks(history.pending_hooks || session.pending_hooks || [])
+      } catch (error) {
+        console.error('Failed to hydrate setting agent session:', error)
+      }
+    }
+    void hydrateSession()
+  }, [projectId])
 
   // 自动滚动到底部
   useEffect(() => {
@@ -109,7 +149,15 @@ export default function SettingAgentChat({
     setLoading(true)
 
     try {
-      const response = await chatWithSettingAgent(projectId, input.trim())
+      const requestId = `setting_chat_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`
+      const response = await chatWithSettingAgent(projectId, input.trim(), undefined, {
+        sessionId: sessionId || undefined,
+        requestId,
+      })
+      if (response.session_id && response.session_id !== sessionId) {
+        setSessionId(response.session_id)
+        localStorage.setItem(`settingAgentSession:${projectId}:management`, response.session_id)
+      }
 
       const assistantMessage: Message = {
         id: `assistant_${Date.now()}`,
@@ -226,7 +274,10 @@ export default function SettingAgentChat({
 
     setLoading(true)
     try {
-      const result = await savePendingLores(projectId, loresToSave)
+      const result = await savePendingLores(projectId, loresToSave, {
+        sessionId: sessionId || undefined,
+        requestId: `save_lores_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+      })
       if (result.success) {
         setMessages((prev) => [
           ...prev,
@@ -300,7 +351,10 @@ export default function SettingAgentChat({
 
     setLoading(true)
     try {
-      const result = await savePendingCharacters(projectId, charactersToSave)
+      const result = await savePendingCharacters(projectId, charactersToSave, {
+        sessionId: sessionId || undefined,
+        requestId: `save_characters_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+      })
       if (result.success) {
         setMessages((prev) => [
           ...prev,
@@ -373,7 +427,10 @@ export default function SettingAgentChat({
 
     setLoading(true)
     try {
-      const result = await savePendingHooks(projectId, hooksToSave)
+      const result = await savePendingHooks(projectId, hooksToSave, {
+        sessionId: sessionId || undefined,
+        requestId: `save_hooks_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+      })
       if (result.success) {
         setMessages((prev) => [
           ...prev,
@@ -978,17 +1035,17 @@ export default function SettingAgentChat({
                           <span className="text-xs px-2 py-0.5 bg-gray-200 text-gray-600 rounded">
                             优先级：{hook.priority}
                           </span>
-                          {hook.related_characters.map((item, i) => (
+                          {hook.related_characters.map((item: string, i: number) => (
                             <span key={`char-${i}`} className="text-xs px-2 py-0.5 bg-blue-100 text-blue-700 rounded">
                               角色：{item}
                             </span>
                           ))}
-                          {hook.related_locations.map((item, i) => (
+                          {hook.related_locations.map((item: string, i: number) => (
                             <span key={`loc-${i}`} className="text-xs px-2 py-0.5 bg-green-100 text-green-700 rounded">
                               地点：{item}
                             </span>
                           ))}
-                          {hook.related_objects.map((item, i) => (
+                          {hook.related_objects.map((item: string, i: number) => (
                             <span key={`obj-${i}`} className="text-xs px-2 py-0.5 bg-amber-100 text-amber-700 rounded">
                               物件：{item}
                             </span>

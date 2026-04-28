@@ -53,6 +53,50 @@ class Settings(BaseSettings):
         description="PostgreSQL 连接 URL",
     )
 
+    # Redis / 操作生命周期配置
+    redis_url: str = Field(
+        default=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+        description="Redis 连接 URL，用于运行中操作锁、租约和事件缓存",
+    )
+    redis_enabled: bool = Field(
+        default=os.getenv("REDIS_ENABLED", "true").lower() in {"1", "true", "yes", "on"},
+        description="是否启用 Redis 热协调层；关闭或不可用时回退到 Postgres 幂等",
+    )
+    operation_lease_ttl_seconds: int = Field(
+        default=int(os.getenv("OPERATION_LEASE_TTL_SECONDS", "60")),
+        description="运行中操作租约 TTL（秒）",
+    )
+    operation_cache_ttl_seconds: int = Field(
+        default=int(os.getenv("OPERATION_CACHE_TTL_SECONDS", "86400")),
+        description="操作幂等缓存 TTL（秒）",
+    )
+    workflow_event_retention_seconds: int = Field(
+        default=int(os.getenv("WORKFLOW_EVENT_RETENTION_SECONDS", "604800")),
+        description="工作流事件缓存保留时间（秒）",
+    )
+
+    # 业务级执行 Trace 配置
+    trace_enabled: bool = Field(
+        default=os.getenv("TRACE_ENABLED", "true").lower() in {"1", "true", "yes", "on"},
+        description="是否启用业务级执行 Trace",
+    )
+    trace_capture_prompts: bool = Field(
+        default=os.getenv("TRACE_CAPTURE_PROMPTS", "false").lower() in {"1", "true", "yes", "on"},
+        description="是否保存完整 prompt；默认关闭",
+    )
+    trace_capture_llm_responses: bool = Field(
+        default=os.getenv("TRACE_CAPTURE_LLM_RESPONSES", "true").lower() in {"1", "true", "yes", "on"},
+        description="是否保存 LLM 响应摘要",
+    )
+    trace_max_artifact_chars: int = Field(
+        default=int(os.getenv("TRACE_MAX_ARTIFACT_CHARS", "50000")),
+        description="Trace artifact 最大字符数",
+    )
+    trace_redact_secrets: bool = Field(
+        default=os.getenv("TRACE_REDACT_SECRETS", "true").lower() in {"1", "true", "yes", "on"},
+        description="Trace 写入前是否脱敏敏感字段",
+    )
+
     # NebulaGraph 配置
     nebula_host: Optional[str] = Field(
         default=os.getenv("NEBULA_HOST", "127.0.0.1"),
@@ -69,6 +113,40 @@ class Settings(BaseSettings):
     nebula_password: str = Field(
         default=os.getenv("NEBULA_PASSWORD", "nebula"),
         description="NebulaGraph 密码",
+    )
+
+    # 关系图投影配置
+    graph_projection_enabled: bool = Field(
+        default=os.getenv("GRAPH_PROJECTION_ENABLED", "false").lower() in {"1", "true", "yes", "on"},
+        description="是否启用关系图投影任务入队",
+    )
+    graph_projection_outbox_enabled: bool = Field(
+        default=os.getenv("GRAPH_PROJECTION_OUTBOX_ENABLED", "true").lower() in {"1", "true", "yes", "on"},
+        description="是否启用 graph_projection_jobs outbox 写入",
+    )
+    graph_projection_retry_limit: int = Field(
+        default=int(os.getenv("GRAPH_PROJECTION_RETRY_LIMIT", "5")),
+        description="关系图投影任务最大重试次数",
+    )
+    graph_projection_batch_size: int = Field(
+        default=int(os.getenv("GRAPH_PROJECTION_BATCH_SIZE", "100")),
+        description="关系图投影 worker 批量大小",
+    )
+    graph_projection_worker_enabled: bool = Field(
+        default=os.getenv("GRAPH_PROJECTION_WORKER_ENABLED", "false").lower() in {"1", "true", "yes", "on"},
+        description="是否启用关系图投影后台 worker",
+    )
+    graph_projection_poll_interval_seconds: float = Field(
+        default=float(os.getenv("GRAPH_PROJECTION_POLL_INTERVAL_SECONDS", "2.0")),
+        description="关系图投影 worker 空闲轮询间隔（秒）",
+    )
+    graph_projection_lease_seconds: int = Field(
+        default=int(os.getenv("GRAPH_PROJECTION_LEASE_SECONDS", "60")),
+        description="关系图投影任务处理租约时长（秒）",
+    )
+    graph_projection_retry_base_seconds: int = Field(
+        default=int(os.getenv("GRAPH_PROJECTION_RETRY_BASE_SECONDS", "5")),
+        description="关系图投影任务重试退避基础时长（秒）",
     )
 
     # Qdrant 配置

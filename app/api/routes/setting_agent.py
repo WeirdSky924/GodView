@@ -3,7 +3,7 @@ Setting Agent API 路由
 设定管理、冲突检测、协商解决
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from typing import Any, Dict, List, Optional
 
@@ -24,6 +24,8 @@ class ChatRequest(BaseModel):
     project_id: str
     message: str
     context: Optional[Dict[str, Any]] = None
+    session_id: Optional[str] = None
+    request_id: Optional[str] = None
 
 
 class SettingChangeRequest(BaseModel):
@@ -53,18 +55,24 @@ class SavePendingLoresRequest(BaseModel):
     """保存待确认设定请求"""
     project_id: str
     lores: List[Dict[str, Any]]
+    session_id: Optional[str] = None
+    request_id: Optional[str] = None
 
 
 class SavePendingCharactersRequest(BaseModel):
     """保存待确认角色请求"""
     project_id: str
     characters: List[Dict[str, Any]]
+    session_id: Optional[str] = None
+    request_id: Optional[str] = None
 
 
 class SavePendingHooksRequest(BaseModel):
     """保存待确认伏笔请求"""
     project_id: str
     hooks: List[Dict[str, Any]]
+    session_id: Optional[str] = None
+    request_id: Optional[str] = None
 
 
 class ExecuteLoreModificationRequest(BaseModel):
@@ -77,6 +85,35 @@ class AnalyzeWorldDescriptionRequest(BaseModel):
     """世界观描述结构化分析请求"""
     project_id: str
     description: str
+
+
+@router.post("/{project_id}/session")
+async def create_or_get_session(
+    project_id: str,
+    mode: SettingAgentMode = Query(default=SettingAgentMode.MANAGEMENT),
+    session_id: Optional[str] = Query(default=None),
+):
+    """创建或恢复 Setting Agent 持久化会话。"""
+    service = get_setting_agent_service()
+    session = await service.get_or_create_session(project_id, mode=mode, session_id=session_id)
+    return {
+        "success": True,
+        "session_id": session.id,
+        "mode": session.mode.value,
+        "pending_lores": session.cached_pending_lores,
+        "pending_characters": session.cached_pending_characters,
+        "pending_hooks": session.cached_pending_hooks,
+    }
+
+
+@router.get("/{project_id}/history")
+async def get_chat_history(
+    project_id: str,
+    session_id: Optional[str] = Query(default=None),
+):
+    """获取 Setting Agent 会话历史。"""
+    service = get_setting_agent_service()
+    return await service.get_chat_history(project_id=project_id, session_id=session_id)
 
 
 # ==================== API 端点 ====================
@@ -100,6 +137,8 @@ async def chat_with_setting_agent(request: ChatRequest):
             project_id=request.project_id,
             message=request.message,
             context=request.context,
+            session_id=request.session_id,
+            request_id=request.request_id,
         )
         return result
     except Exception as e:
@@ -136,6 +175,8 @@ async def save_pending_lores(request: SavePendingLoresRequest):
         saved_count = await service.save_pending_lores(
             project_id=request.project_id,
             lores=request.lores,
+            session_id=request.session_id,
+            request_id=request.request_id,
         )
         return {
             "success": True,
@@ -159,6 +200,8 @@ async def save_pending_characters(request: SavePendingCharactersRequest):
         saved_count = await service.save_pending_characters(
             project_id=request.project_id,
             characters=request.characters,
+            session_id=request.session_id,
+            request_id=request.request_id,
         )
         return {
             "success": True,
@@ -184,6 +227,8 @@ async def save_pending_hooks(request: SavePendingHooksRequest):
         saved_count = await service.save_pending_hooks(
             project_id=request.project_id,
             hooks=request.hooks,
+            session_id=request.session_id,
+            request_id=request.request_id,
         )
         return {
             "success": True,

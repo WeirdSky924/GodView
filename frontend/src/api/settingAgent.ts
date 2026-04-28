@@ -73,6 +73,14 @@ export interface ChatResponse {
   pending_lores?: PendingLore[]
   pending_characters?: PendingCharacter[]
   pending_hooks?: PendingHook[]
+  cached_pending_lores?: PendingLore[]
+  cached_pending_characters?: PendingCharacter[]
+  cached_pending_hooks?: PendingHook[]
+  conversation_history?: Array<{
+    role: 'user' | 'assistant'
+    content: string
+    timestamp?: string
+  }>
   improvement_suggestions?: ImprovementSuggestion[]
 }
 
@@ -148,14 +156,23 @@ export interface LoreSummary {
 }
 
 export interface ConversationHistory {
-  project_id: string
+  project_id?: string
   session_id: string
-  history: Array<{
+  messages?: Array<{
+    role: 'user' | 'assistant'
+    content: string
+    timestamp?: string
+    created_at?: string
+  }>
+  history?: Array<{
     role: 'user' | 'assistant'
     content: string
     timestamp: string
   }>
-  total: number
+  pending_lores?: PendingLore[]
+  pending_characters?: PendingCharacter[]
+  pending_hooks?: PendingHook[]
+  total?: number
 }
 
 export interface PendingConflicts {
@@ -172,12 +189,15 @@ export interface PendingConflicts {
 export async function chatWithSettingAgent(
   projectId: string,
   message: string,
-  context?: Record<string, unknown>
+  context?: Record<string, unknown>,
+  options?: { sessionId?: string; requestId?: string },
 ): Promise<ChatResponse> {
   return await api.post(`${API_BASE}/chat`, {
     project_id: projectId,
     message,
     context,
+    session_id: options?.sessionId,
+    request_id: options?.requestId,
   })
 }
 
@@ -242,10 +262,10 @@ export async function getLoreSummary(projectId: string): Promise<LoreSummary> {
  */
 export async function getChatHistory(
   projectId: string,
-  limit: number = 50
+  sessionId?: string,
 ): Promise<ConversationHistory> {
   return await api.get(`${API_BASE}/${projectId}/history`, {
-    params: { limit },
+    params: { session_id: sessionId },
   })
 }
 
@@ -261,10 +281,18 @@ export async function getPendingConflicts(projectId: string): Promise<PendingCon
  */
 export async function createOrGetSession(
   projectId: string,
-  mode: 'bootstrap' | 'management' | 'conflict_resolution' = 'management'
-): Promise<{ success: boolean; session: Record<string, unknown> }> {
+  mode: 'bootstrap' | 'management' | 'conflict_resolution' = 'management',
+  sessionId?: string,
+): Promise<{
+  success: boolean
+  session_id: string
+  mode: string
+  pending_lores?: PendingLore[]
+  pending_characters?: PendingCharacter[]
+  pending_hooks?: PendingHook[]
+}> {
   return await api.post(`${API_BASE}/${projectId}/session`, null, {
-    params: { mode },
+    params: { mode, session_id: sessionId },
   })
 }
 
@@ -273,11 +301,14 @@ export async function createOrGetSession(
  */
 export async function savePendingLores(
   projectId: string,
-  lores: PendingLore[]
+  lores: PendingLore[],
+  options?: { sessionId?: string; requestId?: string },
 ): Promise<{ success: boolean; saved_count: number; message: string }> {
   return await api.post(`${API_BASE}/save-lores`, {
     project_id: projectId,
     lores,
+    session_id: options?.sessionId,
+    request_id: options?.requestId,
   })
 }
 
@@ -286,11 +317,14 @@ export async function savePendingLores(
  */
 export async function savePendingCharacters(
   projectId: string,
-  characters: PendingCharacter[]
+  characters: PendingCharacter[],
+  options?: { sessionId?: string; requestId?: string },
 ): Promise<{ success: boolean; saved_count: number; message: string }> {
   return await api.post(`${API_BASE}/save-characters`, {
     project_id: projectId,
     characters,
+    session_id: options?.sessionId,
+    request_id: options?.requestId,
   })
 }
 
@@ -299,11 +333,14 @@ export async function savePendingCharacters(
  */
 export async function savePendingHooks(
   projectId: string,
-  hooks: PendingHook[]
+  hooks: PendingHook[],
+  options?: { sessionId?: string; requestId?: string },
 ): Promise<{ success: boolean; saved_count: number; message: string }> {
   return await api.post(`${API_BASE}/save-hooks`, {
     project_id: projectId,
     hooks,
+    session_id: options?.sessionId,
+    request_id: options?.requestId,
   })
 }
 

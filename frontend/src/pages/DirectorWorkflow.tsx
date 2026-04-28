@@ -10,6 +10,7 @@ import { useTheme } from '@/contexts/ThemeContext'
 import {
   WorkflowEditor,
   WorkflowMonitor,
+  WorkflowTrace,
   AgentChat,
   InterventionLog,
 } from '@/components/workflow'
@@ -20,12 +21,13 @@ import {
   Activity,
   MessageSquare,
   History,
+  GitBranch,
   ChevronLeft,
   ChevronRight,
 } from 'lucide-react'
 
 // 标签页类型
-type TabType = 'editor' | 'monitor' | 'chat' | 'logs'
+type TabType = 'editor' | 'monitor' | 'trace' | 'chat' | 'logs'
 
 export default function DirectorWorkflow() {
   const { currentProject } = useProject()
@@ -76,6 +78,13 @@ export default function DirectorWorkflow() {
               <MessageSquare size={18} />
             </button>
             <button
+              onClick={() => { setActiveTab('trace'); setRightPanelCollapsed(false) }}
+              className={`p-2 rounded ${activeTab === 'trace' ? 'bg-blue-100 text-blue-600 dark:bg-blue-900' : ''}`}
+              title="Trace"
+            >
+              <GitBranch size={18} />
+            </button>
+            <button
               onClick={() => { setActiveTab('logs'); setRightPanelCollapsed(false) }}
               className={`p-2 rounded ${activeTab === 'logs' ? 'bg-blue-100 text-blue-600 dark:bg-blue-900' : ''}`}
               title="日志"
@@ -118,6 +127,19 @@ export default function DirectorWorkflow() {
             私聊
           </button>
           <button
+            onClick={() => setActiveTab('trace')}
+            className={`flex-1 flex items-center justify-center gap-1.5 px-3 py-2.5 text-sm transition-colors ${
+              activeTab === 'trace'
+                ? 'border-b-2 border-blue-500 text-blue-600'
+                : isDark
+                  ? 'text-gray-400 hover:text-gray-200'
+                  : 'text-gray-500 hover:text-gray-700'
+            }`}
+          >
+            <GitBranch size={14} />
+            Trace
+          </button>
+          <button
             onClick={() => setActiveTab('logs')}
             className={`flex-1 flex items-center justify-center gap-1.5 px-3 py-2.5 text-sm transition-colors ${
               activeTab === 'logs'
@@ -144,6 +166,9 @@ export default function DirectorWorkflow() {
             <WorkflowMonitor
               executionId={executionId}
             />
+          )}
+          {activeTab === 'trace' && (
+            <WorkflowTrace executionId={executionId} />
           )}
           {activeTab === 'chat' && currentProject && (
             <AgentChat

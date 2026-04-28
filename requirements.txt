@@ -8,6 +8,7 @@ sqlalchemy[asyncio]>=2.0.36
 # Database Clients
 asyncpg>=0.30.0
 psycopg2-binary>=2.9.10
+redis>=5.2.0
 nebula3-python>=3.8.1
 qdrant-client>=1.12.0
 

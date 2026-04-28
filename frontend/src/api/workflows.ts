@@ -123,6 +123,72 @@ export interface WorkflowExecution {
   completed_at?: string
   total_duration_ms?: number
   error?: string
+  request_id?: string
+  request_hash?: string
+  operation_id?: string
+  trace_id?: string
+  cancel_requested?: boolean
+}
+
+export interface ExecutionTrace {
+  id: string
+  project_id?: string
+  operation_id?: string
+  request_id?: string
+  workflow_id?: string
+  workflow_execution_id?: string
+  trace_type: string
+  root_name?: string
+  status: string
+  root_input_summary?: Record<string, any>
+  metadata?: Record<string, any>
+  started_at?: string
+  ended_at?: string
+  duration_ms?: number
+  error?: string
+}
+
+export interface TraceSpan {
+  id: string
+  trace_id: string
+  parent_span_id?: string | null
+  name: string
+  kind: string
+  status: string
+  workflow_id?: string
+  workflow_execution_id?: string
+  node_id?: string
+  agent_type?: string
+  attributes?: Record<string, any>
+  started_at?: string
+  ended_at?: string
+  duration_ms?: number
+  error?: string
+}
+
+export interface TraceEvent {
+  id: string
+  trace_id: string
+  span_id?: string | null
+  sequence?: number
+  event_type: string
+  severity?: string
+  payload?: Record<string, any>
+  created_at?: string
+}
+
+export interface TraceArtifact {
+  id: string
+  trace_id: string
+  span_id?: string | null
+  kind: string
+  content_type?: string
+  content?: any
+  text_content?: string
+  content_hash?: string
+  size_bytes?: number
+  redaction_status?: string
+  created_at?: string
 }
 
 export interface WorkflowValidationResult {
@@ -212,12 +278,38 @@ export async function executeWorkflow(
   workflowId: string,
   projectId: string,
   initialContext?: Record<string, any>,
-): Promise<{ success: boolean; message: string; execution_id: string; workflow_id: string }> {
+  options?: { requestId?: string; forceNew?: boolean },
+): Promise<{
+  success: boolean
+  message: string
+  execution_id: string
+  workflow_id: string
+  status?: WorkflowStatus
+  trace_id?: string
+  deduplicated?: boolean
+}> {
   const response = await axios.post(
     `${API_BASE}/workflows/${workflowId}/execute`,
-    initialContext || {},
+    {
+      initial_context: initialContext || {},
+      request_id: options?.requestId,
+      force_new: options?.forceNew || false,
+    },
     { params: { project_id: projectId } },
   )
+  return response.data
+}
+
+/**
+ * 获取当前活跃执行
+ */
+export async function getActiveWorkflowExecution(
+  projectId: string,
+  workflowId?: string,
+): Promise<{ success: boolean; execution: WorkflowExecution | null }> {
+  const response = await axios.get(`${API_BASE}/workflows/executions/active`, {
+    params: { project_id: projectId, workflow_id: workflowId },
+  })
   return response.data
 }
 
@@ -237,8 +329,48 @@ export function createWorkflowExecutionEventSource(executionId: string): EventSo
 }
 
 /**
- * 获取执行列表
+ * 获取执行 Trace
  */
+export async function getExecutionTrace(executionId: string): Promise<{
+  success: boolean
+  trace: ExecutionTrace | null
+  spans: TraceSpan[]
+  events: TraceEvent[]
+  artifacts: TraceArtifact[]
+}> {
+  const response = await axios.get(`${API_BASE}/workflows/executions/${executionId}/trace`)
+  return response.data
+}
+
+/**
+ * 获取 Trace spans
+ */
+export async function getTraceSpans(traceId: string): Promise<TraceSpan[]> {
+  const response = await axios.get(`${API_BASE}/workflows/traces/${traceId}/spans`)
+  return response.data.spans || []
+}
+
+/**
+ * 获取 Trace events
+ */
+export async function getTraceEvents(traceId: string, limit: number = 200): Promise<TraceEvent[]> {
+  const response = await axios.get(`${API_BASE}/workflows/traces/${traceId}/events`, {
+    params: { limit },
+  })
+  return response.data.events || []
+}
+
+/**
+ * 获取 Trace artifacts
+ */
+export async function getTraceArtifacts(traceId: string, spanId?: string): Promise<TraceArtifact[]> {
+  const response = await axios.get(`${API_BASE}/workflows/traces/${traceId}/artifacts`, {
+    params: { span_id: spanId },
+  })
+  return response.data.artifacts || []
+}
+
+
 export async function getExecutions(
   projectId: string,
   status?: WorkflowStatus,

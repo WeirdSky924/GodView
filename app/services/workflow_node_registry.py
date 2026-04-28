@@ -21,6 +21,14 @@ _PROFILES: dict[str, WorkflowNodeExecutionProfile] = {
         agent_type="master_plotter",
         kind="direct_agent",
         aliases=("plotter",),
+        metadata={
+            "graph_context": {
+                "enabled": True,
+                "mode": "summary",
+                "max_nodes": 16,
+                "include_hooks": True,
+            }
+        },
     ),
     "summarizer": WorkflowNodeExecutionProfile(
         agent_type="summarizer",
@@ -33,6 +41,14 @@ _PROFILES: dict[str, WorkflowNodeExecutionProfile] = {
     "writer": WorkflowNodeExecutionProfile(
         agent_type="writer",
         kind="direct_agent",
+        metadata={
+            "graph_context": {
+                "enabled": True,
+                "mode": "summary",
+                "max_nodes": 12,
+                "include_hooks": True,
+            }
+        },
     ),
     "evaluator": WorkflowNodeExecutionProfile(
         agent_type="evaluator",

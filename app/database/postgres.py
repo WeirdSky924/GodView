@@ -197,6 +197,11 @@ class PostgresDatabase:
                 'examples', 'counter_examples', 'conditions', 'exceptions',
                 # writing_rule_sets 表的 JSONB 字段
                 'rule_ids', 'rule_overrides', 'target_genres',
+                # operation lifecycle / workflow events / setting/bootstrap persistence / trace
+                'response_payload', 'event_data', 'conversation_snapshot', 'pending_conflicts',
+                'cached_pending_lores', 'cached_pending_characters', 'cached_pending_hooks',
+                'cached_context_sections', 'payload', 'setting_agent_history', 'extracted_seed', 'confirmed_seed',
+                'root_input_summary', 'metadata', 'attributes', 'content',
             ]
 
             for row in rows:
@@ -1641,6 +1646,275 @@ class PostgresDatabase:
                         except Exception as e:
                             logger.warning(f"创建表时出错（可能已存在）: {str(e)[:100]}")
 
+            operation_schema_sql = """
+            CREATE TABLE IF NOT EXISTS operation_requests (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                request_id TEXT NOT NULL UNIQUE,
+                operation_type TEXT NOT NULL,
+                project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+                resource_type TEXT,
+                resource_id TEXT,
+                request_hash TEXT NOT NULL,
+                trace_id UUID,
+                status TEXT NOT NULL DEFAULT 'pending',
+                response_payload JSONB DEFAULT '{}',
+                error TEXT,
+                lease_token TEXT,
+                lease_expires_at TIMESTAMP WITH TIME ZONE,
+                last_heartbeat_at TIMESTAMP WITH TIME ZONE,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP WITH TIME ZONE
+            );
+            CREATE INDEX IF NOT EXISTS idx_operation_requests_project ON operation_requests(project_id);
+            CREATE INDEX IF NOT EXISTS idx_operation_requests_resource ON operation_requests(operation_type, project_id, resource_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_operation_requests_active_hash
+                ON operation_requests(operation_type, project_id, resource_id, request_hash)
+                WHERE status IN ('pending', 'running', 'paused');
+            """
+            for statement in operation_schema_sql.split(';'):
+                if statement.strip():
+                    try:
+                        await session.execute(text(statement))
+                    except Exception as e:
+                        logger.warning(f"创建操作请求表结构时出错: {str(e)[:100]}")
+
+            trace_schema_sql = """
+            CREATE TABLE IF NOT EXISTS execution_traces (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                project_id UUID REFERENCES projects(id) ON DELETE SET NULL,
+                operation_id UUID REFERENCES operation_requests(id) ON DELETE SET NULL,
+                request_id TEXT,
+                workflow_id TEXT,
+                workflow_execution_id TEXT,
+                trace_type TEXT NOT NULL,
+                root_name TEXT,
+                status TEXT NOT NULL DEFAULT 'running',
+                root_input_summary JSONB DEFAULT '{}',
+                metadata JSONB DEFAULT '{}',
+                started_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                ended_at TIMESTAMP WITH TIME ZONE,
+                duration_ms INTEGER,
+                error TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_execution_traces_execution ON execution_traces(workflow_execution_id);
+            CREATE INDEX IF NOT EXISTS idx_execution_traces_project_started ON execution_traces(project_id, started_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_execution_traces_operation ON execution_traces(operation_id);
+            CREATE TABLE IF NOT EXISTS execution_trace_spans (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                trace_id UUID NOT NULL REFERENCES execution_traces(id) ON DELETE CASCADE,
+                parent_span_id UUID REFERENCES execution_trace_spans(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running',
+                workflow_id TEXT,
+                workflow_execution_id TEXT,
+                node_id TEXT,
+                agent_type TEXT,
+                attributes JSONB DEFAULT '{}',
+                started_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                ended_at TIMESTAMP WITH TIME ZONE,
+                duration_ms INTEGER,
+                error TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_execution_trace_spans_trace ON execution_trace_spans(trace_id, started_at ASC);
+            CREATE INDEX IF NOT EXISTS idx_execution_trace_spans_parent ON execution_trace_spans(parent_span_id);
+            CREATE TABLE IF NOT EXISTS execution_trace_events (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                trace_id UUID NOT NULL REFERENCES execution_traces(id) ON DELETE CASCADE,
+                span_id UUID REFERENCES execution_trace_spans(id) ON DELETE SET NULL,
+                sequence BIGSERIAL,
+                event_type TEXT NOT NULL,
+                severity TEXT DEFAULT 'info',
+                payload JSONB DEFAULT '{}',
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_execution_trace_events_trace_sequence ON execution_trace_events(trace_id, sequence ASC);
+            CREATE INDEX IF NOT EXISTS idx_execution_trace_events_span ON execution_trace_events(span_id, created_at ASC);
+            CREATE TABLE IF NOT EXISTS execution_trace_artifacts (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                trace_id UUID NOT NULL REFERENCES execution_traces(id) ON DELETE CASCADE,
+                span_id UUID REFERENCES execution_trace_spans(id) ON DELETE SET NULL,
+                kind TEXT NOT NULL,
+                content_type TEXT DEFAULT 'json',
+                content JSONB,
+                text_content TEXT,
+                content_hash TEXT,
+                size_bytes INTEGER,
+                redaction_status TEXT DEFAULT 'none',
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_execution_trace_artifacts_trace ON execution_trace_artifacts(trace_id, created_at ASC);
+            CREATE INDEX IF NOT EXISTS idx_execution_trace_artifacts_span ON execution_trace_artifacts(span_id, created_at ASC);
+            """
+            for statement in trace_schema_sql.split(';'):
+                if statement.strip():
+                    try:
+                        await session.execute(text(statement))
+                    except Exception as e:
+                        logger.warning(f"创建 Trace 表结构时出错: {str(e)[:100]}")
+
+            operation_trace_updates = [
+                "ALTER TABLE operation_requests ADD COLUMN IF NOT EXISTS trace_id UUID REFERENCES execution_traces(id) ON DELETE SET NULL",
+                "CREATE INDEX IF NOT EXISTS idx_operation_requests_trace ON operation_requests(trace_id)",
+            ]
+            for statement in operation_trace_updates:
+                try:
+                    await session.execute(text(statement))
+                except Exception as e:
+                    logger.warning(f"更新操作请求 Trace 字段时出错: {str(e)[:100]}")
+
+            workflow_schema_updates = [
+                "ALTER TABLE workflow_executions ADD COLUMN IF NOT EXISTS operation_id UUID REFERENCES operation_requests(id) ON DELETE SET NULL",
+                "ALTER TABLE workflow_executions ADD COLUMN IF NOT EXISTS trace_id UUID REFERENCES execution_traces(id) ON DELETE SET NULL",
+                "ALTER TABLE workflow_executions ADD COLUMN IF NOT EXISTS request_id TEXT",
+                "ALTER TABLE workflow_executions ADD COLUMN IF NOT EXISTS request_hash TEXT",
+                "ALTER TABLE workflow_executions ADD COLUMN IF NOT EXISTS lease_token TEXT",
+                "ALTER TABLE workflow_executions ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMP WITH TIME ZONE",
+                "ALTER TABLE workflow_executions ADD COLUMN IF NOT EXISTS last_heartbeat_at TIMESTAMP WITH TIME ZONE",
+                "ALTER TABLE workflow_executions ADD COLUMN IF NOT EXISTS cancel_requested BOOLEAN DEFAULT FALSE",
+                "ALTER TABLE workflow_executions ADD COLUMN IF NOT EXISTS resume_cursor JSONB DEFAULT '{}'",
+                "CREATE INDEX IF NOT EXISTS idx_workflow_executions_project_workflow_status ON workflow_executions(project_id, workflow_id, status)",
+                "CREATE INDEX IF NOT EXISTS idx_workflow_executions_request ON workflow_executions(request_id)",
+                "CREATE INDEX IF NOT EXISTS idx_workflow_executions_trace ON workflow_executions(trace_id)",
+            ]
+            if 'workflow_executions' in existing_tables:
+                for statement in workflow_schema_updates:
+                    try:
+                        await session.execute(text(statement))
+                    except Exception as e:
+                        logger.warning(f"更新工作流执行表结构时出错: {str(e)[:100]}")
+
+            event_and_session_schema_sql = """
+            CREATE TABLE IF NOT EXISTS workflow_execution_events (
+                id BIGSERIAL PRIMARY KEY,
+                execution_id VARCHAR(64) REFERENCES workflow_executions(id) ON DELETE CASCADE,
+                event_type TEXT NOT NULL,
+                event_data JSONB DEFAULT '{}',
+                sequence_no BIGINT NOT NULL,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_execution_events_sequence ON workflow_execution_events(execution_id, sequence_no);
+            CREATE INDEX IF NOT EXISTS idx_workflow_execution_events_created ON workflow_execution_events(execution_id, created_at);
+            CREATE TABLE IF NOT EXISTS bootstrap_sessions (
+                id TEXT PRIMARY KEY,
+                project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+                status TEXT NOT NULL,
+                current_stage TEXT NOT NULL,
+                progress DOUBLE PRECISION DEFAULT 0,
+                setting_agent_history JSONB DEFAULT '[]',
+                extracted_seed JSONB DEFAULT '{}',
+                confirmed_seed JSONB DEFAULT '{}',
+                error_message TEXT,
+                retry_count INTEGER DEFAULT 0,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP WITH TIME ZONE
+            );
+            CREATE INDEX IF NOT EXISTS idx_bootstrap_sessions_project ON bootstrap_sessions(project_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_bootstrap_sessions_active_project
+                ON bootstrap_sessions(project_id)
+                WHERE status NOT IN ('completed', 'failed');
+            CREATE TABLE IF NOT EXISTS setting_agent_sessions (
+                id TEXT PRIMARY KEY,
+                project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+                mode TEXT NOT NULL,
+                status TEXT DEFAULT 'active',
+                conversation_snapshot JSONB DEFAULT '[]',
+                pending_conflicts JSONB DEFAULT '[]',
+                cached_pending_lores JSONB DEFAULT '[]',
+                cached_pending_characters JSONB DEFAULT '[]',
+                cached_pending_hooks JSONB DEFAULT '[]',
+                cached_context_sections JSONB DEFAULT '{}',
+                full_context_loaded BOOLEAN DEFAULT FALSE,
+                last_activity_at TIMESTAMP WITH TIME ZONE,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_setting_agent_sessions_project ON setting_agent_sessions(project_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_setting_agent_sessions_active_project_mode ON setting_agent_sessions(project_id, mode) WHERE status = 'active';
+            CREATE TABLE IF NOT EXISTS setting_agent_messages (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                session_id TEXT REFERENCES setting_agent_sessions(id) ON DELETE CASCADE,
+                request_id TEXT,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                metadata JSONB DEFAULT '{}',
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_setting_agent_messages_session_created ON setting_agent_messages(session_id, created_at);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_setting_agent_messages_request_role ON setting_agent_messages(session_id, request_id, role) WHERE request_id IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS setting_agent_pending_items (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                session_id TEXT REFERENCES setting_agent_sessions(id) ON DELETE CASCADE,
+                request_id TEXT,
+                item_type TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                payload JSONB NOT NULL DEFAULT '{}',
+                status TEXT DEFAULT 'pending',
+                saved_ref_id TEXT,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_setting_agent_pending_items_session ON setting_agent_pending_items(session_id, status);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_setting_agent_pending_items_fingerprint ON setting_agent_pending_items(session_id, item_type, fingerprint);
+            """
+            for statement in event_and_session_schema_sql.split(';'):
+                if statement.strip():
+                    try:
+                        await session.execute(text(statement))
+                    except Exception as e:
+                        logger.warning(f"创建执行事件/Setting Agent 会话表结构时出错: {str(e)[:100]}")
+
+            graph_projection_schema_sql = """
+            CREATE TABLE IF NOT EXISTS graph_projection_jobs (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                idempotency_key TEXT NOT NULL UNIQUE,
+                project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+                source_entity_type TEXT NOT NULL,
+                source_entity_id TEXT NOT NULL,
+                projection_type TEXT NOT NULL,
+                operation TEXT NOT NULL DEFAULT 'upsert',
+                payload JSONB NOT NULL DEFAULT '{}',
+                content_hash TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                available_at TIMESTAMP WITH TIME ZONE,
+                worker_id TEXT,
+                claimed_at TIMESTAMP WITH TIME ZONE,
+                lease_expires_at TIMESTAMP WITH TIME ZONE,
+                next_attempt_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                processed_at TIMESTAMP WITH TIME ZONE
+            );
+            CREATE INDEX IF NOT EXISTS idx_graph_projection_jobs_status_created
+                ON graph_projection_jobs(status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_graph_projection_jobs_project_status
+                ON graph_projection_jobs(project_id, status);
+            CREATE INDEX IF NOT EXISTS idx_graph_projection_jobs_entity
+                ON graph_projection_jobs(source_entity_type, source_entity_id);
+            """
+            for statement in graph_projection_schema_sql.split(';'):
+                if statement.strip():
+                    try:
+                        await session.execute(text(statement))
+                    except Exception as e:
+                        logger.warning(f"创建关系图投影任务表结构时出错: {str(e)[:100]}")
+
+            graph_projection_schema_updates = [
+                "ALTER TABLE graph_projection_jobs ADD COLUMN IF NOT EXISTS worker_id TEXT",
+                "ALTER TABLE graph_projection_jobs ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMP WITH TIME ZONE",
+                "ALTER TABLE graph_projection_jobs ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMP WITH TIME ZONE",
+                "ALTER TABLE graph_projection_jobs ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP",
+            ]
+            for statement in graph_projection_schema_updates:
+                try:
+                    await session.execute(text(statement))
+                except Exception as e:
+                    logger.warning(f"更新关系图投影任务表结构时出错: {str(e)[:100]}")
+
             region_schema_updates = [
                 "ALTER TABLE regions ADD COLUMN IF NOT EXISTS state TEXT DEFAULT 'normal'",
                 "ALTER TABLE regions ADD COLUMN IF NOT EXISTS state_summary TEXT",
@@ -2091,7 +2365,7 @@ class PostgresDatabase:
         execution_data['project_id'] = _validate_uuid(execution_data.get('project_id'))
 
         # 处理 JSON 字段
-        json_fields = ['node_states', 'context', 'intervention_ids']
+        json_fields = ['node_states', 'context', 'intervention_ids', 'resume_cursor']
         for field in json_fields:
             if field in execution_data and execution_data[field] is not None:
                 value = execution_data[field]
@@ -2104,7 +2378,7 @@ class PostgresDatabase:
                     execution_data[field] = json.dumps(value)
 
         # 处理时间字段
-        for field in ['started_at', 'completed_at']:
+        for field in ['started_at', 'completed_at', 'lease_expires_at', 'last_heartbeat_at']:
             if field in execution_data and isinstance(execution_data[field], str):
                 try:
                     execution_data[field] = datetime.fromisoformat(
@@ -2116,15 +2390,46 @@ class PostgresDatabase:
         # 动态构建 SQL
         project_id_sql = "CAST(:project_id AS UUID)" if execution_data.get('project_id') else "NULL"
 
+        execution_data.setdefault('operation_id', None)
+        execution_data.setdefault('trace_id', None)
+        execution_data.setdefault('request_id', None)
+        execution_data.setdefault('request_hash', None)
+        execution_data.setdefault('lease_token', None)
+        execution_data.setdefault('lease_expires_at', None)
+        execution_data.setdefault('last_heartbeat_at', None)
+        execution_data.setdefault('cancel_requested', False)
+        execution_data.setdefault('resume_cursor', {})
+        operation_id_sql = "CAST(:operation_id AS UUID)" if execution_data.get('operation_id') else "NULL"
+        trace_id_sql = "CAST(:trace_id AS UUID)" if execution_data.get('trace_id') else "NULL"
+
         query = """
-        INSERT INTO workflow_executions (id, workflow_id, project_id, status, current_node, node_states, context, intervention_ids, started_at, completed_at, total_duration_ms, error)
-        VALUES (:id, :workflow_id, """ + project_id_sql + """, :status, :current_node, :node_states, :context, :intervention_ids, :started_at, :completed_at, :total_duration_ms, :error)
+        INSERT INTO workflow_executions (
+            id, workflow_id, project_id, operation_id, trace_id, request_id, request_hash,
+            status, current_node, node_states, context, intervention_ids,
+            lease_token, lease_expires_at, last_heartbeat_at, cancel_requested, resume_cursor,
+            started_at, completed_at, total_duration_ms, error
+        )
+        VALUES (
+            :id, :workflow_id, """ + project_id_sql + ", " + operation_id_sql + ", " + trace_id_sql + """, :request_id, :request_hash,
+            :status, :current_node, :node_states, :context, :intervention_ids,
+            :lease_token, :lease_expires_at, :last_heartbeat_at, :cancel_requested, :resume_cursor,
+            :started_at, :completed_at, :total_duration_ms, :error
+        )
         ON CONFLICT (id) DO UPDATE SET
+            operation_id = EXCLUDED.operation_id,
+            trace_id = EXCLUDED.trace_id,
+            request_id = EXCLUDED.request_id,
+            request_hash = EXCLUDED.request_hash,
             status = EXCLUDED.status,
             current_node = EXCLUDED.current_node,
             node_states = EXCLUDED.node_states,
             context = EXCLUDED.context,
             intervention_ids = EXCLUDED.intervention_ids,
+            lease_token = EXCLUDED.lease_token,
+            lease_expires_at = EXCLUDED.lease_expires_at,
+            last_heartbeat_at = EXCLUDED.last_heartbeat_at,
+            cancel_requested = EXCLUDED.cancel_requested,
+            resume_cursor = EXCLUDED.resume_cursor,
             completed_at = EXCLUDED.completed_at,
             total_duration_ms = EXCLUDED.total_duration_ms,
             error = EXCLUDED.error
@@ -2145,6 +2450,1022 @@ class PostgresDatabase:
         query = "SELECT * FROM workflow_executions WHERE id = :id"
         results = await self.execute_query(query, {"id": execution_id})
         return results[0] if results else None
+
+    async def get_active_workflow_execution(
+        self,
+        project_id: str,
+        workflow_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """获取项目/工作流当前活跃执行。"""
+        conditions = ["project_id = :project_id", "status IN ('pending', 'running', 'paused')"]
+        params: Dict[str, Any] = {"project_id": project_id}
+        if workflow_id:
+            conditions.append("workflow_id = :workflow_id")
+            params["workflow_id"] = workflow_id
+
+        query = f"""
+        SELECT * FROM workflow_executions
+        WHERE {' AND '.join(conditions)}
+        ORDER BY started_at DESC
+        LIMIT 1
+        """
+        results = await self.execute_query(query, params)
+        return results[0] if results else None
+
+    async def append_workflow_execution_event(
+        self,
+        execution_id: str,
+        event_type: str,
+        event_data: Dict[str, Any],
+    ) -> int:
+        """追加工作流执行事件并返回 sequence_no。"""
+        if isinstance(event_data, str):
+            payload = event_data
+        else:
+            payload = json.dumps(event_data, default=str)
+        query = """
+        WITH next_seq AS (
+            SELECT COALESCE(MAX(sequence_no), 0) + 1 AS sequence_no
+            FROM workflow_execution_events
+            WHERE execution_id = :execution_id
+        )
+        INSERT INTO workflow_execution_events (execution_id, event_type, event_data, sequence_no)
+        SELECT :execution_id, :event_type, :event_data, sequence_no FROM next_seq
+        RETURNING sequence_no
+        """
+        results = await self.execute_query(
+            query,
+            {"execution_id": execution_id, "event_type": event_type, "event_data": payload},
+        )
+        return int(results[0]["sequence_no"]) if results else 0
+
+    async def get_workflow_execution_events_since(
+        self,
+        execution_id: str,
+        sequence_no: int = 0,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """获取指定序号后的工作流执行事件。"""
+        query = """
+        SELECT * FROM workflow_execution_events
+        WHERE execution_id = :execution_id AND sequence_no > :sequence_no
+        ORDER BY sequence_no ASC
+        LIMIT :limit
+        """
+        return await self.execute_query(
+            query,
+            {"execution_id": execution_id, "sequence_no": sequence_no, "limit": limit},
+        )
+
+    async def save_operation_request(self, operation_data: Dict[str, Any]) -> str:
+        """保存或更新操作请求。"""
+        data = dict(operation_data)
+        data["project_id"] = _validate_uuid(data.get("project_id"))
+        for field in ["response_payload"]:
+            value = data.get(field, {})
+            if isinstance(value, (dict, list)):
+                data[field] = json.dumps(value, default=str)
+        for field in ["lease_expires_at", "last_heartbeat_at", "completed_at"]:
+            if field in data and isinstance(data[field], str):
+                try:
+                    data[field] = datetime.fromisoformat(data[field].replace('Z', '+00:00'))
+                except Exception:
+                    data[field] = None
+        data.setdefault("id", None)
+        data.setdefault("trace_id", None)
+        data.setdefault("resource_type", None)
+        data.setdefault("resource_id", None)
+        data.setdefault("response_payload", {})
+        data.setdefault("error", None)
+        data.setdefault("lease_token", None)
+        data.setdefault("lease_expires_at", None)
+        data.setdefault("last_heartbeat_at", None)
+        data.setdefault("completed_at", None)
+        id_sql = "CAST(:id AS UUID)" if data.get("id") else "gen_random_uuid()"
+        project_id_sql = "CAST(:project_id AS UUID)" if data.get("project_id") else "NULL"
+        trace_id_sql = "CAST(:trace_id AS UUID)" if data.get("trace_id") else "NULL"
+        query = """
+        INSERT INTO operation_requests (
+            id, request_id, operation_type, project_id, resource_type, resource_id,
+            request_hash, trace_id, status, response_payload, error, lease_token,
+            lease_expires_at, last_heartbeat_at, completed_at, updated_at
+        )
+        VALUES (
+            """ + id_sql + """, :request_id, :operation_type, """ + project_id_sql + """, :resource_type, :resource_id,
+            :request_hash, """ + trace_id_sql + """, :status, :response_payload, :error, :lease_token,
+            :lease_expires_at, :last_heartbeat_at, :completed_at, CURRENT_TIMESTAMP
+        )
+        ON CONFLICT (request_id) DO UPDATE SET
+            trace_id = COALESCE(EXCLUDED.trace_id, operation_requests.trace_id),
+            status = EXCLUDED.status,
+            response_payload = EXCLUDED.response_payload,
+            error = EXCLUDED.error,
+            lease_token = EXCLUDED.lease_token,
+            lease_expires_at = EXCLUDED.lease_expires_at,
+            last_heartbeat_at = EXCLUDED.last_heartbeat_at,
+            completed_at = EXCLUDED.completed_at,
+            updated_at = CURRENT_TIMESTAMP
+        RETURNING id
+        """
+        results = await self.execute_query(query, data)
+        return str(results[0]["id"]) if results else str(data.get("id") or "")
+
+    async def get_operation_request_by_request_id(self, request_id: str) -> Optional[Dict[str, Any]]:
+        """按 request_id 获取操作请求。"""
+        results = await self.execute_query(
+            "SELECT * FROM operation_requests WHERE request_id = :request_id",
+            {"request_id": request_id},
+        )
+        return results[0] if results else None
+
+    async def get_active_operation_request(
+        self,
+        operation_type: str,
+        project_id: str,
+        resource_id: Optional[str],
+        request_hash: str,
+    ) -> Optional[Dict[str, Any]]:
+        """按语义哈希查找活跃操作。"""
+        results = await self.execute_query(
+            """
+            SELECT * FROM operation_requests
+            WHERE operation_type = :operation_type
+              AND project_id = :project_id
+              AND COALESCE(resource_id, '') = COALESCE(:resource_id, '')
+              AND request_hash = :request_hash
+              AND status IN ('pending', 'running', 'paused')
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            {
+                "operation_type": operation_type,
+                "project_id": project_id,
+                "resource_id": resource_id,
+                "request_hash": request_hash,
+            },
+        )
+        return results[0] if results else None
+
+    # ==================== Trace 相关操作 ====================
+
+    async def create_execution_trace(self, trace_data: Dict[str, Any]) -> str:
+        """创建或更新执行 Trace。Trace 写入失败不影响主流程。"""
+        data = dict(trace_data)
+        trace_id = data.get("id") or str(uuid_module.uuid4())
+        data["id"] = trace_id
+        data["project_id"] = _validate_uuid(data.get("project_id"))
+        data["operation_id"] = _validate_uuid(data.get("operation_id"))
+        for field in ["root_input_summary", "metadata"]:
+            value = data.get(field, {})
+            if isinstance(value, (dict, list)):
+                data[field] = json.dumps(value, default=str)
+        data.setdefault("request_id", None)
+        data.setdefault("workflow_id", None)
+        data.setdefault("workflow_execution_id", None)
+        data.setdefault("trace_type", "manual")
+        data.setdefault("root_name", None)
+        data.setdefault("status", "running")
+        data.setdefault("started_at", datetime.now())
+        data.setdefault("error", None)
+        project_id_sql = "CAST(:project_id AS UUID)" if data.get("project_id") else "NULL"
+        operation_id_sql = "CAST(:operation_id AS UUID)" if data.get("operation_id") else "NULL"
+        try:
+            await self.execute_write(
+                f"""
+                INSERT INTO execution_traces (
+                    id, project_id, operation_id, request_id, workflow_id, workflow_execution_id,
+                    trace_type, root_name, status, root_input_summary, metadata, started_at, error
+                )
+                VALUES (
+                    CAST(:id AS UUID),
+                    {project_id_sql},
+                    {operation_id_sql},
+                    :request_id, :workflow_id, :workflow_execution_id,
+                    :trace_type, :root_name, :status,
+                    CAST(:root_input_summary AS jsonb), CAST(:metadata AS jsonb), :started_at, :error
+                )
+                ON CONFLICT (id) DO UPDATE SET
+                    project_id = EXCLUDED.project_id,
+                    operation_id = EXCLUDED.operation_id,
+                    request_id = EXCLUDED.request_id,
+                    workflow_id = EXCLUDED.workflow_id,
+                    workflow_execution_id = EXCLUDED.workflow_execution_id,
+                    trace_type = EXCLUDED.trace_type,
+                    root_name = EXCLUDED.root_name,
+                    status = EXCLUDED.status,
+                    root_input_summary = EXCLUDED.root_input_summary,
+                    metadata = EXCLUDED.metadata,
+                    error = EXCLUDED.error
+                """,
+                data,
+            )
+        except Exception as e:
+            logger.warning(f"Trace 创建失败: {e}")
+        return trace_id
+
+    async def finish_execution_trace(self, trace_id: str, status: str, error: Optional[str] = None) -> None:
+        """结束执行 Trace。"""
+        try:
+            await self.execute_write(
+                """
+                UPDATE execution_traces
+                SET status = :status,
+                    ended_at = CURRENT_TIMESTAMP,
+                    duration_ms = CAST(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - started_at)) * 1000 AS INTEGER),
+                    error = :error
+                WHERE id = CAST(:trace_id AS UUID)
+                """,
+                {"trace_id": trace_id, "status": status, "error": error},
+            )
+        except Exception as e:
+            logger.warning(f"Trace 结束失败: {e}")
+
+    async def create_trace_span(self, span_data: Dict[str, Any]) -> str:
+        """创建 Trace span。"""
+        data = dict(span_data)
+        span_id = data.get("id") or str(uuid_module.uuid4())
+        data["id"] = span_id
+        data.setdefault("parent_span_id", None)
+        data.setdefault("status", "running")
+        data.setdefault("workflow_id", None)
+        data.setdefault("workflow_execution_id", None)
+        data.setdefault("node_id", None)
+        data.setdefault("agent_type", None)
+        data.setdefault("attributes", {})
+        data.setdefault("started_at", datetime.now())
+        data.setdefault("error", None)
+        parent_span_id_sql = "CAST(:parent_span_id AS UUID)" if data.get("parent_span_id") else "NULL"
+        if isinstance(data.get("attributes"), (dict, list)):
+            data["attributes"] = json.dumps(data["attributes"], default=str)
+        try:
+            await self.execute_write(
+                f"""
+                INSERT INTO execution_trace_spans (
+                    id, trace_id, parent_span_id, name, kind, status,
+                    workflow_id, workflow_execution_id, node_id, agent_type,
+                    attributes, started_at, error
+                )
+                VALUES (
+                    CAST(:id AS UUID), CAST(:trace_id AS UUID),
+                    {parent_span_id_sql},
+                    :name, :kind, :status,
+                    :workflow_id, :workflow_execution_id, :node_id, :agent_type,
+                    CAST(:attributes AS jsonb), :started_at, :error
+                )
+                ON CONFLICT (id) DO UPDATE SET
+                    status = EXCLUDED.status,
+                    attributes = EXCLUDED.attributes,
+                    error = EXCLUDED.error
+                """,
+                data,
+            )
+        except Exception as e:
+            logger.warning(f"Trace span 创建失败: {e}")
+        return span_id
+
+    async def finish_trace_span(
+        self,
+        span_id: str,
+        status: str,
+        error: Optional[str] = None,
+        attributes: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """结束 Trace span。"""
+        payload = {
+            "span_id": span_id,
+            "status": status,
+            "error": error,
+            "attributes": json.dumps(attributes, default=str) if attributes is not None else None,
+        }
+        try:
+            if attributes is None:
+                await self.execute_write(
+                    """
+                    UPDATE execution_trace_spans
+                    SET status = :status,
+                        ended_at = CURRENT_TIMESTAMP,
+                        duration_ms = CAST(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - started_at)) * 1000 AS INTEGER),
+                        error = :error
+                    WHERE id = CAST(:span_id AS UUID)
+                    """,
+                    payload,
+                )
+            else:
+                await self.execute_write(
+                    """
+                    UPDATE execution_trace_spans
+                    SET status = :status,
+                        ended_at = CURRENT_TIMESTAMP,
+                        duration_ms = CAST(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - started_at)) * 1000 AS INTEGER),
+                        error = :error,
+                        attributes = attributes || CAST(:attributes AS jsonb)
+                    WHERE id = CAST(:span_id AS UUID)
+                    """,
+                    payload,
+                )
+        except Exception as e:
+            logger.warning(f"Trace span 结束失败: {e}")
+
+    async def append_trace_event(self, event_data: Dict[str, Any]) -> Optional[str]:
+        """追加 Trace 事件。"""
+        data = dict(event_data)
+        data.setdefault("span_id", None)
+        data.setdefault("severity", "info")
+        data.setdefault("payload", {})
+        span_id_sql = "CAST(:span_id AS UUID)" if data.get("span_id") else "NULL"
+        if isinstance(data.get("payload"), (dict, list)):
+            data["payload"] = json.dumps(data["payload"], default=str)
+        try:
+            results = await self.execute_query(
+                f"""
+                INSERT INTO execution_trace_events (trace_id, span_id, event_type, severity, payload)
+                VALUES (
+                    CAST(:trace_id AS UUID),
+                    {span_id_sql},
+                    :event_type, :severity, CAST(:payload AS jsonb)
+                )
+                RETURNING id
+                """,
+                data,
+            )
+            return str(results[0]["id"]) if results else None
+        except Exception as e:
+            logger.warning(f"Trace event 写入失败: {e}")
+            return None
+
+    async def save_trace_artifact(self, artifact_data: Dict[str, Any]) -> Optional[str]:
+        """保存 Trace artifact。"""
+        data = dict(artifact_data)
+        data.setdefault("span_id", None)
+        data.setdefault("content_type", "json")
+        data.setdefault("content", None)
+        data.setdefault("text_content", None)
+        data.setdefault("content_hash", None)
+        data.setdefault("size_bytes", None)
+        data.setdefault("redaction_status", "none")
+        span_id_sql = "CAST(:span_id AS UUID)" if data.get("span_id") else "NULL"
+        content_sql = "CAST(:content AS jsonb)" if data.get("content") is not None else "NULL"
+        if isinstance(data.get("content"), (dict, list)):
+            data["content"] = json.dumps(data["content"], default=str)
+        elif data.get("content") is None:
+            data["content"] = None
+        try:
+            results = await self.execute_query(
+                f"""
+                INSERT INTO execution_trace_artifacts (
+                    trace_id, span_id, kind, content_type, content, text_content,
+                    content_hash, size_bytes, redaction_status
+                )
+                VALUES (
+                    CAST(:trace_id AS UUID),
+                    {span_id_sql},
+                    :kind, :content_type,
+                    {content_sql},
+                    :text_content, :content_hash, :size_bytes, :redaction_status
+                )
+                RETURNING id
+                """,
+                data,
+            )
+            return str(results[0]["id"]) if results else None
+        except Exception as e:
+            logger.warning(f"Trace artifact 写入失败: {e}")
+            return None
+
+    async def get_trace_by_execution(self, execution_id: str) -> Optional[Dict[str, Any]]:
+        """按 workflow execution ID 获取 Trace。"""
+        try:
+            results = await self.execute_query(
+                """
+                SELECT * FROM execution_traces
+                WHERE workflow_execution_id = :execution_id
+                ORDER BY started_at DESC
+                LIMIT 1
+                """,
+                {"execution_id": execution_id},
+            )
+            return results[0] if results else None
+        except Exception as e:
+            logger.warning(f"读取 execution Trace 失败: {e}")
+            return None
+
+    async def get_execution_trace(self, trace_id: str) -> Optional[Dict[str, Any]]:
+        """按 Trace ID 获取 Trace。"""
+        try:
+            results = await self.execute_query(
+                "SELECT * FROM execution_traces WHERE id = CAST(:trace_id AS UUID)",
+                {"trace_id": trace_id},
+            )
+            return results[0] if results else None
+        except Exception as e:
+            logger.warning(f"读取 Trace 失败: {e}")
+            return None
+
+    async def get_trace_spans(self, trace_id: str) -> List[Dict[str, Any]]:
+        """获取 Trace spans。"""
+        try:
+            return await self.execute_query(
+                """
+                SELECT * FROM execution_trace_spans
+                WHERE trace_id = CAST(:trace_id AS UUID)
+                ORDER BY started_at ASC
+                """,
+                {"trace_id": trace_id},
+            )
+        except Exception as e:
+            logger.warning(f"读取 Trace spans 失败: {e}")
+            return []
+
+    async def get_trace_events(self, trace_id: str, limit: int = 200) -> List[Dict[str, Any]]:
+        """获取 Trace events。"""
+        try:
+            return await self.execute_query(
+                """
+                SELECT * FROM execution_trace_events
+                WHERE trace_id = CAST(:trace_id AS UUID)
+                ORDER BY sequence ASC
+                LIMIT :limit
+                """,
+                {"trace_id": trace_id, "limit": limit},
+            )
+        except Exception as e:
+            logger.warning(f"读取 Trace events 失败: {e}")
+            return []
+
+    async def get_trace_artifacts(self, trace_id: str, span_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """获取 Trace artifacts。"""
+        try:
+            if span_id:
+                return await self.execute_query(
+                    """
+                    SELECT * FROM execution_trace_artifacts
+                    WHERE trace_id = CAST(:trace_id AS UUID) AND span_id = CAST(:span_id AS UUID)
+                    ORDER BY created_at ASC
+                    """,
+                    {"trace_id": trace_id, "span_id": span_id},
+                )
+            return await self.execute_query(
+                """
+                SELECT * FROM execution_trace_artifacts
+                WHERE trace_id = CAST(:trace_id AS UUID)
+                ORDER BY created_at ASC
+                """,
+                {"trace_id": trace_id},
+            )
+        except Exception as e:
+            logger.warning(f"读取 Trace artifacts 失败: {e}")
+            return []
+
+    async def save_bootstrap_session(self, session_data: Dict[str, Any]) -> str:
+        """保存或更新 Bootstrap 会话快照。"""
+        data = dict(session_data)
+        data["project_id"] = _validate_uuid(data.get("project_id"))
+        for field in ["setting_agent_history", "extracted_seed", "confirmed_seed"]:
+            value = data.get(field, [] if field == "setting_agent_history" else {})
+            if isinstance(value, (dict, list)):
+                data[field] = json.dumps(value, default=str)
+        for field in ["created_at", "updated_at", "completed_at"]:
+            if field in data and isinstance(data[field], str):
+                try:
+                    data[field] = datetime.fromisoformat(data[field].replace('Z', '+00:00'))
+                except Exception:
+                    data[field] = None
+        query = """
+        INSERT INTO bootstrap_sessions (
+            id, project_id, status, current_stage, progress, setting_agent_history,
+            extracted_seed, confirmed_seed, error_message, retry_count,
+            created_at, updated_at, completed_at
+        )
+        VALUES (
+            :id, CAST(:project_id AS UUID), :status, :current_stage, :progress,
+            :setting_agent_history, :extracted_seed, :confirmed_seed, :error_message,
+            :retry_count, :created_at, :updated_at, :completed_at
+        )
+        ON CONFLICT (id) DO UPDATE SET
+            status = EXCLUDED.status,
+            current_stage = EXCLUDED.current_stage,
+            progress = EXCLUDED.progress,
+            setting_agent_history = EXCLUDED.setting_agent_history,
+            extracted_seed = EXCLUDED.extracted_seed,
+            confirmed_seed = EXCLUDED.confirmed_seed,
+            error_message = EXCLUDED.error_message,
+            retry_count = EXCLUDED.retry_count,
+            updated_at = EXCLUDED.updated_at,
+            completed_at = EXCLUDED.completed_at
+        RETURNING id
+        """
+        results = await self.execute_query(query, data)
+        return str(results[0]["id"]) if results else str(data.get("id"))
+
+    async def get_bootstrap_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """按 ID 获取 Bootstrap 会话。"""
+        results = await self.execute_query(
+            "SELECT * FROM bootstrap_sessions WHERE id = :id",
+            {"id": session_id},
+        )
+        return results[0] if results else None
+
+    async def get_active_bootstrap_session(self, project_id: str) -> Optional[Dict[str, Any]]:
+        """获取项目当前未结束 Bootstrap 会话。"""
+        results = await self.execute_query(
+            """
+            SELECT * FROM bootstrap_sessions
+            WHERE project_id = CAST(:project_id AS UUID)
+              AND status NOT IN ('completed', 'failed')
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            {"project_id": project_id},
+        )
+        return results[0] if results else None
+
+    # ==================== 关系图投影任务操作 ====================
+
+    async def upsert_graph_projection_job(self, job_data: Dict[str, Any]) -> str:
+        """保存或更新关系图投影任务，按 idempotency_key 幂等。"""
+        data = dict(job_data)
+        data["project_id"] = _validate_uuid(data.get("project_id"))
+        payload = data.get("payload") or {}
+        if isinstance(payload, str):
+            try:
+                json.loads(payload)
+            except (json.JSONDecodeError, TypeError):
+                payload = {}
+        if isinstance(payload, (dict, list)):
+            data["payload"] = json.dumps(payload, default=str)
+        elif payload is None:
+            data["payload"] = "{}"
+
+        data.setdefault("operation", "upsert")
+        data.setdefault("status", "queued")
+        data.setdefault("attempt_count", 0)
+        data.setdefault("last_error", None)
+        data.setdefault("available_at", None)
+        data.setdefault("next_attempt_at", None)
+        data.setdefault("processed_at", None)
+        for field in ["available_at", "next_attempt_at", "processed_at"]:
+            if isinstance(data.get(field), str):
+                try:
+                    data[field] = datetime.fromisoformat(data[field].replace('Z', '+00:00'))
+                except Exception:
+                    data[field] = None
+
+        query = """
+        INSERT INTO graph_projection_jobs (
+            idempotency_key, project_id, source_entity_type, source_entity_id,
+            projection_type, operation, payload, content_hash, status,
+            attempt_count, last_error, available_at, next_attempt_at, processed_at, updated_at
+        )
+        VALUES (
+            :idempotency_key, CAST(:project_id AS UUID), :source_entity_type, :source_entity_id,
+            :projection_type, :operation, :payload, :content_hash, :status,
+            :attempt_count, :last_error, :available_at, :next_attempt_at, :processed_at, CURRENT_TIMESTAMP
+        )
+        ON CONFLICT (idempotency_key) DO UPDATE SET
+            project_id = EXCLUDED.project_id,
+            source_entity_type = EXCLUDED.source_entity_type,
+            source_entity_id = EXCLUDED.source_entity_id,
+            projection_type = EXCLUDED.projection_type,
+            operation = EXCLUDED.operation,
+            payload = EXCLUDED.payload,
+            content_hash = EXCLUDED.content_hash,
+            status = CASE
+                WHEN graph_projection_jobs.content_hash IS DISTINCT FROM EXCLUDED.content_hash THEN 'queued'
+                WHEN graph_projection_jobs.status = 'completed' THEN graph_projection_jobs.status
+                ELSE EXCLUDED.status
+            END,
+            attempt_count = CASE
+                WHEN graph_projection_jobs.content_hash IS DISTINCT FROM EXCLUDED.content_hash THEN 0
+                ELSE graph_projection_jobs.attempt_count
+            END,
+            last_error = NULL,
+            available_at = EXCLUDED.available_at,
+            next_attempt_at = EXCLUDED.next_attempt_at,
+            processed_at = CASE
+                WHEN graph_projection_jobs.content_hash IS DISTINCT FROM EXCLUDED.content_hash THEN NULL
+                ELSE graph_projection_jobs.processed_at
+            END,
+            updated_at = CURRENT_TIMESTAMP
+        RETURNING id
+        """
+        results = await self.execute_query(query, data)
+        return str(results[0]["id"]) if results else ""
+
+    async def get_graph_projection_job_by_key(self, idempotency_key: str) -> Optional[Dict[str, Any]]:
+        """按幂等 key 获取关系图投影任务。"""
+        results = await self.execute_query(
+            "SELECT * FROM graph_projection_jobs WHERE idempotency_key = :idempotency_key",
+            {"idempotency_key": idempotency_key},
+        )
+        return results[0] if results else None
+
+    async def list_graph_projection_jobs(
+        self,
+        project_id: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """列出关系图投影任务，用于状态查询和后续 worker 消费。"""
+        conditions = []
+        params: Dict[str, Any] = {"limit": limit}
+        if project_id:
+            conditions.append("project_id = CAST(:project_id AS UUID)")
+            params["project_id"] = _validate_uuid(project_id)
+        if status:
+            conditions.append("status = :status")
+            params["status"] = status
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        return await self.execute_query(
+            f"""
+            SELECT * FROM graph_projection_jobs
+            {where_clause}
+            ORDER BY created_at DESC
+            LIMIT :limit
+            """,
+            params,
+        )
+
+    async def claim_graph_projection_jobs(
+        self,
+        worker_id: str,
+        limit: int = 100,
+        lease_seconds: int = 60,
+    ) -> List[Dict[str, Any]]:
+        """原子领取待处理的关系图投影任务。"""
+        query = """
+        WITH due_jobs AS (
+            SELECT id
+            FROM graph_projection_jobs
+            WHERE (
+                status = 'queued'
+                AND (next_attempt_at IS NULL OR next_attempt_at <= CURRENT_TIMESTAMP)
+            ) OR (
+                status = 'processing'
+                AND lease_expires_at IS NOT NULL
+                AND lease_expires_at < CURRENT_TIMESTAMP
+            )
+            ORDER BY created_at ASC
+            LIMIT :limit
+            FOR UPDATE SKIP LOCKED
+        )
+        UPDATE graph_projection_jobs jobs
+        SET status = 'processing',
+            worker_id = :worker_id,
+            claimed_at = CURRENT_TIMESTAMP,
+            lease_expires_at = CURRENT_TIMESTAMP + (:lease_seconds * INTERVAL '1 second'),
+            updated_at = CURRENT_TIMESTAMP
+        FROM due_jobs
+        WHERE jobs.id = due_jobs.id
+        RETURNING jobs.*
+        """
+        return await self.execute_query(
+            query,
+            {
+                "worker_id": worker_id,
+                "limit": limit,
+                "lease_seconds": lease_seconds,
+            },
+        )
+
+    async def mark_graph_projection_job_completed(self, job_id: str, worker_id: str) -> bool:
+        """标记关系图投影任务完成。"""
+        query = """
+        UPDATE graph_projection_jobs
+        SET status = 'completed',
+            last_error = NULL,
+            worker_id = NULL,
+            claimed_at = NULL,
+            lease_expires_at = NULL,
+            processed_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = CAST(:job_id AS UUID)
+          AND worker_id = :worker_id
+          AND status = 'processing'
+        """
+        return await self.execute_write(query, {"job_id": job_id, "worker_id": worker_id}) > 0
+
+    async def mark_graph_projection_job_retry(
+        self,
+        job_id: str,
+        worker_id: str,
+        error: str,
+        retry_in_seconds: int,
+    ) -> bool:
+        """释放关系图投影任务并安排重试。"""
+        query = """
+        UPDATE graph_projection_jobs
+        SET status = 'queued',
+            attempt_count = attempt_count + 1,
+            last_error = :error,
+            worker_id = NULL,
+            claimed_at = NULL,
+            lease_expires_at = NULL,
+            next_attempt_at = CURRENT_TIMESTAMP + (:retry_in_seconds * INTERVAL '1 second'),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = CAST(:job_id AS UUID)
+          AND worker_id = :worker_id
+          AND status = 'processing'
+        """
+        return await self.execute_write(
+            query,
+            {
+                "job_id": job_id,
+                "worker_id": worker_id,
+                "error": error[:2000],
+                "retry_in_seconds": retry_in_seconds,
+            },
+        ) > 0
+
+    async def mark_graph_projection_job_failed(
+        self,
+        job_id: str,
+        worker_id: str,
+        error: str,
+    ) -> bool:
+        """标记关系图投影任务永久失败。"""
+        query = """
+        UPDATE graph_projection_jobs
+        SET status = 'failed',
+            attempt_count = attempt_count + 1,
+            last_error = :error,
+            worker_id = NULL,
+            claimed_at = NULL,
+            lease_expires_at = NULL,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = CAST(:job_id AS UUID)
+          AND worker_id = :worker_id
+          AND status = 'processing'
+        """
+        return await self.execute_write(
+            query,
+            {
+                "job_id": job_id,
+                "worker_id": worker_id,
+                "error": error[:2000],
+            },
+        ) > 0
+
+    async def save_setting_agent_session(self, session_data: Dict[str, Any]) -> str:
+        """保存或更新 Setting Agent 会话。"""
+        data = dict(session_data)
+        data["project_id"] = _validate_uuid(data.get("project_id"))
+        for field in [
+            "conversation_snapshot",
+            "pending_conflicts",
+            "cached_pending_lores",
+            "cached_pending_characters",
+            "cached_pending_hooks",
+            "cached_context_sections",
+        ]:
+            value = data.get(field, [] if field != "cached_context_sections" else {})
+            if isinstance(value, str):
+                try:
+                    json.loads(value)
+                except (json.JSONDecodeError, TypeError):
+                    value = [] if field != "cached_context_sections" else {}
+            if isinstance(value, (dict, list)):
+                data[field] = json.dumps(value, default=str)
+            elif value is None:
+                data[field] = "[]" if field != "cached_context_sections" else "{}"
+        for field in ["created_at", "updated_at", "last_activity_at"]:
+            if isinstance(data.get(field), str):
+                try:
+                    data[field] = datetime.fromisoformat(data[field].replace('Z', '+00:00'))
+                except Exception:
+                    data[field] = None
+        data.setdefault("status", "active")
+        data.setdefault("conversation_snapshot", "[]")
+        data.setdefault("pending_conflicts", "[]")
+        data.setdefault("cached_pending_lores", "[]")
+        data.setdefault("cached_pending_characters", "[]")
+        data.setdefault("cached_pending_hooks", "[]")
+        data.setdefault("cached_context_sections", "{}")
+        data.setdefault("full_context_loaded", False)
+        data.setdefault("created_at", datetime.now())
+        data.setdefault("updated_at", datetime.now())
+        data.setdefault("last_activity_at", datetime.now())
+        query = """
+        INSERT INTO setting_agent_sessions (
+            id, project_id, mode, status, conversation_snapshot, pending_conflicts,
+            cached_pending_lores, cached_pending_characters, cached_pending_hooks,
+            cached_context_sections, full_context_loaded, last_activity_at, created_at, updated_at
+        )
+        VALUES (
+            :id, CAST(:project_id AS UUID), :mode, :status, :conversation_snapshot, :pending_conflicts,
+            :cached_pending_lores, :cached_pending_characters, :cached_pending_hooks,
+            :cached_context_sections, :full_context_loaded, :last_activity_at, :created_at, :updated_at
+        )
+        ON CONFLICT (id) DO UPDATE SET
+            mode = EXCLUDED.mode,
+            status = EXCLUDED.status,
+            conversation_snapshot = EXCLUDED.conversation_snapshot,
+            pending_conflicts = EXCLUDED.pending_conflicts,
+            cached_pending_lores = EXCLUDED.cached_pending_lores,
+            cached_pending_characters = EXCLUDED.cached_pending_characters,
+            cached_pending_hooks = EXCLUDED.cached_pending_hooks,
+            cached_context_sections = EXCLUDED.cached_context_sections,
+            full_context_loaded = EXCLUDED.full_context_loaded,
+            last_activity_at = EXCLUDED.last_activity_at,
+            updated_at = CURRENT_TIMESTAMP
+        """
+        await self.execute_write(query, data)
+        return data["id"]
+
+    async def get_setting_agent_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """按 ID 获取 Setting Agent 会话。"""
+        results = await self.execute_query(
+            "SELECT * FROM setting_agent_sessions WHERE id = :id",
+            {"id": session_id},
+        )
+        return results[0] if results else None
+
+    async def get_active_setting_agent_session(
+        self,
+        project_id: str,
+        mode: str,
+    ) -> Optional[Dict[str, Any]]:
+        """获取项目指定模式的活跃 Setting Agent 会话。"""
+        results = await self.execute_query(
+            """
+            SELECT * FROM setting_agent_sessions
+            WHERE project_id = CAST(:project_id AS UUID)
+              AND mode = :mode
+              AND status = 'active'
+            ORDER BY last_activity_at DESC NULLS LAST, created_at DESC
+            LIMIT 1
+            """,
+            {"project_id": project_id, "mode": mode},
+        )
+        return results[0] if results else None
+
+    async def append_setting_agent_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        request_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """追加 Setting Agent 消息；带 request_id 时按角色幂等。"""
+        payload = json.dumps(metadata or {}, default=str)
+        query = """
+        INSERT INTO setting_agent_messages (session_id, request_id, role, content, metadata)
+        VALUES (:session_id, :request_id, :role, :content, :metadata)
+        ON CONFLICT (session_id, request_id, role) WHERE request_id IS NOT NULL DO UPDATE SET
+            content = EXCLUDED.content,
+            metadata = EXCLUDED.metadata
+        RETURNING id
+        """
+        results = await self.execute_query(
+            query,
+            {
+                "session_id": session_id,
+                "request_id": request_id,
+                "role": role,
+                "content": content,
+                "metadata": payload,
+            },
+        )
+        return str(results[0]["id"]) if results else ""
+
+    async def get_setting_agent_messages(
+        self,
+        session_id: str,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """获取 Setting Agent 会话消息。"""
+        return await self.execute_query(
+            """
+            SELECT * FROM setting_agent_messages
+            WHERE session_id = :session_id
+            ORDER BY created_at ASC
+            LIMIT :limit
+            """,
+            {"session_id": session_id, "limit": limit},
+        )
+
+    async def get_setting_agent_message_by_request(
+        self,
+        session_id: str,
+        request_id: str,
+        role: str = "assistant",
+    ) -> Optional[Dict[str, Any]]:
+        """按 request_id 和角色获取 Setting Agent 消息。"""
+        results = await self.execute_query(
+            """
+            SELECT * FROM setting_agent_messages
+            WHERE session_id = :session_id AND request_id = :request_id AND role = :role
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            {"session_id": session_id, "request_id": request_id, "role": role},
+        )
+        return results[0] if results else None
+
+    async def upsert_setting_agent_pending_item(
+        self,
+        session_id: str,
+        item_type: str,
+        fingerprint: str,
+        payload: Dict[str, Any],
+        request_id: Optional[str] = None,
+        status: str = "pending",
+        saved_ref_id: Optional[str] = None,
+    ) -> str:
+        """保存 Setting Agent 待确认项，按 fingerprint 幂等。"""
+        query = """
+        INSERT INTO setting_agent_pending_items (
+            session_id, request_id, item_type, fingerprint, payload, status, saved_ref_id, updated_at
+        )
+        VALUES (
+            :session_id, :request_id, :item_type, :fingerprint, :payload, :status, :saved_ref_id, CURRENT_TIMESTAMP
+        )
+        ON CONFLICT (session_id, item_type, fingerprint) DO UPDATE SET
+            request_id = COALESCE(EXCLUDED.request_id, setting_agent_pending_items.request_id),
+            payload = EXCLUDED.payload,
+            status = EXCLUDED.status,
+            saved_ref_id = EXCLUDED.saved_ref_id,
+            updated_at = CURRENT_TIMESTAMP
+        RETURNING id
+        """
+        results = await self.execute_query(
+            query,
+            {
+                "session_id": session_id,
+                "request_id": request_id,
+                "item_type": item_type,
+                "fingerprint": fingerprint,
+                "payload": json.dumps(payload, default=str),
+                "status": status,
+                "saved_ref_id": saved_ref_id,
+            },
+        )
+        return str(results[0]["id"]) if results else ""
+
+    async def get_setting_agent_pending_items(
+        self,
+        session_id: str,
+        status: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """获取 Setting Agent 待确认项。"""
+        conditions = ["session_id = :session_id"]
+        params: Dict[str, Any] = {"session_id": session_id}
+        if status:
+            conditions.append("status = :status")
+            params["status"] = status
+        return await self.execute_query(
+            f"""
+            SELECT * FROM setting_agent_pending_items
+            WHERE {' AND '.join(conditions)}
+            ORDER BY created_at ASC
+            """,
+            params,
+        )
+
+    async def get_setting_agent_pending_item(
+        self,
+        session_id: str,
+        item_type: str,
+        fingerprint: str,
+    ) -> Optional[Dict[str, Any]]:
+        """按 fingerprint 获取 Setting Agent 待确认项。"""
+        results = await self.execute_query(
+            """
+            SELECT * FROM setting_agent_pending_items
+            WHERE session_id = :session_id
+              AND item_type = :item_type
+              AND fingerprint = :fingerprint
+            LIMIT 1
+            """,
+            {
+                "session_id": session_id,
+                "item_type": item_type,
+                "fingerprint": fingerprint,
+            },
+        )
+        return results[0] if results else None
+
+    async def mark_setting_agent_pending_item_saved(
+        self,
+        session_id: str,
+        item_type: str,
+        fingerprint: str,
+        saved_ref_id: str,
+    ) -> None:
+        """标记 Setting Agent 待确认项已落库。"""
+        await self.execute_write(
+            """
+            UPDATE setting_agent_pending_items
+            SET status = 'saved', saved_ref_id = :saved_ref_id, updated_at = CURRENT_TIMESTAMP
+            WHERE session_id = :session_id AND item_type = :item_type AND fingerprint = :fingerprint
+            """,
+            {
+                "session_id": session_id,
+                "item_type": item_type,
+                "fingerprint": fingerprint,
+                "saved_ref_id": saved_ref_id,
+            },
+        )
 
     async def get_workflow_executions_by_project(
         self,

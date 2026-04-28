@@ -536,6 +536,7 @@ class DatabaseManager:
             self.data_dir,
             self.data_dir / "postgres",
             self.data_dir / "qdrant",
+            self.data_dir / "redis",
             self.data_dir / "nebula" / "meta",
             self.data_dir / "nebula" / "storage",
             self.init_sql_dir,
@@ -1508,6 +1509,32 @@ CREATE TABLE IF NOT EXISTS skill_call_records (
 CREATE INDEX idx_skill_call_records_skill ON skill_call_records(skill_id);
 CREATE INDEX idx_skill_call_records_project ON skill_call_records(project_id);
 
+-- ================== 操作幂等请求表 ==================
+CREATE TABLE IF NOT EXISTS operation_requests (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    request_id TEXT NOT NULL UNIQUE,
+    operation_type TEXT NOT NULL,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    resource_type TEXT,
+    resource_id TEXT,
+    request_hash TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    response_payload JSONB DEFAULT '{}',
+    error TEXT,
+    lease_token TEXT,
+    lease_expires_at TIMESTAMP WITH TIME ZONE,
+    last_heartbeat_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE INDEX idx_operation_requests_project ON operation_requests(project_id);
+CREATE INDEX idx_operation_requests_resource ON operation_requests(operation_type, project_id, resource_id);
+CREATE UNIQUE INDEX idx_operation_requests_active_hash
+    ON operation_requests(operation_type, project_id, resource_id, request_hash)
+    WHERE status IN ('pending', 'running', 'paused');
+
 -- ================== 工作流定义表 ==================
 CREATE TABLE IF NOT EXISTS workflow_definitions (
     id VARCHAR(64) PRIMARY KEY,
@@ -1530,11 +1557,19 @@ CREATE TABLE IF NOT EXISTS workflow_executions (
     id VARCHAR(64) PRIMARY KEY,
     workflow_id VARCHAR(64) REFERENCES workflow_definitions(id) ON DELETE CASCADE,
     project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    operation_id UUID REFERENCES operation_requests(id) ON DELETE SET NULL,
+    request_id TEXT,
+    request_hash TEXT,
     status VARCHAR(50) DEFAULT 'pending',
     current_node VARCHAR(64),
     node_states JSONB DEFAULT '{}',
     context JSONB DEFAULT '{}',
     intervention_ids JSONB DEFAULT '[]',
+    lease_token TEXT,
+    lease_expires_at TIMESTAMP WITH TIME ZONE,
+    last_heartbeat_at TIMESTAMP WITH TIME ZONE,
+    cancel_requested BOOLEAN DEFAULT FALSE,
+    resume_cursor JSONB DEFAULT '{}',
     started_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     completed_at TIMESTAMP WITH TIME ZONE,
     total_duration_ms INTEGER,
@@ -1544,6 +1579,95 @@ CREATE TABLE IF NOT EXISTS workflow_executions (
 CREATE INDEX idx_workflow_executions_workflow ON workflow_executions(workflow_id);
 CREATE INDEX idx_workflow_executions_project ON workflow_executions(project_id);
 CREATE INDEX idx_workflow_executions_status ON workflow_executions(status);
+CREATE INDEX idx_workflow_executions_project_workflow_status ON workflow_executions(project_id, workflow_id, status);
+CREATE INDEX idx_workflow_executions_request ON workflow_executions(request_id);
+
+-- ================== 工作流执行事件表 ==================
+CREATE TABLE IF NOT EXISTS workflow_execution_events (
+    id BIGSERIAL PRIMARY KEY,
+    execution_id VARCHAR(64) REFERENCES workflow_executions(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    event_data JSONB DEFAULT '{}',
+    sequence_no BIGINT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX idx_workflow_execution_events_sequence ON workflow_execution_events(execution_id, sequence_no);
+CREATE INDEX idx_workflow_execution_events_created ON workflow_execution_events(execution_id, created_at);
+
+-- ================== Bootstrap 会话表 ==================
+CREATE TABLE IF NOT EXISTS bootstrap_sessions (
+    id TEXT PRIMARY KEY,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    current_stage TEXT NOT NULL,
+    progress DOUBLE PRECISION DEFAULT 0,
+    setting_agent_history JSONB DEFAULT '[]',
+    extracted_seed JSONB DEFAULT '{}',
+    confirmed_seed JSONB DEFAULT '{}',
+    error_message TEXT,
+    retry_count INTEGER DEFAULT 0,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE INDEX IF NOT EXISTS idx_bootstrap_sessions_project ON bootstrap_sessions(project_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bootstrap_sessions_active_project
+    ON bootstrap_sessions(project_id)
+    WHERE status NOT IN ('completed', 'failed');
+
+-- ================== Setting Agent 会话表 ==================
+CREATE TABLE IF NOT EXISTS setting_agent_sessions (
+    id TEXT PRIMARY KEY,
+    project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+    mode TEXT NOT NULL,
+    status TEXT DEFAULT 'active',
+    conversation_snapshot JSONB DEFAULT '[]',
+    pending_conflicts JSONB DEFAULT '[]',
+    cached_pending_lores JSONB DEFAULT '[]',
+    cached_pending_characters JSONB DEFAULT '[]',
+    cached_pending_hooks JSONB DEFAULT '[]',
+    cached_context_sections JSONB DEFAULT '{}',
+    full_context_loaded BOOLEAN DEFAULT FALSE,
+    last_activity_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_setting_agent_sessions_project ON setting_agent_sessions(project_id);
+CREATE UNIQUE INDEX idx_setting_agent_sessions_active_project_mode ON setting_agent_sessions(project_id, mode) WHERE status = 'active';
+
+-- ================== Setting Agent 消息表 ==================
+CREATE TABLE IF NOT EXISTS setting_agent_messages (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    session_id TEXT REFERENCES setting_agent_sessions(id) ON DELETE CASCADE,
+    request_id TEXT,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    metadata JSONB DEFAULT '{}',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_setting_agent_messages_session_created ON setting_agent_messages(session_id, created_at);
+CREATE UNIQUE INDEX idx_setting_agent_messages_request_role ON setting_agent_messages(session_id, request_id, role) WHERE request_id IS NOT NULL;
+
+-- ================== Setting Agent 待确认项表 ==================
+CREATE TABLE IF NOT EXISTS setting_agent_pending_items (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    session_id TEXT REFERENCES setting_agent_sessions(id) ON DELETE CASCADE,
+    request_id TEXT,
+    item_type TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    payload JSONB NOT NULL DEFAULT '{}',
+    status TEXT DEFAULT 'pending',
+    saved_ref_id TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_setting_agent_pending_items_session ON setting_agent_pending_items(session_id, status);
+CREATE UNIQUE INDEX idx_setting_agent_pending_items_fingerprint ON setting_agent_pending_items(session_id, item_type, fingerprint);
 
 -- ================== 更新时间触发器 ==================
 CREATE OR REPLACE FUNCTION update_updated_at()
@@ -1642,6 +1766,22 @@ SELECT 'Database initialization completed!' AS status;
       retries: 5
     environment:
       QDRANT__LOG_LEVEL: INFO
+
+  # Redis 操作缓存与运行中租约
+  redis:
+    image: redis:7-alpine
+    container_name: godview-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./data/redis:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   # NebulaGraph 图数据库
   nebula:
@@ -1774,7 +1914,7 @@ networks:
         if include_nebula:
             cmd = compose_cmd + ['up', '-d']
         else:
-            cmd = compose_cmd + ['up', '-d', 'postgres', 'qdrant']
+            cmd = compose_cmd + ['up', '-d', 'postgres', 'qdrant', 'redis']
 
         # 首次启动可能需要拉取镜像，不捕获输出以显示进度
         print_info("正在启动数据库服务（首次启动需要拉取镜像，请耐心等待）...")
@@ -1861,6 +2001,19 @@ networks:
                 time.sleep(1)
         else:
             print_warning("Qdrant 启动超时")
+
+        # 等待 Redis
+        for i in range(30):
+            success, _ = run_command(
+                ['docker', 'exec', 'godview-redis', 'redis-cli', 'ping'],
+                capture=True
+            )
+            if success:
+                print_success("Redis 就绪")
+                break
+            time.sleep(1)
+        else:
+            print_warning("Redis 启动超时")
 
     def init_qdrant_collections(self) -> bool:
         """初始化 Qdrant 向量集合"""

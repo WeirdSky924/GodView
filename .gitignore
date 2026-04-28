@@ -56,6 +56,9 @@ frontend/build/
 # Vite 缓存
 frontend/.vite/
 
+# TypeScript 增量编译缓存
+*.tsbuildinfo
+
 # ======================== 数据库和数据 ========================
 # 本地数据目录（Docker 持久化）
 data/
@@ -147,4 +150,7 @@ dmypy.json
 
 # Claude Code 本地设置
 .claude/
+
+# Playwright MCP 临时快照
+.playwright-mcp/
 migrations/

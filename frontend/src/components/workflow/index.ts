@@ -10,6 +10,7 @@ export { default as ParallelNode } from './ParallelNode'
 export { default as NodePanel } from './NodePanel'
 export { default as PropertyPanel } from './PropertyPanel'
 export { default as WorkflowMonitor } from './WorkflowMonitor'
+export { default as WorkflowTrace } from './WorkflowTrace'
 export { default as AgentChat } from './AgentChat'
 export { default as InterventionLog } from './InterventionLog'
 

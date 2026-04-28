@@ -71,6 +71,7 @@ async def list_worlds(
 async def update_world(world_id: str, world: World):
     """更新世界数据"""
     from app.api.app import postgres_db
+    from app.services.graph_projection_service import enqueue_graph_projection_best_effort
     from datetime import datetime
 
     logger.info(f"[Worlds] 收到更新请求: world_id={world_id}")
@@ -95,6 +96,7 @@ async def update_world(world_id: str, world: World):
 
     try:
         await postgres_db.save_world(world_data)
+        await enqueue_graph_projection_best_effort("world", world_data)
         logger.info(f"[Worlds] 世界 '{world.name}' 更新成功")
         return {"success": True, "id": world_id, "message": f"世界 '{world.name}' 更新成功"}
     except Exception as e:
@@ -150,6 +152,7 @@ async def create_world(world: World):
         Dict: 创建结果
     """
     from app.api.app import postgres_db
+    from app.services.graph_projection_service import enqueue_graph_projection_best_effort
     import uuid
     from datetime import datetime
 
@@ -169,6 +172,7 @@ async def create_world(world: World):
 
     try:
         await postgres_db.save_world(world_data)
+        await enqueue_graph_projection_best_effort("world", world_data)
         return {
             "success": True,
             "id": world_data["id"],
@@ -212,6 +216,7 @@ async def create_region(world_id: str, region: Region):
         Dict: 创建结果
     """
     from app.api.app import postgres_db
+    from app.services.graph_projection_service import enqueue_graph_projection_best_effort
 
     if not postgres_db:
         raise HTTPException(status_code=503, detail="数据库未连接")
@@ -222,6 +227,7 @@ async def create_region(world_id: str, region: Region):
 
     try:
         await postgres_db.save_region(region_data)
+        await enqueue_graph_projection_best_effort("region", region_data)
         return {
             "success": True,
             "id": region_data["id"],
@@ -247,6 +253,7 @@ async def get_region(world_id: str, region_id: str):
 async def update_region(world_id: str, region_id: str, region: Region):
     """更新区域"""
     from app.api.app import postgres_db
+    from app.services.graph_projection_service import enqueue_graph_projection_best_effort
     from datetime import datetime
 
     if not postgres_db:
@@ -261,6 +268,7 @@ async def update_region(world_id: str, region_id: str, region: Region):
 
     try:
         await postgres_db.save_region(region_data)
+        await enqueue_graph_projection_best_effort("region", region_data)
         return {"success": True, "id": region_id, "message": f"区域 '{region.name}' 更新成功"}
     except Exception as e:
         logger.error(f"更新区域失败：{e}")

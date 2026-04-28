@@ -55,6 +55,7 @@ async def start_bootstrap(request: StartBootstrapRequest):
         session = await orchestrator.create_session(
             project_id=request.project_id,
             initial_message=request.initial_message,
+            request_id=request.request_id,
         )
         return {
             "success": True,
@@ -276,7 +277,7 @@ async def revise_seed(session_id: str, request: ReviseSeedRequest):
 # ==================== 执行 Bootstrap ====================
 
 @router.post("/{session_id}/run", response_model=Dict[str, Any])
-async def run_bootstrap(session_id: str):
+async def run_bootstrap(session_id: str, body: Optional[Dict[str, Any]] = Body(default=None)):
     """
     执行 Bootstrap
 
@@ -290,11 +291,11 @@ async def run_bootstrap(session_id: str):
 
     try:
         orchestrator = get_bootstrap_orchestrator()
-        result = await orchestrator.run_bootstrap(session_id)
+        request_id = body.get("request_id") if body else None
+        result = await orchestrator.run_bootstrap(session_id, request_id=request_id)
 
         return {
-            "success": True,
-            "message": "Bootstrap 执行完成",
+            **result,
             "result": result,
         }
     except Exception as e:

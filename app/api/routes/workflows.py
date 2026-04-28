@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 
 from app.models.workflow_definition import (
     WorkflowDefinition,
@@ -59,6 +60,14 @@ def set_workflow_engine(engine):
     """设置工作流引擎实例"""
     global _workflow_engine
     _workflow_engine = engine
+
+
+class WorkflowExecuteRequest(BaseModel):
+    """工作流执行请求，兼容旧版裸 initial_context body。"""
+
+    initial_context: Dict[str, Any] = Field(default_factory=dict)
+    request_id: Optional[str] = None
+    force_new: bool = False
 
 
 def _format_sse(event_name: str, payload: Dict[str, Any]) -> str:
@@ -215,6 +224,75 @@ async def stream_execution_events(request: Request, execution_id: str):
 
 
 
+@router.get("/executions/{execution_id}/trace", response_model=Dict[str, Any])
+async def get_execution_trace(execution_id: str):
+    """获取指定 workflow execution 的完整 Trace 摘要。"""
+    db = get_db()
+    if not db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+
+    trace = await db.get_trace_by_execution(execution_id)
+    if not trace:
+        return {"success": True, "trace": None, "spans": [], "events": [], "artifacts": []}
+
+    trace_id = str(trace["id"])
+    spans = await db.get_trace_spans(trace_id)
+    events = await db.get_trace_events(trace_id, limit=200)
+    artifacts = await db.get_trace_artifacts(trace_id)
+    return {
+        "success": True,
+        "trace": trace,
+        "spans": spans,
+        "events": events,
+        "artifacts": artifacts,
+    }
+
+
+@router.get("/traces/{trace_id}", response_model=Dict[str, Any])
+async def get_trace(trace_id: str):
+    """获取 Trace 基本信息。"""
+    db = get_db()
+    if not db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+    trace = await db.get_execution_trace(trace_id)
+    if not trace:
+        raise HTTPException(status_code=404, detail="Trace 不存在")
+    return {"success": True, "trace": trace}
+
+
+@router.get("/traces/{trace_id}/spans", response_model=Dict[str, Any])
+async def get_trace_spans(trace_id: str):
+    """获取 Trace spans。"""
+    db = get_db()
+    if not db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+    return {"success": True, "spans": await db.get_trace_spans(trace_id)}
+
+
+@router.get("/traces/{trace_id}/events", response_model=Dict[str, Any])
+async def get_trace_events(
+    trace_id: str,
+    limit: int = Query(default=200, ge=1, le=1000),
+):
+    """获取 Trace events。"""
+    db = get_db()
+    if not db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+    return {"success": True, "events": await db.get_trace_events(trace_id, limit=limit)}
+
+
+@router.get("/traces/{trace_id}/artifacts", response_model=Dict[str, Any])
+async def get_trace_artifacts(
+    trace_id: str,
+    span_id: Optional[str] = Query(None),
+):
+    """获取 Trace artifacts。"""
+    db = get_db()
+    if not db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+    return {"success": True, "artifacts": await db.get_trace_artifacts(trace_id, span_id=span_id)}
+
+
 @router.get("/executions/{execution_id}/export-markdown", response_model=Dict[str, Any])
 async def export_execution_markdown(execution_id: str):
     """
@@ -305,6 +383,7 @@ async def list_executions(
                 "started_at": row["started_at"].isoformat() if row["started_at"] else None,
                 "completed_at": row["completed_at"].isoformat() if row["completed_at"] else None,
                 "total_duration_ms": row["total_duration_ms"],
+                "trace_id": str(row.get("trace_id")) if row.get("trace_id") else None,
                 "error": row["error"],
             })
 
@@ -312,6 +391,21 @@ async def list_executions(
     except Exception as e:
         logger.error(f"获取执行列表失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/executions/active", response_model=Dict[str, Any])
+async def get_active_execution(
+    project_id: str = Query(..., description="项目ID"),
+    workflow_id: Optional[str] = Query(None, description="工作流ID"),
+):
+    """获取项目/工作流当前活跃执行，用于前端刷新恢复。"""
+    db = get_db()
+    if not db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+    row = await db.get_active_workflow_execution(project_id=project_id, workflow_id=workflow_id)
+    if not row:
+        return {"success": True, "execution": None}
+    return {"success": True, "execution": row}
 
 
 @router.get("/{workflow_id}", response_model=Dict[str, Any])
@@ -474,7 +568,7 @@ async def _setup_agent_provider_for_execution(project_id: str):
 async def execute_workflow(
     workflow_id: str,
     project_id: str = Query(..., description="项目ID"),
-    initial_context: Optional[Dict[str, Any]] = None,
+    body: Optional[Dict[str, Any]] = None,
 ):
     """
     执行工作流
@@ -482,13 +576,24 @@ async def execute_workflow(
     Args:
         workflow_id: 工作流ID
         project_id: 项目ID
-        initial_context: 初始上下文
+        body: 支持 {initial_context, request_id, force_new}，也兼容旧版裸 initial_context
 
     Returns:
         Dict: 执行ID和初始状态
     """
     engine = get_workflow_engine()
     db = get_db()
+
+    request_id = None
+    force_new = False
+    initial_context: Dict[str, Any] = {}
+    if body:
+        if any(key in body for key in ("initial_context", "request_id", "force_new")):
+            initial_context = body.get("initial_context") or {}
+            request_id = body.get("request_id")
+            force_new = bool(body.get("force_new", False))
+        else:
+            initial_context = body
 
     try:
         # 初始化 Agent provider
@@ -499,13 +604,20 @@ async def execute_workflow(
             project_id,
             initial_context or {},
             db,
+            request_id=request_id,
+            force_new=force_new,
         )
+        execution = await engine.get_execution_state(execution_id, db)
 
         return {
             "success": True,
-            "message": "工作流已启动",
+            "message": "工作流已启动" if not force_new else "工作流已强制新建并启动",
             "execution_id": execution_id,
             "workflow_id": workflow_id,
+            "request_id": execution.request_id if execution else request_id,
+            "status": execution.status.value if execution else None,
+            "trace_id": execution.trace_id if execution else None,
+            "deduplicated": bool(execution and request_id and execution.request_id == request_id and execution.id == execution_id),
         }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

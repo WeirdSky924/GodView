@@ -3,11 +3,12 @@
 v6 核心需求：持续设定管理、冲突检测、协商解决
 """
 
+import hashlib
 import json
 import logging
 import uuid
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import settings
 from app.models.bootstrap import BootstrapSession, BootstrapStage, BootstrapMessage
@@ -29,7 +30,9 @@ from app.models.plot import HookStatus, HookType
 from app.models.skill import ExecuteSkillDTO
 from app.models.token_usage import UsageCategory
 from app.services.conflict_detector import ConflictDetector, get_conflict_detector
+from app.services.operation_lifecycle_service import OperationLifecycleService
 from app.services.token_tracker import token_tracker
+from app.services.trace_service import TraceService, get_trace_service
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +118,7 @@ class SettingAgentService:
         self,
         project_id: str,
         mode: SettingAgentMode = SettingAgentMode.MANAGEMENT,
+        session_id: Optional[str] = None,
     ) -> SettingAgentSession:
         """
         获取或创建 Setting Agent 会话
@@ -122,13 +126,49 @@ class SettingAgentService:
         Args:
             project_id: 项目 ID
             mode: 运行模式
+            session_id: 可选会话 ID，用于刷新后恢复
 
         Returns:
             SettingAgentSession: 会话对象
         """
-        # 检查是否已有会话
+        from app.api.app import postgres_db
+
+        if session_id and session_id in self._management_sessions:
+            session = self._management_sessions[session_id]
+            if not postgres_db:
+                return session
+            row = await postgres_db.get_setting_agent_session(session_id)
+            if row:
+                return session
+            if await self._persist_session_snapshot(session):
+                return session
+
+        if session_id and postgres_db:
+            row = await postgres_db.get_setting_agent_session(session_id)
+            if row:
+                session = self._session_from_row(row)
+                self._management_sessions[session.id] = session
+                await self._load_knowledge_index(project_id)
+                return session
+
+        # 检查是否已有内存会话
         for session in self._management_sessions.values():
-            if session.project_id == project_id and session.is_active:
+            if session.project_id == project_id and session.mode == mode and session.is_active:
+                if not postgres_db:
+                    return session
+                row = await postgres_db.get_setting_agent_session(session.id)
+                if row:
+                    return session
+                if await self._persist_session_snapshot(session):
+                    return session
+                continue
+
+        if postgres_db:
+            row = await postgres_db.get_active_setting_agent_session(project_id, mode.value if hasattr(mode, "value") else str(mode))
+            if row:
+                session = self._session_from_row(row)
+                self._management_sessions[session.id] = session
+                await self._load_knowledge_index(project_id)
                 return session
 
         # 创建新会话
@@ -136,6 +176,8 @@ class SettingAgentService:
             project_id=project_id,
             mode=mode,
         )
+        if not await self._persist_session_snapshot(session):
+            raise RuntimeError("Setting Agent 会话持久化失败，无法创建可恢复会话")
         self._management_sessions[session.id] = session
 
         # 加载知识索引
@@ -150,7 +192,113 @@ class SettingAgentService:
             self._knowledge_indices[project_id] = LoreKnowledgeIndex(project_id=project_id)
             # TODO: 从数据库加载现有设定并构建索引
 
-    # ==================== 设定变更处理 ====================
+    async def _persist_session_snapshot(self, session: SettingAgentSession) -> bool:
+        """持久化 Setting Agent 会话快照。"""
+        try:
+            from app.api.app import postgres_db
+            if not postgres_db:
+                return False
+            await postgres_db.save_setting_agent_session({
+                "id": session.id,
+                "project_id": session.project_id,
+                "mode": session.mode.value if hasattr(session.mode, "value") else str(session.mode),
+                "status": "active" if session.is_active else "closed",
+                "conversation_snapshot": session.conversation_history,
+                "pending_conflicts": [c.model_dump(mode="json") if hasattr(c, "model_dump") else c for c in session.pending_conflicts],
+                "cached_pending_lores": session.cached_pending_lores,
+                "cached_pending_characters": session.cached_pending_characters,
+                "cached_pending_hooks": session.cached_pending_hooks,
+                "cached_context_sections": session.cached_context_sections,
+                "full_context_loaded": session.full_context_loaded,
+                "created_at": session.created_at,
+                "updated_at": datetime.now(),
+                "last_activity_at": session.last_activity_at,
+            })
+            return True
+        except Exception as e:
+            logger.warning(f"持久化 Setting Agent 会话失败: {e}")
+            return False
+
+    def _session_from_row(self, row: Dict[str, Any]) -> SettingAgentSession:
+        """从数据库行恢复 SettingAgentSession。"""
+        session = SettingAgentSession(
+            id=row["id"],
+            project_id=str(row["project_id"]),
+            mode=SettingAgentMode(row.get("mode") or SettingAgentMode.MANAGEMENT.value),
+            conversation_history=row.get("conversation_snapshot") or [],
+            pending_conflicts=[],
+            cached_pending_lores=row.get("cached_pending_lores") or [],
+            cached_pending_characters=row.get("cached_pending_characters") or [],
+            cached_pending_hooks=row.get("cached_pending_hooks") or [],
+            full_context_loaded=bool(row.get("full_context_loaded") or False),
+            cached_context_sections=row.get("cached_context_sections") or {},
+            is_active=(row.get("status") or "active") == "active",
+            created_at=row.get("created_at") or datetime.now(),
+            updated_at=row.get("updated_at") or datetime.now(),
+            last_activity_at=row.get("last_activity_at") or datetime.now(),
+        )
+        return session
+
+    @staticmethod
+    def _fingerprint_payload(payload: Dict[str, Any]) -> str:
+        """生成 pending item 幂等指纹。"""
+        raw = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True, default=str)
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, raw))
+
+    async def _persist_pending_items(
+        self,
+        session: SettingAgentSession,
+        item_type: str,
+        items: List[Dict[str, Any]],
+        request_id: Optional[str] = None,
+    ) -> None:
+        """持久化待确认项，按 session/type/fingerprint 幂等。"""
+        if not items:
+            return
+        try:
+            from app.api.app import postgres_db
+            if not postgres_db:
+                return
+            for item in items:
+                await postgres_db.upsert_setting_agent_pending_item(
+                    session_id=session.id,
+                    item_type=item_type,
+                    fingerprint=self._fingerprint_payload(item),
+                    payload=item,
+                    request_id=request_id,
+                    status="pending",
+                )
+        except Exception as e:
+            logger.warning(f"持久化 Setting Agent 待确认项失败: {item_type}, error={e}")
+
+    async def get_chat_history(
+        self,
+        project_id: str,
+        session_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """获取持久化聊天历史和 pending 快照。"""
+        session = await self.get_or_create_session(project_id, session_id=session_id)
+        from app.api.app import postgres_db
+        messages = []
+        pending_lores = session.cached_pending_lores
+        pending_characters = session.cached_pending_characters
+        pending_hooks = session.cached_pending_hooks
+        if postgres_db:
+            messages = await postgres_db.get_setting_agent_messages(session.id)
+            pending_items = await postgres_db.get_setting_agent_pending_items(session.id, status="pending")
+            if pending_items:
+                pending_lores = [item.get("payload") or {} for item in pending_items if item.get("item_type") == "lore"]
+                pending_characters = [item.get("payload") or {} for item in pending_items if item.get("item_type") == "character"]
+                pending_hooks = [item.get("payload") or {} for item in pending_items if item.get("item_type") == "hook"]
+        if not messages:
+            messages = session.conversation_history
+        return {
+            "session_id": session.id,
+            "messages": messages,
+            "pending_lores": pending_lores,
+            "pending_characters": pending_characters,
+            "pending_hooks": pending_hooks,
+        }
 
     async def process_setting_change(
         self,
@@ -393,6 +541,10 @@ class SettingAgentService:
             "message": message,
             "session_id": session.id,
             "mode": session.mode.value,
+            "conversation_history": session.conversation_history,
+            "cached_pending_lores": session.cached_pending_lores,
+            "cached_pending_characters": session.cached_pending_characters,
+            "cached_pending_hooks": session.cached_pending_hooks,
         }
         if structured_data is not None:
             result["structured_data"] = structured_data
@@ -646,6 +798,8 @@ class SettingAgentService:
         project_id: str,
         message: str,
         context: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+        request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         与 Setting Agent 聊天
@@ -658,9 +812,23 @@ class SettingAgentService:
         Returns:
             Dict: 响应结果
         """
-        session = await self.get_or_create_session(project_id)
+        session = await self.get_or_create_session(project_id, session_id=session_id)
+        from app.api.app import postgres_db
+        if request_id and postgres_db:
+            existing_response = await postgres_db.get_setting_agent_message_by_request(
+                session.id,
+                request_id,
+                role="assistant",
+            )
+            if existing_response:
+                return self._build_chat_response(
+                    session,
+                    message=existing_response.get("content") or "",
+                    pending_lores=session.cached_pending_lores or None,
+                    pending_characters=session.cached_pending_characters or None,
+                    pending_hooks=session.cached_pending_hooks or None,
+                )
 
-        # ========== 优化1：保存指令跳过LLM调用 ==========
         # 检测用户是否发送"保存"等确认性指令
         if self._is_save_intent(message) and (session.cached_pending_lores or session.cached_pending_characters or session.cached_pending_hooks):
             logger.info(f"[SettingAgent] 检测到保存意图，直接返回缓存的 pending 数据（跳过LLM调用）")
@@ -703,6 +871,11 @@ class SettingAgentService:
                 pending_hooks=session.cached_pending_hooks or None,
             )
 
+            if postgres_db:
+                await postgres_db.append_setting_agent_message(session.id, "user", message, request_id=request_id)
+                await postgres_db.append_setting_agent_message(session.id, "assistant", response, request_id=request_id)
+            await self._persist_session_snapshot(session)
+
             return result
 
         # 添加用户消息到历史
@@ -711,6 +884,8 @@ class SettingAgentService:
             "content": message,
             "timestamp": datetime.now().isoformat(),
         })
+        if postgres_db:
+            await postgres_db.append_setting_agent_message(session.id, "user", message, request_id=request_id)
 
         # 构建系统提示（异步）
         system_prompt = await self._build_management_system_prompt(session)
@@ -829,6 +1004,10 @@ class SettingAgentService:
         pending_hooks = await self._extract_hooks_from_conversation(project_id, session)
         pending_characters = await self._extract_characters_from_conversation(project_id, session)
 
+        await self._persist_pending_items(session, "lore", pending_lores, request_id=request_id)
+        await self._persist_pending_items(session, "hook", pending_hooks, request_id=request_id)
+        await self._persist_pending_items(session, "character", pending_characters, request_id=request_id)
+
         # 缓存 pending 数据到 session（供下次"保存"指令跳过LLM使用）
         if pending_lores:
             session.cached_pending_lores = pending_lores
@@ -870,6 +1049,10 @@ class SettingAgentService:
                     logger.info(f"[SettingAgent] 发现 {len(improvement_suggestions)} 个设定改进建议")
             except Exception as e:
                 logger.warning(f"[SettingAgent] 设定分析失败: {e}")
+
+        if postgres_db:
+            await postgres_db.append_setting_agent_message(session.id, "assistant", response, request_id=request_id)
+        await self._persist_session_snapshot(session)
 
         return self._build_chat_response(
             session,
@@ -1167,10 +1350,78 @@ class SettingAgentService:
             logger.error(f"提取伏笔失败: {e}")
             return []
 
+    async def _begin_save_operation(
+        self,
+        postgres_db,
+        project_id: str,
+        session_id: Optional[str],
+        request_id: Optional[str],
+        operation_type: str,
+        item_type: str,
+        items: List[Dict[str, Any]],
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
+        """启动保存操作；同 request_id 重放时返回已保存数量。"""
+        if not request_id:
+            return None, None
+        fingerprints = [self._fingerprint_payload(item) for item in items]
+        lifecycle = OperationLifecycleService(db=postgres_db)
+        begin = await lifecycle.begin_or_replay(
+            operation_type=operation_type,
+            project_id=project_id,
+            resource_type="setting_agent_session",
+            resource_id=session_id,
+            request_payload={
+                "project_id": project_id,
+                "session_id": session_id,
+                "item_type": item_type,
+                "fingerprints": fingerprints,
+                "count": len(fingerprints),
+            },
+            request_id=request_id,
+        )
+        if begin.replayed:
+            payload = begin.operation.get("response_payload") or {}
+            return begin.operation, int(payload.get("saved_count", 0))
+        operation = await lifecycle.mark_running(begin.operation)
+        return operation, None
+
+    async def _complete_save_operation(
+        self,
+        postgres_db,
+        operation: Optional[Dict[str, Any]],
+        saved_count: int,
+    ) -> None:
+        """记录保存操作完成结果。"""
+        if not operation:
+            return
+        await OperationLifecycleService(db=postgres_db).complete(
+            operation,
+            {"saved_count": saved_count},
+        )
+
+    async def _should_skip_saved_pending_item(
+        self,
+        postgres_db,
+        session: Optional[SettingAgentSession],
+        item_type: str,
+        payload: Dict[str, Any],
+    ) -> bool:
+        """若待确认项已标记 saved，则跳过重复落库。"""
+        if not session:
+            return False
+        pending_item = await postgres_db.get_setting_agent_pending_item(
+            session.id,
+            item_type,
+            self._fingerprint_payload(payload),
+        )
+        return bool(pending_item and pending_item.get("status") == "saved")
+
     async def save_pending_lores(
         self,
         project_id: str,
         lores: List[Dict[str, Any]],
+        session_id: Optional[str] = None,
+        request_id: Optional[str] = None,
     ) -> int:
         """
         保存用户确认的设定到数据库
@@ -1187,8 +1438,22 @@ class SettingAgentService:
             return 0
 
         saved_count = 0
+        session = await self.get_or_create_session(project_id, session_id=session_id) if session_id else None
+        operation, replay_count = await self._begin_save_operation(
+            postgres_db,
+            project_id,
+            session.id if session else session_id,
+            request_id,
+            "setting_save_lores",
+            "lore",
+            lores,
+        )
+        if replay_count is not None:
+            return replay_count
         for lore_data in lores:
             if not lore_data.get("title") or not lore_data.get("content"):
+                continue
+            if await self._should_skip_saved_pending_item(postgres_db, session, "lore", lore_data):
                 continue
 
             lore_entry = {
@@ -1216,6 +1481,13 @@ class SettingAgentService:
                     INSERT INTO lore_entries (id, project_id, title, category, priority, content, summary, keywords, tags, constraints, related_characters, related_locations, related_items, forbidden_actions, source, created_at, updated_at)
                     VALUES (:id, CAST(:project_id AS UUID), :title, :category, :priority, :content, :summary, :keywords, :tags, :constraints, :related_characters, :related_locations, :related_items, :forbidden_actions, :source, :created_at, :updated_at)
                 """, lore_entry)
+                if session:
+                    await postgres_db.mark_setting_agent_pending_item_saved(
+                        session.id,
+                        "lore",
+                        self._fingerprint_payload(lore_data),
+                        lore_entry["id"],
+                    )
                 saved_count += 1
                 logger.info(f"保存用户确认的设定: {lore_entry['title']}")
 
@@ -1244,6 +1516,7 @@ class SettingAgentService:
         if saved_count > 0:
             self._clear_cached_pending_lores(project_id)
             self.invalidate_context_cache(project_id)
+        await self._complete_save_operation(postgres_db, operation, saved_count)
 
         return saved_count
 
@@ -1251,6 +1524,8 @@ class SettingAgentService:
         self,
         project_id: str,
         hooks: List[Dict[str, Any]],
+        session_id: Optional[str] = None,
+        request_id: Optional[str] = None,
     ) -> int:
         """保存用户确认的伏笔到数据库"""
         from app.api.app import postgres_db
@@ -1258,8 +1533,22 @@ class SettingAgentService:
             return 0
 
         saved_count = 0
+        session = await self.get_or_create_session(project_id, session_id=session_id) if session_id else None
+        operation, replay_count = await self._begin_save_operation(
+            postgres_db,
+            project_id,
+            session.id if session else session_id,
+            request_id,
+            "setting_save_hooks",
+            "hook",
+            hooks,
+        )
+        if replay_count is not None:
+            return replay_count
         for hook_data in hooks:
             if not hook_data.get("title"):
+                continue
+            if await self._should_skip_saved_pending_item(postgres_db, session, "hook", hook_data):
                 continue
 
             hook_entry = {
@@ -1285,6 +1574,15 @@ class SettingAgentService:
 
             try:
                 await postgres_db.save_hook(hook_entry)
+                from app.services.graph_projection_service import enqueue_graph_projection_best_effort
+                await enqueue_graph_projection_best_effort("hook", hook_entry)
+                if session:
+                    await postgres_db.mark_setting_agent_pending_item_saved(
+                        session.id,
+                        "hook",
+                        self._fingerprint_payload(hook_data),
+                        hook_entry["id"],
+                    )
                 saved_count += 1
                 logger.info(f"保存用户确认的伏笔: {hook_entry['title']}")
             except Exception as e:
@@ -1293,6 +1591,7 @@ class SettingAgentService:
         if saved_count > 0:
             self._clear_cached_pending_hooks(project_id)
             self.invalidate_context_cache(project_id)
+        await self._complete_save_operation(postgres_db, operation, saved_count)
 
         return saved_count
 
@@ -1768,6 +2067,8 @@ class SettingAgentService:
         self,
         project_id: str,
         characters: List[Dict[str, Any]],
+        session_id: Optional[str] = None,
+        request_id: Optional[str] = None,
     ) -> int:
         """
         保存用户确认的角色到数据库
@@ -1786,9 +2087,23 @@ class SettingAgentService:
             return 0
 
         saved_count = 0
+        session = await self.get_or_create_session(project_id, session_id=session_id) if session_id else None
+        operation, replay_count = await self._begin_save_operation(
+            postgres_db,
+            project_id,
+            session.id if session else session_id,
+            request_id,
+            "setting_save_characters",
+            "character",
+            characters,
+        )
+        if replay_count is not None:
+            return replay_count
         for char_data in characters:
             name = (char_data.get("name") or "").strip()
             if not name:
+                continue
+            if await self._should_skip_saved_pending_item(postgres_db, session, "character", char_data):
                 continue
 
             try:
@@ -1819,6 +2134,15 @@ class SettingAgentService:
 
                 merged_character = await _auto_configure_character_agent(merged_character)
                 await postgres_db.save_character(merged_character)
+                from app.services.graph_projection_service import enqueue_graph_projection_best_effort
+                await enqueue_graph_projection_best_effort("character", merged_character)
+                if session:
+                    await postgres_db.mark_setting_agent_pending_item_saved(
+                        session.id,
+                        "character",
+                        self._fingerprint_payload(char_data),
+                        merged_character["id"],
+                    )
 
                 saved_count += 1
                 logger.info(f"保存用户确认的角色: {name}")
@@ -1829,6 +2153,7 @@ class SettingAgentService:
         if saved_count > 0:
             self._clear_cached_pending_characters(project_id)
             self.invalidate_context_cache(project_id)
+        await self._complete_save_operation(postgres_db, operation, saved_count)
 
         return saved_count
 
@@ -3102,6 +3427,10 @@ class SettingAgentService:
         # 计算输入 token（估算）
         input_tokens = sum(len(m.get("content", "")) // 4 for m in messages)
 
+        trace_service = get_trace_service()
+        trace_tokens = TraceService.set_context(TraceService.current_trace_id(), TraceService.current_span_id())
+        started_at = time.monotonic()
+
         last_error = None
         for attempt in range(self._max_retries):
             try:
@@ -3112,6 +3441,28 @@ class SettingAgentService:
                 else:
                     response, usage = await self._call_openai_with_usage(messages)
 
+                duration_ms = int((time.monotonic() - started_at) * 1000)
+                await trace_service.record_event("llm_call_completed", {
+                    "agent_name": "setting_agent",
+                    "agent_type": "setting_agent",
+                    "project_id": project_id,
+                    "provider": self.llm_provider,
+                    "model": self.llm_model,
+                    "category": UsageCategory.SETTING_AGENT.value,
+                    "streaming": False,
+                    "structured": False,
+                    "message_count": len(messages),
+                    "attempt": attempt + 1,
+                    "prompt_chars": sum(len(m.get("content", "")) for m in messages),
+                    "prompt_hash": hashlib.sha256("\n".join(m.get("content", "") for m in messages).encode("utf-8")).hexdigest(),
+                    "response_chars": len(response or ""),
+                    "response_hash": hashlib.sha256((response or "").encode("utf-8")).hexdigest() if response else None,
+                    "input_tokens": usage.get("input_tokens", input_tokens),
+                    "output_tokens": usage.get("output_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", usage.get("input_tokens", input_tokens) + usage.get("output_tokens", 0)),
+                    "duration_ms": duration_ms,
+                })
+
                 # 记录 token 使用
                 if project_id and usage:
                     await self._record_token_usage(project_id, usage, input_tokens)
@@ -3119,6 +3470,7 @@ class SettingAgentService:
                 # 成功，重置失败计数
                 self._consecutive_failures = 0
                 self._last_failure_time = None
+                TraceService.reset_context(trace_tokens)
                 return response
 
             except Exception as e:
@@ -3136,6 +3488,17 @@ class SettingAgentService:
                     await asyncio.sleep(delay)
                 else:
                     logger.error(f"[SettingAgent] LLM 调用失败，已达最大重试次数 ({self._max_retries}次): {e}")
+                    await trace_service.record_event("llm_call_failed", {
+                        "agent_name": "setting_agent",
+                        "agent_type": "setting_agent",
+                        "project_id": project_id,
+                        "provider": self.llm_provider,
+                        "model": self.llm_model,
+                        "attempt": attempt + 1,
+                        "error": str(e),
+                    }, severity="error")
+
+        TraceService.reset_context(trace_tokens)
 
         # 所有重试都失败
         logger.error(f"[SettingAgent] LLM 调用最终失败: {last_error}")
@@ -3210,6 +3573,10 @@ class SettingAgentService:
         ]
 
         runner = get_structured_llm_runner()
+        trace_service = get_trace_service()
+        trace_tokens = TraceService.set_context(TraceService.current_trace_id(), TraceService.current_span_id())
+        import time
+        started_at = time.monotonic()
         parsed, raw_text = await runner.run_structured(model, schema, messages)
 
         # 估算 token 用量并记录（与 _call_llm 保持一致）
@@ -3217,6 +3584,27 @@ class SettingAgentService:
             try:
                 input_tokens = (len(system_prompt) + len(prompt)) // 4
                 output_tokens = len(raw_text or "") // 4
+                await trace_service.record_event("llm_call_completed", {
+                    "agent_name": "setting_agent",
+                    "agent_type": "setting_agent",
+                    "project_id": project_id,
+                    "provider": self.llm_provider,
+                    "model": self.llm_model,
+                    "category": UsageCategory.SETTING_AGENT.value,
+                    "streaming": False,
+                    "structured": True,
+                    "schema_name": getattr(schema, "__name__", str(schema)),
+                    "message_count": len(messages),
+                    "prompt_chars": len(system_prompt) + len(prompt),
+                    "prompt_hash": hashlib.sha256(f"{system_prompt}\n{prompt}".encode("utf-8")).hexdigest(),
+                    "response_chars": len(raw_text or ""),
+                    "response_hash": hashlib.sha256((raw_text or "").encode("utf-8")).hexdigest() if raw_text else None,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": input_tokens + output_tokens,
+                    "duration_ms": int((time.monotonic() - started_at) * 1000),
+                })
+                TraceService.reset_context(trace_tokens)
                 await self._record_token_usage(
                     project_id,
                     {"input_tokens": input_tokens, "output_tokens": output_tokens},

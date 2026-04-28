@@ -256,6 +256,53 @@ class AgentPromptBuilder:
                     status = hook.get("status", "pending")
                     parts.append(f"- [{status}] {title}")
 
+        graph_context = context.get("graph_context") if isinstance(context.get("graph_context"), dict) else {}
+        graph_summary = context.get("graph_context_summary") or graph_context.get("summary")
+        if graph_context or graph_summary:
+            parts.append("\n### 关系图上下文（局部）")
+            if graph_summary:
+                parts.append(f"- 摘要: {graph_summary}")
+
+            source = context.get("graph_context_source") or graph_context.get("source")
+            if source:
+                parts.append(f"- 来源: {source}")
+
+            anchor = graph_context.get("anchor") if isinstance(graph_context.get("anchor"), dict) else None
+            if anchor:
+                anchor_name = anchor.get("name") or anchor.get("id") or "未知"
+                anchor_type = anchor.get("type") or "未知类型"
+                parts.append(f"- Anchor: {anchor_name} ({anchor_type})")
+
+            relationships = graph_context.get("relationships") if isinstance(graph_context.get("relationships"), list) else []
+            if relationships:
+                parts.append("- 关键关系:")
+                for relationship in relationships[:8]:
+                    if not isinstance(relationship, dict):
+                        continue
+                    target = relationship.get("target_name") or relationship.get("target_id") or "未知对象"
+                    relation_type = relationship.get("type") or "关系"
+                    strength = relationship.get("strength")
+                    strength_text = f"，强度: {strength}" if strength not in (None, "") else ""
+                    parts.append(f"  - {target}: {relation_type}{strength_text}")
+
+            nodes = graph_context.get("nodes") if isinstance(graph_context.get("nodes"), list) else []
+            related_nodes = []
+            for node in nodes[:8]:
+                if not isinstance(node, dict):
+                    continue
+                node_name = node.get("name") or node.get("id")
+                node_type = node.get("type") or "node"
+                if node_name:
+                    related_nodes.append(f"{node_name}({node_type})")
+            if related_nodes:
+                parts.append(f"- 相关节点: {'、'.join(related_nodes)}")
+
+            warnings = context.get("graph_context_warnings") or graph_context.get("warnings") or []
+            if warnings:
+                warning_text = "；".join(str(item) for item in warnings[:2] if item)
+                if warning_text:
+                    parts.append(f"- 注意: {warning_text}")
+
         # 全局状态
         if global_state:
             parts.append("\n### 项目状态")

@@ -27,6 +27,11 @@ import {
   updateWorkflow,
   deleteWorkflow,
   executeWorkflow,
+  getActiveWorkflowExecution,
+  getExecution,
+  pauseExecution,
+  resumeExecution,
+  cancelExecution,
   type WorkflowDefinition,
   type WorkflowNode as WfNode,
   type WorkflowEdge as WfEdge,
@@ -35,7 +40,8 @@ import {
 } from '@/api/workflows'
 import { getWorkflowNodeTypes, type NodeTypeInfo, type WorkflowNodeTypes } from '@/api/nodeTypes'
 import WorkflowMonitor from '@/components/workflow/WorkflowMonitor'
-import { Network, Users, GitBranch, Play, Save, Trash2, Plus, Loader2 } from 'lucide-react'
+import WorkflowTrace from '@/components/workflow/WorkflowTrace'
+import { Network, Users, GitBranch, Play, Save, Trash2, Plus, Loader2, Pause, Square, RotateCcw } from 'lucide-react'
 import { useTheme } from '@/contexts/ThemeContext'
 import { useProject } from '@/contexts/ProjectContext'
 import WorkflowHelp from '@/components/workflow/WorkflowHelp'
@@ -168,6 +174,8 @@ type VisualNodeData = {
 type WorkflowOrigin = 'project' | 'global_template'
 
 const generateId = () => `node_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`
+const isActiveExecutionStatus = (status?: string) => status === 'pending' || status === 'running' || status === 'paused'
+const executionStorageKey = (projectId: string, workflowId: string) => `workflowExecution:${projectId}:${workflowId}`
 
 const standardAllNodesDefinition = {
   name: '全内置节点标准流程',
@@ -709,6 +717,8 @@ export default function Visualizer() {
   const [saving, setSaving] = useState(false)
   const [executing, setExecuting] = useState(false)
   const [currentExecutionId, setCurrentExecutionId] = useState<string | null>(null)
+  const [currentExecutionStatus, setCurrentExecutionStatus] = useState<string | null>(null)
+  const [rightWorkflowPanel, setRightWorkflowPanel] = useState<'monitor' | 'trace'>('monitor')
 
   useEffect(() => {
     loadNodeTypes()
@@ -803,6 +813,7 @@ export default function Visualizer() {
     setNodes(workflowToCanvasNodes(workflow))
     setEdges(workflowToCanvasEdges(workflow))
     setCurrentExecutionId(null)
+    setCurrentExecutionStatus(null)
   }
 
   const handleNewWorkflow = () => {
@@ -896,8 +907,55 @@ export default function Visualizer() {
     }
   }
 
-  const handleExecuteWorkflow = async () => {
+  useEffect(() => {
+    if (!currentProject || !selectedWorkflow) return
+
+    const restoreExecution = async () => {
+      const params = new URLSearchParams(window.location.search)
+      const urlExecutionId = params.get('execution_id')
+      const storedExecutionId = localStorage.getItem(executionStorageKey(currentProject.id, selectedWorkflow.id))
+      const candidateExecutionId = urlExecutionId || storedExecutionId
+
+      try {
+        if (urlExecutionId) {
+          const execution = await getExecution(urlExecutionId)
+          setCurrentExecutionId(execution.id)
+          setCurrentExecutionStatus(execution.status)
+          localStorage.setItem(executionStorageKey(currentProject.id, selectedWorkflow.id), execution.id)
+          return
+        }
+
+        if (storedExecutionId) {
+          const execution = await getExecution(storedExecutionId)
+          if (isActiveExecutionStatus(execution.status)) {
+            setCurrentExecutionId(execution.id)
+            setCurrentExecutionStatus(execution.status)
+            localStorage.setItem(executionStorageKey(currentProject.id, selectedWorkflow.id), execution.id)
+            return
+          }
+          localStorage.removeItem(executionStorageKey(currentProject.id, selectedWorkflow.id))
+        }
+
+        const active = await getActiveWorkflowExecution(currentProject.id, selectedWorkflow.id)
+        if (active.execution && isActiveExecutionStatus(active.execution.status)) {
+          setCurrentExecutionId(active.execution.id)
+          setCurrentExecutionStatus(active.execution.status)
+          localStorage.setItem(executionStorageKey(currentProject.id, selectedWorkflow.id), active.execution.id)
+        }
+      } catch (error) {
+        console.warn('Failed to restore workflow execution:', error)
+      }
+    }
+
+    void restoreExecution()
+  }, [currentProject, selectedWorkflow])
+  const handleExecuteWorkflow = async (forceNew = false) => {
     if (!currentProject) return
+
+    if (currentExecutionId && isActiveExecutionStatus(currentExecutionStatus || undefined) && !forceNew) {
+      alert(`当前已有运行中的执行：${currentExecutionId}`)
+      return
+    }
 
     setExecuting(true)
     try {
@@ -911,10 +969,21 @@ export default function Visualizer() {
         await loadWorkflows()
       }
 
-      const result = await executeWorkflow(workflow.id, currentProject.id, {
-        chapter_num: workflow.variables?.chapter_num || 1,
-      })
+      const requestId = `workflow_${workflow.id}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`
+      const result = await executeWorkflow(
+        workflow.id,
+        currentProject.id,
+        {
+          chapter_num: workflow.variables?.chapter_num || 1,
+        },
+        { requestId, forceNew },
+      )
       setCurrentExecutionId(result.execution_id)
+      setCurrentExecutionStatus(result.status || 'running')
+      localStorage.setItem(executionStorageKey(currentProject.id, workflow.id), result.execution_id)
+      const params = new URLSearchParams(window.location.search)
+      params.set('execution_id', result.execution_id)
+      window.history.replaceState(null, '', `${window.location.pathname}?${params.toString()}`)
       alert(`工作流已启动！执行ID: ${result.execution_id}`)
     } catch (error) {
       console.error('Failed to execute workflow:', error)
@@ -922,6 +991,48 @@ export default function Visualizer() {
     } finally {
       setExecuting(false)
     }
+  }
+
+  const handlePauseExecution = async () => {
+    if (!currentExecutionId) return
+    try {
+      await pauseExecution(currentExecutionId)
+      setCurrentExecutionStatus('paused')
+    } catch (error) {
+      console.error('Failed to pause execution:', error)
+      alert('暂停失败')
+    }
+  }
+
+  const handleResumeExecution = async () => {
+    if (!currentExecutionId) return
+    try {
+      await resumeExecution(currentExecutionId)
+      setCurrentExecutionStatus('running')
+    } catch (error) {
+      console.error('Failed to resume execution:', error)
+      alert('恢复失败')
+    }
+  }
+
+  const handleCancelExecution = async () => {
+    if (!currentExecutionId) return
+    if (!confirm('确定要取消当前工作流执行吗？')) return
+    try {
+      await cancelExecution(currentExecutionId)
+      setCurrentExecutionStatus('cancelled')
+      if (currentProject && selectedWorkflow) {
+        localStorage.removeItem(executionStorageKey(currentProject.id, selectedWorkflow.id))
+      }
+    } catch (error) {
+      console.error('Failed to cancel execution:', error)
+      alert('取消失败')
+    }
+  }
+
+  const handleForceNewExecution = async () => {
+    if (!confirm('当前可能已有执行在运行。确定要强制启动一个新执行吗？')) return
+    await handleExecuteWorkflow(true)
   }
 
   const handleDeleteWorkflow = async (workflow: WorkflowDefinition, e: React.MouseEvent) => {
@@ -941,6 +1052,7 @@ export default function Visualizer() {
         setEdges([])
         setWorkflowName('新工作流')
         setCurrentExecutionId(null)
+      setCurrentExecutionStatus(null)
       }
       await loadWorkflows()
     } catch (error) {
@@ -1210,13 +1322,48 @@ export default function Visualizer() {
 
             <Card className="p-3">
               <button
-                onClick={handleExecuteWorkflow}
-                disabled={executing || !selectedWorkflow}
+                onClick={() => handleExecuteWorkflow()}
+                disabled={executing || !selectedWorkflow || Boolean(currentExecutionId && isActiveExecutionStatus(currentExecutionStatus || undefined))}
                 className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-green-500 text-white rounded text-sm hover:bg-green-600 disabled:opacity-50"
               >
                 <Play size={14} />
-                {executing ? '执行中...' : '执行'}
+                {executing ? '执行中...' : currentExecutionId && isActiveExecutionStatus(currentExecutionStatus || undefined) ? '已有执行运行中' : '执行'}
               </button>
+              {currentExecutionId && (
+                <div className="mt-2 space-y-2 text-xs">
+                  <div className="truncate text-gray-500" title={currentExecutionId}>执行ID: {currentExecutionId}</div>
+                  <div className="grid grid-cols-3 gap-1">
+                    <button
+                      onClick={handlePauseExecution}
+                      disabled={currentExecutionStatus !== 'running'}
+                      className="flex items-center justify-center gap-1 px-2 py-1 rounded bg-yellow-100 text-yellow-700 disabled:opacity-50"
+                    >
+                      <Pause size={12} /> 暂停
+                    </button>
+                    <button
+                      onClick={handleResumeExecution}
+                      disabled={currentExecutionStatus !== 'paused'}
+                      className="flex items-center justify-center gap-1 px-2 py-1 rounded bg-blue-100 text-blue-700 disabled:opacity-50"
+                    >
+                      <RotateCcw size={12} /> 恢复
+                    </button>
+                    <button
+                      onClick={handleCancelExecution}
+                      disabled={!isActiveExecutionStatus(currentExecutionStatus || undefined)}
+                      className="flex items-center justify-center gap-1 px-2 py-1 rounded bg-red-100 text-red-700 disabled:opacity-50"
+                    >
+                      <Square size={12} /> 取消
+                    </button>
+                  </div>
+                  <button
+                    onClick={handleForceNewExecution}
+                    disabled={executing || !selectedWorkflow}
+                    className="w-full px-2 py-1 rounded border border-gray-300 text-gray-600 hover:bg-gray-50 disabled:opacity-50"
+                  >
+                    强制新执行
+                  </button>
+                </div>
+              )}
             </Card>
           </div>
 
@@ -1282,10 +1429,42 @@ export default function Visualizer() {
             </div>
 
             <div
-              className="w-[360px] border rounded-xl overflow-hidden"
+              className="w-[360px] border rounded-xl overflow-hidden flex flex-col"
               style={{ height: 'calc(100vh - 280px)', minHeight: '500px' }}
             >
-              <WorkflowMonitor executionId={currentExecutionId} />
+              <div className={`flex border-b ${isDark ? 'border-gray-700 bg-gray-900' : 'border-gray-200 bg-white'}`}>
+                <button
+                  onClick={() => setRightWorkflowPanel('monitor')}
+                  className={`flex-1 px-3 py-2 text-sm ${
+                    rightWorkflowPanel === 'monitor'
+                      ? 'border-b-2 border-blue-500 text-blue-600'
+                      : isDark
+                        ? 'text-gray-400 hover:text-gray-200'
+                        : 'text-gray-500 hover:text-gray-700'
+                  }`}
+                >
+                  监控
+                </button>
+                <button
+                  onClick={() => setRightWorkflowPanel('trace')}
+                  className={`flex-1 px-3 py-2 text-sm ${
+                    rightWorkflowPanel === 'trace'
+                      ? 'border-b-2 border-blue-500 text-blue-600'
+                      : isDark
+                        ? 'text-gray-400 hover:text-gray-200'
+                        : 'text-gray-500 hover:text-gray-700'
+                  }`}
+                >
+                  Trace
+                </button>
+              </div>
+              <div className="flex-1 overflow-hidden">
+                {rightWorkflowPanel === 'monitor' ? (
+                  <WorkflowMonitor executionId={currentExecutionId} />
+                ) : (
+                  <WorkflowTrace executionId={currentExecutionId} />
+                )}
+              </div>
             </div>
           </div>
         </div>

@@ -93,6 +93,7 @@ class SettingAgent:
 
         # 检查是否需要提取 seed
         seed_extracted = await self._check_and_extract_seed(session)
+        await orchestrator._persist_session(session)
 
         return {
             "response": response_content,

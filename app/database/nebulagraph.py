@@ -15,6 +15,27 @@ from nebula3.data.DataObject import Value, ValueWrapper
 logger = logging.getLogger(__name__)
 
 
+def _escape_ngql_string(value: Any) -> str:
+    """转义 nGQL 字符串字面量内容。"""
+    return str(value or "").replace("\\", "\\\\").replace('"', '\\"').replace("'", "\\'")
+
+
+def _format_ngql_value(value: Any) -> str:
+    """将 Python 值转换为 nGQL 字面量。"""
+    if value is None:
+        return '""'
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, datetime):
+        return f'"{_escape_ngql_string(value.isoformat())}"'
+    if isinstance(value, (dict, list)):
+        import json
+        return f'"{_escape_ngql_string(json.dumps(value, ensure_ascii=False, default=str))}"'
+    return f'"{_escape_ngql_string(value)}"'
+
+
 class NebulaGraphDatabase:
     """NebulaGraph 数据库操作类"""
 
@@ -825,6 +846,52 @@ class NebulaGraphDatabase:
 
             return events
 
+    async def upsert_vertex(self, tag: str, vid: str, properties: Dict[str, Any]) -> bool:
+        """幂等写入顶点。"""
+        await self.connect()
+        if not vid or not tag or not properties:
+            return False
+
+        fields = list(properties.keys())
+        values = [_format_ngql_value(properties[field]) for field in fields]
+        query = f"""
+        INSERT VERTEX {tag} ({', '.join(fields)})
+        VALUES \"{_escape_ngql_string(vid)}\": ({', '.join(values)})
+        """
+
+        with self._get_session() as session:
+            session.execute(f"USE {self.space_name}")
+            result = session.execute(query)
+            if not result.is_succeeded():
+                logger.warning(f"NebulaGraph 顶点写入失败 {tag}:{vid}: {result.error_msg()}")
+            return result.is_succeeded()
+
+    async def upsert_edge(self, edge: str, src_vid: str, dst_vid: str, properties: Dict[str, Any]) -> bool:
+        """幂等写入边。"""
+        await self.connect()
+        if not edge or not src_vid or not dst_vid:
+            return False
+
+        fields = list(properties.keys())
+        values = [_format_ngql_value(properties[field]) for field in fields]
+        if fields:
+            query = f"""
+            INSERT EDGE {edge} ({', '.join(fields)})
+            VALUES \"{_escape_ngql_string(src_vid)}\" -> \"{_escape_ngql_string(dst_vid)}\": ({', '.join(values)})
+            """
+        else:
+            query = f"""
+            INSERT EDGE {edge} ()
+            VALUES \"{_escape_ngql_string(src_vid)}\" -> \"{_escape_ngql_string(dst_vid)}\": ()
+            """
+
+        with self._get_session() as session:
+            session.execute(f"USE {self.space_name}")
+            result = session.execute(query)
+            if not result.is_succeeded():
+                logger.warning(f"NebulaGraph 边写入失败 {edge}:{src_vid}->{dst_vid}: {result.error_msg()}")
+            return result.is_succeeded()
+
     # ==================== 角色相关操作 ====================
 
     async def insert_character(self, character_id: str, properties: Dict[str, Any]) -> bool:
@@ -941,28 +1008,176 @@ class NebulaGraphDatabase:
     ) -> List[Dict[str, Any]]:
         """获取角色的所有关系"""
         query = f"""
-        GO FROM "{character_id}" OVER knows
-        YIELD $$.character.name AS target_name, knows.relationship_type AS type,
-              knows.strength AS strength, knows.since AS since
+        GO FROM \"{_escape_ngql_string(character_id)}\" OVER knows
+        YIELD dst(edge) AS target_id,
+              $$.character.name AS target_name,
+              knows.relationship_type AS type,
+              knows.strength AS strength,
+              knows.since AS since
         """
 
         with self._get_session() as session:
             session.execute(f"USE {self.space_name}")
             result = session.execute(query)
             if not result.is_succeeded():
+                logger.warning(f"获取角色关系失败 {character_id}: {result.error_msg()}")
                 return []
 
             relationships = []
             for i in range(result.row_size()):
                 row_values = result.row_values(i)
+                target_id = self._value_to_python(row_values[0]) if len(row_values) > 0 else ""
+                target_name = self._value_to_python(row_values[1]) if len(row_values) > 1 else target_id
+                relationship_type = self._value_to_python(row_values[2]) if len(row_values) > 2 else "related"
+                strength = self._value_to_python(row_values[3]) if len(row_values) > 3 else 0.0
                 relationships.append({
-                    "target_name": str(row_values[0]),
-                    "type": str(row_values[1]),
-                    "strength": float(row_values[2].as_double()) if len(row_values) > 2 and row_values[2].is_double() else 0.0,
-                    "since": str(row_values[3]) if len(row_values) > 3 else "",
+                    "target_id": str(target_id or ""),
+                    "target_name": str(target_name or target_id or ""),
+                    "type": str(relationship_type or "related"),
+                    "strength": float(strength or 0.0) if isinstance(strength, (int, float)) else 0.0,
+                    "since": str(self._value_to_python(row_values[4])) if len(row_values) > 4 else "",
                 })
 
             return relationships
+
+    async def get_local_character_graph(
+        self,
+        character_id: str,
+        depth: int = 1,
+        max_nodes: int = 16,
+    ) -> Dict[str, Any]:
+        """读取角色周边的局部关系图。"""
+        await self.connect()
+        safe_character_id = _escape_ngql_string(character_id)
+        nodes: Dict[str, Dict[str, Any]] = {}
+        edges: List[Dict[str, Any]] = []
+        relationships: List[Dict[str, Any]] = []
+        warnings: List[str] = []
+
+        def add_node(node_id: Any, node_type: str, properties: Dict[str, Any]) -> None:
+            if not node_id or len(nodes) >= max_nodes:
+                return
+            node_id_str = str(node_id)
+            nodes.setdefault(node_id_str, {
+                "id": node_id_str,
+                "type": node_type,
+                "name": properties.get("name") or properties.get("title") or node_id_str,
+                "summary": properties.get("description") or properties.get("status") or properties.get("state"),
+                "properties": properties,
+            })
+
+        add_node(character_id, "character", {"id": character_id})
+
+        queries = [
+            (
+                "knows",
+                f"""
+                GO {max(1, min(int(depth or 1), 2))} STEPS FROM \"{safe_character_id}\" OVER knows
+                YIELD src(edge) AS source_id,
+                      dst(edge) AS target_id,
+                      $$.character.name AS target_name,
+                      $$.character.description AS target_description,
+                      $$.character.role AS target_role,
+                      $$.character.status AS target_status,
+                      knows.relationship_type AS relationship_type,
+                      knows.strength AS strength
+                """,
+            ),
+            (
+                "located_in",
+                f"""
+                GO FROM \"{safe_character_id}\" OVER located_in
+                YIELD src(edge) AS source_id,
+                      dst(edge) AS target_id,
+                      $$.region.name AS target_name,
+                      $$.region.description AS target_description,
+                      $$.region.region_type AS region_type,
+                      $$.region.world_id AS world_id
+                """,
+            ),
+            (
+                "belongs_to",
+                f"""
+                GO FROM \"{safe_character_id}\" OVER belongs_to
+                YIELD src(edge) AS source_id,
+                      dst(edge) AS target_id,
+                      $$.world.name AS target_name,
+                      $$.world.description AS target_description,
+                      $$.world.world_type AS world_type
+                """,
+            ),
+            (
+                "involves_character",
+                f"""
+                GO FROM \"{safe_character_id}\" OVER involves_character REVERSELY
+                YIELD dst(edge) AS source_id,
+                      src(edge) AS target_id,
+                      $^.hook.title AS target_name,
+                      $^.hook.status AS target_status,
+                      $^.hook.hook_type AS hook_type,
+                      involves_character.role AS role
+                """,
+            ),
+        ]
+
+        with self._get_session() as session:
+            session.execute(f"USE {self.space_name}")
+            for edge_type, query in queries:
+                result = session.execute(query)
+                if not result.is_succeeded():
+                    warnings.append(f"{edge_type} 查询失败: {result.error_msg()}")
+                    continue
+                for row in self._result_rows(result):
+                    source_id = str(row.get("source_id") or character_id)
+                    target_id = str(row.get("target_id") or "")
+                    if not target_id:
+                        continue
+                    if edge_type == "knows":
+                        target_type = "character"
+                        label = row.get("relationship_type") or "related"
+                        relationships.append({
+                            "target_id": target_id,
+                            "target_name": row.get("target_name") or target_id,
+                            "type": label,
+                            "strength": row.get("strength") or 0.0,
+                            "source": "nebula",
+                        })
+                    elif edge_type == "located_in":
+                        target_type = "region"
+                        label = "当前位置"
+                    elif edge_type == "belongs_to":
+                        target_type = "world"
+                        label = "所属世界"
+                    else:
+                        target_type = "hook"
+                        label = row.get("role") or "相关伏笔"
+                    add_node(target_id, target_type, {
+                        "id": target_id,
+                        "name": row.get("target_name"),
+                        "description": row.get("target_description"),
+                        "status": row.get("target_status"),
+                        "role": row.get("target_role"),
+                        "relationship_type": row.get("relationship_type"),
+                        "region_type": row.get("region_type"),
+                        "world_type": row.get("world_type"),
+                        "hook_type": row.get("hook_type"),
+                        "world_id": row.get("world_id"),
+                    })
+                    edges.append({
+                        "source": source_id,
+                        "target": target_id,
+                        "type": edge_type,
+                        "label": label,
+                        "properties": {k: v for k, v in row.items() if k not in {"source_id", "target_id", "target_name", "target_description"}},
+                    })
+
+        return {
+            "nodes": list(nodes.values()),
+            "edges": edges,
+            "relationships": relationships,
+            "warnings": warnings,
+            "partial": bool(warnings),
+        }
 
     # ==================== 记忆相关操作 ====================
 
@@ -1132,14 +1347,52 @@ class NebulaGraphDatabase:
     # ==================== 工具方法 ====================
 
     def _parse_vertex(self, row) -> Dict[str, Any]:
-        """解析顶点数据"""
-        result = {}
-        # 简化解析，实际使用需要根据具体数据结构
-        return result
+        """解析顶点数据。"""
+        if hasattr(row, "values") and row.values:
+            value = row.values[0]
+            parsed = self._value_to_python(value)
+            if isinstance(parsed, dict):
+                return parsed
+            return {"value": parsed}
+        if isinstance(row, dict):
+            return row
+        return {}
 
     def _parse_path(self, data) -> Dict[str, List]:
-        """解析路径数据"""
-        return {"vertices": [], "edges": []}
+        """解析路径/邻居查询结果。"""
+        if not data:
+            return {"vertices": [], "edges": []}
+        vertices: List[Dict[str, Any]] = []
+        edges: List[Dict[str, Any]] = []
+        for row in data.rows() or []:
+            for value in getattr(row, "values", []) or []:
+                parsed = self._value_to_python(value)
+                if isinstance(parsed, list):
+                    for item in parsed:
+                        if isinstance(item, dict):
+                            vertices.append(item)
+                elif isinstance(parsed, dict):
+                    if {"src", "dst"}.intersection(parsed.keys()):
+                        edges.append(parsed)
+                    else:
+                        vertices.append(parsed)
+        return {"vertices": vertices, "edges": edges}
+
+    def _result_rows(self, result) -> List[Dict[str, Any]]:
+        """把 Nebula 查询结果按列名转成 dict 行。"""
+        data = getattr(result, "data", None)
+        if data is None:
+            return []
+        columns = list(getattr(data, "column_names", []) or [])
+        rows: List[Dict[str, Any]] = []
+        for index in range(result.row_size()):
+            values = result.row_values(index)
+            row: Dict[str, Any] = {}
+            for value_index, value in enumerate(values):
+                key = columns[value_index] if value_index < len(columns) else f"col_{value_index}"
+                row[key] = self._value_to_python(value)
+            rows.append(row)
+        return rows
 
     async def query(self, query_string: str) -> Dict[str, Any]:
         """
@@ -1178,8 +1431,16 @@ class NebulaGraphDatabase:
 
         return result
 
-    def _value_to_python(self, value: Value) -> Any:
+    def _value_to_python(self, value: Any) -> Any:
         """将 Nebula Value 转换为 Python 类型"""
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if isinstance(value, dict):
+            return {k: self._value_to_python(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._value_to_python(v) for v in value]
+        if not hasattr(value, "is_null"):
+            return str(value)
         if value.is_null():
             return None
         elif value.is_bool():

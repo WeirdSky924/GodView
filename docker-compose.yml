@@ -49,6 +49,22 @@ services:
     environment:
       QDRANT__LOG_LEVEL: INFO
 
+  # Redis 操作缓存与运行中租约
+  redis:
+    image: redis:7-alpine
+    container_name: godview-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./data/redis:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   # NebulaGraph 图数据库
   nebula:
     image: vesoft/nebula-graphd:v3

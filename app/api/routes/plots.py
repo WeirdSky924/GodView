@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Query
 
 from app.models.plot import Chapter, CreateChapterDTO, Hook, Plot, UpdateChapterDTO
+from app.services.graph_projection_service import enqueue_graph_projection_best_effort
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +112,7 @@ async def create_hook(hook: Hook):
 
     try:
         await postgres_db.save_hook(hook_data)
+        await enqueue_graph_projection_best_effort("hook", hook_data)
         return {
             "success": True,
             "id": hook.id,
@@ -140,6 +142,9 @@ async def update_hook_status(hook_id: str, status: str):
 
     try:
         await postgres_db.update_hook_status(hook_id, status)
+        hook = await postgres_db.get_hook(hook_id)
+        if hook:
+            await enqueue_graph_projection_best_effort("hook", hook)
         return {
             "success": True,
             "message": f"伏笔状态已更新为 '{status}'",
@@ -598,6 +603,7 @@ async def update_hook(hook_id: str, hook: Hook):
 
     try:
         await postgres_db.save_hook(hook_data)
+        await enqueue_graph_projection_best_effort("hook", hook_data)
         return {
             "success": True,
             "id": hook_id,

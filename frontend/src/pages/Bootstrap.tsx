@@ -12,6 +12,11 @@ import SeedConfirmDialog from '@/components/bootstrap/SeedConfirmDialog'
 
 type BootstrapStage = 'project_select' | 'setting_agent' | 'outline_input' | 'seed_confirmation' | 'running' | 'completed'
 
+const bootstrapSessionStorageKey = (projectId: string) => `bootstrapSession:${projectId}`
+const bootstrapStartRequestStorageKey = (projectId: string) => `bootstrapRequest:${projectId}:start`
+const bootstrapRunRequestStorageKey = (sessionId: string) => `bootstrapRequest:${sessionId}:run`
+const createRequestId = (prefix: string) => `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`
+
 export default function BootstrapPage() {
   const { sessionId } = useParams<{ sessionId?: string }>()
   const navigate = useNavigate()
@@ -88,6 +93,40 @@ export default function BootstrapPage() {
     }
   }
 
+  const restoreProjectBootstrapSession = async (projectId: string): Promise<BootstrapSession | null> => {
+    const storedSessionId = localStorage.getItem(bootstrapSessionStorageKey(projectId))
+    if (!storedSessionId) return null
+    try {
+      const sessionData = await getBootstrapSession(storedSessionId)
+      setSession(sessionData)
+      updateStageFromSession(sessionData)
+      return sessionData
+    } catch (err) {
+      localStorage.removeItem(bootstrapSessionStorageKey(projectId))
+      localStorage.removeItem(bootstrapStartRequestStorageKey(projectId))
+      return null
+    }
+  }
+
+  const startOrRestoreBootstrap = async (projectId: string) => {
+    const restored = await restoreProjectBootstrapSession(projectId)
+    if (restored) {
+      navigate(`/bootstrap/${restored.id}`)
+      return restored
+    }
+
+    const requestKey = bootstrapStartRequestStorageKey(projectId)
+    const requestId = localStorage.getItem(requestKey) || createRequestId('bootstrap_start')
+    localStorage.setItem(requestKey, requestId)
+    const result = await startBootstrap(projectId, undefined, { requestId })
+    const newSession = result.session
+    localStorage.setItem(bootstrapSessionStorageKey(projectId), newSession.id)
+    setSession(newSession)
+    setStage('setting_agent')
+    navigate(`/bootstrap/${newSession.id}`)
+    return newSession
+  }
+
   const handleCreateProject = async () => {
     if (!newProjectName.trim()) {
       setError('请输入项目名称')
@@ -106,11 +145,7 @@ export default function BootstrapPage() {
       setNewProjectName('')
 
       // 创建项目后自动启动 Bootstrap 流程
-      const result = await startBootstrap(project.id)
-      const newSession = result.session
-      setSession(newSession)
-      setStage('setting_agent')
-      navigate(`/bootstrap/${newSession.id}`)
+      await startOrRestoreBootstrap(project.id)
     } catch (err) {
       console.error('Failed to create project:', err)
       setError('创建项目失败')
@@ -127,11 +162,7 @@ export default function BootstrapPage() {
 
     setLoading(true)
     try {
-      const result = await startBootstrap(selectedProjectId)
-      const newSession = result.session
-      setSession(newSession)
-      setStage('setting_agent')
-      navigate(`/bootstrap/${newSession.id}`)
+      await startOrRestoreBootstrap(selectedProjectId)
     } catch (err) {
       console.error('Failed to start bootstrap:', err)
       setError('启动引导流程失败')
@@ -215,7 +246,10 @@ export default function BootstrapPage() {
       setStage('running')
 
       // 自动运行 bootstrap
-      await runBootstrap(session.id)
+      const runRequestKey = bootstrapRunRequestStorageKey(session.id)
+      const runRequestId = localStorage.getItem(runRequestKey) || createRequestId('bootstrap_run')
+      localStorage.setItem(runRequestKey, runRequestId)
+      await runBootstrap(session.id, { requestId: runRequestId })
     } catch (err) {
       console.error('Failed to confirm seed:', err)
       setError('确认种子数据失败')
@@ -229,7 +263,10 @@ export default function BootstrapPage() {
 
     setLoading(true)
     try {
-      await runBootstrap(session.id)
+      const runRequestKey = bootstrapRunRequestStorageKey(session.id)
+      const runRequestId = localStorage.getItem(runRequestKey) || createRequestId('bootstrap_run')
+      localStorage.setItem(runRequestKey, runRequestId)
+      await runBootstrap(session.id, { requestId: runRequestId })
       setStage('running')
     } catch (err) {
       console.error('Failed to run bootstrap:', err)

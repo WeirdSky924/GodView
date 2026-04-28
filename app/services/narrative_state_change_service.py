@@ -257,6 +257,8 @@ class StateChangeApplier:
             ])
 
         await self.db.save_character(updated)
+        from app.services.graph_projection_service import enqueue_graph_projection_best_effort
+        await enqueue_graph_projection_best_effort("character", updated)
         return {"projection": "character", "entity_id": entity_id}
 
     async def _apply_hook_change(self, change: Dict[str, Any]) -> Dict[str, Any]:
@@ -289,6 +291,8 @@ class StateChangeApplier:
         if status == "resolved" and not updated.get("resolved_at"):
             updated["resolved_at"] = datetime.utcnow()
         await self.db.save_hook(updated)
+        from app.services.graph_projection_service import enqueue_graph_projection_best_effort
+        await enqueue_graph_projection_best_effort("hook", updated)
         return {"projection": "hook", "entity_id": entity_id, "status": status}
 
     async def _apply_region_change(self, change: Dict[str, Any]) -> Dict[str, Any]:
@@ -309,6 +313,8 @@ class StateChangeApplier:
         else:
             self._merge_fields(updated, after_state, ["state", "state_summary", "destroyed_at"])
         await self.db.save_region(updated)
+        from app.services.graph_projection_service import enqueue_graph_projection_best_effort
+        await enqueue_graph_projection_best_effort("region", updated)
         return {"projection": "region", "entity_id": entity_id, "state": updated.get("state")}
 
     def _merge_fields(self, target: Dict[str, Any], source: Dict[str, Any], fields: List[str]) -> None:

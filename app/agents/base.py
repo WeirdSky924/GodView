@@ -3,6 +3,7 @@ Agent 基类
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -15,6 +16,7 @@ from langchain_core.language_models import BaseLanguageModel
 
 from app.models.agent_output_contract import OutputContractMode
 from app.models.token_usage import UsageCategory
+from app.services.trace_service import TraceService, get_trace_service
 
 logger = logging.getLogger(__name__)
 
@@ -510,7 +512,22 @@ class BaseAgent(ABC):
         if full_system_prompt:
             messages = [SystemMessage(content=full_system_prompt)] + messages
 
-        response = await self.model.ainvoke(messages)
+        trace_service = get_trace_service(db)
+        trace_tokens = TraceService.set_context(TraceService.current_trace_id(), TraceService.current_span_id())
+        started_at = time.monotonic()
+        try:
+            response = await self.model.ainvoke(messages)
+        except Exception as e:
+            await trace_service.record_event("llm_call_failed", {
+                "agent_name": self.name,
+                "agent_type": self.AGENT_TYPE,
+                "category": category.value if hasattr(category, "value") else str(category),
+                "error": str(e),
+            }, severity="error")
+            TraceService.reset_context(trace_tokens)
+            raise
+
+        duration_ms = int((time.monotonic() - started_at) * 1000)
 
         # 处理不同模型的响应格式
         raw_content = response.content
@@ -546,6 +563,25 @@ class BaseAgent(ABC):
             input_tokens = sum(len(msg.content) // 4 for msg in messages)
         if output_tokens == 0:
             output_tokens = len(content) // 4
+
+        await trace_service.record_event("llm_call_completed", {
+            "agent_name": self.name,
+            "agent_type": self.AGENT_TYPE,
+            "project_id": self.project_id,
+            "category": category.value if hasattr(category, "value") else str(category),
+            "streaming": False,
+            "structured": False,
+            "message_count": len(messages),
+            "prompt_chars": sum(len(getattr(msg, "content", "") or "") for msg in messages),
+            "prompt_hash": hashlib.sha256("\n".join(str(getattr(msg, "content", "") or "") for msg in messages).encode("utf-8")).hexdigest(),
+            "response_chars": len(content),
+            "response_hash": hashlib.sha256(content.encode("utf-8")).hexdigest() if content else None,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "duration_ms": duration_ms,
+        })
+        TraceService.reset_context(trace_tokens)
 
         self._record_token_usage(input_tokens, output_tokens, category)
 
@@ -608,6 +644,9 @@ class BaseAgent(ABC):
 
         try:
             logger.info(f"Agent {self.name} 开始流式调用 LLM...")
+            trace_service = get_trace_service(db)
+            trace_tokens = TraceService.set_context(TraceService.current_trace_id(), TraceService.current_span_id())
+            started_at = time.monotonic()
             # 使用 astream 进行流式输出（添加超时保护）
             async def stream_with_timeout():
                 nonlocal full_content, last_chunk, chunk_count
@@ -648,6 +687,14 @@ class BaseAgent(ABC):
 
         except asyncio.TimeoutError:
             logger.error(f"Agent {self.name} 流式调用超时（超过 300 秒）")
+            await trace_service.record_event("llm_call_failed", {
+                "agent_name": self.name,
+                "agent_type": self.AGENT_TYPE,
+                "streaming": True,
+                "error": "timeout",
+                "partial_response_chars": len(full_content),
+            }, severity="error")
+            TraceService.reset_context(trace_tokens)
             # 返回已有内容
             if full_content:
                 logger.info(f"Agent {self.name} 返回已获取的 {len(full_content)} 字符内容")
@@ -655,6 +702,14 @@ class BaseAgent(ABC):
             raise
         except Exception as e:
             logger.error(f"流式调用 LLM 失败: {e}")
+            await trace_service.record_event("llm_call_failed", {
+                "agent_name": self.name,
+                "agent_type": self.AGENT_TYPE,
+                "streaming": True,
+                "error": str(e),
+                "partial_response_chars": len(full_content),
+            }, severity="error")
+            TraceService.reset_context(trace_tokens)
             # 如果流式失败，回退到普通调用
             full_content = await self._call_llm(messages, temperature, max_tokens, category)
             return full_content
@@ -672,6 +727,27 @@ class BaseAgent(ABC):
             input_tokens = sum(len(msg.content) // 4 for msg in messages)
         if output_tokens == 0:
             output_tokens = len(full_content) // 4
+
+        duration_ms = int((time.monotonic() - started_at) * 1000)
+        await trace_service.record_event("llm_call_completed", {
+            "agent_name": self.name,
+            "agent_type": self.AGENT_TYPE,
+            "project_id": self.project_id,
+            "category": category.value if hasattr(category, "value") else str(category),
+            "streaming": True,
+            "structured": False,
+            "message_count": len(messages),
+            "chunk_count": chunk_count,
+            "prompt_chars": sum(len(getattr(msg, "content", "") or "") for msg in messages),
+            "prompt_hash": hashlib.sha256("\n".join(str(getattr(msg, "content", "") or "") for msg in messages).encode("utf-8")).hexdigest(),
+            "response_chars": len(full_content),
+            "response_hash": hashlib.sha256(full_content.encode("utf-8")).hexdigest() if full_content else None,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "duration_ms": duration_ms,
+        })
+        TraceService.reset_context(trace_tokens)
 
         self._record_token_usage(input_tokens, output_tokens, category)
 
@@ -779,6 +855,9 @@ class BaseAgent(ABC):
         except Exception:
             model_to_use = self.model
 
+        trace_service = get_trace_service()
+        trace_tokens = TraceService.set_context(TraceService.current_trace_id(), TraceService.current_span_id())
+        started_at = time.monotonic()
         parsed, raw_text = await runner.run_structured(
             model_to_use,
             schema,
@@ -791,6 +870,26 @@ class BaseAgent(ABC):
         try:
             input_tokens = sum(len(getattr(msg, "content", "") or "") // 4 for msg in full_messages)
             output_tokens = len(raw_text or "") // 4 or len(parsed.model_dump_json()) // 4
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            await trace_service.record_event("llm_call_completed", {
+                "agent_name": self.name,
+                "agent_type": self.AGENT_TYPE,
+                "project_id": self.project_id,
+                "category": category.value if hasattr(category, "value") else str(category),
+                "streaming": False,
+                "structured": True,
+                "schema_name": getattr(schema, "__name__", str(schema)),
+                "message_count": len(full_messages),
+                "prompt_chars": sum(len(getattr(msg, "content", "") or "") for msg in full_messages),
+                "prompt_hash": hashlib.sha256("\n".join(str(getattr(msg, "content", "") or "") for msg in full_messages).encode("utf-8")).hexdigest(),
+                "response_chars": len(raw_text or ""),
+                "response_hash": hashlib.sha256((raw_text or "").encode("utf-8")).hexdigest() if raw_text else None,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+                "duration_ms": duration_ms,
+            })
+            TraceService.reset_context(trace_tokens)
             self._record_token_usage(input_tokens, output_tokens, category)
         except Exception as exc:
             logger.debug(f"structured token 估算失败: {exc}")

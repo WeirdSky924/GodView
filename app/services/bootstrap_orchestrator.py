@@ -4,6 +4,7 @@ v4 核心需求：驱动项目初始化流程，管理 bootstrap 各阶段状态
             写入 world/characters/agents/snapshot
 """
 
+import asyncio
 import logging
 import uuid
 from datetime import datetime
@@ -14,6 +15,7 @@ from app.models.project import ProjectStatus
 from app.models.world import World, WorldRule
 from app.models.character import Character
 from app.models.seed import ProjectSeed, SeedType
+from app.services.operation_lifecycle_service import OperationLifecycleService
 
 logger = logging.getLogger(__name__)
 
@@ -23,11 +25,113 @@ class BootstrapOrchestrator:
 
     def __init__(self):
         self._sessions: Dict[str, BootstrapSession] = {}
+        self._project_session_locks: Dict[str, asyncio.Lock] = {}
+        self._session_run_locks: Dict[str, asyncio.Lock] = {}
+
+    def _session_to_db_row(self, session: BootstrapSession) -> Dict[str, Any]:
+        """序列化 Bootstrap session 供 Postgres 持久化。"""
+        return {
+            "id": session.id,
+            "project_id": session.project_id,
+            "status": session.status.value if hasattr(session.status, "value") else str(session.status),
+            "current_stage": session.current_stage.value if hasattr(session.current_stage, "value") else str(session.current_stage),
+            "progress": session.progress,
+            "setting_agent_history": session.setting_agent_history,
+            "extracted_seed": session.extracted_seed,
+            "confirmed_seed": session.confirmed_seed,
+            "error_message": session.error_message,
+            "retry_count": session.retry_count,
+            "created_at": session.created_at,
+            "updated_at": session.updated_at,
+            "completed_at": session.completed_at,
+        }
+
+    def _session_from_db_row(self, row: Dict[str, Any]) -> BootstrapSession:
+        """从 Postgres 行恢复 Bootstrap session。"""
+        return BootstrapSession(
+            id=row["id"],
+            project_id=str(row["project_id"]),
+            status=BootstrapStage(row.get("status") or BootstrapStage.DRAFT.value),
+            current_stage=BootstrapStage(row.get("current_stage") or BootstrapStage.DRAFT.value),
+            progress=float(row.get("progress") or 0),
+            setting_agent_history=row.get("setting_agent_history") or [],
+            extracted_seed=row.get("extracted_seed") or {},
+            confirmed_seed=row.get("confirmed_seed") or {},
+            error_message=row.get("error_message"),
+            retry_count=int(row.get("retry_count") or 0),
+            created_at=row.get("created_at") or datetime.now(),
+            updated_at=row.get("updated_at") or datetime.now(),
+            completed_at=row.get("completed_at"),
+        )
+
+    async def _persist_session(self, session: BootstrapSession) -> None:
+        """持久化 Bootstrap session；失败不阻断内存流程。"""
+        try:
+            from app.api.app import postgres_db
+            if postgres_db:
+                await postgres_db.save_bootstrap_session(self._session_to_db_row(session))
+        except Exception as e:
+            logger.warning(f"Persist bootstrap session failed: {session.id}, error={e}")
+
+    async def _load_session_from_db(self, session_id: str) -> Optional[BootstrapSession]:
+        try:
+            from app.api.app import postgres_db
+            if not postgres_db:
+                return None
+            row = await postgres_db.get_bootstrap_session(session_id)
+            if not row:
+                return None
+            session = self._session_from_db_row(row)
+            self._sessions[session.id] = session
+            return session
+        except Exception as e:
+            logger.warning(f"Load bootstrap session failed: {session_id}, error={e}")
+            return None
+
+    async def _get_active_project_session_from_db(self, project_id: str) -> Optional[BootstrapSession]:
+        try:
+            from app.api.app import postgres_db
+            if not postgres_db:
+                return None
+            row = await postgres_db.get_active_bootstrap_session(project_id)
+            if not row:
+                return None
+            session = self._session_from_db_row(row)
+            self._sessions[session.id] = session
+            return session
+        except Exception as e:
+            logger.warning(f"Load active bootstrap session failed: {project_id}, error={e}")
+            return None
+
+    def _get_active_project_session(self, project_id: str) -> Optional[BootstrapSession]:
+        """获取同项目未结束的 Bootstrap 会话，避免重复初始化。"""
+        terminal = {BootstrapStage.COMPLETED, BootstrapStage.FAILED}
+        for session in self._sessions.values():
+            if session.project_id == project_id and session.status not in terminal:
+                return session
+        return None
+
+    def _get_project_session_lock(self, project_id: str) -> asyncio.Lock:
+        """获取项目级 session 创建锁，避免并发 start 竞态。"""
+        lock = self._project_session_locks.get(project_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._project_session_locks[project_id] = lock
+        return lock
+
+    def _get_session_run_lock(self, session_id: str) -> asyncio.Lock:
+        """获取 session 级 bootstrap 执行锁，避免并发 run 重复落库。"""
+        lock = self._session_run_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_run_locks[session_id] = lock
+        return lock
 
     async def create_session(
         self,
         project_id: str,
         initial_message: Optional[str] = None,
+        request_id: Optional[str] = None,
     ) -> BootstrapSession:
         """
         创建 Bootstrap 会话
@@ -39,32 +143,43 @@ class BootstrapOrchestrator:
         Returns:
             BootstrapSession: Bootstrap 会话
         """
-        # 生成会话 ID
-        session_id = f"bootstrap_{uuid.uuid4().hex[:12]}"
+        async with self._get_project_session_lock(project_id):
+            existing_session = self._get_active_project_session(project_id)
+            if not existing_session:
+                existing_session = await self._get_active_project_session_from_db(project_id)
+            if existing_session:
+                logger.info(f"Reusing active bootstrap session: {existing_session.id}, project_id={project_id}")
+                return existing_session
 
-        # 创建会话
-        session = BootstrapSession(
-            id=session_id,
-            project_id=project_id,
-            status=BootstrapStage.DRAFT,
-            current_stage=BootstrapStage.DRAFT,
-            progress=0.0,
-        )
+            # 生成会话 ID
+            session_id = f"bootstrap_{uuid.uuid4().hex[:12]}"
 
-        self._sessions[session_id] = session
-        logger.info(f"Created bootstrap session: {session_id}, total sessions: {len(self._sessions)}")
+            # 创建会话
+            session = BootstrapSession(
+                id=session_id,
+                project_id=project_id,
+                status=BootstrapStage.DRAFT,
+                current_stage=BootstrapStage.DRAFT,
+                progress=0.0,
+            )
 
-        # 如果有初始消息，进入收集设定阶段
-        if initial_message:
-            session.current_stage = BootstrapStage.COLLECTING_SETTING
-            session.status = BootstrapStage.COLLECTING_SETTING
-            session.progress = 0.1
+            self._sessions[session_id] = session
+            logger.info(f"Created bootstrap session: {session_id}, total sessions: {len(self._sessions)}")
 
-        return session
+            # 如果有初始消息，进入收集设定阶段
+            if initial_message:
+                session.current_stage = BootstrapStage.COLLECTING_SETTING
+                session.status = BootstrapStage.COLLECTING_SETTING
+                session.progress = 0.1
+
+            await self._persist_session(session)
+            return session
 
     async def get_session(self, session_id: str) -> Optional[BootstrapSession]:
         """获取 Bootstrap 会话"""
         session = self._sessions.get(session_id)
+        if not session:
+            session = await self._load_session_from_db(session_id)
         if not session:
             logger.warning(f"Session {session_id} not found. Available: {list(self._sessions.keys())}")
         return session
@@ -84,7 +199,7 @@ class BootstrapOrchestrator:
         Returns:
             BootstrapSession: 更新后的会话
         """
-        session = self._sessions.get(session_id)
+        session = await self.get_session(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
 
@@ -92,9 +207,7 @@ class BootstrapOrchestrator:
         session.status = stage
         session.updated_at = datetime.now()
 
-        # 更新进度
-        session.progress = self._calculate_progress(stage)
-
+        await self._persist_session(session)
         return session
 
     def _calculate_progress(self, stage: BootstrapStage) -> float:
@@ -130,7 +243,7 @@ class BootstrapOrchestrator:
         Returns:
             BootstrapSession: 更新后的会话
         """
-        session = self._sessions.get(session_id)
+        session = await self.get_session(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
 
@@ -154,8 +267,7 @@ class BootstrapOrchestrator:
         session.current_stage = BootstrapStage.AWAITING_CONFIRMATION
         session.status = BootstrapStage.AWAITING_CONFIRMATION
         session.progress = 0.5
-        session.updated_at = datetime.now()
-
+        await self._persist_session(session)
         return session
 
     async def revise_seed(
@@ -173,7 +285,7 @@ class BootstrapOrchestrator:
         Returns:
             BootstrapSession: 更新后的会话
         """
-        session = self._sessions.get(session_id)
+        session = await self.get_session(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
 
@@ -188,6 +300,7 @@ class BootstrapOrchestrator:
         # 清空已提取的 seed，要求重新生成
         session.extracted_seed = {}
 
+        await self._persist_session(session)
         return session
 
     async def finalize_setting(
@@ -205,7 +318,7 @@ class BootstrapOrchestrator:
         Returns:
             Dict: 包含 seed_data 和 session 的结果
         """
-        session = self._sessions.get(session_id)
+        session = await self.get_session(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
 
@@ -231,6 +344,7 @@ class BootstrapOrchestrator:
         session.progress = 0.4
         session.updated_at = datetime.now()
 
+        await self._persist_session(session)
         return {
             "seed_data": seed_data,
             "session": session.model_dump(mode="json"),
@@ -259,7 +373,23 @@ class BootstrapOrchestrator:
             "seed_type": "minimal",
         }
 
-    async def run_bootstrap(self, session_id: str) -> Dict[str, Any]:
+    def _build_completed_result(self, session: BootstrapSession) -> Dict[str, Any]:
+        """基于 session 当前 seed 构造幂等完成响应。"""
+        seed = session.confirmed_seed or {}
+        return {
+            "success": True,
+            "project_id": session.project_id,
+            "world_id": seed.get("world_id"),
+            "character_count": len(seed.get("character_ids") or seed.get("main_characters", [])),
+            "message": "Bootstrap 执行完成",
+        }
+
+    async def run_bootstrap(self, session_id: str, request_id: Optional[str] = None) -> Dict[str, Any]:
+        """串行化同一 session 的 Bootstrap 执行，避免并发 run 重复落库。"""
+        async with self._get_session_run_lock(session_id):
+            return await self._run_bootstrap_locked(session_id, request_id=request_id)
+
+    async def _run_bootstrap_locked(self, session_id: str, request_id: Optional[str] = None) -> Dict[str, Any]:
         """
         执行 Bootstrap
 
@@ -269,9 +399,28 @@ class BootstrapOrchestrator:
         Returns:
             Dict: Bootstrap 执行结果
         """
-        session = self._sessions.get(session_id)
+        session = await self.get_session(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
+
+        if session.status == BootstrapStage.COMPLETED:
+            return self._build_completed_result(session)
+
+        active_stages = {
+            BootstrapStage.BOOTSTRAPPING_WORLD,
+            BootstrapStage.BOOTSTRAPPING_AGENTS,
+            BootstrapStage.BOOTSTRAPPING_CHARACTERS,
+            BootstrapStage.CREATING_SNAPSHOT,
+        }
+        if session.status in active_stages or session.current_stage in active_stages:
+            return {
+                "success": True,
+                "project_id": session.project_id,
+                "world_id": session.confirmed_seed.get("world_id") if isinstance(session.confirmed_seed, dict) else None,
+                "character_count": len(session.confirmed_seed.get("character_ids", [])) if isinstance(session.confirmed_seed, dict) else 0,
+                "message": "Bootstrap 正在执行中",
+                "status": session.status.value,
+            }
 
         # Debug: 检查 confirmed_seed
         logger.info(f"run_bootstrap: confirmed_seed type = {type(session.confirmed_seed)}")
@@ -289,6 +438,26 @@ class BootstrapOrchestrator:
             except json.JSONDecodeError:
                 raise ValueError("confirmed_seed 是字符串但无法解析为 JSON")
 
+        operation = None
+        from app.api.app import postgres_db
+        if postgres_db:
+            lifecycle = OperationLifecycleService(db=postgres_db)
+            begin = await lifecycle.begin_or_replay(
+                operation_type="bootstrap_run",
+                project_id=session.project_id,
+                resource_type="bootstrap_session",
+                resource_id=session.id,
+                request_payload={
+                    "session_id": session.id,
+                    "project_id": session.project_id,
+                    "confirmed_seed": session.confirmed_seed,
+                },
+                request_id=request_id,
+            )
+            if begin.replayed:
+                return begin.operation.get("response_payload") or self._build_completed_result(session)
+            operation = await lifecycle.mark_running(begin.operation)
+
         try:
             # 阶段 1: 创建世界
             await self._bootstrap_world(session)
@@ -301,18 +470,21 @@ class BootstrapOrchestrator:
             session.current_stage = BootstrapStage.BOOTSTRAPPING_AGENTS
             session.progress = 0.7
             session.updated_at = datetime.now()
+            await self._persist_session(session)
 
             # 阶段 3: 创建角色
             await self._bootstrap_characters(session)
             session.current_stage = BootstrapStage.BOOTSTRAPPING_CHARACTERS
             session.progress = 0.8
             session.updated_at = datetime.now()
+            await self._persist_session(session)
 
             # 阶段 4: 创建初始快照
             await self._create_initial_snapshot(session)
             session.current_stage = BootstrapStage.CREATING_SNAPSHOT
             session.progress = 0.9
             session.updated_at = datetime.now()
+            await self._persist_session(session)
 
             # 完成
             session.current_stage = BootstrapStage.COMPLETED
@@ -323,17 +495,15 @@ class BootstrapOrchestrator:
 
             # 更新项目状态
             await self._update_project_status(session.project_id, ProjectStatus.ACTIVE)
+            await self._persist_session(session)
 
             # Debug: 检查返回前的 confirmed_seed
             logger.info(f"Before return: confirmed_seed type = {type(session.confirmed_seed)}, world_id = {session.confirmed_seed.get('world_id', 'N/A')}")
 
-            return {
-                "success": True,
-                "project_id": session.project_id,
-                "world_id": session.confirmed_seed.get("world_id"),
-                "character_count": len(session.confirmed_seed.get("main_characters", [])),
-                "message": "Bootstrap 执行完成",
-            }
+            result = self._build_completed_result(session)
+            if postgres_db and operation:
+                await OperationLifecycleService(db=postgres_db).complete(operation, result)
+            return result
 
         except Exception as e:
             logger.error(f"Bootstrap 执行失败：{e}")
@@ -341,6 +511,9 @@ class BootstrapOrchestrator:
             session.status = BootstrapStage.FAILED
             session.error_message = str(e)
             session.progress = 0.0
+            await self._persist_session(session)
+            if postgres_db and operation:
+                await OperationLifecycleService(db=postgres_db).fail(operation, str(e))
             raise
 
     async def _bootstrap_world(self, session: BootstrapSession):
@@ -353,13 +526,20 @@ class BootstrapOrchestrator:
         logger.info(f"_bootstrap_world: world_rules type = {type(seed.get('world_rules'))}")
         logger.info(f"_bootstrap_world: main_characters type = {type(seed.get('main_characters'))}")
 
-        # 获取 world 数据
-        world_setting = seed.get("world_setting", {})
+        if seed.get("world_id"):
+            logger.info(f"Bootstrap world already exists, skip creation: {seed['world_id']}")
+            return
 
-        # 检查 world_setting 是否是字典
+        # 获取 world 数据
+        world_setting = seed.get("world_setting")
         if not isinstance(world_setting, dict):
-            logger.error(f"world_setting is not dict: {world_setting}")
             world_setting = {}
+        if seed.get("world_name"):
+            world_setting.setdefault("name", seed.get("world_name"))
+        if seed.get("world_description"):
+            world_setting.setdefault("description", seed.get("world_description"))
+        if seed.get("genre"):
+            world_setting.setdefault("world_type", seed.get("genre"))
 
         # 使用标准 UUID 格式
         world_id = str(uuid.uuid4())
@@ -413,7 +593,10 @@ class BootstrapOrchestrator:
         # 保存到数据库
         from app.api.app import postgres_db
         if postgres_db:
-            await postgres_db.save_world(world.model_dump(mode="json"))
+            world_data = world.model_dump(mode="json")
+            await postgres_db.save_world(world_data)
+            from app.services.graph_projection_service import enqueue_graph_projection_best_effort
+            await enqueue_graph_projection_best_effort("world", world_data)
 
             # 更新项目的 world_id
             await postgres_db.update_project(project_id, {"world_id": world_id})
@@ -427,7 +610,11 @@ class BootstrapOrchestrator:
     async def _bootstrap_regions(self, session: BootstrapSession, world_id: str):
         """创建区域"""
         seed = session.confirmed_seed
-        regions_data = seed.get("regions", [])
+        if seed.get("region_ids"):
+            logger.info(f"Bootstrap regions already exist, skip creation: {seed['region_ids']}")
+            return
+
+        regions_data = seed.get("regions") or seed.get("main_regions") or []
 
         if not isinstance(regions_data, list):
             logger.error(f"regions_data is not list: {regions_data}")
@@ -435,6 +622,7 @@ class BootstrapOrchestrator:
 
         from app.models.world import Region, RegionType
 
+        created_region_ids = []
         for region_data in regions_data:
             if not isinstance(region_data, dict):
                 logger.warning(f"region_data is not dict: {region_data}, skipping")
@@ -476,7 +664,13 @@ class BootstrapOrchestrator:
 
             from app.api.app import postgres_db
             if postgres_db:
-                await postgres_db.save_region(region.model_dump(mode="json"))
+                region_payload = region.model_dump(mode="json")
+                await postgres_db.save_region(region_payload)
+                from app.services.graph_projection_service import enqueue_graph_projection_best_effort
+                await enqueue_graph_projection_best_effort("region", region_payload)
+                created_region_ids.append(region.id)
+
+        seed["region_ids"] = created_region_ids
 
     async def _bootstrap_agents(self, session: BootstrapSession):
         """初始化 Agents"""
@@ -492,6 +686,10 @@ class BootstrapOrchestrator:
 
         if not world_id:
             raise ValueError("World 尚未创建")
+
+        if seed.get("character_ids"):
+            logger.info(f"Bootstrap characters already exist, skip creation: {seed['character_ids']}")
+            return
 
         # 获取角色数据
         main_characters = seed.get("main_characters", [])
@@ -532,7 +730,10 @@ class BootstrapOrchestrator:
 
             from app.api.app import postgres_db
             if postgres_db:
-                await postgres_db.save_character(character.model_dump(mode="json"))
+                character_payload = character.model_dump(mode="json")
+                await postgres_db.save_character(character_payload)
+                from app.services.graph_projection_service import enqueue_graph_projection_best_effort
+                await enqueue_graph_projection_best_effort("character", character_payload)
                 created_character_ids.append(character.id)
 
         # 更新 seed 中的角色 ID 列表
@@ -545,6 +746,10 @@ class BootstrapOrchestrator:
 
         if not world_id:
             raise ValueError("World 尚未创建")
+
+        if seed.get("initial_snapshot_id"):
+            logger.info(f"Bootstrap initial snapshot already exists, skip creation: {seed['initial_snapshot_id']}")
+            return
 
         snapshot_data = {
             "id": str(uuid.uuid4()),
@@ -570,6 +775,7 @@ class BootstrapOrchestrator:
         from app.api.app import postgres_db
         if postgres_db:
             await postgres_db.save_snapshot(snapshot_data)
+            seed["initial_snapshot_id"] = snapshot_data["id"]
 
     async def _update_project_status(self, project_id: str, status: ProjectStatus):
         """更新项目状态"""

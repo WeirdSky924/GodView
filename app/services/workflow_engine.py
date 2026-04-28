@@ -8,8 +8,9 @@ import json
 import logging
 import random
 import re
+import uuid
 from collections import defaultdict, deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from app.agents.base import AgentResponse
@@ -36,6 +37,8 @@ from app.models.workflow_execution import (
     WorkflowExecution,
     WorkflowExecutionCreate,
 )
+from app.services.operation_lifecycle_service import OperationLifecycleService
+from app.services.redis_service import redis_service
 from app.services.workflow_node_catalog import normalize_workflow_node_data, normalize_workflow_nodes
 from app.services.workflow_node_registry import (
     get_workflow_node_adapter,
@@ -44,7 +47,9 @@ from app.services.workflow_node_registry import (
 from app.services.workflow_replay_export_service import (
     get_workflow_replay_export_service,
 )
+from app.services.trace_service import TraceService, get_trace_service
 from app.services.agent_config_service import get_agent_config_service
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +60,9 @@ class WorkflowEngine:
     def __init__(self):
         # 执行中的工作流实例
         self._executions: Dict[str, WorkflowExecution] = {}
+        # 运行中 task registry，避免刷新/恢复后重复启动同一 execution
+        self._running_tasks: Dict[str, asyncio.Task] = {}
+        self._execution_locks: Dict[str, asyncio.Lock] = {}
         # 工作流定义缓存
         self._workflows: Dict[str, WorkflowDefinition] = {}
         # WebSocket 广播回调
@@ -709,6 +717,8 @@ class WorkflowEngine:
         project_id: str,
         initial_context: Dict[str, Any] = None,
         db=None,
+        request_id: Optional[str] = None,
+        force_new: bool = False,
     ) -> str:
         """执行工作流
 
@@ -717,6 +727,8 @@ class WorkflowEngine:
             project_id: 项目ID
             initial_context: 初始上下文，可选包含 target_chapters 参数
             db: 数据库连接
+            request_id: 幂等请求 ID
+            force_new: 是否强制创建新执行
         """
         workflow = await self.get_workflow(workflow_id, db)
         if not workflow:
@@ -729,6 +741,36 @@ class WorkflowEngine:
 
         # 初始化上下文
         context = initial_context or {}
+        request_payload = {
+            "workflow_id": workflow_id,
+            "project_id": project_id,
+            "initial_context": context,
+            "workflow_updated_at": workflow.updated_at.isoformat() if workflow.updated_at else None,
+        }
+        operation_result = None
+        operation = None
+        if db:
+            operation_service = OperationLifecycleService(db=db, redis=redis_service)
+            operation_result = await operation_service.begin_or_replay(
+                operation_type="workflow_execute",
+                project_id=project_id,
+                resource_type="workflow",
+                resource_id=workflow_id,
+                request_payload=request_payload,
+                request_id=request_id,
+                force_new=force_new,
+            )
+            operation = operation_result.operation
+            response_payload = operation.get("response_payload") or {}
+            existing_execution_id = response_payload.get("execution_id")
+            if operation_result.replayed and existing_execution_id:
+                return existing_execution_id
+            if operation_result.deduplicated:
+                existing_execution_id = existing_execution_id or await self._get_execution_id_by_operation_id(
+                    str(operation.get("id")), db
+                )
+                if existing_execution_id:
+                    return existing_execution_id
 
         # ========== 自动章节序号确定 ==========
         chapter_number = context.get("chapter_num")
@@ -763,13 +805,42 @@ class WorkflowEngine:
             except Exception as e:
                 logger.warning(f"加载章节大纲失败: {e}")
 
+        trace_service = get_trace_service(db)
+        trace_id = str(operation.get("trace_id")) if operation and operation.get("trace_id") else str(uuid.uuid4())
+        context["_trace"] = {"trace_id": trace_id, "enabled": bool(settings.trace_enabled)}
+
         # 创建执行实例
         execution = WorkflowExecution(
             workflow_id=workflow_id,
             project_id=project_id,
             status=WorkflowStatus.RUNNING,
             context=context,
+            operation_id=str(operation.get("id")) if operation else None,
+            request_id=operation.get("request_id") if operation else request_id,
+            request_hash=operation.get("request_hash") if operation else None,
+            trace_id=trace_id,
+            lease_token=operation.get("lease_token") if operation else uuid.uuid4().hex,
+            lease_expires_at=datetime.now() + timedelta(seconds=60),
+            last_heartbeat_at=datetime.now(),
         )
+
+        if db:
+            await trace_service.start_trace(
+                trace_type="workflow",
+                root_name=workflow.name,
+                project_id=project_id,
+                operation_id=execution.operation_id,
+                request_id=execution.request_id,
+                workflow_id=workflow_id,
+                workflow_execution_id=execution.id,
+                root_input_summary={
+                    "chapter_num": context.get("chapter_num"),
+                    "chapter_title": context.get("chapter_title"),
+                    "context_keys": sorted([str(k) for k in context.keys() if k != "_trace"]),
+                },
+                metadata={"node_count": len(workflow.nodes), "edge_count": len(workflow.edges)},
+                trace_id=trace_id,
+            )
 
         # 初始化节点状态
         for node in workflow.nodes:
@@ -778,6 +849,9 @@ class WorkflowEngine:
         # 保存到数据库
         if db:
             await self._save_execution_to_db(execution, db)
+            if operation:
+                operation_service = OperationLifecycleService(db=db, redis=redis_service)
+                await operation_service.mark_running(operation, {"execution_id": execution.id, "trace_id": trace_id})
 
         self._executions[execution.id] = execution
 
@@ -786,13 +860,55 @@ class WorkflowEngine:
             "workflow_id": workflow_id,
             "execution_id": execution.id,
             "chapter_number": context.get("chapter_num"),
+            "request_id": execution.request_id,
+            "trace_id": execution.trace_id,
         })
 
         # 异步执行工作流
-        asyncio.create_task(self._run_workflow(execution.id, workflow, db))
+        self._start_workflow_task(execution.id, workflow, db)
 
         logger.info(f"启动工作流执行: {execution.id}, 章节: {context.get('chapter_num')}")
         return execution.id
+
+    def _start_workflow_task(self, execution_id: str, workflow: WorkflowDefinition, db=None) -> asyncio.Task:
+        """启动并登记 workflow task；若已有活跃 task 则复用。"""
+        task = self._running_tasks.get(execution_id)
+        if task and not task.done():
+            return task
+        task = asyncio.create_task(self._run_workflow(execution_id, workflow, db))
+        self._running_tasks[execution_id] = task
+        return task
+
+    async def _get_execution_id_by_operation_id(self, operation_id: str, db) -> Optional[str]:
+        """按 operation_id 获取关联 execution。"""
+        if not operation_id:
+            return None
+        results = await db.execute_query(
+            """
+            SELECT id FROM workflow_executions
+            WHERE operation_id = CAST(:operation_id AS UUID)
+            ORDER BY started_at DESC
+            LIMIT 1
+            """,
+            {"operation_id": operation_id},
+        )
+        return results[0]["id"] if results else None
+
+    async def _mark_operation_terminal(self, execution: WorkflowExecution, db=None) -> None:
+        """同步 workflow 终态到 operation_requests。"""
+        if not db or not execution.operation_id or not execution.request_id:
+            return
+        operation = await db.get_operation_request_by_request_id(execution.request_id)
+        if not operation:
+            return
+        operation_service = OperationLifecycleService(db=db, redis=redis_service)
+        payload = {"execution_id": execution.id, "status": execution.status.value, "trace_id": execution.trace_id}
+        if execution.status == WorkflowStatus.COMPLETED:
+            await operation_service.complete(operation, payload)
+        elif execution.status == WorkflowStatus.CANCELLED:
+            await operation_service.cancel_requested(operation, payload)
+        elif execution.status == WorkflowStatus.FAILED:
+            await operation_service.fail(operation, execution.error or "workflow failed", payload)
 
     async def _run_workflow(
         self,
@@ -817,6 +933,21 @@ class WorkflowEngine:
             # ========== 构建前驱图和后继图 ==========
             predecessors = self._build_predecessor_graph(workflow)
             successors = self._build_successor_graph(workflow)
+
+            trace_service = get_trace_service(db)
+            trace_tokens = TraceService.set_context(execution.trace_id, None)
+            try:
+                await trace_service.record_event(
+                    "workflow_graph_built",
+                    {
+                        "node_count": len(workflow.nodes),
+                        "edge_count": len(workflow.edges),
+                        "predecessor_count": len(predecessors),
+                        "successor_count": len(successors),
+                    },
+                )
+            finally:
+                TraceService.reset_context(trace_tokens)
 
             logger.info(f"前驱图: {predecessors}")
             logger.info(f"后继图: {successors}")
@@ -882,6 +1013,11 @@ class WorkflowEngine:
                 iteration += 1
 
                 # 检查是否被暂停或取消
+                if execution.cancel_requested:
+                    execution.status = WorkflowStatus.CANCELLED
+                    execution.completed_at = datetime.now()
+                    logger.info(f"工作流 {execution_id} 收到取消请求")
+                    return
                 if execution.status in [WorkflowStatus.PAUSED, WorkflowStatus.CANCELLED]:
                     logger.info(f"工作流 {execution_id} 被暂停或取消")
                     return
@@ -1117,7 +1253,31 @@ class WorkflowEngine:
                         # 不再添加结束节点的后继
                         continue
 
+                # 保存循环 checkpoint/heartbeat
+                if db:
+                    execution.resume_cursor = {
+                        "completed_nodes": list(completed_nodes),
+                        "ready_nodes": list(ready_nodes),
+                        "iteration": iteration,
+                    }
+                    execution.last_heartbeat_at = datetime.now()
+                    execution.lease_expires_at = datetime.now() + timedelta(seconds=getattr(settings, "operation_lease_ttl_seconds", 60))
+                    await self._save_execution_to_db(execution, db)
+                    if execution.request_id:
+                        operation = await db.get_operation_request_by_request_id(execution.request_id)
+                        if operation:
+                            await OperationLifecycleService(db=db, redis=redis_service).heartbeat(operation)
+
                 logger.info(f"已完成节点: {completed_nodes}, 下批就绪: {ready_nodes}")
+                tokens = TraceService.set_context(execution.trace_id, None)
+                try:
+                    await trace_service.record_event("workflow_checkpoint_saved", {
+                        "iteration": iteration,
+                        "completed_nodes": list(completed_nodes),
+                        "ready_nodes": list(ready_nodes),
+                    })
+                finally:
+                    TraceService.reset_context(tokens)
 
             # ========== 完成 ==========
             if execution.status == WorkflowStatus.RUNNING:
@@ -1138,7 +1298,12 @@ class WorkflowEngine:
 
             # 保存到数据库
             if db:
+                trace_service = get_trace_service(db)
+                await trace_service.finish_trace(execution.trace_id, execution.status.value, error=execution.error)
                 await self._save_execution_to_db(execution, db)
+                await self._mark_operation_terminal(execution, db)
+
+            self._running_tasks.pop(execution_id, None)
 
             if execution.status in {
                 WorkflowStatus.COMPLETED,
@@ -1154,6 +1319,7 @@ class WorkflowEngine:
             await self._broadcast_status(execution_id, "workflow_completed", {
                 "status": execution.status.value,
                 "error": execution.error,
+                "trace_id": execution.trace_id,
             })
 
     async def _execute_node_with_merge(
@@ -1341,6 +1507,10 @@ class WorkflowEngine:
             "evaluation_feedback",
             "retry_message",
             "user_feedback",
+            "graph_context",
+            "graph_context_summary",
+            "graph_context_source",
+            "graph_context_warnings",
         ]
         snapshot = {
             key: source_context.get(key)
@@ -1410,6 +1580,43 @@ class WorkflowEngine:
             elif data_type == "events":
                 events = await db.get_events(project_id) if hasattr(db, 'get_events') else []
                 return events
+
+            elif data_type == "graph_context":
+                request = context.get("graph_context_request") or {}
+                if not isinstance(request, dict) or not request.get("enabled"):
+                    return None
+                anchor_type = request.get("anchor_type") or "character"
+                anchor_id = request.get("anchor_id") or context.get("character_id")
+                if not anchor_id:
+                    logger.warning("graph_context 请求缺少 anchor_id")
+                    return None
+                try:
+                    from app.api.app import nebula_db
+                    from app.models.graph_context import GraphContextOptions, GraphContextSource
+                    from app.services.graph_context_service import GraphContextService
+
+                    options = GraphContextOptions(
+                        depth=int(request.get("depth") or 1),
+                        max_nodes=int(request.get("max_nodes") or 16),
+                        include_world=bool(request.get("include_world", True)),
+                        include_region=bool(request.get("include_region", True)),
+                        include_hooks=bool(request.get("include_hooks", True)),
+                        allow_fallback=bool(request.get("allow_fallback", True)),
+                        source=GraphContextSource(request.get("source") or "auto"),
+                    )
+                    graph_service = GraphContextService(db, nebula_db)
+                    graph_context = await graph_service.get_local_graph_context(
+                        anchor_type,
+                        str(anchor_id),
+                        project_id=project_id,
+                        options=options,
+                    )
+                    graph_context_data = graph_context.model_dump(mode="json")
+                    context["graph_context_candidate"] = graph_context_data
+                    return graph_context_data
+                except Exception as e:
+                    logger.warning(f"加载 graph_context 失败，跳过图上下文: {e}")
+                    return None
 
             elif data_type == "locations":
                 locations = await db.get_locations(project_id) if hasattr(db, 'get_locations') else []
@@ -1745,6 +1952,28 @@ class WorkflowEngine:
         output_contract: Optional[AgentOutputContract] = None
         agent_response: Optional[AgentResponse] = None
 
+        trace_service = get_trace_service(db)
+        trace_tokens = TraceService.set_context(execution.trace_id, None)
+        node_span_id: Optional[str] = None
+        if db and execution.trace_id and settings.trace_enabled:
+            node_span_id = await db.create_trace_span({
+                "trace_id": execution.trace_id,
+                "name": f"node.{node.agent_type or node.id}",
+                "kind": "node",
+                "workflow_id": execution.workflow_id,
+                "workflow_execution_id": execution.id,
+                "node_id": node.id,
+                "agent_type": node.agent_type,
+                "attributes": {
+                    "node_id": node.id,
+                    "node_type": actual_node_type.value,
+                    "label": node.label,
+                    "agent_type": node.agent_type,
+                },
+            })
+            TraceService.reset_context(trace_tokens)
+            trace_tokens = TraceService.set_context(execution.trace_id, node_span_id)
+
         # ========== 根据节点 inputs 配置准备输入数据 ==========
         # 如果节点有 inputs 配置，使用新逻辑；否则保持原有行为（向后兼容）
         if node.inputs:
@@ -1753,6 +1982,15 @@ class WorkflowEngine:
             logger.info(f"节点 '{node.label}' 根据 inputs 配置准备了 {len(node.inputs)} 个输入")
 
         node_state.input_data = self._build_node_input_snapshot(node, execution, prepared_context)
+        if db:
+            await self._save_execution_to_db(execution, db)
+        await trace_service.record_event("node_started", {
+            "node_id": node.id,
+            "node_type": actual_node_type.value,
+            "label": node.label,
+            "agent_type": node.agent_type,
+        })
+        await trace_service.record_artifact("node_input", content=node_state.input_data)
 
         # 广播节点开始
         broadcast_data = {
@@ -1814,9 +2052,11 @@ class WorkflowEngine:
                 execution.status = WorkflowStatus.PAUSED
                 output = {"status": "waiting_for_input"}
 
+            safe_output = self._make_json_safe(output)
+
             # 更新状态
             node_state.status = NodeStatus.COMPLETED
-            node_state.output_data = self._make_json_safe(output)
+            node_state.output_data = safe_output
             node_state.completed_at = datetime.now()
 
             if output_contract:
@@ -1830,23 +2070,24 @@ class WorkflowEngine:
                 delta = node_state.completed_at - node_state.started_at
                 node_state.duration_ms = int(delta.total_seconds() * 1000)
 
-            if actual_node_type == NodeType.CONDITION and isinstance(output, dict) and "quality_passed" in output:
-                execution.context["evaluation_passed"] = output["quality_passed"]
+            if actual_node_type == NodeType.CONDITION and isinstance(safe_output, dict) and "quality_passed" in safe_output:
+                execution.context["evaluation_passed"] = safe_output["quality_passed"]
 
             # ========== 根据节点 outputs 配置处理输出 ==========
             if node.outputs:
                 # 使用配置处理输出
-                processed_output = await self._process_node_outputs(node, output, execution, db)
+                processed_output = await self._process_node_outputs(node, safe_output, execution, db)
+                processed_output = self._make_json_safe(processed_output)
                 execution.context.update(processed_output)
                 context_updates = list(processed_output.keys())
                 logger.info(f"节点 '{node.label}' 根据 outputs 配置处理了 {len(node.outputs)} 个输出")
-            elif isinstance(output, dict):
+            elif isinstance(safe_output, dict):
                 # 向后兼容：所有输出保存到上下文
-                execution.context.update(output)
-                context_updates = list(output.keys())
-            elif output is not None:
+                execution.context.update(safe_output)
+                context_updates = list(safe_output.keys())
+            elif safe_output is not None:
                 default_output_key = f"{node.id}_output"
-                execution.context[default_output_key] = output
+                execution.context[default_output_key] = safe_output
                 context_updates = [default_output_key]
 
         except Exception as e:
@@ -1877,6 +2118,30 @@ class WorkflowEngine:
         # 如果是 Agent 节点，添加 agent_type
         if actual_node_type == NodeType.AGENT and node.agent_type:
             completed_data["agent_type"] = node.agent_type
+        if db:
+            await self._save_execution_to_db(execution, db)
+        if node_state.status == NodeStatus.FAILED:
+            await trace_service.record_event("node_failed", {
+                "node_id": node.id,
+                "node_type": actual_node_type.value,
+                "label": node.label,
+                "error": node_state.error,
+            }, severity="error")
+            if db and node_span_id:
+                await db.finish_trace_span(node_span_id, "failed", error=node_state.error)
+        else:
+            await trace_service.record_event("node_completed", {
+                "node_id": node.id,
+                "node_type": actual_node_type.value,
+                "label": node.label,
+                "status": node_state.status.value,
+                "context_updates": context_updates,
+                "duration_ms": node_state.duration_ms,
+            })
+            await trace_service.record_artifact("node_output", content=node_state.output_data)
+            if db and node_span_id:
+                await db.finish_trace_span(node_span_id, "completed", attributes={"duration_ms": node_state.duration_ms})
+        TraceService.reset_context(trace_tokens)
         await self._broadcast_status(execution.id, "node_completed", completed_data)
     async def _execute_start_node(
         self,
@@ -2057,6 +2322,270 @@ class WorkflowEngine:
             logger.warning(f"读取 Agent 运行时状态失败: project={project_id}, agent={agent_type}, error={e}")
             return None
 
+    def _coerce_graph_context_bool(self, value: Any, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off"}:
+                return False
+        return bool(value)
+
+    def _get_node_graph_context_policy(
+        self,
+        node: WorkflowNode,
+        profile: Any,
+        execution: "WorkflowExecution",
+    ) -> Optional[Dict[str, Any]]:
+        """合并执行请求、profile 和节点配置中的图上下文策略。"""
+        request = execution.context.get("graph_context_request") or {}
+        if not isinstance(request, dict):
+            return None
+
+        profile_policy: Dict[str, Any] = {}
+        if profile and isinstance(getattr(profile, "metadata", None), dict):
+            raw_profile_policy = profile.metadata.get("graph_context")
+            if isinstance(raw_profile_policy, dict):
+                profile_policy = raw_profile_policy
+
+        node_policy: Dict[str, Any] = {}
+        raw_node_policy = (node.config or {}).get("graph_context")
+        if isinstance(raw_node_policy, dict):
+            node_policy = raw_node_policy
+
+        node_enabled = self._coerce_graph_context_bool(node_policy.get("enabled"), False)
+        request_enabled = self._coerce_graph_context_bool(request.get("enabled"), False)
+        profile_supported = self._coerce_graph_context_bool(profile_policy.get("enabled"), False)
+
+        if not (profile_supported or node_enabled):
+            return None
+        if not (request_enabled or node_enabled):
+            return None
+
+        policy = {**profile_policy, **request, **node_policy}
+        policy["enabled"] = True
+        policy["max_nodes"] = int(policy.get("max_nodes") or profile_policy.get("max_nodes") or 16)
+        policy["depth"] = int(policy.get("depth") or 1)
+        policy["include_world"] = self._coerce_graph_context_bool(policy.get("include_world"), True)
+        policy["include_region"] = self._coerce_graph_context_bool(policy.get("include_region"), True)
+        policy["include_hooks"] = self._coerce_graph_context_bool(policy.get("include_hooks"), True)
+        policy["allow_fallback"] = self._coerce_graph_context_bool(policy.get("allow_fallback"), True)
+        policy["source"] = policy.get("source") or "auto"
+        policy["anchor_type"] = policy.get("anchor_type") or "character"
+        return policy
+
+    def _extract_graph_context_anchor_id(self, policy: Dict[str, Any], context: Dict[str, Any]) -> Optional[str]:
+        """从请求和节点上下文中推导局部图 anchor。"""
+        for key in ("anchor_id", "character_id"):
+            value = policy.get(key) or context.get(key)
+            if value:
+                return str(value)
+
+        selected = context.get("selected_characters")
+        selected_list = selected if isinstance(selected, list) else []
+        if len(selected_list) == 1:
+            item = selected_list[0]
+            if isinstance(item, dict):
+                value = item.get("id") or item.get("character_id")
+                if value:
+                    return str(value)
+            elif item:
+                return str(item)
+
+        characters = context.get("characters")
+        character_list = characters if isinstance(characters, list) else []
+        if len(character_list) == 1:
+            item = character_list[0]
+            if isinstance(item, dict):
+                value = item.get("id") or item.get("character_id")
+                if value:
+                    return str(value)
+        return None
+
+    def _compact_graph_context(self, graph_context: Dict[str, Any], max_nodes: int = 16) -> Dict[str, Any]:
+        """把 GraphContextResponse 裁剪成可安全进入 prompt 的小摘要。"""
+        if not isinstance(graph_context, dict):
+            return {}
+
+        anchor = graph_context.get("anchor") if isinstance(graph_context.get("anchor"), dict) else None
+        nodes = graph_context.get("nodes") if isinstance(graph_context.get("nodes"), list) else []
+        edges = graph_context.get("edges") if isinstance(graph_context.get("edges"), list) else []
+        relationships = graph_context.get("relationships") if isinstance(graph_context.get("relationships"), list) else []
+        limit = max(1, min(int(max_nodes or 16), 24))
+
+        compact_anchor = None
+        if anchor:
+            compact_anchor = {
+                key: anchor.get(key)
+                for key in ("id", "type", "name", "summary")
+                if anchor.get(key) not in (None, "")
+            }
+
+        compact_nodes = []
+        for node in nodes[:limit]:
+            if not isinstance(node, dict):
+                continue
+            compact_nodes.append({
+                key: node.get(key)
+                for key in ("id", "type", "name", "summary")
+                if node.get(key) not in (None, "")
+            })
+
+        compact_edges = []
+        for edge in edges[:limit]:
+            if not isinstance(edge, dict):
+                continue
+            compact_edges.append({
+                key: edge.get(key)
+                for key in ("source", "target", "type", "label")
+                if edge.get(key) not in (None, "")
+            })
+
+        compact_relationships = []
+        for relationship in relationships[: min(limit, 8)]:
+            if not isinstance(relationship, dict):
+                continue
+            compact_relationships.append({
+                key: relationship.get(key)
+                for key in ("target_id", "target_name", "type", "strength", "source")
+                if relationship.get(key) not in (None, "")
+            })
+
+        compact = {
+            "source": graph_context.get("source"),
+            "partial": bool(graph_context.get("partial", False)),
+            "warnings": list(graph_context.get("warnings") or [])[:3],
+            "summary": graph_context.get("summary") or "",
+            "anchor": compact_anchor,
+            "nodes": compact_nodes,
+            "edges": compact_edges,
+            "relationships": compact_relationships,
+        }
+        if not any([compact.get("summary"), compact_anchor, compact_nodes, compact_edges, compact_relationships]):
+            return {}
+        return compact
+
+    async def _maybe_attach_graph_context(
+        self,
+        node: WorkflowNode,
+        execution: "WorkflowExecution",
+        db,
+        context: Dict[str, Any],
+        profile: Any,
+    ) -> Dict[str, Any]:
+        """按节点策略加载局部关系图，并只向节点上下文附加 compact 版本。"""
+        policy = self._get_node_graph_context_policy(node, profile, execution)
+        if not policy:
+            return context
+
+        if not db:
+            context["graph_context_warnings"] = ["数据库连接不存在，跳过关系图上下文"]
+            return context
+
+        anchor_id = self._extract_graph_context_anchor_id(policy, context)
+        if not anchor_id:
+            warning = "graph_context 已启用但无法推导 anchor_id，跳过关系图上下文"
+            context["graph_context_warnings"] = [warning]
+            execution.context["graph_context_warnings"] = [warning]
+            logger.warning(warning)
+            return context
+
+        try:
+            from app.api.app import nebula_db
+            from app.models.graph_context import GraphContextOptions, GraphContextSource
+            from app.services.graph_context_service import GraphContextService
+
+            trace_service = get_trace_service(db)
+            await trace_service.record_event("graph_context_requested", {
+                "node_id": node.id,
+                "anchor_type": policy.get("anchor_type") or "character",
+                "anchor_id": anchor_id,
+                "source": policy.get("source") or "auto",
+            })
+
+            options = GraphContextOptions(
+                depth=max(1, min(int(policy.get("depth") or 1), 2)),
+                max_nodes=max(1, min(int(policy.get("max_nodes") or 16), 100)),
+                include_world=self._coerce_graph_context_bool(policy.get("include_world"), True),
+                include_region=self._coerce_graph_context_bool(policy.get("include_region"), True),
+                include_hooks=self._coerce_graph_context_bool(policy.get("include_hooks"), True),
+                allow_fallback=self._coerce_graph_context_bool(policy.get("allow_fallback"), True),
+                source=GraphContextSource(policy.get("source") or "auto"),
+            )
+            graph_service = GraphContextService(db, nebula_db)
+            graph_context = await graph_service.get_local_graph_context(
+                policy.get("anchor_type") or "character",
+                anchor_id,
+                project_id=execution.project_id,
+                options=options,
+            )
+            graph_context_data = graph_context.model_dump(mode="json")
+            await trace_service.record_event("graph_context_loaded", {
+                "node_id": node.id,
+                "anchor_type": policy.get("anchor_type") or "character",
+                "anchor_id": anchor_id,
+                "source": graph_context_data.get("source"),
+                "node_count": len(graph_context_data.get("nodes") or []),
+                "edge_count": len(graph_context_data.get("edges") or []),
+                "relationship_count": len(graph_context_data.get("relationships") or []),
+                "partial": bool(graph_context_data.get("partial", False)),
+                "warnings": graph_context_data.get("warnings") or [],
+            })
+            compact = self._compact_graph_context(graph_context_data, max_nodes=options.max_nodes)
+            execution.context["graph_context_candidate"] = graph_context_data
+            if not compact:
+                warnings = list(graph_context_data.get("warnings") or [])
+                warnings.append("关系图上下文为空，未注入 prompt")
+                context["graph_context_warnings"] = warnings[:3]
+                execution.context["graph_context_warnings"] = warnings[:3]
+                return context
+
+            context["graph_context"] = compact
+            context["graph_context_summary"] = compact.get("summary", "")
+            context["graph_context_source"] = compact.get("source")
+            context["graph_context_warnings"] = compact.get("warnings", [])
+            await trace_service.record_event("graph_context_compacted", {
+                "node_id": node.id,
+                "source": compact.get("source"),
+                "node_count": len(compact.get("nodes") or []),
+                "edge_count": len(compact.get("edges") or []),
+                "relationship_count": len(compact.get("relationships") or []),
+                "partial": bool(compact.get("partial", False)),
+                "warnings": compact.get("warnings") or [],
+            })
+            await trace_service.record_artifact("graph_context", content=compact)
+            await trace_service.record_event("graph_context_attached_to_prompt", {
+                "node_id": node.id,
+                "source": compact.get("source"),
+                "summary_chars": len(compact.get("summary") or ""),
+            })
+            execution.context.update({
+                "graph_context": compact,
+                "graph_context_summary": compact.get("summary", ""),
+                "graph_context_source": compact.get("source"),
+                "graph_context_warnings": compact.get("warnings", []),
+            })
+            return context
+        except Exception as e:
+            warning = f"加载关系图上下文失败，已跳过: {e}"
+            context["graph_context_warnings"] = [warning]
+            execution.context["graph_context_warnings"] = [warning]
+            logger.warning(warning)
+            try:
+                trace_service = get_trace_service(db)
+                await trace_service.record_event("graph_context_failed", {
+                    "node_id": node.id,
+                    "anchor_id": anchor_id,
+                    "error": str(e),
+                }, severity="warning")
+            except Exception:
+                pass
+            return context
+
     async def _execute_agent_node(
         self,
         node: WorkflowNode,
@@ -2081,6 +2610,8 @@ class WorkflowEngine:
             )
         else:
             context = await self._load_agent_context(resolved_agent_type, execution, db)
+
+        context = await self._maybe_attach_graph_context(node, execution, db, context, profile)
 
         pending_interventions = await self.get_pending_interventions(
             execution.id,
@@ -3223,6 +3754,13 @@ class WorkflowEngine:
             execution.context["chapter_saved"] = True
 
             logger.info(f"章节已保存到数据库: {chapter_id} - {chapter_title} ({word_count} 字)")
+            trace_service = get_trace_service(db)
+            await trace_service.record_event("chapter_saved", {
+                "chapter_id": chapter_id,
+                "title": chapter_title,
+                "content_chars": len(content),
+                "word_count": word_count,
+            })
 
             # 广播章节保存事件
             await self._broadcast_status(execution.id, "chapter_saved", {
@@ -7485,9 +8023,15 @@ class WorkflowEngine:
     async def pause_workflow(self, execution_id: str, db=None) -> bool:
         """暂停工作流"""
         execution = self._executions.get(execution_id)
+        if not execution and db:
+            execution = await self._load_execution_from_db(execution_id, db)
+            if execution:
+                self._executions[execution_id] = execution
         if not execution:
             return False
 
+        if execution.status == WorkflowStatus.PAUSED:
+            return True
         if execution.status != WorkflowStatus.RUNNING:
             return False
 
@@ -7518,10 +8062,19 @@ class WorkflowEngine:
             logger.warning(f"工作流执行不存在: {execution_id}")
             return False
 
+        active_task = self._running_tasks.get(execution_id)
+        if active_task and not active_task.done():
+            return True
+        if execution.status == WorkflowStatus.RUNNING:
+            workflow = await self.get_workflow(execution.workflow_id, db)
+            if workflow:
+                self._start_workflow_task(execution_id, workflow, db)
+            return True
         if execution.status != WorkflowStatus.PAUSED:
             return False
 
         execution.status = WorkflowStatus.RUNNING
+        execution.cancel_requested = False
 
         if db:
             await self._save_execution_to_db(execution, db)
@@ -7532,24 +8085,36 @@ class WorkflowEngine:
         # 重新启动执行循环
         workflow = await self.get_workflow(execution.workflow_id, db)
         if workflow:
-            asyncio.create_task(self._run_workflow(execution_id, workflow, db))
+            self._start_workflow_task(execution_id, workflow, db)
 
         return True
 
     async def cancel_workflow(self, execution_id: str, db=None) -> bool:
         """取消工作流"""
         execution = self._executions.get(execution_id)
+        if not execution and db:
+            execution = await self._load_execution_from_db(execution_id, db)
+            if execution:
+                self._executions[execution_id] = execution
         if not execution:
             return False
 
+        if execution.status == WorkflowStatus.CANCELLED:
+            return True
         if execution.status in [WorkflowStatus.COMPLETED, WorkflowStatus.FAILED]:
             return False
 
+        execution.cancel_requested = True
         execution.status = WorkflowStatus.CANCELLED
         execution.completed_at = datetime.now()
 
+        task = self._running_tasks.get(execution_id)
+        if task and not task.done():
+            task.cancel()
+
         if db:
             await self._save_execution_to_db(execution, db)
+            await self._mark_operation_terminal(execution, db)
 
         await self._broadcast_status(execution_id, "workflow_cancelled", {})
         logger.info(f"取消工作流: {execution_id}")
@@ -7883,6 +8448,17 @@ class WorkflowEngine:
             "data": serialized_data,
         }
 
+        try:
+            from app.api.app import postgres_db
+            if postgres_db:
+                await postgres_db.append_workflow_execution_event(
+                    execution_id,
+                    event_type,
+                    serialized_data,
+                )
+        except Exception as e:
+            logger.debug(f"追加 workflow 事件日志失败: {execution_id}, {event_type}, error={e}")
+
         if self._broadcast_callback:
             try:
                 await self._broadcast_callback(execution_id, event_type, serialized_data)
@@ -7966,6 +8542,12 @@ class WorkflowEngine:
             export_service = get_workflow_replay_export_service()
             file_path = export_service.save_markdown(execution, workflow_definition)
             execution.context["replay_markdown_path"] = file_path
+            trace_service = get_trace_service(db)
+            await trace_service.record_event("workflow_replay_exported", {"file_path": file_path})
+            await trace_service.record_artifact(
+                "replay",
+                content={"file_path": file_path, "filename": file_path.split("/")[-1] if file_path else None},
+            )
             logger.info(f"已导出 workflow replay markdown: {file_path}")
             return file_path
         except Exception as e:
@@ -8097,35 +8679,30 @@ class WorkflowEngine:
 
     async def _save_execution_to_db(self, execution: WorkflowExecution, db):
         """保存执行记录到数据库"""
-        import json
-        query = """
-        INSERT INTO workflow_executions (id, workflow_id, project_id, status, current_node, node_states, context, intervention_ids, started_at, completed_at, total_duration_ms, error)
-        VALUES (:id, :workflow_id, :project_id, :status, :current_node, :node_states, :context, :intervention_ids, :started_at, :completed_at, :total_duration_ms, :error)
-        ON CONFLICT (id) DO UPDATE SET
-            status = EXCLUDED.status,
-            current_node = EXCLUDED.current_node,
-            node_states = EXCLUDED.node_states,
-            context = EXCLUDED.context,
-            intervention_ids = EXCLUDED.intervention_ids,
-            completed_at = EXCLUDED.completed_at,
-            total_duration_ms = EXCLUDED.total_duration_ms,
-            error = EXCLUDED.error
-        """
-        params = {
+        data = {
             "id": execution.id,
             "workflow_id": execution.workflow_id,
             "project_id": execution.project_id,
+            "operation_id": execution.operation_id,
+            "request_id": execution.request_id,
+            "request_hash": execution.request_hash,
+            "trace_id": execution.trace_id,
             "status": execution.status.value,
             "current_node": execution.current_node,
-            "node_states": json.dumps({k: v.model_dump(mode='json') for k, v in execution.node_states.items()}),
-            "context": json.dumps(execution.context, default=str),
-            "intervention_ids": json.dumps(execution.intervention_ids),
+            "node_states": self._make_json_safe({k: v.model_dump(mode='json') for k, v in execution.node_states.items()}),
+            "context": self._make_json_safe(execution.context),
+            "intervention_ids": self._make_json_safe(execution.intervention_ids),
+            "lease_token": execution.lease_token,
+            "lease_expires_at": execution.lease_expires_at,
+            "last_heartbeat_at": execution.last_heartbeat_at,
+            "cancel_requested": execution.cancel_requested,
+            "resume_cursor": self._make_json_safe(execution.resume_cursor),
             "started_at": execution.started_at,
             "completed_at": execution.completed_at,
             "total_duration_ms": execution.total_duration_ms,
             "error": execution.error,
         }
-        await db.execute_write(query, params)
+        await db.save_workflow_execution(data)
 
     async def _load_execution_from_db(self, execution_id: str, db) -> Optional[WorkflowExecution]:
         """从数据库加载执行记录"""
@@ -8164,6 +8741,15 @@ class WorkflowEngine:
             completed_at=row["completed_at"],
             total_duration_ms=row["total_duration_ms"],
             error=row["error"],
+            operation_id=str(row.get("operation_id")) if row.get("operation_id") else None,
+            request_id=row.get("request_id"),
+            request_hash=row.get("request_hash"),
+            trace_id=str(row.get("trace_id")) if row.get("trace_id") else None,
+            lease_token=row.get("lease_token"),
+            lease_expires_at=row.get("lease_expires_at"),
+            last_heartbeat_at=row.get("last_heartbeat_at"),
+            cancel_requested=bool(row.get("cancel_requested") or False),
+            resume_cursor=row.get("resume_cursor") or {},
         )
 
 

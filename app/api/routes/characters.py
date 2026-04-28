@@ -147,7 +147,8 @@ async def create_character(character: Character):
     Returns:
         Dict: 创建结果
     """
-    from app.api.app import postgres_db, nebula_db
+    from app.api.app import postgres_db
+    from app.services.graph_projection_service import get_graph_projection_service
     import uuid
     from datetime import datetime
 
@@ -194,23 +195,11 @@ async def create_character(character: Character):
     try:
         await postgres_db.save_character(char_data)
 
-        # 同步到 NebulaGraph（如果已连接）
-        if nebula_db:
-            try:
-                import json
-                nebula_props = {
-                    "name": char_data.get("name", ""),
-                    "description": char_data.get("description", ""),
-                    "role": char_data.get("role", "supporting"),
-                    "importance_tier": char_data.get("importance_tier", "npc"),
-                    "status": char_data.get("status", "active"),
-                    "personality_traits": json.dumps(char_data.get("personality_traits", [])),
-                    "created_at": char_data["created_at"].isoformat() if hasattr(char_data["created_at"], 'isoformat') else str(char_data["created_at"]),
-                }
-                await nebula_db.insert_character(char_data["id"], nebula_props)
-                logger.info(f"角色 {char_data['id']} 已同步到 NebulaGraph")
-            except Exception as e:
-                logger.warning(f"角色同步到 NebulaGraph 失败: {e}")
+        graph_projection_service = get_graph_projection_service()
+        if graph_projection_service:
+            projection_result = await graph_projection_service.enqueue_character_projection(char_data)
+            if projection_result.get("status") == "failed":
+                logger.warning(f"角色关系图投影任务入队失败: {projection_result.get('reason')}")
 
         return {
             "success": True,
@@ -531,6 +520,7 @@ async def update_character(character_id: str, character: Character):
         Dict: 更新结果
     """
     from app.api.app import postgres_db
+    from app.services.graph_projection_service import enqueue_graph_projection_best_effort
 
     if not postgres_db:
         raise HTTPException(status_code=503, detail="数据库未连接")
@@ -572,6 +562,7 @@ async def update_character(character_id: str, character: Character):
 
     try:
         await postgres_db.save_character(char_data)
+        await enqueue_graph_projection_best_effort("character", char_data)
         return {
             "success": True,
             "id": character_id,
@@ -613,7 +604,7 @@ async def delete_character(character_id: str):
 @router.get("/{character_id}/relationships", response_model=List[Dict[str, Any]])
 async def get_character_relationships(character_id: str):
     """
-    获取角色关系（从 NebulaGraph）
+    获取角色关系（NebulaGraph 优先，Postgres fallback）
 
     Args:
         character_id: 角色 ID
@@ -621,13 +612,64 @@ async def get_character_relationships(character_id: str):
     Returns:
         List: 关系列表
     """
-    from app.api.app import nebula_db
+    from app.api.app import nebula_db, postgres_db
+    from app.services.graph_context_service import GraphContextService
 
-    if not nebula_db:
-        raise HTTPException(status_code=503, detail="图数据库未连接")
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
 
-    relationships = await nebula_db.get_relationships(character_id)
-    return relationships
+    character = await postgres_db.get_character(character_id)
+    if not character:
+        raise HTTPException(status_code=404, detail="角色不存在")
+
+    service = GraphContextService(postgres_db, nebula_db)
+    return await service.get_character_relationships(
+        character_id,
+        project_id=character.get("project_id"),
+        allow_fallback=True,
+    )
+
+
+@router.get("/{character_id}/graph-context", response_model=Dict[str, Any])
+async def get_character_graph_context(
+    character_id: str,
+    depth: int = Query(default=1, ge=1, le=2),
+    max_nodes: int = Query(default=16, ge=1, le=100),
+    include_world: bool = Query(default=True),
+    include_region: bool = Query(default=True),
+    include_hooks: bool = Query(default=True),
+    allow_fallback: bool = Query(default=True),
+    source: str = Query(default="auto", pattern="^(auto|nebula|postgres)$"),
+):
+    """获取角色局部关系图上下文。"""
+    from app.api.app import nebula_db, postgres_db
+    from app.models.graph_context import GraphContextOptions, GraphContextSource
+    from app.services.graph_context_service import GraphContextService
+
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+
+    character = await postgres_db.get_character(character_id)
+    if not character:
+        raise HTTPException(status_code=404, detail="角色不存在")
+
+    options = GraphContextOptions(
+        depth=depth,
+        max_nodes=max_nodes,
+        include_world=include_world,
+        include_region=include_region,
+        include_hooks=include_hooks,
+        allow_fallback=allow_fallback,
+        source=GraphContextSource(source),
+    )
+    service = GraphContextService(postgres_db, nebula_db)
+    context = await service.get_local_graph_context(
+        "character",
+        character_id,
+        project_id=character.get("project_id"),
+        options=options,
+    )
+    return context.model_dump(mode="json")
 
 
 @router.post("/{character_id}/memories", response_model=Dict[str, Any])

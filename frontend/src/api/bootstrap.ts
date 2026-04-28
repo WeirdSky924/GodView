@@ -51,10 +51,15 @@ export interface SeedData {
 
 // ==================== API 函数 ====================
 
-export async function startBootstrap(projectId: string, initialMessage?: string): Promise<{ session: BootstrapSession }> {
+export async function startBootstrap(
+  projectId: string,
+  initialMessage?: string,
+  options?: { requestId?: string },
+): Promise<{ session: BootstrapSession }> {
   return client.post('/bootstrap/start', {
     project_id: projectId,
     initial_message: initialMessage,
+    request_id: options?.requestId,
   })
 }
 
@@ -100,8 +105,10 @@ export async function reviseSeed(sessionId: string, feedback: string): Promise<{
   })
 }
 
-export async function runBootstrap(sessionId: string): Promise<any> {
-  return client.post(`/bootstrap/${sessionId}/run`)
+export async function runBootstrap(sessionId: string, options?: { requestId?: string }): Promise<any> {
+  return client.post(`/bootstrap/${sessionId}/run`, {
+    request_id: options?.requestId,
+  })
 }
 
 export async function getSeed(sessionId: string): Promise<any> {
