@@ -125,6 +125,7 @@ export interface WorkflowExecution {
   error?: string
   request_id?: string
   request_hash?: string
+  director_session_id?: string
   operation_id?: string
   lease_token?: string
   lease_expires_at?: string
@@ -310,9 +311,10 @@ export async function executeWorkflow(
 export async function getActiveWorkflowExecution(
   projectId: string,
   workflowId?: string,
+  directorSessionId?: string,
 ): Promise<{ success: boolean; execution: WorkflowExecution | null }> {
   const response = await axios.get(`${API_BASE}/workflows/executions/active`, {
-    params: { project_id: projectId, workflow_id: workflowId },
+    params: { project_id: projectId, workflow_id: workflowId, director_session_id: directorSessionId },
   })
   return response.data
 }

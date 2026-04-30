@@ -311,8 +311,15 @@ function getPreferredWorkflowId(workflows: WorkflowDefinition[], currentWorkflow
   return workflows[0]?.id || ''
 }
 
-function getDirectorStorageKey(projectId: string, key: 'workflow' | 'execution'): string {
-  return `godview.director.${projectId}.${key}`
+function getDirectorStorageKey(projectId: string, key: 'workflow' | 'execution', sessionId?: string): string {
+  const sessionScope = sessionId?.trim()
+  return sessionScope
+    ? `godview.director.${projectId}.${sessionScope}.${key}`
+    : `godview.director.${projectId}.${key}`
+}
+
+function getDirectorExecutionSessionId(execution: WorkflowExecution): string {
+  return String(execution.director_session_id || execution.context?.director_session_id || '')
 }
 
 function isTerminalExecutionStatus(status?: string): boolean {
@@ -1328,7 +1335,7 @@ export default function Director() {
             setIsExecutionStreamReady(false)
             setIsConnected(false)
             if (currentProject) {
-              localStorage.removeItem(getDirectorStorageKey(currentProject.id, 'execution'))
+              localStorage.removeItem(getDirectorStorageKey(currentProject.id, 'execution', sessionId.trim()))
             }
             sessionStartAttempted.current = false
             loadRuntimePanels()
@@ -1453,12 +1460,14 @@ export default function Director() {
     try {
       const workflows = await getWorkflows(currentProject.id, true)
       setSavedWorkflows(workflows)
-      const storedWorkflowId = localStorage.getItem(getDirectorStorageKey(currentProject.id, 'workflow')) || ''
+      const storedWorkflowId = sessionId.trim()
+        ? localStorage.getItem(getDirectorStorageKey(currentProject.id, 'workflow', sessionId)) || ''
+        : ''
       setSelectedWorkflowId((currentId) => getPreferredWorkflowId(workflows, currentId || storedWorkflowId))
     } catch (error) {
       console.error('Failed to load workflows:', error)
     }
-  }, [currentProject])
+  }, [currentProject, sessionId])
 
   const loadChapterOutlines = useCallback(async () => {
     if (!currentProject) {
@@ -1529,32 +1538,33 @@ export default function Director() {
   useEffect(() => { if (sessionId.trim()) loadRuntimePanels() }, [sessionId])
 
   useEffect(() => {
-    if (!currentProject || !selectedWorkflowId) return
-    localStorage.setItem(getDirectorStorageKey(currentProject.id, 'workflow'), selectedWorkflowId)
-  }, [currentProject, selectedWorkflowId])
+    if (!currentProject || !selectedWorkflowId || !sessionId.trim()) return
+    localStorage.setItem(getDirectorStorageKey(currentProject.id, 'workflow', sessionId), selectedWorkflowId)
+  }, [currentProject, selectedWorkflowId, sessionId])
 
   useEffect(() => {
-    if (!currentProject) return
-    const storageKey = getDirectorStorageKey(currentProject.id, 'execution')
+    if (!currentProject || !sessionId.trim()) return
+    const storageKey = getDirectorStorageKey(currentProject.id, 'execution', sessionId)
     if (executionId) {
       localStorage.setItem(storageKey, executionId)
     }
-  }, [currentProject, executionId])
+  }, [currentProject, executionId, sessionId])
 
   useEffect(() => {
-    if (!currentProject || savedWorkflows.length === 0 || !selectedWorkflowId) return
+    if (!currentProject || savedWorkflows.length === 0 || !selectedWorkflowId || !sessionId.trim()) return
 
     let active = true
 
     const hydrateActiveExecution = async () => {
-      const storedExecutionId = localStorage.getItem(getDirectorStorageKey(currentProject.id, 'execution')) || ''
-      const workflowId = selectedWorkflowId || localStorage.getItem(getDirectorStorageKey(currentProject.id, 'workflow')) || undefined
+      const normalizedSessionId = sessionId.trim()
+      const storedExecutionId = localStorage.getItem(getDirectorStorageKey(currentProject.id, 'execution', normalizedSessionId)) || ''
+      const workflowId = selectedWorkflowId || localStorage.getItem(getDirectorStorageKey(currentProject.id, 'workflow', normalizedSessionId)) || undefined
 
       try {
         let execution: WorkflowExecution | null = null
 
         try {
-          const activeResult = await getActiveWorkflowExecution(currentProject.id, workflowId)
+          const activeResult = await getActiveWorkflowExecution(currentProject.id, workflowId, normalizedSessionId)
           execution = activeResult.execution
         } catch (error) {
           console.warn('Active workflow execution could not be loaded:', error)
@@ -1563,13 +1573,19 @@ export default function Director() {
         if (!execution && storedExecutionId) {
           try {
             const storedExecution = await getExecution(storedExecutionId)
-            execution = storedExecution
+            if (getDirectorExecutionSessionId(storedExecution) === normalizedSessionId) {
+              execution = storedExecution
+            } else {
+              localStorage.removeItem(getDirectorStorageKey(currentProject.id, 'execution', normalizedSessionId))
+            }
           } catch (error) {
             console.warn('Stored workflow execution could not be loaded:', error)
           }
         }
 
         if (!active || !execution) return
+
+        if (getDirectorExecutionSessionId(execution) !== normalizedSessionId) return
 
         const workflow = savedWorkflows.find(item => item.id === execution.workflow_id) || selectedWorkflowRef.current
         if (execution.workflow_id && savedWorkflows.some(item => item.id === execution.workflow_id)) {
@@ -1581,9 +1597,9 @@ export default function Director() {
         }
         applyWorkflowExecutionSnapshot(execution, workflow)
         if (isActiveExecutionStatus(execution.status)) {
-          addLog(`已恢复后台执行：${execution.id}`)
+          addLog(`已恢复当前会话后台执行：${execution.id}`)
         } else if (isTerminalExecutionStatus(execution.status)) {
-          addLog(`已恢复最近执行快照：${execution.id}`)
+          addLog(`已恢复当前会话最近执行快照：${execution.id}`)
         }
       } catch (error) {
         if (!active) return
@@ -1596,7 +1612,7 @@ export default function Director() {
     return () => {
       active = false
     }
-  }, [addLog, applyWorkflowExecutionSnapshot, currentProject, savedWorkflows, selectedWorkflowId])
+  }, [addLog, applyWorkflowExecutionSnapshot, currentProject, savedWorkflows, selectedWorkflowId, sessionId])
   useEffect(() => {
     if (!executionId) {
       setIsExecutionStreamReady(false)
@@ -1686,8 +1702,9 @@ export default function Director() {
   const startSession = () => {
     if (!sessionId.trim()) return addLog('请输入会话 ID')
     if (!currentProject) return addLog('请先选择项目')
+    const normalizedSessionId = sessionId.trim()
     setExecutionId('')
-    localStorage.removeItem(getDirectorStorageKey(currentProject.id, 'execution'))
+    localStorage.removeItem(getDirectorStorageKey(currentProject.id, 'execution', normalizedSessionId))
     setPendingUserInput(null)
     setWorkflowUserInput('')
     setIsExecutionStreamReady(false)
@@ -1703,7 +1720,7 @@ export default function Director() {
       setIsGenerating(false)
       setExecutionId('')
       if (currentProject) {
-        localStorage.removeItem(getDirectorStorageKey(currentProject.id, 'execution'))
+        localStorage.removeItem(getDirectorStorageKey(currentProject.id, 'execution', sessionId.trim()))
       }
       setIsExecutionStreamReady(false)
       setIsConnected(false)
@@ -1724,7 +1741,7 @@ export default function Director() {
     setAutoModeChapters([])
     setExecutionId('')
     if (currentProject) {
-      localStorage.removeItem(getDirectorStorageKey(currentProject.id, 'execution'))
+      localStorage.removeItem(getDirectorStorageKey(currentProject.id, 'execution', sessionId.trim()))
     }
     setPendingUserInput(null)
     setWorkflowUserInput('')
@@ -1753,6 +1770,7 @@ export default function Director() {
         workflow_id: selectedWorkflowId,
         project_id: currentProject.id,
         outline_mode: 'selected',
+        director_session_id: sessionId.trim(),
         outline_ids: selectedAutoOutlines.map(outline => outline.id),
         outline_chapter_numbers: selectedAutoOutlines.map(outline => outline.chapter_number),
         style_reference: autoModeForm.style_reference,
@@ -1766,6 +1784,7 @@ export default function Director() {
         workflow_id: selectedWorkflowId,
         project_id: currentProject.id,
         outline_mode: 'auto_progression',
+        director_session_id: sessionId.trim(),
         auto_advance_outlines: true,
         start_chapter_num: startOutline.chapter_number,
         chapter_count: autoModeForm.chapter_count,
@@ -1854,6 +1873,7 @@ export default function Director() {
       workflow_id: selectedWorkflowId,
       project_id: currentProject.id,
       chapter_outline_id: selectedSingleOutline.id,
+      director_session_id: sessionId.trim(),
       chapter_num: selectedSingleOutline.chapter_number,
       target_word_count: chapterForm.targetWordCount || selectedSingleOutline.target_word_count,
     })

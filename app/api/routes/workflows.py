@@ -160,12 +160,17 @@ async def create_workflow(request: WorkflowDefinitionCreate):
 async def get_active_execution(
     project_id: str = Query(..., description="项目ID"),
     workflow_id: Optional[str] = Query(None, description="工作流ID"),
+    director_session_id: Optional[str] = Query(None, description="Director 界面会话ID"),
 ):
     """获取项目/工作流当前活跃执行，用于前端刷新恢复。"""
     db = get_db()
     if not db:
         raise HTTPException(status_code=503, detail="数据库未连接")
-    row = await db.get_active_workflow_execution(project_id=project_id, workflow_id=workflow_id)
+    row = await db.get_active_workflow_execution(
+        project_id=project_id,
+        workflow_id=workflow_id,
+        director_session_id=director_session_id,
+    )
     if not row:
         return {"success": True, "execution": None}
     return {"success": True, "execution": row}
@@ -215,12 +220,53 @@ async def stream_execution_events(request: Request, execution_id: str):
             }
             yield _format_sse("workflow_event", initial_event)
 
+            latest_replayed_sequence_no = 0
+            if db and hasattr(db, "get_workflow_execution_events_since"):
+                try:
+                    historical_events = await db.get_workflow_execution_events_since(
+                        execution_id,
+                        sequence_no=0,
+                        limit=200,
+                    )
+                    for row in historical_events:
+                        raw_event_data = row.get("event_data") or {}
+                        if isinstance(raw_event_data, str):
+                            try:
+                                event_data = json.loads(raw_event_data)
+                            except json.JSONDecodeError:
+                                event_data = {"raw": raw_event_data}
+                        else:
+                            event_data = raw_event_data
+
+                        try:
+                            sequence_no = int(row.get("sequence_no") or 0)
+                        except (TypeError, ValueError):
+                            sequence_no = 0
+                        latest_replayed_sequence_no = max(latest_replayed_sequence_no, sequence_no)
+
+                        replay_event = {
+                            "type": row.get("event_type"),
+                            "execution_id": execution_id,
+                            "data": engine._serialize_for_json(event_data),
+                            "sequence_no": sequence_no,
+                            "replayed": True,
+                        }
+                        yield _format_sse("workflow_event", replay_event)
+                except Exception as e:
+                    logger.warning(f"回放工作流执行历史事件失败: {execution_id}, error={e}")
+
             while True:
                 if await request.is_disconnected():
                     break
 
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=15)
+                    try:
+                        event_sequence_no = int(event.get("sequence_no") or 0)
+                    except (TypeError, ValueError, AttributeError):
+                        event_sequence_no = 0
+                    if event_sequence_no and event_sequence_no <= latest_replayed_sequence_no:
+                        continue
                     yield _format_sse("workflow_event", event)
                 except asyncio.TimeoutError:
                     yield ": keepalive\n\n"

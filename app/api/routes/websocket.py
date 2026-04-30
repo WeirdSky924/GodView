@@ -574,6 +574,7 @@ def get_or_create_director(client_id: str, project_id: Optional[str] = None) -> 
         },
         project_id=project_id,
     )
+    director.session_id = client_id
     manager.director_sessions[client_id] = director
     return director
 
@@ -1350,6 +1351,7 @@ async def handle_auto_write_chapter(websocket: WebSocket, message: dict, client_
                 "chapter_goal": chapter_goal,
                 "target_word_count": target_word_count,
                 "style_reference": style_reference,
+                "director_session_id": client_id,
             }
             if chapter_outline_payload:
                 initial_context.update({
@@ -1626,7 +1628,7 @@ async def handle_workflow_start(websocket: WebSocket, message: dict, client_id: 
 
     workflow_id = message.get("workflow_id")
     project_id = message.get("project_id")
-    initial_context = message.get("initial_context", {})
+    initial_context = {**(message.get("initial_context", {}) or {}), "director_session_id": client_id}
 
     if not workflow_id or not project_id:
         await send_error(websocket, "缺少 workflow_id 或 project_id")

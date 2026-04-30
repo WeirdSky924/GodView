@@ -327,16 +327,18 @@ class SceneCoordinatorAgent(BaseAgent):
             mode = input_data.get("mode", "interactive")
             iteration_count = input_data.get("iteration_count", 2)  # 默认2轮
             target_word_count = input_data.get("target_word_count", 1500)
+            reference_mode = bool(input_data.get("reference_mode", False))
             plot_intents = input_data.get("plot_intents", [])
 
             self._current_scene = scene_directions
             self._conversation_history = []
 
-            # 根据目标字数动态调整迭代轮数
-            if target_word_count >= 3000:
-                iteration_count = max(iteration_count, 4)
-            elif target_word_count >= 2000:
-                iteration_count = max(iteration_count, 3)
+            # 根据目标字数动态调整迭代轮数；参考素材模式不按章节正文规模扩写
+            if not reference_mode:
+                if target_word_count >= 3000:
+                    iteration_count = max(iteration_count, 4)
+                elif target_word_count >= 2000:
+                    iteration_count = max(iteration_count, 3)
 
             if mentioned_characters or unavailable_characters:
                 scene_directions["mentioned_character_rule"] = (
@@ -374,7 +376,7 @@ class SceneCoordinatorAgent(BaseAgent):
             ])
             current_word_count = await self._count_words_with_skill(full_content)
 
-            if current_word_count < target_word_count * 0.7:
+            if not reference_mode and current_word_count < target_word_count * 0.7:
                 logger.info(f"内容字数不足 ({current_word_count}/{target_word_count})，进行补充迭代...")
                 supplement_results = await self._supplement_scene_content(
                     characters_data, distribution_plan, scene_directions, world_info,
@@ -383,6 +385,11 @@ class SceneCoordinatorAgent(BaseAgent):
                     plot_intents=plot_intents,
                 )
                 performance_results.extend(supplement_results)
+            elif reference_mode and current_word_count < target_word_count * 0.7:
+                logger.info(
+                    f"参考素材模式：场景演绎内容较短 ({current_word_count}/{target_word_count})，"
+                    "不进行章节正文式补写"
+                )
 
             # 4. 整合表演内容
             final_result = await self._integrate_performances(
@@ -392,6 +399,9 @@ class SceneCoordinatorAgent(BaseAgent):
             # 添加统计信息（使用 skill 统计字数）
             final_result["iteration_count"] = iteration_count
             final_result["target_word_count"] = target_word_count
+            final_result["reference_mode"] = reference_mode
+            final_result["material_role"] = input_data.get("material_role", "reference_only" if reference_mode else "performance")
+            final_result["usage_instruction"] = input_data.get("usage_instruction", "")
             final_result["actual_word_count"] = await self._count_words_with_skill(final_result.get("full_content", ""))
             final_result["performers"] = performers
             final_result["mentioned_characters"] = mentioned_characters

@@ -56,6 +56,7 @@ class DirectorSystem:
         self.world_data = world_data
         self.config = config or {}
         self.project_id = project_id  # v7: 用于加载 prompt 模板
+        self.session_id: Optional[str] = None
 
         self.current_chapter: Optional[Dict[str, Any]] = None
         self.chapter_events: List[Dict[str, Any]] = []
@@ -1723,6 +1724,7 @@ class DirectorSystem:
                     "chapter_goal": chapter_goal,
                     "target_word_count": target_word_count,
                     "style_reference": style_reference,
+                    "director_session_id": self.session_id,
                 }
                 if chapter_item.get("chapter_outline"):
                     initial_context.update({

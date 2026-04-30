@@ -414,6 +414,7 @@ class SkillRetrievalService:
                         params[-1] += " [必填]"
                 params_info = "\n".join(params)
 
+            param_block = f"- 参数:\n{params_info}" if params_info else ""
             candidate_info.append(f"""
 ### 候选 {i + 1}: {skill.name}
 - ID: {skill.id}
@@ -421,7 +422,7 @@ class SkillRetrievalService:
 - 相似度: {c.similarity_score:.2f}
 - 类型: {skill.skill_type.value}
 - 分类: {skill.category.value}
-{f"- 参数:\\n{params_info}" if params_info else ""}
+{param_block}
 """)
 
         prompt = f"""你是一个智能技能选择系统。根据用户的场景描述，从候选技能中选择最合适的技能并提取调用参数。

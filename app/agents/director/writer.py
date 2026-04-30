@@ -385,9 +385,9 @@ class WriterAgent(BaseAgent):
             retry_count = input_data.get("retry_count", 0)
             retry_message = input_data.get("retry_message", "")
 
-            # 计算字数要求：Writer 要写到章节目标附近，不能只检查最低字数。
+            # 计算字数要求：Writer 要写到章节目标附近，允许适度展开但不能失控超写。
             min_word_count = max(1, int(word_count * 0.9))
-            max_word_count = max(word_count, int(word_count * 1.1))
+            max_word_count = max(word_count, int(word_count * 1.25))
 
             # ========== 决定生成策略 ==========
             use_segmented = word_count >= SEGMENT_THRESHOLD
@@ -513,11 +513,15 @@ class WriterAgent(BaseAgent):
             limit=6,
         )
 
+        workflow_binding_block = self._build_workflow_binding_block(input_data)
+
         # 构建用户消息
         if auto_write_mode and writing_prompt:
             user_message = writing_prompt
+            if workflow_binding_block:
+                user_message = f"{user_message}\n\n{workflow_binding_block}"
             if writing_rules_guidance:
-                user_message = f"{writing_prompt}\n\n{writing_rules_guidance}"
+                user_message = f"{user_message}\n\n{writing_rules_guidance}"
         else:
             user_message = self._build_user_message(
                 intents=intents,
@@ -588,6 +592,7 @@ class WriterAgent(BaseAgent):
                 chapter_num=chapter_num,
                 total_chapters=total_chapters,
                 writing_rules_guidance=writing_rules_guidance,
+                workflow_binding_block=workflow_binding_block,
             )
 
             # 调用 LLM 续写 (structured)
@@ -729,7 +734,7 @@ class WriterAgent(BaseAgent):
                 total_segments=segment_count,
                 target_words=segment_target,
                 min_words=max(1, int(segment_target * 0.85)),
-                max_words=max(segment_target, int(segment_target * 1.15)),
+                max_words=max(segment_target, int(segment_target * 1.25)),
                 world_info=world_info,
                 previous_style=previous_style if i == 0 else None,
                 writing_rules_guidance=segment_writing_rules_guidance,
@@ -848,6 +853,7 @@ class WriterAgent(BaseAgent):
         total_chapters: int,
         world_info: Optional[Dict[str, Any]] = None,
         discussion_asset_digest: str = "",
+        workflow_binding_block: str = "",
     ) -> Dict[str, Any]:
         """
         规划分段结构
@@ -871,6 +877,12 @@ class WriterAgent(BaseAgent):
 【角色状态】
 {chr(10).join([f"- {k}: {v}" for k, v in character_moods.items()]) if character_moods else "无特定状态"}
 """
+        if workflow_binding_block:
+            prompt += f"""
+
+{workflow_binding_block}
+"""
+
         if discussion_asset_digest:
             prompt += f"""
 
@@ -881,10 +893,14 @@ class WriterAgent(BaseAgent):
         prompt += f"""
 
 【规划要求】
-1. 每段应该有明确的叙事焦点
-2. 段落之间要自然过渡
-3. 保持剧情连贯性
-4. 合理分配信息密度
+1. 每段应该有明确的叙事焦点，并优先覆盖绑定章节大纲中的必达节点
+2. 必须把章节大纲、章节目标、修订要求中的关键剧情点分配到具体段落，不允许用通用桥段替代
+3. 段落之间要自然过渡
+4. 保持剧情连贯性
+5. 合理分配信息密度
+6. 每一段都必须回答“因为什么发生、角色做了什么、外部世界因此有什么变化”；不能连续规划纯对话/纯心理活动段落
+7. 开章可以克制，但必须有实际事件推进：遭遇、发现、抉择、误会、追索、任务、危机、线索或环境变化至少出现一种
+8. 不得规划未授权角色、组织、能力、地点或专有概念；如素材冲突，以绑定大纲、固定设定和角色硬约束为准
 
 请输出 JSON 格式：
 {{
@@ -940,12 +956,13 @@ class WriterAgent(BaseAgent):
         previous_style: Optional[str] = None,
         writing_rules_guidance: str = "",
         discussion_asset_digest: str = "",
+        workflow_binding_block: str = "",
     ) -> str:
         """构建分段生成提示"""
         parts = []
 
         min_words = min_words or max(1, int(target_words * 0.85))
-        max_words = max_words or max(target_words, int(target_words * 1.15))
+        max_words = max_words or max(target_words, int(target_words * 1.25))
 
         parts.append(f"""【分段写作任务】
 - 当前是第 {segment_num}/{total_segments} 段
@@ -957,6 +974,9 @@ class WriterAgent(BaseAgent):
         key_elements = self._as_list(segment_info.get('key_elements', []))
         if key_elements:
             parts.append(f"\n【本段关键元素】\n{chr(10).join(['- ' + str(e) for e in key_elements])}")
+
+        if workflow_binding_block:
+            parts.append(f"\n{workflow_binding_block}")
 
         if writing_rules_guidance:
             parts.append(f"\n{writing_rules_guidance}")
@@ -980,8 +1000,14 @@ class WriterAgent(BaseAgent):
 【写作要求】
 1. 本段字数必须控制在 {min_words}-{max_words} 字范围内，接近目标 {target_words} 字即可，不要为了铺陈而超写
 2. 与前文自然衔接
-3. 突出本段的叙事焦点
-4. 保持网文的节奏感和可读性
+3. 突出本段的叙事焦点，并覆盖本段关键元素
+4. 严格遵守工作流绑定上下文，不得新增未授权角色、组织、能力、地点或专有概念
+5. 场景演绎素材只可作为参考，不得覆盖章节大纲或逐字照抄
+6. 本段必须有可见的故事推进：角色行动、发现线索、遭遇阻力、做出选择、环境变化或局势变化至少出现一种
+7. 对话必须服务于行动和因果推进；禁止整段只写已有角色互相解释、寒暄、分析或情绪演绎
+8. 写清楚前因后果：读者应能理解“为什么现在发生、为什么角色这样做、这一段结束后局势有什么变化”
+9. “金手指”只能作为作者/策划视角标签，不得出现在主角正文认知或台词中；角色只能用其自身世界观可理解的名称描述异常能力或物件
+10. 保持网文的节奏感和可读性
 
 输出 JSON 格式：
 {{
@@ -1000,24 +1026,29 @@ class WriterAgent(BaseAgent):
         chapter_num: int,
         total_chapters: int,
         writing_rules_guidance: str = "",
+        workflow_binding_block: str = "",
     ) -> str:
         """构建补充内容提示"""
         guidance_block = f"\n【当前相关写作规则】\n{writing_rules_guidance}\n" if writing_rules_guidance else ""
+        binding_block = f"\n{workflow_binding_block}\n" if workflow_binding_block else ""
         return f"""请为以下章节内容进行补充，增加约 {shortage} 字。
 
 【已有内容】
-{existing_content}{guidance_block}
+{existing_content}{binding_block}{guidance_block}
 【长篇创作意识】
 - 当前是第 {chapter_num} 章，全书共 {total_chapters} 章
 - 保持剧情可持续发展，不要急于推进到高潮
 
 【补充方向】
-请选择以下方向之一进行补充：
-1. 深化场景细节描写
-2. 增加角色内心活动
-3. 丰富对话和互动
-4. 添加环境氛围渲染
+请优先补足绑定章节大纲中尚未覆盖的必达节点，或扩写已有合法场景中的因果链与行动后果；不得新增未授权角色、组织、能力、地点或专有概念。
+补充内容必须优先选择能增强故事推进的方向，避免只增加聊天和心理活动：
+1. 补足事件前因或直接诱因
+2. 写出角色采取的具体行动
+3. 增加外部阻力、线索发现或局势变化
+4. 写清角色选择造成的后果
 5. 埋下伏笔或悬念
+
+注意：“金手指”是作者视角术语，正文角色不得这样称呼或理解相关能力/物件。
 
 输出 JSON 格式：
 {{
@@ -1035,13 +1066,15 @@ class WriterAgent(BaseAgent):
         chapter_num: int,
         total_chapters: int,
         writing_rules_guidance: str = "",
+        workflow_binding_block: str = "",
     ) -> str:
         """构建续写提示"""
         guidance_block = f"\n【当前相关写作规则】\n{writing_rules_guidance}\n" if writing_rules_guidance else ""
+        binding_block = f"\n{workflow_binding_block}\n" if workflow_binding_block else ""
         return f"""请继续写作，补充约 {shortage} 字的内容。
 
 【已有内容】
-{existing_content}{guidance_block}
+{existing_content}{binding_block}{guidance_block}
 【长篇创作意识】
 - 当前是第 {chapter_num} 章，全书共 {total_chapters} 章
 - 请保持剧情可持续发展的节奏
@@ -1049,12 +1082,15 @@ class WriterAgent(BaseAgent):
 - 续写内容要与上文自然衔接
 
 【续写方向】
+请优先补足绑定章节大纲中尚未覆盖的必达节点，或沿着已有合法内容自然续写出新的行动、线索、阻力或局势变化；不得新增未授权角色、组织、能力、地点或专有概念。
 请选择以下方向之一进行续写：
-1. 深化当前场景的细节描写
-2. 增加角色之间的互动和对话
-3. 添加环境氛围的渲染
-4. 推进剧情的自然发展
+1. 补足事件前因或读者理解当前冲突所需的信息
+2. 推进角色的具体行动和选择
+3. 引入或深化外部阻力、线索发现、环境变化
+4. 写出上一段行动造成的后果
 5. 为后续情节埋下伏笔
+
+注意：“金手指”是作者视角术语，正文角色不得这样称呼或理解相关能力/物件。
 
 输出 JSON 格式：
 {{
@@ -1184,11 +1220,13 @@ class WriterAgent(BaseAgent):
                 "- 绑定章节大纲、固定设定和动态设定是事实输入源，必须承接，不能改写为另一套剧情。\n"
                 "- 当章节大纲明确要求某个能力觉醒、融合、警告、线索或场景在本章发生时，必须执行；不得以长篇渐进展开为理由延后或替换。\n"
                 "- 场景演绎素材和讨论素材只作为参考材料/写作索引，不是必须逐字照抄的正文脚本；如与绑定大纲或固定设定冲突，以绑定大纲和固定设定为准。\n"
-                "- 角色出场硬约束优先级高于讨论素材和场景演绎素材：只有 present_character_names 中的角色可以正面出场、说话或行动。\n"
+                "- 角色出场硬约束只限制谁能正面出场、说话或行动；它不是把章节写成室内聊天或静态群像的理由。\n"
+                "- 只有 present_character_names 中的角色可以正面出场、说话或行动。\n"
                 "- mentioned_only_names / forbidden_direct_appearance_names 中的角色只能作为传闻、回忆、姓名、势力或影响被提及；不得写成当前场景的活人参与者、发言者或行动者。\n"
                 "- 如果讨论资产、场景演绎素材或写作计划引入未授权角色，必须跳过或改写，不得作为事实承接。\n"
                 "- 角色来源、历史、身份和背景必须遵守 category=character_setting 的设定库条目；缺失时不要自行补写。\n"
-                "- 不要引入项目设定中不存在的通用修真/玄幻规则、组织、角色或专有概念。"
+                "- 不要引入项目设定中不存在的通用修真/玄幻规则、组织、角色或专有概念。\n"
+                "- “金手指”是作者视角/元叙事术语；正文中主角不能把自己的异常能力、系统、物品或机缘称为“金手指”，也不能理解这个词的作者语境。请改写成角色视角能理解的称呼，如异常感应、残页、印记、回响、梦境、旧物、未知能力等。"
             )
 
         return "\n\n".join(parts)
@@ -1226,7 +1264,7 @@ class WriterAgent(BaseAgent):
         message_parts.append(
             f"【字数要求（强制）】\n"
             f"目标：约 {word_count} 字\n"
-            f"可接受范围：{min_word_count}-{int(word_count * 1.1)} 字\n"
+            f"可接受范围：{min_word_count}-{int(word_count * 1.25)} 字\n"
             "写作完成后请自行统计字数；不要只追求超过最低值，也不要明显超出上限。"
         )
 
@@ -1253,33 +1291,9 @@ class WriterAgent(BaseAgent):
             message_parts.append(world_section)
 
         workflow_context = workflow_context or {}
-        binding_blocks = [
-            ("绑定章节大纲（必须遵循，不可替换）", workflow_context.get("chapter_outline")),
-            ("章节目标", workflow_context.get("chapter_goals") or workflow_context.get("chapter_goal")),
-            ("角色出场硬约束", workflow_context.get("character_constraints")),
-            ("场景方向", workflow_context.get("scene_directions")),
-            ("场景演绎素材", workflow_context.get("performance_result")),
-            ("总编剧写作计划", workflow_context.get("writing_plan") or workflow_context.get("plot_guidance")),
-            ("固定最高级设定", workflow_context.get("fixed_lore_entries")),
-            ("本章动态设定", workflow_context.get("dynamic_lore_entries") or workflow_context.get("selected_lore_entries")),
-            ("上一轮评估修订要求", workflow_context.get("retry_message") or workflow_context.get("revision_notes")),
-        ]
-        for title, value in binding_blocks:
-            block = self._format_workflow_context_block(title, value)
-            if block:
-                message_parts.append(block)
-
-        if any(value for _, value in binding_blocks):
-            message_parts.append(
-                "【工作流状态使用要求】\n"
-                "- 上述绑定章节大纲、固定设定和动态设定是事实输入源，必须承接，不能改写为另一套剧情。\n"
-                "- 场景演绎素材和总编剧写作计划是写作素材/索引，请整合进正文，但若与绑定大纲或固定设定冲突，以绑定大纲和固定设定为准。\n"
-                "- 角色出场硬约束优先级高于讨论素材和场景演绎素材：只有 present_character_names 中的角色可以正面出场、说话或行动。\n"
-                "- mentioned_only_names / forbidden_direct_appearance_names 中的角色只能作为传闻、回忆、姓名、势力或影响被提及；不得写成当前场景的活人参与者、发言者或行动者。\n"
-                "- 如果讨论资产、场景演绎素材或写作计划引入未授权角色，必须跳过或改写，不得作为事实承接。\n"
-                "- 角色来源、历史、身份和背景必须遵守 category=character_setting 的设定库条目；缺失时不要自行补写。\n"
-                "- 不要引入项目设定中不存在的通用修真/玄幻规则。"
-            )
+        workflow_binding_block = self._build_workflow_binding_block(workflow_context)
+        if workflow_binding_block:
+            message_parts.append(workflow_binding_block)
 
         # 团队讨论共识（如果有）
         if discussion_summary:
@@ -1332,8 +1346,12 @@ class WriterAgent(BaseAgent):
             "\n请将以上要素融合，生成一段有小说质感的连贯文本。"
             "注意：\n"
             "- 多用动作和神态描写，少用直接告知\n"
-            "- 对话要符合角色性格\n"
+            "- 对话要符合角色性格，但对话必须推动行动、线索、冲突或决策，不能代替剧情本身\n"
+            "- 每章都要有实际故事开展：至少写出一个明确事件、一个外部阻力或变化、一次角色选择，以及这一切带来的后果\n"
+            "- 写清楚前因后果，让读者理解事件为何发生、角色为何行动、章节结束时局势发生了什么变化\n"
+            "- 长篇开章可以保留谜团，但不能省略读者理解当前事件所需的基本因果链\n"
             "- 伏笔要自然嵌入，不突兀\n"
+            "- 正文角色不得使用或理解‘金手指’这个作者视角术语；如输入里有金手指，请改写为角色可感知的异常能力、物件、印记、回响、梦境或未知机缘\n"
             "- 必须控制在字数范围内，接近目标字数即可，禁止明显超写\n"
             "- 保持长篇网文的节奏感，不要急于推进到高潮"
         )

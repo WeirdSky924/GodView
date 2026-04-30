@@ -340,11 +340,13 @@ class HookManagerAgent(BaseAgent):
                 hook_type = h.get('hook_type', '未知')
                 priority = h.get('priority', 5)
                 desc = h.get('description', '')[:50]  # 截断描述
-                hooks_text.append(f"- [{status}] {title} (类型:{hook_type}, 优先级:{priority})")
+                hook_id = h.get('id', '')
+                hooks_text.append(f"- ID: {hook_id} | [{status}] {title} (类型:{hook_type}, 优先级:{priority})")
                 if desc:
                     hooks_text.append(f"  描述: {desc}...")
 
             message_parts.append(f"【现有伏笔 ({len(existing_hooks)}个)】\n{chr(10).join(hooks_text)}")
+            message_parts.append("⚠️ 回收或更新现有伏笔时，hooks_to_resolve.id 和 hooks_status_updates.id 必须逐字使用上方 ID 字段；不要填写伏笔标题、名称或描述。")
             message_parts.append("⚠️ 以上是数据库中已存在的伏笔，请优先考虑如何利用和管理这些伏笔。")
         else:
             message_parts.append("【现有伏笔】\n暂无已存储的伏笔。")

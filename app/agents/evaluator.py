@@ -192,7 +192,7 @@ class EvaluatorAgent(BaseAgent):
 - 如果角色出场硬约束中的 mentioned_only_names / forbidden_direct_appearance_names 被写成当前场景的活人参与者、发言者或行动者，quality_passed 必须为 false。
 - 如果正文违反 category=character_setting 的角色来源、历史、身份或背景设定，quality_passed 必须为 false。
 - 集体讨论或场景演绎素材若引入未授权角色或违反角色状态，不能作为通过依据，必须指出并要求改写。
-- 字数需达到目标字数的 80%；目标字数为 {target_word_count or '未提供'}。
+- 字数需达到目标字数的 80%，且通常不超过目标字数的 125%；目标字数为 {target_word_count or '未提供'}。
 - 如果缺少必要上下文，应在 upstream_context_usage_check 中说明，不能凭空补设定。
 
 【当前章节数据】
@@ -218,7 +218,7 @@ class EvaluatorAgent(BaseAgent):
   "world_rule_check": {{"passed": true/false, "issues": ["项目/世界规则问题"]}},
   "lore_conflict_check": {{"passed": true/false, "issues": ["设定冲突问题"]}},
   "character_participation_check": {{"passed": true/false, "issues": ["角色参与问题"]}},
-  "word_count_check": {{"passed": true/false, "actual": {word_count}, "target": {target_word_count}, "min_required": {int(target_word_count * 0.8) if target_word_count else 0}}},
+  "word_count_check": {{"passed": true/false, "actual": {word_count}, "target": {target_word_count}, "min_required": {int(target_word_count * 0.8) if target_word_count else 0}, "max_allowed": {int(target_word_count * 1.25) if target_word_count else 0}}},
   "upstream_context_usage_check": {{"passed": true/false, "used_context": ["已使用的上游状态"], "missing_context": ["缺失上下文"]}},
   "asset_persistence_check": {{"passed": true/false, "issues": ["地图/伏笔/设定持久化问题"]}},
   "pacing_check": {{"is_appropriate": true/false, "note": "节奏是否适合当前章节位置"}},

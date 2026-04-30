@@ -995,6 +995,7 @@ class WorkflowEngine:
             operation_id=str(operation.get("id")) if operation else None,
             request_id=operation.get("request_id") if operation else request_id,
             request_hash=operation.get("request_hash") if operation else None,
+            director_session_id=context.get("director_session_id"),
             trace_id=trace_id,
             lease_token=operation.get("lease_token") if operation else uuid.uuid4().hex,
             lease_expires_at=datetime.now() + timedelta(seconds=60),
@@ -1048,6 +1049,7 @@ class WorkflowEngine:
             "request_id": execution.request_id,
             "trace_id": execution.trace_id,
             "world_id": context.get("world_id"),
+            "director_session_id": execution.director_session_id,
         })
 
         # 异步执行工作流
@@ -4070,9 +4072,11 @@ class WorkflowEngine:
                     from app.utils.text_utils import count_mixed_text, validate_word_count
                     actual_word_count = count_mixed_text(chapter_content)
                     word_count_passed, _, word_count_msg = validate_word_count(
-                        chapter_content, target_word_count
+                        chapter_content,
+                        target_word_count,
+                        tolerance=0.25,
                     )
-                    max_word_count = int(target_word_count * 1.1)
+                    max_word_count = int(target_word_count * 1.25)
                     word_count_check = {
                         "actual": actual_word_count,
                         "target": target_word_count,
@@ -4632,6 +4636,14 @@ class WorkflowEngine:
             hooks_to_resolve = hook_output.get("hooks_to_resolve", [])
             hooks_status_updates = hook_output.get("hooks_status_updates", [])
 
+            def _valid_hook_uuid(raw_id: Any) -> Optional[str]:
+                if raw_id in (None, ""):
+                    return None
+                try:
+                    return str(uuid.UUID(str(raw_id)))
+                except (TypeError, ValueError, AttributeError):
+                    return None
+
             # 保存新伏笔
             planted_ids = []
             duplicate_candidates = []
@@ -4688,20 +4700,32 @@ class WorkflowEngine:
                 planted_ids.append(hook_id)
                 logger.info(f"保存新伏笔: {hook_record['title']}")
 
-            # 更新伏笔状态（回收）
+            resolved_ids = []
+            skipped_hook_updates = []
             for hook_data in hooks_to_resolve:
-                hook_id = hook_data.get("id")
+                raw_hook_id = hook_data.get("id")
+                hook_id = _valid_hook_uuid(raw_hook_id)
                 if hook_id:
                     await db.update_hook_status(hook_id, "resolved")
+                    resolved_ids.append(hook_id)
                     logger.info(f"伏笔已回收: {hook_id}")
+                elif raw_hook_id:
+                    skipped_hook_updates.append({"id": raw_hook_id, "reason": "invalid_uuid", "action": "resolve"})
+                    logger.warning(f"跳过伏笔回收：非 UUID id={raw_hook_id}")
 
             # 更新伏笔状态
+            updated_ids = []
             for update_data in hooks_status_updates:
-                hook_id = update_data.get("id")
+                raw_hook_id = update_data.get("id")
+                hook_id = _valid_hook_uuid(raw_hook_id)
                 new_status = update_data.get("new_status")
                 if hook_id and new_status:
                     await db.update_hook_status(hook_id, new_status)
+                    updated_ids.append(hook_id)
                     logger.info(f"伏笔状态更新: {hook_id} -> {new_status}")
+                elif raw_hook_id:
+                    skipped_hook_updates.append({"id": raw_hook_id, "reason": "invalid_uuid", "action": "status_update"})
+                    logger.warning(f"跳过伏笔状态更新：非 UUID id={raw_hook_id}")
 
             if planted_ids:
                 get_workflow_state(execution).set_asset_state(
@@ -4718,15 +4742,17 @@ class WorkflowEngine:
                 "source": source,
                 "planted_count": len(planted_ids) - len(duplicate_candidates),
                 "duplicate_count": len(duplicate_candidates),
-                "resolved_count": len(hooks_to_resolve),
-                "updated_count": len(hooks_status_updates),
+                "resolved_count": len(resolved_ids),
+                "updated_count": len(updated_ids),
+                "skipped_count": len(skipped_hook_updates),
                 "world_id": execution.context.get("world_id"),
             })
 
             return {
                 "planted": planted_ids,
-                "resolved": [h.get("id") for h in hooks_to_resolve if h.get("id")],
-                "updated": [h.get("id") for h in hooks_status_updates if h.get("id")],
+                "resolved": resolved_ids,
+                "updated": updated_ids,
+                "skipped": skipped_hook_updates,
                 "errors": [],
             }
 
@@ -5769,7 +5795,7 @@ class WorkflowEngine:
         *,
         participant_keys: Optional[List[str]] = None,
         default_scene_name: Optional[str] = None,
-        target_word_multiplier: int = 2,
+        target_word_multiplier: float = 1.0,
         default_iteration_count: int = 3,
     ) -> Dict[str, Any]:
         """执行共享的多角色场景链路，供 scene_performance 与 group_discussion 复用。"""
@@ -5822,10 +5848,11 @@ class WorkflowEngine:
             iteration_count = node_config.get("iteration_count", default_iteration_count)
             plot_intents = execution.context.get("intents", [])
             chapter_word_count = execution.context.get("target_word_count", 2000)
-            target_word_count = max(
-                chapter_word_count * target_word_multiplier,
-                node_config.get("target_word_count", 0) or 0,
-            ) or chapter_word_count
+            configured_target = node_config.get("target_word_count", 0) or 0
+            if configured_target:
+                target_word_count = configured_target
+            else:
+                target_word_count = max(1, int(chapter_word_count * target_word_multiplier))
 
             coordinator_input = {
                 "scene_directions": scene_directions,
@@ -5835,6 +5862,12 @@ class WorkflowEngine:
                 "mode": scene_directions.get("scene_type", "interactive"),
                 "iteration_count": iteration_count,
                 "target_word_count": target_word_count,
+                "reference_mode": True,
+                "material_role": "reference_only",
+                "usage_instruction": (
+                    "场景演绎结果是供 Writer / Master Plotter 参考的素材索引，"
+                    "不是必须逐字照抄的章节正文；若与章节大纲、固定设定或角色硬约束冲突，必须跳过或改写。"
+                ),
                 "plot_intents": plot_intents,
                 "chapter_word_count": chapter_word_count,
             }
@@ -5877,6 +5910,12 @@ class WorkflowEngine:
                 "scene_type": scene_directions.get("scene_type", "interactive"),
                 "characters": performance_result.get("characters") or [c.get("name", "未知") for c in characters_data],
                 "messages": performance_messages,
+                "material_role": "reference_only",
+                "reference_mode": True,
+                "usage_instruction": (
+                    "场景演绎结果是供后续节点参考的素材索引，不是必须逐字照抄的章节正文；"
+                    "若与章节大纲、固定设定或角色硬约束冲突，必须跳过或改写。"
+                ),
                 "performers": scene_directions.get("performers", []),
                 "mentioned_characters": scene_directions.get("mentioned_characters", []),
                 "background_characters": scene_directions.get("background_characters", []),
@@ -5950,8 +5989,8 @@ class WorkflowEngine:
             db,
             participant_keys=["required_characters"],
             default_scene_name=node.label,
-            target_word_multiplier=2,
-            default_iteration_count=3,
+            target_word_multiplier=0.25,
+            default_iteration_count=2,
         )
 
     # 等待用户确认的超时时间（秒）
@@ -9838,14 +9877,17 @@ class WorkflowEngine:
             "data": serialized_data,
         }
 
+        sequence_no = 0
         try:
             from app.api.app import postgres_db
             if postgres_db:
-                await postgres_db.append_workflow_execution_event(
+                sequence_no = await postgres_db.append_workflow_execution_event(
                     execution_id,
                     event_type,
                     serialized_data,
                 )
+                if sequence_no:
+                    event_payload["sequence_no"] = sequence_no
         except Exception as e:
             logger.debug(f"追加 workflow 事件日志失败: {execution_id}, {event_type}, error={e}")
 
@@ -10084,6 +10126,7 @@ class WorkflowEngine:
             "operation_id": execution.operation_id,
             "request_id": execution.request_id,
             "request_hash": execution.request_hash,
+            "director_session_id": execution.director_session_id,
             "trace_id": execution.trace_id,
             "status": execution.status.value,
             "current_node": execution.current_node,
@@ -10142,6 +10185,7 @@ class WorkflowEngine:
             operation_id=str(row.get("operation_id")) if row.get("operation_id") else None,
             request_id=row.get("request_id"),
             request_hash=row.get("request_hash"),
+            director_session_id=row.get("director_session_id"),
             trace_id=str(row.get("trace_id")) if row.get("trace_id") else None,
             lease_token=row.get("lease_token"),
             lease_expires_at=row.get("lease_expires_at"),

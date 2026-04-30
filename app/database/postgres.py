@@ -1900,6 +1900,9 @@ class PostgresDatabase:
             record[field] = json.dumps(record[field])
         world_id_sql = "CAST(:world_id AS UUID)" if record.get("world_id") else "NULL"
         chapter_id_sql = "CAST(:chapter_id AS UUID)" if record.get("chapter_id") else "NULL"
+        conflict_clause = "ON CONFLICT (id) DO UPDATE SET"
+        if record.get("event_id"):
+            conflict_clause = "ON CONFLICT (project_id, event_id) WHERE event_id IS NOT NULL DO UPDATE SET"
         query = """
         INSERT INTO events (
             id, project_id, world_id, chapter_id, event_id, event_name, event_type, status,
@@ -1914,7 +1917,7 @@ class PostgresDatabase:
             :suggested_chapter, :source, :workflow_execution_id, :workflow_id, :node_id,
             :agent_type, CAST(:metadata AS jsonb), :created_at, :updated_at
         )
-        ON CONFLICT (id) DO UPDATE SET
+        """ + conflict_clause + """
             project_id = EXCLUDED.project_id,
             world_id = EXCLUDED.world_id,
             chapter_id = EXCLUDED.chapter_id,
@@ -1940,6 +1943,13 @@ class PostgresDatabase:
             updated_at = EXCLUDED.updated_at
         """
         await self.execute_write(query, record)
+        if record.get("event_id"):
+            existing = await self.execute_query(
+                "SELECT id FROM events WHERE project_id = CAST(:project_id AS UUID) AND event_id = :event_id LIMIT 1",
+                {"project_id": record["project_id"], "event_id": record["event_id"]},
+            )
+            if existing:
+                return str(existing[0].get("id"))
         return event_pk
 
     async def get_event(self, event_id: str) -> Optional[Dict[str, Any]]:
@@ -2469,6 +2479,7 @@ class PostgresDatabase:
                 "ALTER TABLE workflow_executions ADD COLUMN IF NOT EXISTS trace_id UUID REFERENCES execution_traces(id) ON DELETE SET NULL",
                 "ALTER TABLE workflow_executions ADD COLUMN IF NOT EXISTS request_id TEXT",
                 "ALTER TABLE workflow_executions ADD COLUMN IF NOT EXISTS request_hash TEXT",
+                "ALTER TABLE workflow_executions ADD COLUMN IF NOT EXISTS director_session_id TEXT",
                 "ALTER TABLE workflow_executions ADD COLUMN IF NOT EXISTS lease_token TEXT",
                 "ALTER TABLE workflow_executions ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMP WITH TIME ZONE",
                 "ALTER TABLE workflow_executions ADD COLUMN IF NOT EXISTS last_heartbeat_at TIMESTAMP WITH TIME ZONE",
@@ -2477,6 +2488,7 @@ class PostgresDatabase:
                 "CREATE INDEX IF NOT EXISTS idx_workflow_executions_project_workflow_status ON workflow_executions(project_id, workflow_id, status)",
                 "CREATE INDEX IF NOT EXISTS idx_workflow_executions_active_project ON workflow_executions(project_id, status, last_heartbeat_at DESC, started_at DESC)",
                 "CREATE INDEX IF NOT EXISTS idx_workflow_executions_active_project_workflow ON workflow_executions(project_id, workflow_id, status, last_heartbeat_at DESC, started_at DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_workflow_executions_active_director_session ON workflow_executions(project_id, workflow_id, director_session_id, status, last_heartbeat_at DESC, started_at DESC)",
                 "CREATE INDEX IF NOT EXISTS idx_workflow_executions_request ON workflow_executions(request_id)",
                 "CREATE INDEX IF NOT EXISTS idx_workflow_executions_trace ON workflow_executions(trace_id)",
             ]
@@ -3266,6 +3278,7 @@ class PostgresDatabase:
         execution_data.setdefault('trace_id', None)
         execution_data.setdefault('request_id', None)
         execution_data.setdefault('request_hash', None)
+        execution_data.setdefault('director_session_id', None)
         execution_data.setdefault('lease_token', None)
         execution_data.setdefault('lease_expires_at', None)
         execution_data.setdefault('last_heartbeat_at', None)
@@ -3276,13 +3289,13 @@ class PostgresDatabase:
 
         query = """
         INSERT INTO workflow_executions (
-            id, workflow_id, project_id, operation_id, trace_id, request_id, request_hash,
+            id, workflow_id, project_id, operation_id, trace_id, request_id, request_hash, director_session_id,
             status, current_node, node_states, context, intervention_ids,
             lease_token, lease_expires_at, last_heartbeat_at, cancel_requested, resume_cursor,
             started_at, completed_at, total_duration_ms, error
         )
         VALUES (
-            :id, :workflow_id, """ + project_id_sql + ", " + operation_id_sql + ", " + trace_id_sql + """, :request_id, :request_hash,
+            :id, :workflow_id, """ + project_id_sql + ", " + operation_id_sql + ", " + trace_id_sql + """, :request_id, :request_hash, :director_session_id,
             :status, :current_node, :node_states, :context, :intervention_ids,
             :lease_token, :lease_expires_at, :last_heartbeat_at, :cancel_requested, :resume_cursor,
             :started_at, :completed_at, :total_duration_ms, :error
@@ -3292,6 +3305,7 @@ class PostgresDatabase:
             trace_id = EXCLUDED.trace_id,
             request_id = EXCLUDED.request_id,
             request_hash = EXCLUDED.request_hash,
+            director_session_id = EXCLUDED.director_session_id,
             status = EXCLUDED.status,
             current_node = EXCLUDED.current_node,
             node_states = EXCLUDED.node_states,
@@ -3327,6 +3341,7 @@ class PostgresDatabase:
         self,
         project_id: str,
         workflow_id: Optional[str] = None,
+        director_session_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """获取项目/工作流当前活跃执行。"""
         conditions = ["project_id = :project_id", "status IN ('pending', 'running', 'paused')"]
@@ -3334,6 +3349,9 @@ class PostgresDatabase:
         if workflow_id:
             conditions.append("workflow_id = :workflow_id")
             params["workflow_id"] = workflow_id
+        if director_session_id:
+            conditions.append("director_session_id = :director_session_id")
+            params["director_session_id"] = director_session_id
 
         query = f"""
         SELECT * FROM workflow_executions
