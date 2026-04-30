@@ -14,6 +14,19 @@ export default defineConfig(({ mode }) => {
         '@': path.resolve(__dirname, './src'),
       },
     },
+    build: {
+      rollupOptions: {
+        output: {
+          manualChunks: {
+            react: ['react', 'react-dom', 'react-router-dom'],
+            motion: ['framer-motion'],
+            flow: ['reactflow'],
+            icons: ['lucide-react'],
+            vendor: ['axios', 'zustand'],
+          },
+        },
+      },
+    },
     server: {
       port: 5173,
       host: true,
@@ -22,6 +35,7 @@ export default defineConfig(({ mode }) => {
         '/api': {
           target: env.VITE_API_TARGET || 'http://localhost:8000',
           changeOrigin: true,
+          ws: true,
         },
       },
     },

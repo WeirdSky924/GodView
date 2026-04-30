@@ -5,15 +5,62 @@
  */
 
 import { useEffect, useState } from 'react'
-import { BookOpen, Users, Globe, Sliders, Sparkles, FolderOpen, Bot, User, Lock, ToggleRight, ToggleLeft } from 'lucide-react'
+import { BookOpen, Users, Globe, Sliders, Sparkles, FolderOpen, Bot, User, Lock, ToggleRight } from 'lucide-react'
 import TokenStats from '@/components/TokenStats'
 import { AnimatedCard, AnimatedList, AnimatedListItem, AnimatedNumber, GradientBackground } from '@/components/animations'
 import { useTheme } from '@/contexts/ThemeContext'
 import { useProject } from '@/contexts/ProjectContext'
 import { getGlobalStats, type GlobalStats } from '@/api/config'
-import { getAgentTemplates, type AgentTemplate } from '@/api/agentTemplates'
-import { getCharacters, type Character } from '@/api/characters'
+import { getAgentTemplates } from '@/api/agentTemplates'
+import {
+  CharacterImportanceTier,
+  TIER_DISPLAY_NAMES,
+  getCharacters,
+  type Character,
+} from '@/api/characters'
 import { useAgentTypes } from '@/hooks/useAgentTypes'
+
+const characterImportanceOrder: Record<string, number> = {
+  [CharacterImportanceTier.PROTAGONIST]: 10,
+  [CharacterImportanceTier.CO_PROTAGONIST]: 20,
+  [CharacterImportanceTier.DEUTERAGONIST]: 30,
+  [CharacterImportanceTier.MENTOR]: 40,
+  [CharacterImportanceTier.LOVE_INTEREST]: 50,
+  [CharacterImportanceTier.BEST_FRIEND]: 60,
+  [CharacterImportanceTier.ARCHENEMY]: 70,
+  [CharacterImportanceTier.MAJOR_ALLY]: 80,
+  [CharacterImportanceTier.MAJOR_ANTAGONIST]: 90,
+  [CharacterImportanceTier.RIVAL]: 100,
+  [CharacterImportanceTier.FAMILY_MEMBER]: 110,
+  [CharacterImportanceTier.GUARDIAN]: 120,
+  [CharacterImportanceTier.ARC_ANTAGONIST]: 130,
+  [CharacterImportanceTier.ARC_ALLY]: 140,
+  [CharacterImportanceTier.RECURRING]: 150,
+  [CharacterImportanceTier.CATALYST]: 160,
+  [CharacterImportanceTier.MYSTERY_FIGURE]: 170,
+  [CharacterImportanceTier.MINION]: 180,
+  [CharacterImportanceTier.INFORMANT]: 190,
+  [CharacterImportanceTier.MENTOR_FIGURE]: 200,
+  [CharacterImportanceTier.COMIC_RELIEF]: 210,
+  [CharacterImportanceTier.VICTIM]: 220,
+  [CharacterImportanceTier.NPC]: 230,
+  [CharacterImportanceTier.BACKGROUND]: 240,
+  [CharacterImportanceTier.CAMEO]: 250,
+}
+
+function sortCharactersByImportance(items: Character[]) {
+  return [...items].sort((a, b) => {
+    const aTier = characterImportanceOrder[a.importance_tier || CharacterImportanceTier.NPC] ?? 999
+    const bTier = characterImportanceOrder[b.importance_tier || CharacterImportanceTier.NPC] ?? 999
+    if (aTier !== bTier) return aTier - bTier
+
+    const aPriority = a.plot_priority ?? 0
+    const bPriority = b.plot_priority ?? 0
+    if (aPriority !== bPriority) return bPriority - aPriority
+
+    return a.name.localeCompare(b.name, 'zh-CN')
+  })
+}
 
 interface AgentStatus {
   id: string
@@ -35,10 +82,10 @@ export default function Dashboard() {
   const [stats, setStats] = useState<GlobalStats | null>(null)
   const [loading, setLoading] = useState(true)
   const [agents, setAgents] = useState<AgentStatus[]>([])
-  const [characterAgents, setCharacterAgents] = useState<AgentStatus[]>([])
+  const [characters, setCharacters] = useState<Character[]>([])
 
   // 动态加载 Agent 类型元数据
-  const { getLabel, isCoreType, loading: loadingTypes } = useAgentTypes()
+  const { getLabel, isCoreType } = useAgentTypes()
 
   useEffect(() => {
     loadStats()
@@ -59,46 +106,30 @@ export default function Dashboard() {
 
   const loadAgentStatus = async () => {
     try {
-      // 获取 Agent 模板列表
-      const templates = await getAgentTemplates()
+      const templates = await getAgentTemplates(undefined, undefined, undefined, 100)
 
-      // 转换为 Agent 状态
-      const systemAgents: AgentStatus[] = templates.map((t: AgentTemplate) => ({
-        id: t.id,
-        name: t.name,
-        type: t.agent_type,
-        desc: getLabel(t.agent_type),
-        status: t.is_optional ? (t.is_enabled ? 'ready' : 'disabled') : 'ready',
-        isOptional: t.is_optional,
-        isEnabled: t.is_enabled,
-        isCore: isCoreType(t.agent_type),
+      const systemAgents: AgentStatus[] = templates.map((template) => ({
+        id: template.id,
+        name: template.name,
+        type: template.agent_type,
+        desc: template.description || getLabel(template.agent_type),
+        status: template.is_optional ? (template.is_enabled ? 'ready' : 'disabled') : 'ready',
+        isOptional: template.is_optional,
+        isEnabled: template.is_enabled,
+        isCore: isCoreType(template.agent_type),
       }))
 
       setAgents(systemAgents)
 
-      // 如果有当前项目，加载角色 Agent
       if (currentProject?.id) {
-        const characters = await getCharacters(currentProject.id)
-        const charAgents: AgentStatus[] = characters
-          .filter((c: Character) => c.has_agent)
-          .map((c: Character) => ({
-            id: c.id || '',
-            name: `${c.name} Agent`,
-            type: 'character',
-            desc: c.role === 'main' ? '主角' : c.role === 'antagonist' ? '反派' : '配角',
-            status: c.agent_enabled ? 'ready' : 'inactive',
-            isOptional: false,
-            isEnabled: c.agent_enabled || false,
-            isCore: false,
-            isCharacter: true,
-            characterName: c.name,
-          }))
-        setCharacterAgents(charAgents)
+        setCharacters(await getCharacters(currentProject.id))
       } else {
-        setCharacterAgents([])
+        setCharacters([])
       }
     } catch (error) {
       console.error('Failed to load agent status:', error)
+      setAgents([])
+      setCharacters([])
     }
   }
 
@@ -106,7 +137,7 @@ export default function Dashboard() {
     { icon: <Users size={24} />, label: '角色数量', value: stats?.character_count || 0, color: 'from-blue-500 to-blue-600', glow: 'glow-primary' },
     { icon: <Globe size={24} />, label: '世界设定', value: stats?.world_count || 0, color: 'from-green-500 to-emerald-600', glow: 'glow-success' },
     { icon: <BookOpen size={24} />, label: '已生成章节', value: stats?.chapter_count || 0, color: 'from-purple-500 to-violet-600', glow: 'glow-secondary' },
-    { icon: <Bot size={24} />, label: '角色 Agent', value: characterAgents.length, color: 'from-orange-500 to-red-600', glow: 'glow-secondary' },
+    { icon: <Bot size={24} />, label: '系统 Agent', value: agents.length, color: 'from-orange-500 to-red-600', glow: 'glow-secondary' },
   ] : [
     { icon: <FolderOpen size={24} />, label: '项目数量', value: stats?.project_count || 0, color: 'from-cyan-500 to-blue-600', glow: 'glow-primary' },
     { icon: <Users size={24} />, label: '角色数量', value: stats?.character_count || 0, color: 'from-blue-500 to-blue-600', glow: 'glow-primary' },
@@ -114,7 +145,16 @@ export default function Dashboard() {
     { icon: <BookOpen size={24} />, label: '已生成章节', value: stats?.chapter_count || 0, color: 'from-purple-500 to-violet-600', glow: 'glow-secondary' },
   ]
 
-  // 分离核心和可选 Agent（使用动态数据）
+  const roleLabels: Record<string, string> = {
+    main: '主角',
+    protagonist: '主角',
+    antagonist: '反派',
+    supporting: '配角',
+    mentor: '导师',
+    ally: '盟友',
+    villain: '反派',
+  }
+  const sortedCharacters = sortCharactersByImportance(characters)
   const coreAgents = agents.filter(a => a.isCore || (!a.isOptional))
   const optionalAgents = agents.filter(a => a.isOptional && !a.isCore)
 
@@ -206,10 +246,10 @@ export default function Dashboard() {
       </AnimatedList>
 
       {/* Agent 状态概览 */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8 items-stretch">
         {/* 系统 Agent */}
-        <AnimatedCard delay={0.5} className={isDark ? 'glass-card' : 'bg-white shadow-md border border-gray-100'}>
-          <div className="p-6">
+        <AnimatedCard delay={0.5} className={`${isDark ? 'glass-card' : 'bg-white shadow-md border border-gray-100'} h-full`}>
+          <div className="p-6 h-full flex flex-col">
             <h2 className={`text-lg font-semibold mb-4 flex items-center gap-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>
               <Bot className="w-5 h-5" />
               系统 Agent
@@ -237,30 +277,30 @@ export default function Dashboard() {
           </div>
         </AnimatedCard>
 
-        {/* 角色 Agent */}
-        <AnimatedCard delay={0.6} className={isDark ? 'glass-card' : 'bg-white shadow-md border border-gray-100'}>
-          <div className="p-6">
+        {/* 角色列表 */}
+        <AnimatedCard delay={0.6} className={`${isDark ? 'glass-card' : 'bg-white shadow-md border border-gray-100'} h-full`}>
+          <div className="p-6 h-full flex flex-col">
             <h2 className={`text-lg font-semibold mb-4 flex items-center gap-2 ${isDark ? 'text-white' : 'text-gray-800'}`}>
               <User className="w-5 h-5" />
-              角色 Agent
+              角色列表
               {currentProject && (
                 <span className={`text-sm font-normal ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
-                  ({characterAgents.length})
+                  ({characters.length})
                 </span>
               )}
             </h2>
             {!currentProject ? (
-              <p className={`text-sm ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
-                选择项目后查看角色 Agent 状态
-              </p>
-            ) : characterAgents.length === 0 ? (
-              <p className={`text-sm ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
-                暂无启用 Agent 的角色，在角色管理中为主角启用 Agent
-              </p>
+              <div className={`text-sm flex-1 flex items-center justify-center rounded-lg border border-dashed ${isDark ? 'text-gray-500 border-gray-700 bg-gray-800/30' : 'text-gray-400 border-gray-200 bg-gray-50'}`}>
+                选择项目后查看角色列表
+              </div>
+            ) : characters.length === 0 ? (
+              <div className={`text-sm flex-1 flex items-center justify-center rounded-lg border border-dashed ${isDark ? 'text-gray-500 border-gray-700 bg-gray-800/30' : 'text-gray-400 border-gray-200 bg-gray-50'}`}>
+                当前项目暂无角色
+              </div>
             ) : (
-              <AnimatedList className="space-y-2">
-                {characterAgents.map((agent, index) => (
-                  <AgentStatusItem key={agent.id} agent={agent} isDark={isDark} index={index} />
+              <AnimatedList className="space-y-2 flex-1 overflow-y-auto pr-1">
+                {sortedCharacters.map((character, index) => (
+                  <CharacterItem key={character.id || character.name} character={character} isDark={isDark} index={index} roleLabels={roleLabels} />
                 ))}
               </AnimatedList>
             )}
@@ -333,3 +373,91 @@ function AgentStatusItem({ agent, isDark, index }: { agent: AgentStatus; isDark:
     </AnimatedListItem>
   )
 }
+
+// 角色列表项组件
+function CharacterItem({
+  character,
+  isDark,
+  index,
+  roleLabels,
+}: {
+  character: Character
+  isDark: boolean
+  index: number
+  roleLabels: Record<string, string>
+}) {
+  const statusLabels: Record<string, string> = {
+    active: '活跃',
+    inactive: '未激活',
+    dead: '死亡',
+    paused: '暂停',
+    ghost: '幽灵',
+    resurrected: '复活',
+  }
+
+  const statusBadgeColors: Record<string, string> = {
+    active: isDark
+      ? 'bg-green-900/50 text-green-400 border border-green-700'
+      : 'bg-green-100 text-green-600 border border-green-200',
+    inactive: isDark
+      ? 'bg-gray-700 text-gray-400 border border-gray-600'
+      : 'bg-gray-200 text-gray-500 border border-gray-300',
+    dead: isDark
+      ? 'bg-red-900/50 text-red-400 border border-red-700'
+      : 'bg-red-100 text-red-600 border border-red-200',
+    paused: isDark
+      ? 'bg-yellow-900/50 text-yellow-400 border border-yellow-700'
+      : 'bg-yellow-100 text-yellow-600 border border-yellow-200',
+    ghost: isDark
+      ? 'bg-indigo-900/50 text-indigo-400 border border-indigo-700'
+      : 'bg-indigo-100 text-indigo-600 border border-indigo-200',
+    resurrected: isDark
+      ? 'bg-purple-900/50 text-purple-400 border border-purple-700'
+      : 'bg-purple-100 text-purple-600 border border-purple-200',
+  }
+
+  const roleLabel = character.importance_tier
+    ? TIER_DISPLAY_NAMES[character.importance_tier as CharacterImportanceTier] || roleLabels[character.role] || character.role
+    : roleLabels[character.role] || character.role || '角色'
+  const statusLabel = statusLabels[character.status] || character.status || '未知'
+  const statusClass = statusBadgeColors[character.status] || statusBadgeColors.inactive
+
+  return (
+    <AnimatedListItem key={character.id || character.name}>
+      <div
+        className={`flex items-center justify-between p-3 rounded-lg transition-colors border ${
+          isDark
+            ? 'bg-gray-800/50 hover:bg-gray-800 border-gray-700'
+            : 'bg-gray-50 hover:bg-gray-100 border-gray-200'
+        }`}
+        style={{ animationDelay: `${index * 0.03}s` }}
+      >
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="w-8 h-8 rounded-full bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-white text-xs font-semibold flex-shrink-0">
+            {character.name.slice(0, 1)}
+          </div>
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <p className={`font-medium text-sm truncate ${isDark ? 'text-white' : 'text-gray-800'}`}>{character.name}</p>
+              <span className={`text-xs px-1.5 py-0.5 rounded flex-shrink-0 ${isDark ? 'bg-blue-900/50 text-blue-400' : 'bg-blue-100 text-blue-600'}`}>
+                {roleLabel}
+              </span>
+              {character.has_agent && (
+                <span className={`text-xs px-1.5 py-0.5 rounded flex-shrink-0 ${isDark ? 'bg-purple-900/50 text-purple-400' : 'bg-purple-100 text-purple-600'}`}>
+                  Agent
+                </span>
+              )}
+            </div>
+            {character.description && (
+              <p className={`text-xs truncate ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>{character.description}</p>
+            )}
+          </div>
+        </div>
+        <span className={`px-2 py-0.5 text-xs rounded-full flex-shrink-0 ${statusClass}`}>
+          {statusLabel}
+        </span>
+      </div>
+    </AnimatedListItem>
+  )
+}
+

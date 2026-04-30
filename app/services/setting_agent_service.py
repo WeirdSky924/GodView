@@ -1470,6 +1470,24 @@ class SettingAgentService:
             if await self._should_skip_saved_pending_item(postgres_db, session, "lore", lore_data):
                 continue
 
+            duplicate = None
+            if hasattr(postgres_db, "find_duplicate_lore"):
+                duplicate = await postgres_db.find_duplicate_lore(
+                    project_id,
+                    lore_data.get("title", ""),
+                    lore_data.get("content", ""),
+                )
+            if duplicate:
+                if session:
+                    await postgres_db.mark_setting_agent_pending_item_saved(
+                        session.id,
+                        "lore",
+                        self._fingerprint_payload(lore_data),
+                        str(duplicate.get("id")),
+                    )
+                logger.info(f"跳过重复设定: {lore_data.get('title', '')} -> {duplicate.get('id')}")
+                continue
+
             lore_entry = {
                 "id": str(uuid.uuid4()),
                 "project_id": project_id,
@@ -1576,6 +1594,26 @@ class SettingAgentService:
                 "scope_type": hook_data.get("scope_type") or effective_scope_type,
             }
             if await self._should_skip_saved_pending_item(postgres_db, session, "hook", scoped_hook_data):
+                continue
+
+            duplicate = None
+            if hasattr(postgres_db, "find_duplicate_hook"):
+                duplicate = await postgres_db.find_duplicate_hook(
+                    project_id,
+                    scoped_hook_data.get("title", ""),
+                    scoped_hook_data.get("description", ""),
+                    world_id=scoped_hook_data.get("world_id"),
+                    scope_type=scoped_hook_data.get("scope_type"),
+                )
+            if duplicate:
+                if session:
+                    await postgres_db.mark_setting_agent_pending_item_saved(
+                        session.id,
+                        "hook",
+                        self._fingerprint_payload(scoped_hook_data),
+                        str(duplicate.get("id")),
+                    )
+                logger.info(f"跳过重复伏笔: {scoped_hook_data.get('title', '')} -> {duplicate.get('id')}")
                 continue
 
             hook_entry = {
@@ -1807,6 +1845,17 @@ class SettingAgentService:
 
             elif mod_type == "missing":
                 # 添加缺失的设定
+                duplicate = None
+                if hasattr(postgres_db, "find_duplicate_lore"):
+                    duplicate = await postgres_db.find_duplicate_lore(
+                        project_id,
+                        modification.get("suggested_title", "新设定"),
+                        suggested_content,
+                    )
+                if duplicate:
+                    logger.info(f"跳过重复设定: {modification.get('suggested_title', '新设定')} -> {duplicate.get('id')}")
+                    return {"success": True, "message": f"设定已存在，复用现有条目: {duplicate.get('id')}"}
+
                 lore_entry = {
                     "id": str(uuid.uuid4()),
                     "project_id": project_id,

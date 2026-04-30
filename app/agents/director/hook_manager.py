@@ -71,9 +71,13 @@ class HookManagerAgent(BaseAgent):
 
 ## 伏笔类型
 
-- **suspense** (悬念): 让读者产生疑问，期待后续解答
-- **foreshadow** (伏笔): 暗示未来事件，制造"原来如此"的体验
-- **twist** (转折): 为意外的剧情转折做铺垫
+- **mystery** (谜团): 让读者产生疑问，期待后续解答
+- **object** (物件): 与特殊物品、遗物、装备相关的伏笔
+- **character** (角色): 与角色身份、动机、命运相关的伏笔
+- **event** (事件): 与后续事件、事故、行动相关的伏笔
+- **location** (地点): 与地点、地图、隐藏区域相关的伏笔
+- **relationship** (关系): 与角色关系变化相关的伏笔
+- **custom** (自定义): 不适合以上类型时使用
 
 ## 伏笔原则
 
@@ -91,9 +95,9 @@ class HookManagerAgent(BaseAgent):
         {
             "title": "伏笔标题",
             "description": "伏笔内容描述",
-            "hook_type": "suspense/foreshadow/twist",
+            "hook_type": "mystery/object/character/event/location/relationship/custom",
             "resolution_hint": "未来如何回收这个伏笔",
-            "priority": 1-10,
+            "priority": 1-5,
             "related_characters": ["相关角色"],
             "related_objects": ["相关物品"]
         }
@@ -148,6 +152,31 @@ class HookManagerAgent(BaseAgent):
             recent_events = input_data.get("recent_events", [])
             chapter_goal = input_data.get("chapter_goal", "")
 
+            raw_chapter_outline = input_data.get("chapter_outline") or {}
+            outline_hooks_to_plant = []
+            outline_hooks_to_resolve = []
+            outline_scene_summaries = []
+            if isinstance(raw_chapter_outline, dict):
+                outline_hooks_to_plant = [str(item) for item in raw_chapter_outline.get("hooks_planted", []) if item]
+                outline_hooks_to_resolve = [str(item) for item in raw_chapter_outline.get("hooks_resolved", []) if item]
+                for scene in raw_chapter_outline.get("scenes", []) or []:
+                    if not isinstance(scene, dict):
+                        continue
+                    scene_text = scene.get("summary") or scene.get("title") or ""
+                    if scene_text:
+                        outline_scene_summaries.append(scene_text)
+                    outline_hooks_to_plant.extend(str(item) for item in scene.get("hooks_to_plant", []) or [] if item)
+                    outline_hooks_to_resolve.extend(str(item) for item in scene.get("hooks_to_resolve", []) or [] if item)
+
+            if outline_hooks_to_plant:
+                planted_in_chapter = list(dict.fromkeys([*planted_in_chapter, *outline_hooks_to_plant]))
+            if outline_hooks_to_resolve:
+                resolved_in_chapter = list(dict.fromkeys([*resolved_in_chapter, *outline_hooks_to_resolve]))
+            if not current_scene and outline_scene_summaries:
+                current_scene = "\n".join(f"- {summary}" for summary in outline_scene_summaries)
+            if not chapter_goal:
+                chapter_goal = input_data.get("chapter_summary") or (raw_chapter_outline.get("summary") if isinstance(raw_chapter_outline, dict) else "")
+
             # 构建用户消息
             user_message = self._build_user_message(
                 existing_hooks=existing_hooks,
@@ -167,6 +196,25 @@ class HookManagerAgent(BaseAgent):
                 category=UsageCategory.HOOK,
             )
             result = parsed.model_dump()
+            result = self._postprocess_hook_result(result, existing_hooks)
+            if not result.get("hooks_to_plant") and planted_in_chapter:
+                result["hooks_to_plant"] = [
+                    {
+                        "title": hook[:40],
+                        "description": hook,
+                        "hook_type": "custom",
+                        "resolution_hint": "根据后续章节大纲或剧情发展回收",
+                        "priority": 3,
+                        "related_characters": [],
+                        "related_objects": [],
+                    }
+                    for hook in planted_in_chapter
+                ]
+                result["suggestions"] = [
+                    *result.get("suggestions", []),
+                    "已根据当前章节大纲补充待埋设伏笔建议。",
+                ]
+                result = self._postprocess_hook_result(result, existing_hooks)
 
             return AgentResponse(
                 success=True,
@@ -183,6 +231,71 @@ class HookManagerAgent(BaseAgent):
         except Exception as e:
             logger.error(f"HookManagerAgent 执行失败：{e}")
             return AgentResponse(success=False, error=str(e))
+
+    def _normalize_hook_type(self, hook_type: Any) -> str:
+        raw = str(hook_type or "").strip().lower()
+        valid_types = {"mystery", "object", "character", "event", "location", "relationship", "custom"}
+        if raw in valid_types:
+            return raw
+        alias_map = {
+            "suspense": "mystery",
+            "foreshadow": "custom",
+            "foreshadowing": "custom",
+            "twist": "event",
+            "item": "object",
+            "artifact": "object",
+            "place": "location",
+            "relation": "relationship",
+        }
+        return alias_map.get(raw, "custom")
+
+    def _normalize_hook_priority(self, priority: Any) -> int:
+        try:
+            value = int(priority)
+        except (TypeError, ValueError):
+            value = 3
+        return max(1, min(5, value))
+
+    def _normalize_duplicate_key(self, title: Any, description: Any = "") -> str:
+        title_key = " ".join(str(title or "").lower().split())
+        desc_key = " ".join(str(description or "").lower().split())
+        return f"{title_key}|{desc_key}"
+
+    def _postprocess_hook_result(
+        self,
+        result: Dict[str, Any],
+        existing_hooks: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        existing_keys = {
+            self._normalize_duplicate_key(hook.get("title"), hook.get("description") or hook.get("plant_context"))
+            for hook in existing_hooks
+            if isinstance(hook, dict)
+        }
+        duplicate_candidates: List[Dict[str, Any]] = []
+        filtered_hooks: List[Dict[str, Any]] = []
+        seen_new: set[str] = set()
+        for hook in result.get("hooks_to_plant", []) or []:
+            if not isinstance(hook, dict):
+                continue
+            hook["hook_type"] = self._normalize_hook_type(hook.get("hook_type"))
+            hook["priority"] = self._normalize_hook_priority(hook.get("priority"))
+            duplicate_key = self._normalize_duplicate_key(hook.get("title"), hook.get("description"))
+            if duplicate_key in existing_keys or duplicate_key in seen_new:
+                duplicate_candidates.append({
+                    "title": hook.get("title"),
+                    "description": hook.get("description", ""),
+                    "reason": "duplicate_existing_or_current_output",
+                })
+                continue
+            seen_new.add(duplicate_key)
+            filtered_hooks.append(hook)
+        result["hooks_to_plant"] = filtered_hooks
+        if duplicate_candidates:
+            result["duplicate_candidates"] = [
+                *result.get("duplicate_candidates", []),
+                *duplicate_candidates,
+            ]
+        return result
 
     def _build_user_message(
         self,
@@ -254,8 +367,10 @@ class HookManagerAgent(BaseAgent):
    - 是否已触发（开始显现）？
    - 是否需要调整优先级？
 
-3. **新伏笔创建**: 仅在确实需要时创建新伏笔
-   - 是否有明确的回收计划？
+3. **新伏笔创建**: 需要同时从两个角度判断
+   - 现有伏笔：是否已有伏笔可复用、推进、触发或回收？
+   - 本章大纲：是否明确要求埋设新的伏笔？如有，应给出自然埋设方案
+   - 新伏笔是否有明确的回收计划？
    - 是否与现有伏笔重复？
    - 是否对未来剧情有重要价值？
 

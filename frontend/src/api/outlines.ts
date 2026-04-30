@@ -238,9 +238,14 @@ export async function approveOutline(
  */
 export async function deleteOutline(
   projectId: string,
-  chapterNumber: number
-): Promise<{ success: boolean; message: string }> {
-  return await api.delete(`${API_BASE}/${chapterNumber}?project_id=${projectId}`)
+  chapterNumber: number,
+  options?: { softDeleteGeneratedChapters?: boolean }
+): Promise<{ success: boolean; message: string; soft_deleted_chapters?: number }> {
+  const params = new URLSearchParams({ project_id: projectId })
+  if (options?.softDeleteGeneratedChapters) {
+    params.set('soft_delete_generated_chapters', 'true')
+  }
+  return await api.delete(`${API_BASE}/${chapterNumber}?${params.toString()}`)
 }
 
 /**

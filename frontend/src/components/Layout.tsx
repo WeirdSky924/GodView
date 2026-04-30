@@ -1,13 +1,14 @@
 import { useState, useEffect } from 'react'
 import { NavLink, useNavigate, useLocation } from 'react-router-dom'
 import {
-  LayoutDashboard, Users, Globe, BookOpen, BookMarked, FileText, Settings, Flag, GitCompare, ShieldAlert, Eye, Network, Mic2, CheckCircle2, FolderOpen, ChevronDown, Plus, Layers, MessageSquare, Bot, PenTool, Sparkles, Sun, Moon, Database, Server, AlertCircle, CheckCircle, XCircle, Clapperboard, Play, ListTree, MapPin
+  LayoutDashboard, Users, Globe, BookOpen, BookMarked, FileText, Settings, Flag, GitCompare, ShieldAlert, Eye, Network, Mic2, CheckCircle2, FolderOpen, ChevronDown, Plus, Layers, MessageSquare, Bot, PenTool, Sparkles, Sun, Moon, Database, Server, AlertCircle, CheckCircle, XCircle, Clapperboard, Play, ListTree, MapPin, Compass, Boxes, PenLine, BarChart3, Cpu
 } from 'lucide-react'
 import { useProject } from '@/contexts/ProjectContext'
 import { useTheme } from '@/contexts/ThemeContext'
 import { motion, AnimatePresence } from 'framer-motion'
 import { getDatabaseStatus } from '@/api/config'
 import type { DatabaseStatusResponse } from '@/api/config'
+import { getSystemConfig } from '@/api/systemConfig'
 
 interface NavItem {
   path: string
@@ -15,27 +16,76 @@ interface NavItem {
   label: string
 }
 
-const navItems: NavItem[] = [
-  { path: '/', icon: <LayoutDashboard size={20} />, label: '仪表盘' },
-  { path: '/characters', icon: <Users size={20} />, label: '角色管理' },
-  { path: '/character-voice', icon: <Mic2 size={20} />, label: '角色声音' },
-  { path: '/worlds', icon: <Globe size={20} />, label: '世界管理' },
-  { path: '/world-map', icon: <MapPin size={20} />, label: '地图管理' },
-  { path: '/lore', icon: <BookMarked size={20} />, label: '设定库' },
-  { path: '/plots', icon: <BookOpen size={20} />, label: '剧情管理' },
-  { path: '/outlines', icon: <ListTree size={20} />, label: '章节大纲' },
-  { path: '/hooks', icon: <Flag size={20} />, label: '伏笔管理' },
-  { path: '/interventions', icon: <ShieldAlert size={20} />, label: '干预日志' },
-  { path: '/simulator', icon: <Eye size={20} />, label: '读者模拟' },
-  { path: '/visualize', icon: <Network size={20} />, label: '可视化工作台' },
-  { path: '/chapter-evaluator', icon: <CheckCircle2 size={20} />, label: '章节判定器' },
-  { path: '/novel', icon: <FileText size={20} />, label: '小说编辑器' },
-  { path: '/skills', icon: <Layers size={20} />, label: 'Agent Skills' },
-  { path: '/prompts', icon: <MessageSquare size={20} />, label: 'Prompt 库' },
-  { path: '/agent-templates', icon: <Bot size={20} />, label: 'Agent 模板' },
-  { path: '/writing-rules', icon: <PenTool size={20} />, label: '写作规则' },
-  { path: '/diff', icon: <GitCompare size={20} />, label: '版本对比' },
-  { path: '/settings', icon: <Settings size={20} />, label: '系统设置' },
+interface NavGroup {
+  key: string
+  label: string
+  icon: React.ReactNode
+  items: NavItem[]
+}
+
+const navGroups: NavGroup[] = [
+  {
+    key: 'overview',
+    label: '总览',
+    icon: <Compass size={16} />,
+    items: [
+      { path: '/', icon: <LayoutDashboard size={18} />, label: '仪表盘' },
+    ],
+  },
+  {
+    key: 'assets',
+    label: '项目资产',
+    icon: <Boxes size={16} />,
+    items: [
+      { path: '/characters', icon: <Users size={18} />, label: '角色管理' },
+      { path: '/character-voice', icon: <Mic2 size={18} />, label: '角色声音' },
+      { path: '/worlds', icon: <Globe size={18} />, label: '世界管理' },
+      { path: '/world-map', icon: <MapPin size={18} />, label: '地图管理' },
+      { path: '/lore', icon: <BookMarked size={18} />, label: '设定库' },
+    ],
+  },
+  {
+    key: 'writing',
+    label: '剧情创作',
+    icon: <PenLine size={16} />,
+    items: [
+      { path: '/plots', icon: <BookOpen size={18} />, label: '剧情管理' },
+      { path: '/outlines', icon: <ListTree size={18} />, label: '章节大纲' },
+      { path: '/hooks', icon: <Flag size={18} />, label: '伏笔管理' },
+      { path: '/novel', icon: <FileText size={18} />, label: '小说编辑器' },
+      { path: '/diff', icon: <GitCompare size={18} />, label: '版本对比' },
+    ],
+  },
+  {
+    key: 'analysis',
+    label: '分析与验证',
+    icon: <BarChart3 size={16} />,
+    items: [
+      { path: '/simulator', icon: <Eye size={18} />, label: '读者模拟' },
+      { path: '/visualize', icon: <Network size={18} />, label: '可视化工作台' },
+      { path: '/chapter-evaluator', icon: <CheckCircle2 size={18} />, label: '章节判定器' },
+      { path: '/interventions', icon: <ShieldAlert size={18} />, label: '干预日志' },
+    ],
+  },
+  {
+    key: 'agents',
+    label: 'Agent 配置',
+    icon: <Cpu size={16} />,
+    items: [
+      { path: '/skills', icon: <Layers size={18} />, label: 'Agent Skills' },
+      { path: '/prompts', icon: <MessageSquare size={18} />, label: 'Prompt 库' },
+      { path: '/agent-templates', icon: <Bot size={18} />, label: 'Agent 模板' },
+      { path: '/writing-rules', icon: <PenTool size={18} />, label: '写作规则' },
+    ],
+  },
+  {
+    key: 'system',
+    label: '系统',
+    icon: <Settings size={16} />,
+    items: [
+      { path: '/settings', icon: <Settings size={18} />, label: '系统设置' },
+    ],
+  },
 ]
 
 const icpNumber = (import.meta as { env?: { VITE_ICP_NUMBER?: string } }).env?.VITE_ICP_NUMBER
@@ -46,10 +96,32 @@ export default function Layout({ children }: { children: React.ReactNode }) {
   const navigate = useNavigate()
   const location = useLocation()
   const [showProjectMenu, setShowProjectMenu] = useState(false)
+  const currentNavGroupKey = navGroups.find((group) => group.items.some((item) => item.path === location.pathname))?.key || 'overview'
+  const [openNavGroups, setOpenNavGroups] = useState<Record<string, boolean>>(() =>
+    Object.fromEntries(navGroups.map((group) => [group.key, group.key === currentNavGroupKey]))
+  )
   const [dbStatus, setDbStatus] = useState<DatabaseStatusResponse | null>(null)
   const [showDbPopover, setShowDbPopover] = useState(false)
+  const [appVersion, setAppVersion] = useState('1.1.11')
 
   const isDark = theme === 'dark'
+
+  useEffect(() => {
+    setOpenNavGroups((previous) => ({ ...previous, [currentNavGroupKey]: true }))
+  }, [currentNavGroupKey])
+
+  useEffect(() => {
+    const fetchSystemConfig = async () => {
+      try {
+        const config = await getSystemConfig()
+        setAppVersion(config.app_version)
+      } catch (e) {
+        console.error('Failed to fetch system config:', e)
+      }
+    }
+
+    void fetchSystemConfig()
+  }, [])
 
   // 仅在设置页或状态浮窗打开时获取数据库状态
   useEffect(() => {
@@ -263,36 +335,84 @@ export default function Layout({ children }: { children: React.ReactNode }) {
 
         {/* 可滚动的导航菜单 */}
         <nav className="flex-1 overflow-y-auto px-2 py-2">
-          {navItems.map((item, index) => (
-            <NavLink
-              key={item.path}
-              to={item.path}
-              className={({ isActive }) =>
-                `flex items-center gap-3 px-4 py-2.5 text-sm rounded-xl mb-1 transition-all ${
-                  isActive
-                    ? isDark
-                      ? 'bg-gradient-to-r from-blue-600/20 to-purple-600/20 text-white border border-blue-500/30'
-                      : 'bg-gradient-to-r from-blue-500/10 to-purple-500/10 text-blue-700 border border-blue-200'
-                    : isDark
-                      ? 'text-gray-400 hover:text-white hover:bg-gray-800/50'
-                      : 'text-gray-600 hover:text-gray-900 hover:bg-gray-100'
-                }`
-              }
-            >
-              {({ isActive }) => (
-                <motion.div
-                  className="flex items-center gap-3 w-full"
+          {navGroups.map((group, groupIndex) => {
+            const isOpen = openNavGroups[group.key]
+            const hasActiveItem = group.items.some((item) => item.path === location.pathname)
+
+            return (
+              <div key={group.key} className="mb-1">
+                <motion.button
+                  type="button"
+                  onClick={() => setOpenNavGroups((previous) => ({ ...previous, [group.key]: !isOpen }))}
+                  className={`w-full flex items-center justify-between px-3 py-2 text-xs font-medium rounded-lg transition-colors ${
+                    hasActiveItem
+                      ? isDark
+                        ? 'text-blue-300 bg-blue-500/10'
+                        : 'text-blue-700 bg-blue-50'
+                      : isDark
+                        ? 'text-gray-500 hover:text-gray-300 hover:bg-gray-800/40'
+                        : 'text-gray-500 hover:text-gray-700 hover:bg-gray-100'
+                  }`}
                   initial={{ opacity: 0, x: -10 }}
                   animate={{ opacity: 1, x: 0 }}
-                  transition={{ delay: index * 0.02 }}
-                  whileHover={{ x: 4 }}
+                  transition={{ delay: groupIndex * 0.02 }}
                 >
-                  <span className={isActive ? 'text-blue-500' : ''}>{item.icon}</span>
-                  <span>{item.label}</span>
-                </motion.div>
-              )}
-            </NavLink>
-          ))}
+                  <span className="flex items-center gap-2">
+                    {group.icon}
+                    {group.label}
+                  </span>
+                  <motion.span animate={{ rotate: isOpen ? 180 : 0 }} transition={{ duration: 0.2 }}>
+                    <ChevronDown size={14} />
+                  </motion.span>
+                </motion.button>
+
+                <AnimatePresence initial={false}>
+                  {isOpen && (
+                    <motion.div
+                      initial={{ height: 0, opacity: 0 }}
+                      animate={{ height: 'auto', opacity: 1 }}
+                      exit={{ height: 0, opacity: 0 }}
+                      transition={{ duration: 0.2 }}
+                      className="overflow-hidden"
+                    >
+                      <div className="mt-1 space-y-1 pl-2">
+                        {group.items.map((item, index) => (
+                          <NavLink
+                            key={item.path}
+                            to={item.path}
+                            className={({ isActive }) =>
+                              `flex items-center gap-3 px-3 py-2 text-sm rounded-xl transition-all ${
+                                isActive
+                                  ? isDark
+                                    ? 'bg-gradient-to-r from-blue-600/20 to-purple-600/20 text-white border border-blue-500/30'
+                                    : 'bg-gradient-to-r from-blue-500/10 to-purple-500/10 text-blue-700 border border-blue-200'
+                                  : isDark
+                                    ? 'text-gray-400 hover:text-white hover:bg-gray-800/50'
+                                    : 'text-gray-600 hover:text-gray-900 hover:bg-gray-100'
+                              }`
+                            }
+                          >
+                            {({ isActive }) => (
+                              <motion.div
+                                className="flex items-center gap-3 w-full"
+                                initial={{ opacity: 0, x: -8 }}
+                                animate={{ opacity: 1, x: 0 }}
+                                transition={{ delay: index * 0.015 }}
+                                whileHover={{ x: 4 }}
+                              >
+                                <span className={isActive ? 'text-blue-500' : ''}>{item.icon}</span>
+                                <span>{item.label}</span>
+                              </motion.div>
+                            )}
+                          </NavLink>
+                        ))}
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </div>
+            )
+          })}
         </nav>
 
         {/* 底部信息 */}
@@ -309,7 +429,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
             </a>
           )}
           <div className="flex items-center justify-between">
-            <span>v7.0.0</span>
+            <span>v{appVersion}</span>
             <div className="flex items-center gap-2">
               {/* 数据库状态指示器 */}
               <div

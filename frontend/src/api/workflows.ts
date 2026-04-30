@@ -126,7 +126,10 @@ export interface WorkflowExecution {
   request_id?: string
   request_hash?: string
   operation_id?: string
-  trace_id?: string
+  lease_token?: string
+  lease_expires_at?: string
+  last_heartbeat_at?: string
+  resume_cursor?: Record<string, any>
   cancel_requested?: boolean
 }
 

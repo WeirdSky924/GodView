@@ -28,8 +28,11 @@ class SettingWorkflowAdapter:
         context = execution.context.copy()
         config = dict(getattr(node, "config", None) or {})
         limit = self._resolve_limit(config)
+        fixed_limit = self._resolve_fixed_limit(config)
+        dynamic_limit = self._resolve_dynamic_limit(config, limit)
         categories = self._resolve_categories(config)
-        include_constitutional_rules = bool(config.get("include_constitutional_rules", False))
+        include_constitutional_rules = bool(config.get("include_constitutional_rules", True))
+        include_core_rules = bool(config.get("include_core_rules", True))
 
         query_parts = self._collect_query_parts(context, config)
         setting_query = self._compact_query(query_parts)
@@ -41,48 +44,77 @@ class SettingWorkflowAdapter:
             warnings.append("缺少可用于检索设定的章节、场景、角色或地点线索")
             return self._build_output([], setting_query, "empty", warnings)
 
-        selected_entries: list[dict[str, Any]] = []
+        dynamic_entries: list[dict[str, Any]] = []
         setting_source = "empty"
 
         context_candidates = self._normalize_lore_entries(context.get("lore_entries"))
         if context_candidates:
-            selected_entries = self._filter_context_candidates(
+            fixed_entries = self._filter_fixed_lore(context_candidates, fixed_limit)
+            dynamic_entries = self._filter_context_candidates(
                 context_candidates,
                 setting_query=setting_query,
                 keywords=keywords,
                 related_entities=related_entities,
                 categories=categories,
-                limit=limit,
+                limit=dynamic_limit,
             )
+            dynamic_entries = self._merge_lore_buckets(
+                dynamic_entries,
+                self._select_character_setting_entries(
+                    context_candidates,
+                    keywords=keywords,
+                    related_entities=related_entities,
+                    limit=dynamic_limit,
+                ),
+            )[:dynamic_limit]
             setting_source = "context_filtered"
-            if not selected_entries:
-                warnings.append("上下文候选设定中没有与当前节点输入匹配的条目")
+            if not dynamic_entries:
+                warnings.append("上下文候选设定中没有与当前节点输入匹配的动态条目")
         else:
-            selected_entries, setting_source = await self._search_existing_lore(
+            fixed_entries = await self._load_fixed_lore(
+                project_id=execution.project_id,
+                db=db,
+                limit=fixed_limit,
+                include_constitutional=include_constitutional_rules,
+                include_core=include_core_rules,
+                warnings=warnings,
+            )
+            dynamic_entries, setting_source = await self._search_existing_lore(
                 project_id=execution.project_id,
                 db=db,
                 setting_query=setting_query,
                 keywords=keywords,
                 related_entities=related_entities,
                 categories=categories,
-                limit=limit,
+                limit=dynamic_limit,
                 warnings=warnings,
             )
-
-        if include_constitutional_rules and db:
-            selected_entries = await self._merge_constitutional_rules(
+            character_setting_entries = await self._load_character_setting_lore(
                 project_id=execution.project_id,
                 db=db,
-                entries=selected_entries,
-                limit=limit,
+                related_entities=related_entities,
+                keywords=keywords,
+                limit=dynamic_limit,
                 warnings=warnings,
             )
+            if character_setting_entries:
+                dynamic_entries = self._merge_lore_buckets(dynamic_entries, character_setting_entries)[:dynamic_limit]
+                setting_source = f"{setting_source}+character_setting" if setting_source != "empty" else "character_setting_db"
+
+        selected_entries = self._merge_lore_buckets(fixed_entries, dynamic_entries)
 
         if not selected_entries and not any("没有" in warning for warning in warnings):
             warnings.append("未检索到与当前节点输入相关的已有设定")
             setting_source = "empty" if setting_source == "keyword_db" else setting_source
 
-        return self._build_output(selected_entries, setting_query, setting_source, warnings)
+        return self._build_output(
+            selected_entries,
+            setting_query,
+            setting_source,
+            warnings,
+            fixed_entries=fixed_entries,
+            dynamic_entries=dynamic_entries,
+        )
 
     def _resolve_limit(self, config: Dict[str, Any]) -> int:
         raw_limit = config.get("setting_limit", config.get("lore_limit", 10))
@@ -91,6 +123,22 @@ class SettingWorkflowAdapter:
         except (TypeError, ValueError):
             limit = 10
         return max(1, min(limit, 30))
+
+    def _resolve_fixed_limit(self, config: Dict[str, Any]) -> int:
+        raw_limit = config.get("fixed_lore_limit", config.get("constitutional_lore_limit", 20))
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError):
+            limit = 20
+        return max(1, min(limit, 60))
+
+    def _resolve_dynamic_limit(self, config: Dict[str, Any], default_limit: int) -> int:
+        raw_limit = config.get("dynamic_lore_limit", config.get("selected_lore_limit", default_limit))
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError):
+            limit = default_limit
+        return max(1, min(limit, 60))
 
     def _resolve_categories(self, config: Dict[str, Any]) -> list[str]:
         raw_categories = config.get("setting_categories", config.get("lore_categories", []))
@@ -400,6 +448,97 @@ class SettingWorkflowAdapter:
 
         return score
 
+    def _select_character_setting_entries(
+        self,
+        entries: list[dict[str, Any]],
+        *,
+        keywords: list[str],
+        related_entities: list[str],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """优先把相关角色的来源/历史/背景设定纳入动态设定桶。"""
+        entity_terms = {str(term).strip().lower() for term in [*keywords, *related_entities] if str(term).strip()}
+        selected: list[dict[str, Any]] = []
+        for entry in entries:
+            if str(entry.get("category") or "").lower() != "character_setting":
+                continue
+            if not entity_terms:
+                selected.append(entry)
+                continue
+            searchable_parts = [
+                str(entry.get("title") or ""),
+                str(entry.get("summary") or ""),
+                str(entry.get("content") or ""),
+                str(entry.get("source") or ""),
+                " ".join(str(item) for item in entry.get("keywords", [])),
+                " ".join(str(item) for item in entry.get("tags", [])),
+                " ".join(str(item) for item in entry.get("related_characters", [])),
+            ]
+            searchable = "\n".join(searchable_parts).lower()
+            if any(term and term in searchable for term in entity_terms):
+                selected.append(entry)
+            if len(selected) >= limit:
+                break
+        return selected[:limit]
+
+    async def _load_character_setting_lore(
+        self,
+        *,
+        project_id: str,
+        db: Any,
+        related_entities: list[str],
+        keywords: list[str],
+        limit: int,
+        warnings: list[str],
+    ) -> list[dict[str, Any]]:
+        """从设定库补充角色来源/历史/背景类设定，避免 Writer 脱离角色设定。"""
+        if not db or not hasattr(db, "execute_query"):
+            return []
+
+        terms = self._dedupe_texts([*related_entities, *keywords])[:30]
+        params: dict[str, Any] = {"project_id": project_id, "limit": limit}
+        conditions = [
+            "project_id = CAST(:project_id AS UUID)",
+            "category = 'character_setting'",
+        ]
+        if terms:
+            term_conditions: list[str] = []
+            for index, term in enumerate(terms):
+                key = f"character_setting_term_{index}"
+                params[key] = f"%{term}%"
+                term_conditions.append(
+                    f"(title ILIKE :{key} OR summary ILIKE :{key} OR content ILIKE :{key} "
+                    f"OR keywords::text ILIKE :{key} OR tags::text ILIKE :{key} "
+                    f"OR related_characters::text ILIKE :{key})"
+                )
+            conditions.append(f"({' OR '.join(term_conditions)})")
+
+        try:
+            rows = await db.execute_query(
+                f"""
+                SELECT * FROM lore_entries
+                WHERE {' AND '.join(conditions)}
+                ORDER BY
+                    CASE priority
+                        WHEN 'constitutional' THEN 1
+                        WHEN 'core' THEN 2
+                        WHEN 'standard' THEN 3
+                        ELSE 4
+                    END,
+                    updated_at DESC
+                LIMIT :limit
+                """,
+                params,
+            )
+        except Exception as exc:
+            warnings.append(f"角色设定检索失败: {exc}")
+            logger.warning("workflow setting adapter character setting search failed: %s", exc)
+            return []
+
+        entries = self._normalize_lore_entries(rows or [])
+        entries.sort(key=self._lore_priority_sort_key)
+        return entries[:limit]
+
     async def _search_existing_lore(
         self,
         *,
@@ -516,7 +655,96 @@ class SettingWorkflowAdapter:
             """,
             params,
         )
-        return self._normalize_lore_entries(rows or [])[:limit]
+        normalized = self._normalize_lore_entries(rows or [])
+        normalized.sort(key=self._lore_priority_sort_key)
+        return normalized[:limit]
+
+    def _filter_fixed_lore(self, entries: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+        fixed_priorities = {"constitutional", "core"}
+        fixed_entries = [
+            entry for entry in entries
+            if str(entry.get("priority") or "").lower() in fixed_priorities
+        ]
+        fixed_entries.sort(key=self._lore_priority_sort_key)
+        return fixed_entries[:limit]
+
+    def _merge_lore_buckets(
+        self,
+        fixed_entries: list[dict[str, Any]],
+        dynamic_entries: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        merged: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for entry in [*fixed_entries, *dynamic_entries]:
+            key = str(entry.get("id") or entry.get("title") or entry.get("content") or "")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(entry)
+        return merged
+
+    def _lore_priority_sort_key(self, entry: dict[str, Any]) -> tuple[int, str]:
+        priority_order = {
+            "constitutional": 0,
+            "core": 1,
+            "standard": 2,
+            "flexible": 3,
+        }
+        priority = str(entry.get("priority") or "standard").lower()
+        return (priority_order.get(priority, 4), str(entry.get("title") or ""))
+
+    async def _load_fixed_lore(
+        self,
+        *,
+        project_id: str,
+        db: Any,
+        limit: int,
+        include_constitutional: bool,
+        include_core: bool,
+        warnings: list[str],
+    ) -> list[dict[str, Any]]:
+        if not db or not hasattr(db, "execute_query"):
+            warnings.append("数据库连接不可用，无法固定加载高级设定")
+            return []
+
+        priorities: list[str] = []
+        if include_constitutional:
+            priorities.append("constitutional")
+        if include_core:
+            priorities.append("core")
+        if not priorities:
+            return []
+
+        priority_conditions = []
+        params: dict[str, Any] = {"project_id": project_id, "limit": limit}
+        for index, priority in enumerate(priorities):
+            key = f"priority_{index}"
+            priority_conditions.append(f"priority = :{key}")
+            params[key] = priority
+
+        try:
+            rows = await db.execute_query(
+                f"""
+                SELECT * FROM lore_entries
+                WHERE project_id = CAST(:project_id AS UUID)
+                AND ({' OR '.join(priority_conditions)})
+                ORDER BY
+                    CASE priority
+                        WHEN 'constitutional' THEN 1
+                        WHEN 'core' THEN 2
+                        WHEN 'standard' THEN 3
+                        ELSE 4
+                    END,
+                    updated_at DESC
+                LIMIT :limit
+                """,
+                params,
+            )
+        except Exception as exc:
+            warnings.append(f"高级固定设定读取失败: {exc}")
+            return []
+
+        return self._normalize_lore_entries(rows or [])
 
     async def _merge_constitutional_rules(
         self,
@@ -560,9 +788,16 @@ class SettingWorkflowAdapter:
         setting_query: str,
         setting_source: str,
         warnings: list[str],
+        *,
+        fixed_entries: Optional[list[dict[str, Any]]] = None,
+        dynamic_entries: Optional[list[dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
+        fixed_entries = fixed_entries or []
+        dynamic_entries = dynamic_entries or []
         return {
             "lore_entries": selected_entries,
+            "fixed_lore_entries": fixed_entries,
+            "dynamic_lore_entries": dynamic_entries,
             "selected_lore_entries": selected_entries,
             "setting_updates": [],
             "new_lores": [],
@@ -571,6 +806,14 @@ class SettingWorkflowAdapter:
             "setting_query": setting_query,
             "setting_source": setting_source,
             "setting_count": len(selected_entries),
+            "fixed_lore_count": len(fixed_entries),
+            "dynamic_lore_count": len(dynamic_entries),
+            "setting_context_summary": {
+                "fixed_priorities": ["constitutional", "core"],
+                "dynamic_source": setting_source,
+                "query": setting_query,
+            },
+            "setting_conflict_warnings": warnings,
             "setting_read_only": True,
             "warnings": warnings,
         }

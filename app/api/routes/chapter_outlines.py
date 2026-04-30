@@ -278,11 +278,16 @@ async def approve_outline(project_id: str, chapter_number: int, request: Approve
 
 
 @router.delete("/{chapter_number}")
-async def delete_outline(project_id: str, chapter_number: int):
+async def delete_outline(
+    project_id: str,
+    chapter_number: int,
+    soft_delete_generated_chapters: bool = Query(False, description="是否同步软删除该大纲生成的小说正文"),
+):
     """
     删除章节大纲
 
-    删除指定的章节大纲
+    默认只删除指定章节大纲并保留已生成正文；如显式传入
+    soft_delete_generated_chapters=true，则软删除该大纲关联生成的章节。
     """
     service = get_plot_outline_service()
     outline = await service.get_outline(project_id, chapter_number)
@@ -290,12 +295,25 @@ async def delete_outline(project_id: str, chapter_number: int):
     if not outline:
         raise HTTPException(status_code=404, detail="章节大纲不存在")
 
-    success = await service.delete_outline(outline.id)
+    result = await service.delete_outline(
+        outline.id,
+        soft_delete_generated_chapters=soft_delete_generated_chapters,
+    )
 
-    if not success:
+    if not result.get("success"):
         raise HTTPException(status_code=500, detail="删除失败")
 
-    return {"success": True, "message": f"第{chapter_number}章大纲已删除"}
+    soft_deleted_chapters = int(result.get("soft_deleted_chapters", 0))
+    if soft_delete_generated_chapters:
+        message = f"第{chapter_number}章大纲已删除，已软删除 {soft_deleted_chapters} 个关联生成章节"
+    else:
+        message = f"第{chapter_number}章大纲已删除，已生成正文已保留"
+
+    return {
+        "success": True,
+        "message": message,
+        "soft_deleted_chapters": soft_deleted_chapters,
+    }
 
 
 @router.post("/{chapter_number}/chat", response_model=ChatResponse)

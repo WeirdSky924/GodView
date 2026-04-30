@@ -111,9 +111,9 @@ def validate_word_count(
         )
     elif actual_count > max_allowed:
         return (
-            True,  # 超字也算达标
+            False,
             actual_count,
-            f"字数超标：实际 {actual_count} 字，目标 {target} 字（允许上限 {max_allowed} 字），超出 {actual_count - target} 字"
+            f"字数超标：实际 {actual_count} 字，目标 {target} 字（允许上限 {max_allowed} 字），超出 {actual_count - max_allowed} 字"
         )
     else:
         return (

@@ -1557,6 +1557,12 @@ class DirectorSystem:
         words_per_chapter: int = 2000,
         style_reference: Optional[str] = None,
         callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        outline_mode: Optional[str] = None,
+        outline_ids: Optional[List[str]] = None,
+        outline_chapter_numbers: Optional[List[int]] = None,
+        auto_advance_outlines: bool = False,
+        start_chapter_num: Optional[int] = None,
+        project_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         启动连续创作模式 - 基于工作流循环执行
@@ -1567,6 +1573,12 @@ class DirectorSystem:
             words_per_chapter: 每章目标字数
             style_reference: 风格参考文本
             callback: 进度回调函数 (event_type, data)
+            outline_mode: 大纲模式，selected 或 auto_progression
+            outline_ids: 手动选择的大纲 ID 列表
+            outline_chapter_numbers: 手动选择的大纲章节号列表
+            auto_advance_outlines: 是否从起始大纲自动推进
+            start_chapter_num: 自动推进起始章节号
+            project_id: 当前项目 ID
 
         Returns:
             Dict: 运行结果
@@ -1596,32 +1608,112 @@ class DirectorSystem:
             if not workflow:
                 return {"success": False, "error": f"工作流不存在: {workflow_id}"}
 
-            # 1. 基于项目状态规划剧情
-            if callback:
-                callback("phase", {"phase": "plot_planning", "message": "正在基于项目规划剧情..."})
+            active_project_id = project_id or self.project_id
+            if not active_project_id:
+                return {"success": False, "error": "无法获取项目ID"}
 
-            plot_plan = await self._plan_overall_plot(
-                chapter_count=chapter_count,
-            )
+            selected_outlines: List[Any] = []
+            use_outline_sequence = outline_mode in {"selected", "auto_progression"} or auto_advance_outlines
 
-            if callback:
-                callback("plot_planned", {"plan": plot_plan})
+            if use_outline_sequence:
+                from app.services.plot_outline_service import get_plot_outline_service
+
+                plot_service = get_plot_outline_service()
+                all_outlines = await plot_service.get_outlines_by_project(str(active_project_id))
+
+                def outline_status(outline: Any) -> str:
+                    status = getattr(outline, "status", "")
+                    return getattr(status, "value", status) or ""
+
+                writable = [
+                    outline for outline in all_outlines
+                    if outline_status(outline) in {"draft", "approved", "revision"}
+                ]
+
+                if outline_mode == "selected":
+                    selected_id_set = {str(item) for item in (outline_ids or [])}
+                    selected_chapter_set = {int(item) for item in (outline_chapter_numbers or [])}
+                    selected_outlines = [
+                        outline for outline in writable
+                        if str(getattr(outline, "id", "")) in selected_id_set
+                        or int(getattr(outline, "chapter_number", 0)) in selected_chapter_set
+                    ]
+                    selected_outlines.sort(key=lambda item: item.chapter_number)
+                else:
+                    start_num = int(start_chapter_num or 1)
+                    selected_outlines = [
+                        outline for outline in writable
+                        if int(outline.chapter_number) >= start_num
+                    ][:int(chapter_count)]
+
+                if not selected_outlines:
+                    return {"success": False, "error": "未找到可用于连续创作的章节大纲"}
+
+                if callback:
+                    callback("phase", {
+                        "phase": "outline_sequence",
+                        "message": f"已选择 {len(selected_outlines)} 个章节大纲，准备按大纲生成",
+                    })
+            else:
+                # 1. 基于项目状态规划剧情
+                if callback:
+                    callback("phase", {"phase": "plot_planning", "message": "正在基于项目规划剧情..."})
+
+                plot_plan = await self._plan_overall_plot(
+                    chapter_count=chapter_count,
+                )
+
+                if callback:
+                    callback("plot_planned", {"plan": plot_plan})
+
+                selected_outlines = []
 
             # 2. 逐章执行工作流
-            for chapter_num in range(1, chapter_count + 1):
+            if selected_outlines:
+                chapter_items = []
+                for outline in selected_outlines:
+                    outline_payload = outline.model_dump(mode="json") if hasattr(outline, "model_dump") else dict(outline)
+                    chapter_items.append({
+                        "chapter_num": int(outline.chapter_number),
+                        "chapter_title": outline.title,
+                        "chapter_goal": outline.summary or "\n".join(outline.chapter_goals or []) or "推进剧情发展",
+                        "chapter_summary": outline.summary,
+                        "target_word_count": outline.target_word_count or words_per_chapter,
+                        "chapter_outline_id": outline.id,
+                        "chapter_outline": outline_payload,
+                    })
+            else:
+                chapter_items = []
+                for chapter_num in range(1, chapter_count + 1):
+                    chapter_title = f"第{chapter_num}章 {plot_plan.get('chapter_titles', [f'第{chapter_num}章'])[chapter_num - 1] if chapter_num <= len(plot_plan.get('chapter_titles', [])) else f'第{chapter_num}章'}"
+                    chapter_goal = plot_plan.get("chapter_goals", ["推进剧情发展"])[chapter_num - 1] if chapter_num <= len(plot_plan.get("chapter_goals", [])) else "推进剧情发展"
+                    chapter_items.append({
+                        "chapter_num": chapter_num,
+                        "chapter_title": chapter_title,
+                        "chapter_goal": chapter_goal,
+                        "target_word_count": words_per_chapter,
+                        "chapter_outline_id": None,
+                        "chapter_outline": None,
+                    })
+
+            for index, chapter_item in enumerate(chapter_items, start=1):
                 if self._auto_stop_flag:
                     if callback:
-                        callback("stopped", {"reason": "用户停止", "chapters_completed": chapter_num - 1})
+                        callback("stopped", {"reason": "用户停止", "chapters_completed": index - 1})
                     break
 
-                chapter_title = f"第{chapter_num}章 {plot_plan.get('chapter_titles', [f'第{chapter_num}章'])[chapter_num - 1] if chapter_num <= len(plot_plan.get('chapter_titles', [])) else f'第{chapter_num}章'}"
-                chapter_goal = plot_plan.get("chapter_goals", ["推进剧情发展"])[chapter_num - 1] if chapter_num <= len(plot_plan.get("chapter_goals", [])) else "推进剧情发展"
+                chapter_num = chapter_item["chapter_num"]
+                chapter_title = chapter_item["chapter_title"]
+                chapter_goal = chapter_item["chapter_goal"]
+                chapter_outline_id = chapter_item.get("chapter_outline_id")
+                target_word_count = chapter_item.get("target_word_count") or words_per_chapter
 
                 if callback:
                     callback("chapter_start", {
                         "chapter_num": chapter_num,
                         "title": chapter_title,
                         "goal": chapter_goal,
+                        "chapter_outline_id": chapter_outline_id,
                     })
 
                 # 设置工作流执行上下文
@@ -1629,20 +1721,21 @@ class DirectorSystem:
                     "chapter_num": chapter_num,
                     "chapter_title": chapter_title,
                     "chapter_goal": chapter_goal,
-                    "target_word_count": words_per_chapter,
+                    "target_word_count": target_word_count,
                     "style_reference": style_reference,
                 }
+                if chapter_item.get("chapter_outline"):
+                    initial_context.update({
+                        "chapter_summary": chapter_item.get("chapter_summary", ""),
+                        "chapter_outline_id": chapter_outline_id,
+                        "chapter_outline": chapter_item["chapter_outline"],
+                    })
 
                 # 执行工作流
                 try:
-                    if not self.project_id:
-                        logger.error("无法获取项目ID，导演系统未正确初始化")
-                        results["error"] = "无法获取项目ID"
-                        break
-
                     execution_id = await engine.execute_workflow(
                         workflow_id,
-                        self.project_id,
+                        str(active_project_id),
                         initial_context,
                         postgres_db,
                     )
@@ -1658,6 +1751,7 @@ class DirectorSystem:
                         if chapter_content:
                             results["chapters"].append({
                                 "chapter_num": chapter_num,
+                                "chapter_outline_id": chapter_outline_id,
                                 "title": chapter_title,
                                 "content": chapter_content,
                                 "word_count": word_count,
@@ -1667,6 +1761,7 @@ class DirectorSystem:
                             if callback:
                                 callback("chapter_completed", {
                                     "chapter_num": chapter_num,
+                                    "chapter_outline_id": chapter_outline_id,
                                     "title": chapter_title,
                                     "word_count": word_count,
                                     "content": chapter_content,
@@ -1679,17 +1774,20 @@ class DirectorSystem:
                         chapter_result = await self.auto_write_chapter(
                             chapter_title=chapter_title,
                             chapter_goal=chapter_goal,
-                            target_word_count=words_per_chapter,
+                            target_word_count=target_word_count,
                             style_reference=style_reference,
                         )
 
                         if chapter_result.get("success"):
+                            chapter_result["chapter_num"] = chapter_num
+                            chapter_result["chapter_outline_id"] = chapter_outline_id
                             results["chapters"].append(chapter_result)
                             results["total_words"] += chapter_result.get("word_count", 0)
 
                             if callback:
                                 callback("chapter_completed", {
                                     "chapter_num": chapter_num,
+                                    "chapter_outline_id": chapter_outline_id,
                                     "title": chapter_title,
                                     "word_count": chapter_result.get("word_count", 0),
                                     "content": chapter_result.get("content", ""),

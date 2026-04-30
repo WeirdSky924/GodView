@@ -132,6 +132,25 @@ def _get_importance_tier(data: Dict[str, Any], default: int = 3) -> int:
     return default
 
 
+def _character_presence_types(character: Dict[str, Any]) -> set[str]:
+    presence_types = character.get("available_presence_types")
+    if isinstance(presence_types, str):
+        return {item.strip().lower() for item in presence_types.replace("，", ",").split(",") if item.strip()}
+    if isinstance(presence_types, list):
+        return {str(item).lower() for item in presence_types if str(item).strip()}
+    return {"present", "mentioned", "background"}
+
+
+def _can_character_perform(character: Dict[str, Any]) -> tuple[bool, str]:
+    status = str(character.get("status") or character.get("activity_status") or "active").lower()
+    if status in {"inactive", "archived", "dead", "retired", "disabled"}:
+        return False, f"status={status}"
+    presence_types = _character_presence_types(character)
+    if presence_types and "present" not in presence_types:
+        return False, "available_presence_types excludes present"
+    return True, "eligible"
+
+
 class SceneCoordinatorAgent(BaseAgent):
     """场景协调者 Agent - 统筹多角色演绎"""
 
@@ -279,6 +298,30 @@ class SceneCoordinatorAgent(BaseAgent):
         try:
             scene_directions = input_data.get("scene_directions", {})
             characters_data = input_data.get("characters", [])
+            performers = scene_directions.get("performers") or characters_data
+            mentioned_characters = scene_directions.get("mentioned_characters") or []
+            background_characters = scene_directions.get("background_characters") or []
+            unavailable_characters = scene_directions.get("unavailable_characters") or []
+            if performers or background_characters:
+                characters_data = [*performers, *background_characters]
+            filtered_characters = []
+            filtered_out = []
+            for character in characters_data:
+                if not isinstance(character, dict):
+                    continue
+                can_perform, reason = _can_character_perform(character)
+                if can_perform:
+                    filtered_characters.append(character)
+                else:
+                    filtered_out.append({**character, "unavailable_reason": reason})
+            if filtered_out:
+                unavailable_characters = [*unavailable_characters, *filtered_out]
+                scene_directions["unavailable_characters"] = unavailable_characters
+                scene_directions.setdefault("participation_warnings", []).extend(
+                    f"场景协调器移除不可正面出场角色 {item.get('name', '未知角色')}：{item.get('unavailable_reason')}"
+                    for item in filtered_out
+                )
+            characters_data = filtered_characters
             world_info = input_data.get("world_info", {})
             previous_output = input_data.get("previous_output", {})
             mode = input_data.get("mode", "interactive")
@@ -294,6 +337,12 @@ class SceneCoordinatorAgent(BaseAgent):
                 iteration_count = max(iteration_count, 4)
             elif target_word_count >= 2000:
                 iteration_count = max(iteration_count, 3)
+
+            if mentioned_characters or unavailable_characters:
+                scene_directions["mentioned_character_rule"] = (
+                    "mentioned_characters/unavailable_characters 只能作为影响、传闻、姓名、势力或回忆被提及，"
+                    "不得直接发言、行动或作为当前场景活人参与者。"
+                )
 
             logger.info(f"场景演绎配置: {iteration_count} 轮迭代, 目标 {target_word_count} 字, {len(characters_data)} 个角色")
 
@@ -344,6 +393,12 @@ class SceneCoordinatorAgent(BaseAgent):
             final_result["iteration_count"] = iteration_count
             final_result["target_word_count"] = target_word_count
             final_result["actual_word_count"] = await self._count_words_with_skill(final_result.get("full_content", ""))
+            final_result["performers"] = performers
+            final_result["mentioned_characters"] = mentioned_characters
+            final_result["background_characters"] = background_characters
+            final_result["unavailable_characters"] = scene_directions.get("unavailable_characters", [])
+            final_result["participation_trace"] = scene_directions.get("participation_trace", [])
+            final_result["participation_warnings"] = scene_directions.get("participation_warnings", [])
 
             return AgentResponse(
                 success=True,
@@ -666,6 +721,23 @@ class SceneCoordinatorAgent(BaseAgent):
         if scene_info:
             parts.append(f"【当前场景】\n地点：{scene_info.get('location', '未知')}\n氛围：{scene_info.get('atmosphere', '正剧')}")
 
+        # 角色出场边界
+        constraint_lines = []
+        present_names = [str(c.get("name")) for c in scene_directions.get("performers", []) if isinstance(c, dict) and c.get("name")]
+        present_names.extend(str(c.get("name")) for c in scene_directions.get("background_characters", []) if isinstance(c, dict) and c.get("name"))
+        mentioned_names = [str(c.get("name")) for c in scene_directions.get("mentioned_characters", []) if isinstance(c, dict) and c.get("name")]
+        unavailable_names = [str(c.get("name")) for c in scene_directions.get("unavailable_characters", []) if isinstance(c, dict) and c.get("name")]
+        if present_names:
+            constraint_lines.append(f"可在当前正面场景互动/发言的角色：{', '.join(dict.fromkeys(present_names))}")
+        if mentioned_names:
+            constraint_lines.append(f"只能提及、不能出场/发言/行动的角色：{', '.join(dict.fromkeys(mentioned_names))}")
+        if unavailable_names:
+            constraint_lines.append(f"禁止作为当前场景活人参与者的角色：{', '.join(dict.fromkeys(unavailable_names))}")
+        if scene_directions.get("mentioned_character_rule"):
+            constraint_lines.append(str(scene_directions.get("mentioned_character_rule")))
+        if constraint_lines:
+            parts.append("【角色出场硬约束】\n" + "\n".join(f"- {line}" for line in constraint_lines) + "\n- 不得让禁止/仅提及角色直接说话、行动、进入现场或推动当前场景。")
+
         # 迭代轮次信息
         parts.append(f"【当前进度】这是第 {round_num}/{total_rounds} 轮对话")
 
@@ -734,7 +806,12 @@ class SceneCoordinatorAgent(BaseAgent):
             char_agent = self.get_or_create_character_agent(char_data)
 
             char_input = {
-                "context": f"""【场景补充任务】
+                "context": self._build_character_context_with_history(
+                    char_data, distribution_plan.get(char_name, {}),
+                    scene_directions, world_info, 1, 1
+                ) + f"""
+
+【场景补充边界】
 当前场景内容字数不足，需要补充约 {shortage} 字。
 
 【已有内容摘要】
@@ -745,7 +822,7 @@ class SceneCoordinatorAgent(BaseAgent):
 请根据场景氛围和剧情发展，进行一段补充表演。
 可以是：
 - 深入的内心独白
-- 与其他角色的互动
+- 与其他允许正面出场角色的互动
 - 对环境的反应
 - 推进剧情的行动
 """,
@@ -834,6 +911,23 @@ class SceneCoordinatorAgent(BaseAgent):
         scene_info = info_package.get("scene_info", {})
         if scene_info:
             parts.append(f"【当前场景】\n地点：{scene_info.get('location', '未知')}\n氛围：{scene_info.get('atmosphere', '正剧')}")
+
+        # 角色出场边界
+        constraint_lines = []
+        present_names = [str(c.get("name")) for c in scene_directions.get("performers", []) if isinstance(c, dict) and c.get("name")]
+        present_names.extend(str(c.get("name")) for c in scene_directions.get("background_characters", []) if isinstance(c, dict) and c.get("name"))
+        mentioned_names = [str(c.get("name")) for c in scene_directions.get("mentioned_characters", []) if isinstance(c, dict) and c.get("name")]
+        unavailable_names = [str(c.get("name")) for c in scene_directions.get("unavailable_characters", []) if isinstance(c, dict) and c.get("name")]
+        if present_names:
+            constraint_lines.append(f"可在当前正面场景互动/发言的角色：{', '.join(dict.fromkeys(present_names))}")
+        if mentioned_names:
+            constraint_lines.append(f"只能提及、不能出场/发言/行动的角色：{', '.join(dict.fromkeys(mentioned_names))}")
+        if unavailable_names:
+            constraint_lines.append(f"禁止作为当前场景活人参与者的角色：{', '.join(dict.fromkeys(unavailable_names))}")
+        if scene_directions.get("mentioned_character_rule"):
+            constraint_lines.append(str(scene_directions.get("mentioned_character_rule")))
+        if constraint_lines:
+            parts.append("【角色出场硬约束】\n" + "\n".join(f"- {line}" for line in constraint_lines) + "\n- 不得让禁止/仅提及角色直接说话、行动、进入现场或推动当前场景。")
 
         # 角色定位
         char_specific = info_package.get("character_specific", {})

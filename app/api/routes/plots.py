@@ -116,13 +116,32 @@ async def create_hook(hook: Hook):
             raise HTTPException(status_code=400, detail="伏笔所属世界不属于当前项目")
     if not hook_data.get("scope_type"):
         hook_data["scope_type"] = "world" if hook_data.get("world_id") else "project"
+    if not hook_data.get("priority"):
+        hook_data["priority"] = 3
+
+    duplicate = None
+    if hook_data.get("project_id") and hasattr(postgres_db, "find_duplicate_hook"):
+        duplicate = await postgres_db.find_duplicate_hook(
+            str(hook_data["project_id"]),
+            hook_data.get("title", ""),
+            hook_data.get("description", "") or hook_data.get("plant_context", ""),
+            world_id=hook_data.get("world_id"),
+            scope_type=hook_data.get("scope_type"),
+        )
+    if duplicate:
+        return {
+            "success": True,
+            "id": str(duplicate.get("id")),
+            "duplicate": True,
+            "message": f"伏笔 '{hook.title}' 已存在，已复用现有条目",
+        }
 
     # 设置默认值和时间戳（使用 datetime 对象）
     now = datetime.now()
     if not hook_data.get("status"):
         hook_data["status"] = "planted"
     if not hook_data.get("priority"):
-        hook_data["priority"] = 5
+        hook_data["priority"] = 3
     hook_data["created_at"] = now
 
     try:

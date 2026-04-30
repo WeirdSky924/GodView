@@ -185,7 +185,12 @@ class SettingAgent(BaseAgent):
 
             return AgentResponse(
                 success=True,
-                data={**result_data, "message": response_text},
+                data={
+                    **result_data,
+                    "message": response_text,
+                    "output": response_text,
+                    "setting_read_only": True,
+                },
             )
 
         except Exception as e:

@@ -37,6 +37,7 @@ const categoryIcons: Record<LoreCategory, React.ReactNode> = {
   culture: <Globe size={18} />,
   race: <Users size={18} />,
   profession: <Package size={18} />,
+  character_setting: <Users size={18} />,
   item: <Package size={18} />,
   skill: <Zap size={18} />,
   custom: <Star size={18} />,

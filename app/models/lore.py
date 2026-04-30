@@ -12,8 +12,18 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 LEGACY_LORE_PRIORITY_MAP = {
     "low": "flexible",
+    "minor": "flexible",
+    "flex": "flexible",
+    "flexible": "flexible",
     "medium": "standard",
+    "normal": "standard",
+    "standard": "standard",
+    "important": "core",
     "high": "core",
+    "core": "core",
+    "critical": "constitutional",
+    "constitution": "constitutional",
+    "constitutional": "constitutional",
 }
 
 LEGACY_LORE_CATEGORY_MAP = {
@@ -28,6 +38,11 @@ LEGACY_LORE_CATEGORY_MAP = {
     "group": "faction",
     "job": "profession",
     "class": "profession",
+    "character": "character_setting",
+    "character_setting": "character_setting",
+    "character_background": "character_setting",
+    "origin": "character_setting",
+    "source_history": "character_setting",
     "artifact": "item",
     "equipment": "item",
     "ability": "skill",
@@ -57,8 +72,19 @@ def normalize_lore_priority(value: Any) -> "LorePriority":
     if isinstance(value, LorePriority):
         return value
 
+    if isinstance(value, (int, float)):
+        if value >= 5:
+            return LorePriority.CONSTITUTIONAL
+        if value >= 4:
+            return LorePriority.CORE
+        if value >= 2:
+            return LorePriority.STANDARD
+        return LorePriority.FLEXIBLE
+
     if isinstance(value, str):
-        normalized = value.strip().lower()
+        normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+        if normalized.isdigit():
+            return normalize_lore_priority(int(normalized))
         if normalized in LEGACY_LORE_PRIORITY_MAP:
             normalized = LEGACY_LORE_PRIORITY_MAP[normalized]
 
@@ -80,6 +106,7 @@ class LoreCategory(str, Enum):
     CULTURE = "culture"  # 文化习俗
     RACE = "race"  # 种族设定
     PROFESSION = "profession"  # 职业/阶层
+    CHARACTER_SETTING = "character_setting"  # 角色设定（来源、历史、背景约束）
     ITEM = "item"  # 物品/装备
     SKILL = "skill"  # 技能/能力
     CUSTOM = "custom"  # 自定义

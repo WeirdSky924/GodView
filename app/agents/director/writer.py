@@ -4,6 +4,7 @@
 """
 
 import logging
+import json
 from typing import Any, Dict, List, Optional, Tuple
 import asyncio
 
@@ -362,7 +363,16 @@ class WriterAgent(BaseAgent):
             character_moods = self._as_dict(input_data.get("character_moods", {}))
             hooks = self._as_list(input_data.get("hooks", []))
             previous_style = self._as_text(input_data.get("previous_style", ""))
-            word_count = input_data.get("word_count", 500)
+            word_count = (
+                input_data.get("target_word_count")
+                or input_data.get("chapter_target_word_count")
+                or input_data.get("word_count")
+                or 500
+            )
+            try:
+                word_count = int(word_count)
+            except (TypeError, ValueError):
+                word_count = 500
             auto_write_mode = bool(input_data.get("auto_write_mode", False))
             writing_prompt = self._as_text(input_data.get("writing_prompt", ""))
             discussion_summary = self._extract_discussion_summary(input_data)
@@ -375,8 +385,9 @@ class WriterAgent(BaseAgent):
             retry_count = input_data.get("retry_count", 0)
             retry_message = input_data.get("retry_message", "")
 
-            # 计算最低字数要求
-            min_word_count = int(word_count)
+            # 计算字数要求：Writer 要写到章节目标附近，不能只检查最低字数。
+            min_word_count = max(1, int(word_count * 0.9))
+            max_word_count = max(word_count, int(word_count * 1.1))
 
             # ========== 决定生成策略 ==========
             use_segmented = word_count >= SEGMENT_THRESHOLD
@@ -387,6 +398,7 @@ class WriterAgent(BaseAgent):
                     input_data=input_data,
                     word_count=word_count,
                     min_word_count=min_word_count,
+                    max_word_count=max_word_count,
                 )
             else:
                 # 普通生成流程
@@ -394,6 +406,7 @@ class WriterAgent(BaseAgent):
                     input_data=input_data,
                     word_count=word_count,
                     min_word_count=min_word_count,
+                    max_word_count=max_word_count,
                 )
 
             # 如果是重试，添加重试标记
@@ -406,17 +419,21 @@ class WriterAgent(BaseAgent):
             actual_word_count = await self._count_words_async(content)
 
             # 字数检查
-            word_count_passed = actual_word_count >= min_word_count
+            word_count_passed = min_word_count <= actual_word_count <= max_word_count
             result["word_count_check"] = {
                 "actual": actual_word_count,
                 "target": word_count,
                 "min_required": min_word_count,
+                "max_allowed": max_word_count,
                 "passed": word_count_passed,
             }
 
-            if not word_count_passed:
+            if actual_word_count < min_word_count:
                 logger.warning(f"字数不达标: 实际 {actual_word_count} < 最低要求 {min_word_count}")
                 result["word_count_warning"] = f"字数不足 {min_word_count - actual_word_count} 字"
+            elif actual_word_count > max_word_count:
+                logger.warning(f"字数超标: 实际 {actual_word_count} > 允许上限 {max_word_count}")
+                result["word_count_warning"] = f"字数超标 {actual_word_count - max_word_count} 字"
             else:
                 logger.info(f"字数达标: {actual_word_count} 字 (目标: {word_count})")
 
@@ -432,6 +449,7 @@ class WriterAgent(BaseAgent):
                 "target_word_count": word_count,
                 "actual_word_count": actual_word_count,
                 "min_word_count": min_word_count,
+                "max_word_count": max_word_count,
                 "word_count_passed": word_count_passed,
                 "auto_write_mode": auto_write_mode,
                 "is_retry": is_retry,
@@ -460,6 +478,7 @@ class WriterAgent(BaseAgent):
         input_data: Dict[str, Any],
         word_count: int,
         min_word_count: int,
+        max_word_count: int,
     ) -> Dict[str, Any]:
         """
         单次生成流程（适用于较小字数需求）
@@ -514,6 +533,7 @@ class WriterAgent(BaseAgent):
                 world_info=world_info,
                 writing_rules_guidance=writing_rules_guidance,
                 discussion_asset_digest=discussion_asset_digest,
+                workflow_context=input_data,
             )
 
         # 调用 LLM (structured)
@@ -610,6 +630,7 @@ class WriterAgent(BaseAgent):
         input_data: Dict[str, Any],
         word_count: int,
         min_word_count: int,
+        max_word_count: int,
     ) -> Dict[str, Any]:
         """
         分段生成流程（适用于大字数需求）
@@ -631,6 +652,8 @@ class WriterAgent(BaseAgent):
         chapter_num = input_data.get("chapter_num", 1)
         total_chapters = input_data.get("total_chapters", 10)
         world_info = self._as_dict(input_data.get("world_info"))
+
+        workflow_binding_block = self._build_workflow_binding_block(input_data)
 
         chapter_rule_context = self._build_writing_rule_context(
             chapter_num=chapter_num,
@@ -665,6 +688,7 @@ class WriterAgent(BaseAgent):
             total_chapters=total_chapters,
             world_info=world_info,
             discussion_asset_digest=discussion_asset_digest,
+            workflow_binding_block=workflow_binding_block,
         )
 
         # ========== 第二阶段：逐段生成 ==========
@@ -704,10 +728,13 @@ class WriterAgent(BaseAgent):
                 segment_num=segment_num,
                 total_segments=segment_count,
                 target_words=segment_target,
+                min_words=max(1, int(segment_target * 0.85)),
+                max_words=max(segment_target, int(segment_target * 1.15)),
                 world_info=world_info,
                 previous_style=previous_style if i == 0 else None,
                 writing_rules_guidance=segment_writing_rules_guidance,
                 discussion_asset_digest=discussion_asset_digest,
+                workflow_binding_block=workflow_binding_block,
             )
 
             # 生成该段 (structured)
@@ -766,6 +793,7 @@ class WriterAgent(BaseAgent):
                 chapter_num=chapter_num,
                 total_chapters=total_chapters,
                 writing_rules_guidance=chapter_writing_rules_guidance,
+                workflow_binding_block=workflow_binding_block,
             )
 
             try:
@@ -792,6 +820,8 @@ class WriterAgent(BaseAgent):
             else:
                 actual_word_count = await self._count_words_async(full_content)
 
+        # 若模型偶发超写，保留完整内容但标记不合格，交由 Evaluator/条件节点触发修订；
+        # 不在这里机械截断，避免破坏章节语义完整性。
         return self._normalize_workflow_output_fields({
             "content": full_content,
             "chapter_content": full_content,
@@ -802,6 +832,9 @@ class WriterAgent(BaseAgent):
             "segment_count": segment_count,
             "segment_results": segment_results,
             "segment_plan": segment_plan,
+            "target_word_count": word_count,
+            "min_word_count": min_word_count,
+            "max_word_count": max_word_count,
         })
 
     async def _plan_segments(
@@ -901,6 +934,8 @@ class WriterAgent(BaseAgent):
         segment_num: int,
         total_segments: int,
         target_words: int,
+        min_words: Optional[int] = None,
+        max_words: Optional[int] = None,
         world_info: Optional[Dict[str, Any]] = None,
         previous_style: Optional[str] = None,
         writing_rules_guidance: str = "",
@@ -909,10 +944,14 @@ class WriterAgent(BaseAgent):
         """构建分段生成提示"""
         parts = []
 
+        min_words = min_words or max(1, int(target_words * 0.85))
+        max_words = max_words or max(target_words, int(target_words * 1.15))
+
         parts.append(f"""【分段写作任务】
 - 当前是第 {segment_num}/{total_segments} 段
 - 本段焦点: {segment_info.get('focus', '自由发挥')}
-- 目标字数: 约 {target_words} 字（最低 {target_words} 字）
+- 目标字数: 约 {target_words} 字
+- 字数范围: {min_words}-{max_words} 字，禁止明显低于或高于该范围
 - 情感基调: {segment_info.get('tone', '平稳')}""")
 
         key_elements = self._as_list(segment_info.get('key_elements', []))
@@ -939,7 +978,7 @@ class WriterAgent(BaseAgent):
 
         parts.append(f"""
 【写作要求】
-1. 必须达到最低字数要求
+1. 本段字数必须控制在 {min_words}-{max_words} 字范围内，接近目标 {target_words} 字即可，不要为了铺陈而超写
 2. 与前文自然衔接
 3. 突出本段的叙事焦点
 4. 保持网文的节奏感和可读性
@@ -1103,6 +1142,57 @@ class WriterAgent(BaseAgent):
         count = self._count_words(text)
         return {"total_count": count, "chinese_count": count, "english_count": 0}
 
+    def _format_workflow_context_block(self, title: str, value: Any, max_chars: Optional[int] = None) -> str:
+        if value in (None, "", [], {}):
+            return ""
+        if isinstance(value, str):
+            text = value
+        else:
+            try:
+                text = json.dumps(value, ensure_ascii=False, indent=2)
+            except TypeError:
+                text = str(value)
+        text = text.strip()
+        if not text:
+            return ""
+        return f"【{title}】\n{text}"
+
+    def _build_workflow_binding_block(self, workflow_context: Optional[Dict[str, Any]]) -> str:
+        """构建所有写作路径共享的工作流硬约束块。"""
+        workflow_context = workflow_context or {}
+        binding_blocks = [
+            ("绑定章节大纲（必须遵循，不可替换）", workflow_context.get("chapter_outline")),
+            ("章节目标", workflow_context.get("chapter_goals") or workflow_context.get("chapter_goal")),
+            ("角色出场硬约束", workflow_context.get("character_constraints")),
+            ("场景方向", workflow_context.get("scene_directions")),
+            ("场景演绎素材（参考材料，不得照抄或覆盖大纲）", workflow_context.get("performance_result")),
+            ("总编剧写作计划", workflow_context.get("writing_plan") or workflow_context.get("plot_guidance")),
+            ("固定最高级设定", workflow_context.get("fixed_lore_entries")),
+            ("本章动态设定", workflow_context.get("dynamic_lore_entries") or workflow_context.get("selected_lore_entries")),
+            ("上一轮评估修订要求", workflow_context.get("retry_message") or workflow_context.get("revision_notes")),
+        ]
+
+        parts: List[str] = []
+        for title, value in binding_blocks:
+            block = self._format_workflow_context_block(title, value)
+            if block:
+                parts.append(block)
+
+        if parts:
+            parts.append(
+                "【工作流状态使用要求】\n"
+                "- 绑定章节大纲、固定设定和动态设定是事实输入源，必须承接，不能改写为另一套剧情。\n"
+                "- 当章节大纲明确要求某个能力觉醒、融合、警告、线索或场景在本章发生时，必须执行；不得以长篇渐进展开为理由延后或替换。\n"
+                "- 场景演绎素材和讨论素材只作为参考材料/写作索引，不是必须逐字照抄的正文脚本；如与绑定大纲或固定设定冲突，以绑定大纲和固定设定为准。\n"
+                "- 角色出场硬约束优先级高于讨论素材和场景演绎素材：只有 present_character_names 中的角色可以正面出场、说话或行动。\n"
+                "- mentioned_only_names / forbidden_direct_appearance_names 中的角色只能作为传闻、回忆、姓名、势力或影响被提及；不得写成当前场景的活人参与者、发言者或行动者。\n"
+                "- 如果讨论资产、场景演绎素材或写作计划引入未授权角色，必须跳过或改写，不得作为事实承接。\n"
+                "- 角色来源、历史、身份和背景必须遵守 category=character_setting 的设定库条目；缺失时不要自行补写。\n"
+                "- 不要引入项目设定中不存在的通用修真/玄幻规则、组织、角色或专有概念。"
+            )
+
+        return "\n\n".join(parts)
+
     def _build_user_message(
         self,
         intents: List[str],
@@ -1118,6 +1208,7 @@ class WriterAgent(BaseAgent):
         world_info: Optional[Dict[str, Any]] = None,
         writing_rules_guidance: str = "",
         discussion_asset_digest: str = "",
+        workflow_context: Optional[Dict[str, Any]] = None,
     ) -> str:
         """构建用户消息"""
         message_parts = []
@@ -1132,7 +1223,12 @@ class WriterAgent(BaseAgent):
 - 世界观要有多层次，让读者感觉还有更深的内容待探索""")
 
         # 字数要求（放在最前面强调）
-        message_parts.append(f"【字数要求（强制）】\n目标：约 {word_count} 字\n最低要求：{min_word_count} 字（必须达到）\n写作完成后请自行统计字数。")
+        message_parts.append(
+            f"【字数要求（强制）】\n"
+            f"目标：约 {word_count} 字\n"
+            f"可接受范围：{min_word_count}-{int(word_count * 1.1)} 字\n"
+            "写作完成后请自行统计字数；不要只追求超过最低值，也不要明显超出上限。"
+        )
 
         if writing_rules_guidance:
             message_parts.append(writing_rules_guidance)
@@ -1156,14 +1252,48 @@ class WriterAgent(BaseAgent):
                 world_section += f"\n\n【核心主题】\n{', '.join(str(theme) for theme in themes)}"
             message_parts.append(world_section)
 
+        workflow_context = workflow_context or {}
+        binding_blocks = [
+            ("绑定章节大纲（必须遵循，不可替换）", workflow_context.get("chapter_outline")),
+            ("章节目标", workflow_context.get("chapter_goals") or workflow_context.get("chapter_goal")),
+            ("角色出场硬约束", workflow_context.get("character_constraints")),
+            ("场景方向", workflow_context.get("scene_directions")),
+            ("场景演绎素材", workflow_context.get("performance_result")),
+            ("总编剧写作计划", workflow_context.get("writing_plan") or workflow_context.get("plot_guidance")),
+            ("固定最高级设定", workflow_context.get("fixed_lore_entries")),
+            ("本章动态设定", workflow_context.get("dynamic_lore_entries") or workflow_context.get("selected_lore_entries")),
+            ("上一轮评估修订要求", workflow_context.get("retry_message") or workflow_context.get("revision_notes")),
+        ]
+        for title, value in binding_blocks:
+            block = self._format_workflow_context_block(title, value)
+            if block:
+                message_parts.append(block)
+
+        if any(value for _, value in binding_blocks):
+            message_parts.append(
+                "【工作流状态使用要求】\n"
+                "- 上述绑定章节大纲、固定设定和动态设定是事实输入源，必须承接，不能改写为另一套剧情。\n"
+                "- 场景演绎素材和总编剧写作计划是写作素材/索引，请整合进正文，但若与绑定大纲或固定设定冲突，以绑定大纲和固定设定为准。\n"
+                "- 角色出场硬约束优先级高于讨论素材和场景演绎素材：只有 present_character_names 中的角色可以正面出场、说话或行动。\n"
+                "- mentioned_only_names / forbidden_direct_appearance_names 中的角色只能作为传闻、回忆、姓名、势力或影响被提及；不得写成当前场景的活人参与者、发言者或行动者。\n"
+                "- 如果讨论资产、场景演绎素材或写作计划引入未授权角色，必须跳过或改写，不得作为事实承接。\n"
+                "- 角色来源、历史、身份和背景必须遵守 category=character_setting 的设定库条目；缺失时不要自行补写。\n"
+                "- 不要引入项目设定中不存在的通用修真/玄幻规则。"
+            )
+
         # 团队讨论共识（如果有）
         if discussion_summary:
-            message_parts.append(f"【团队讨论共识】\n{discussion_summary}\n请在写作中体现以上讨论达成的共识。")
+            message_parts.append(
+                f"【团队讨论共识】\n{discussion_summary}\n"
+                "请在写作中体现以上讨论中不违反绑定大纲、固定设定、角色设定和角色出场硬约束的共识；"
+                "凡是引入未授权角色或违反角色状态的讨论内容，一律作为无效素材跳过。"
+            )
 
         if discussion_asset_digest:
             message_parts.append(
                 f"【已确认讨论资产】\n{discussion_asset_digest}\n"
-                "这些资产来自已确认的集体讨论，可作为本章写作事实使用；请承接其中的剧情加码、伏笔、设定、地点和角色信息，不要与其冲突。"
+                "这些资产来自已确认的集体讨论；只有不违反绑定大纲、固定设定、角色设定和角色出场硬约束的部分才能作为本章写作事实使用。"
+                "若资产包含未授权角色、死亡/未激活角色正面出场，或与角色来源历史冲突，必须跳过或改写。"
             )
 
         # 环境描写
@@ -1204,7 +1334,7 @@ class WriterAgent(BaseAgent):
             "- 多用动作和神态描写，少用直接告知\n"
             "- 对话要符合角色性格\n"
             "- 伏笔要自然嵌入，不突兀\n"
-            "- 必须达到最低字数要求\n"
+            "- 必须控制在字数范围内，接近目标字数即可，禁止明显超写\n"
             "- 保持长篇网文的节奏感，不要急于推进到高潮"
         )
 

@@ -24,18 +24,37 @@ import type {
   CharacterVoiceSampleSearchResult,
   CharacterAgentPrompt,
 } from '@/api/characters'
-import { Plus, Edit, Trash2, User, Mic, Search, RefreshCw, FolderOpen, Bot, Target, Brain, Eye, Sparkles, Crown, Star, Users, Zap, MessageSquare, Heart, Shield, Sword, Ghost, Settings, FileText, ChevronRight, MapPin } from 'lucide-react'
+import { Plus, Edit, Trash2, User, Mic, Search, RefreshCw, FolderOpen, Bot, Target, Brain, Eye, Sparkles, Crown, Star, Users, Zap, MessageSquare, Heart, Shield, Sword, Ghost, Settings, FileText, ChevronRight, MapPin, GitBranch } from 'lucide-react'
 import { useProject } from '@/contexts/ProjectContext'
 import { useTheme } from '@/contexts/ThemeContext'
 import { getRegions, type Region } from '@/api/worlds'
 import { useProjectWorlds } from '@/hooks/useProjectWorlds'
 import { motion, AnimatePresence } from 'framer-motion'
+import CharacterRelationshipEditor from '@/components/characters/CharacterRelationshipEditor'
 
 function splitCsvInput(value: string) {
   return value
     .split(/[，,\n]/)
     .map((item) => item.trim())
     .filter(Boolean)
+}
+
+function normalizeKeyRelationships(
+  value: Record<string, string> | undefined,
+  currentCharacterId?: string,
+) {
+  const result: Record<string, string> = {}
+  Object.entries(value || {}).forEach(([targetId, relation]) => {
+    const cleanTargetId = targetId.trim()
+    const cleanRelation = relation.trim()
+    if (!cleanTargetId || !cleanRelation || cleanTargetId === currentCharacterId) return
+    result[cleanTargetId] = cleanRelation
+  })
+  return result
+}
+
+function resolveRelationshipTargetName(targetId: string, characters: Character[]) {
+  return characters.find((character) => character.id === targetId || character.name === targetId)?.name || targetId
 }
 
 // 角色层级对应的图标和颜色
@@ -101,7 +120,7 @@ export default function Characters() {
   const { worlds, formatWorldLabel } = useProjectWorlds(currentProject?.id, currentProject?.world_id)
 
   // 编辑窗口的标签页
-  const [activeTab, setActiveTab] = useState<'basic' | 'location' | 'appearance' | 'voice' | 'agent'>('basic')
+  const [activeTab, setActiveTab] = useState<'basic' | 'relationships' | 'location' | 'appearance' | 'voice' | 'agent'>('basic')
 
   const [formData, setFormData] = useState<CreateCharacterDTO>({
     name: '',
@@ -126,6 +145,8 @@ export default function Characters() {
     agent_enabled: true,
     agent_goals: [],
     agent_memory: [],
+    relationships: [],
+    key_relationships: {},
   })
   const [lexiconInput, setLexiconInput] = useState('')
   const [forbiddenWordsInput, setForbiddenWordsInput] = useState('')
@@ -217,6 +238,8 @@ export default function Characters() {
       agent_enabled: true,
       agent_goals: [],
       agent_memory: [],
+      relationships: [],
+      key_relationships: {},
     })
     setLexiconInput('')
     setForbiddenWordsInput('')
@@ -252,6 +275,8 @@ export default function Characters() {
       agent_enabled: character.agent_enabled ?? true,
       agent_goals: character.agent_goals || [],
       agent_memory: character.agent_memory || [],
+      relationships: character.relationships || [],
+      key_relationships: character.key_relationships || {},
     })
     setLexiconInput((character.lexicon || []).join('，'))
     setForbiddenWordsInput((character.forbidden_words || []).join('，'))
@@ -276,6 +301,8 @@ export default function Characters() {
         voice_samples: splitCsvInput(voiceSamplesInput),
         agent_goals: splitCsvInput(agentGoalsInput),
         agent_memory: splitCsvInput(agentMemoryInput),
+        relationships: formData.relationships || [],
+        key_relationships: normalizeKeyRelationships(formData.key_relationships, editingChar?.id),
       }
 
       if (editingChar?.id) {
@@ -620,6 +647,11 @@ export default function Characters() {
                                 已设风格
                               </span>
                             )}
+                            {Object.keys(char.key_relationships || {}).length > 0 && (
+                              <span className={`px-2 py-1 rounded ${isDark ? 'bg-blue-900/50 text-blue-300' : 'bg-blue-50 text-blue-600'}`}>
+                                {Object.keys(char.key_relationships || {}).length} 个关系
+                              </span>
+                            )}
                           </div>
                           <div className="flex items-center gap-2">
                             <button
@@ -655,8 +687,8 @@ export default function Characters() {
           </div>
 
           {/* 右侧声音样本面板 */}
-          <Card className="flex flex-col h-fit xl:sticky xl:top-4">
-            <div className={`sticky top-0 z-10 ${isDark ? 'bg-gray-800' : 'bg-white'} pb-4`}>
+          <Card noPadding className="flex h-[calc(100vh-9rem)] min-h-[620px] flex-col overflow-hidden xl:sticky xl:top-4">
+            <div className={`shrink-0 p-6 pb-4 ${isDark ? 'bg-gray-800' : 'bg-white'}`}>
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <Mic size={18} className={isDark ? 'text-gray-400' : 'text-gray-500'} />
@@ -674,7 +706,7 @@ export default function Characters() {
               </div>
             </div>
 
-            <div className="flex-1 overflow-y-auto">
+            <div className="min-h-0 flex-1 overflow-y-auto px-6 pb-6 pr-5">
             {!selectedCharacter ? (
               <p className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>请选择左侧角色后查看和管理声音样本。</p>
             ) : (
@@ -697,6 +729,25 @@ export default function Characters() {
                   <div className="mt-1"><span className="font-medium">说话风格：</span>{selectedCharacter.speech_pattern || '未设置'}</div>
                   <div className="mt-1"><span className="font-medium">当前位置：</span>{selectedCharacter.current_location || '未设置'}</div>
                   <div className="mt-1"><span className="font-medium">到达原因：</span>{selectedCharacter.current_location_reason || '未填写原因'}</div>
+                  <div className="mt-3">
+                    <div className="mb-1 flex items-center gap-1.5 font-medium">
+                      <GitBranch size={14} />关键关系
+                    </div>
+                    {Object.entries(selectedCharacter.key_relationships || {}).length === 0 ? (
+                      <div className={isDark ? 'text-gray-500' : 'text-gray-400'}>暂无关键关系</div>
+                    ) : (
+                      <div className="space-y-1">
+                        {Object.entries(selectedCharacter.key_relationships || {}).slice(0, 3).map(([targetId, relation]) => (
+                          <div key={targetId} className={`rounded px-2 py-1 text-xs ${isDark ? 'bg-gray-900/70 text-gray-300' : 'bg-white text-gray-600'}`}>
+                            {resolveRelationshipTargetName(targetId, characters)}：{relation}
+                          </div>
+                        ))}
+                        {Object.keys(selectedCharacter.key_relationships || {}).length > 3 && (
+                          <div className={isDark ? 'text-gray-500' : 'text-gray-400'}>... 共 {Object.keys(selectedCharacter.key_relationships || {}).length} 条</div>
+                        )}
+                      </div>
+                    )}
+                  </div>
                   {selectedCharacter.has_agent && (
                     <div className="mt-2 flex items-center gap-2">
                       <span className={`inline-flex items-center px-2 py-0.5 text-xs rounded ${isDark ? 'bg-purple-900 text-purple-300' : 'bg-purple-100 text-purple-700'}`}>
@@ -846,6 +897,7 @@ export default function Characters() {
           <div className={`flex border-b ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
             {[
               { key: 'basic', label: '基础信息', icon: User },
+              { key: 'relationships', label: '关系网络', icon: GitBranch },
               { key: 'location', label: '位置地图', icon: MapPin },
               { key: 'appearance', label: '外观性格', icon: Heart },
               { key: 'voice', label: '语言风格', icon: MessageSquare },
@@ -979,6 +1031,20 @@ export default function Characters() {
                   rows={4}
                 />
               </div>
+            )}
+
+            {/* 关系网络 Tab */}
+            {activeTab === 'relationships' && (
+              <CharacterRelationshipEditor
+                characters={characters}
+                currentCharacterId={editingChar?.id}
+                currentCharacterName={formData.name || editingChar?.name || '当前角色'}
+                value={formData.key_relationships || {}}
+                legacyRelationships={formData.relationships || []}
+                onChange={(next) => setFormData({ ...formData, key_relationships: next })}
+                onLegacyRelationshipsChange={(next) => setFormData({ ...formData, relationships: next })}
+                isDark={isDark}
+              />
             )}
 
             {/* 位置地图 Tab */}

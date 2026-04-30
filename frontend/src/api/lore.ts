@@ -29,6 +29,7 @@ export type LoreCategory =
   | 'culture'
   | 'race'
   | 'profession'
+  | 'character_setting'
   | 'item'
   | 'skill'
   | 'custom'

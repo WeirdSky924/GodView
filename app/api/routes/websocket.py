@@ -633,6 +633,8 @@ async def websocket_connect(websocket: WebSocket, client_id: str):
                     await handle_workflow_resume(websocket, message, client_id)
                 elif message_type == "workflow_step":
                     await handle_workflow_step(websocket, message, client_id)
+                elif message_type == "workflow_user_input":
+                    await handle_workflow_user_input(websocket, message, client_id)
                 elif message_type == "workflow_status":
                     await handle_workflow_status(websocket, message, client_id)
                 # v8 Agent 通信
@@ -1045,8 +1047,8 @@ async def handle_stop_session(websocket: WebSocket, message: dict, client_id: st
     for agent in ["Summarizer", "Master Plotter", "Hook Manager", "Writer", "Evaluator", "Character Agent", "ProcGen"]:
         await send_agent_update(websocket, agent, "idle", f"{agent} 已停止", 0)
 
-    await websocket.send_json({"type": "session_stopped", "status": "success"})
     await send_log(websocket, "导演会话已停止")
+    await websocket.send_json({"type": "session_stopped", "status": "success"})
 
 
 async def handle_add_character(websocket: WebSocket, message: dict, client_id: str):
@@ -1185,6 +1187,83 @@ async def handle_get_characters(websocket: WebSocket, message: dict, client_id: 
     })
 
 
+WRITABLE_OUTLINE_STATUSES = {"draft", "approved", "revision"}
+
+
+def _outline_value(outline: Any, key: str, default: Any = None) -> Any:
+    if isinstance(outline, dict):
+        return outline.get(key, default)
+    return getattr(outline, key, default)
+
+
+def _outline_status_value(outline: Any) -> str:
+    status = _outline_value(outline, "status", "")
+    return getattr(status, "value", status) or ""
+
+
+def _outline_to_payload(outline: Any) -> Dict[str, Any]:
+    if isinstance(outline, dict):
+        return outline
+    if hasattr(outline, "model_dump"):
+        return outline.model_dump(mode="json")
+    return dict(outline)
+
+
+def _outline_goal(outline: Any, fallback: str = "推进剧情") -> str:
+    summary = (_outline_value(outline, "summary", "") or "").strip()
+    if summary:
+        return summary
+
+    goals = _outline_value(outline, "chapter_goals", []) or []
+    if goals:
+        return "\n".join(str(goal).strip() for goal in goals if str(goal).strip()) or fallback
+
+    return fallback
+
+
+async def _resolve_message_outline(message: dict, project_id: Optional[str]) -> Any:
+    chapter_num = message.get("chapter_num") or message.get("chapter_number")
+    outline_id = message.get("chapter_outline_id") or message.get("outline_id")
+
+    if not project_id or (not chapter_num and not outline_id):
+        return None
+
+    from app.services.plot_outline_service import get_plot_outline_service
+
+    plot_service = get_plot_outline_service()
+    outline = None
+
+    if chapter_num:
+        outline = await plot_service.get_outline(str(project_id), int(chapter_num))
+
+    if not outline and outline_id:
+        outlines = await plot_service.get_outlines_by_project(str(project_id))
+        outline = next(
+            (item for item in outlines if str(_outline_value(item, "id")) == str(outline_id)),
+            None,
+        )
+
+    return outline
+
+
+def _validate_selected_outline(outline: Any, project_id: Optional[str]) -> Optional[str]:
+    if not outline:
+        return "未找到选中的章节大纲"
+
+    if project_id and str(_outline_value(outline, "project_id")) != str(project_id):
+        return "章节大纲不属于当前项目"
+
+    status = _outline_status_value(outline)
+    if status not in WRITABLE_OUTLINE_STATUSES:
+        if status == "in_writing":
+            return "该章节大纲正在写作中，不能重复启动"
+        if status == "completed":
+            return "该章节大纲已完成，不能重复生成"
+        return f"该章节大纲状态不可写: {status}"
+
+    return None
+
+
 async def handle_auto_write_chapter(websocket: WebSocket, message: dict, client_id: str):
     """
     自动写作完整章节 - 支持基于工作流执行
@@ -1213,13 +1292,36 @@ async def handle_auto_write_chapter(websocket: WebSocket, message: dict, client_
         return
 
     workflow_id = message.get("workflow_id")
-    chapter_title = message.get("chapter_title", "未命名章节")
-    chapter_goal = message.get("chapter_goal", "推进剧情")
-    target_word_count = message.get("target_word_count", 2000)
+    project_id = message.get("project_id") or director.project_id
+    selected_outline = await _resolve_message_outline(message, project_id)
+    outline_error = _validate_selected_outline(selected_outline, project_id) if selected_outline else None
+    if outline_error:
+        await websocket.send_json({
+            "type": "auto_write_chapter_result",
+            "status": "error",
+            "error": outline_error,
+        })
+        return
+
+    if selected_outline:
+        chapter_num = int(_outline_value(selected_outline, "chapter_number", 1))
+        chapter_title = _outline_value(selected_outline, "title", "未命名章节")
+        chapter_goal = _outline_goal(selected_outline)
+        target_word_count = message.get("target_word_count") or _outline_value(selected_outline, "target_word_count", 2000) or 2000
+        chapter_outline_id = _outline_value(selected_outline, "id")
+        chapter_outline_payload = _outline_to_payload(selected_outline)
+    else:
+        chapter_num = int(message.get("chapter_num") or message.get("chapter_number") or 1)
+        chapter_title = message.get("chapter_title", "未命名章节")
+        chapter_goal = message.get("chapter_goal", "推进剧情")
+        target_word_count = message.get("target_word_count", 2000)
+        chapter_outline_id = None
+        chapter_outline_payload = None
+
     style_reference = message.get("style_reference")
 
     await send_agent_update(websocket, "Writer", "working", f"正在自动写作章节: {chapter_title}", 20)
-    await send_log(websocket, f"开始自动写作章节: {chapter_title}")
+    await send_log(websocket, f"开始自动写作章节: 第 {chapter_num} 章《{chapter_title}》")
     await send_log(websocket, f"章节目标: {chapter_goal}")
     await send_log(websocket, f"目标字数: {target_word_count}")
 
@@ -1243,19 +1345,21 @@ async def handle_auto_write_chapter(websocket: WebSocket, message: dict, client_
 
             # 设置工作流执行上下文
             initial_context = {
-                "chapter_num": 1,
+                "chapter_num": chapter_num,
                 "chapter_title": chapter_title,
                 "chapter_goal": chapter_goal,
                 "target_word_count": target_word_count,
                 "style_reference": style_reference,
             }
+            if chapter_outline_payload:
+                initial_context.update({
+                    "chapter_summary": chapter_outline_payload.get("summary", ""),
+                    "chapter_outline_id": chapter_outline_id,
+                    "chapter_outline": chapter_outline_payload,
+                })
 
             # 执行工作流
             # 获取有效的 project_id
-            project_id = director.project_id
-            if not project_id:
-                # 尝试从当前项目上下文获取
-                project_id = message.get("project_id")
             if not project_id:
                 await send_agent_update(websocket, "Writer", "error", "无法获取项目ID，请确保会话已正确初始化", 0)
                 await websocket.send_json({
@@ -1271,54 +1375,22 @@ async def handle_auto_write_chapter(websocket: WebSocket, message: dict, client_
                 initial_context,
                 postgres_db,
             )
+            manager.set_execution(client_id, execution_id)
 
-            # 等待工作流完成
-            import asyncio
-            max_wait = 300  # 最多等待5分钟
-            waited = 0
-            execution = None
-
-            while waited < max_wait:
-                execution = await engine.get_execution_state(execution_id, postgres_db)
-                if execution and execution.status in ["completed", "failed", "cancelled"]:
-                    break
-                await asyncio.sleep(1)
-                waited += 1
-
-            if execution and execution.status == "completed":
-                # 获取工作流输出
-                chapter_content = execution.context.get("chapter_content", "")
-                word_count = len(chapter_content) if chapter_content else 0
-
-                # 保存到数据库
-                await _persist_runtime_state(director)
-
-                # 创建快照
-                snapshot = await _create_auto_snapshot(director, snapshot_type="auto", created_by="auto_write")
-
-                await send_agent_update(websocket, "Writer", "completed", f"章节写作完成: {word_count} 字", 100)
-                await send_log(websocket, f"章节写作完成，实际字数: {word_count}")
-
-                await websocket.send_json({
-                    "type": "auto_write_chapter_result",
-                    "status": "success",
-                    "data": {
-                        "chapter_id": execution.context.get("chapter_id"),
-                        "title": chapter_title,
-                        "content": chapter_content,
-                        "word_count": word_count,
-                        "goal": chapter_goal,
-                        "snapshot_id": snapshot.get("id") if snapshot else None,
-                    },
-                })
-            else:
-                error_msg = execution.error if execution else "工作流执行超时"
-                await send_agent_update(websocket, "Writer", "error", f"工作流执行失败: {error_msg}", 0)
-                await websocket.send_json({
-                    "type": "auto_write_chapter_result",
-                    "status": "error",
-                    "error": error_msg,
-                })
+            await websocket.send_json({
+                "type": "auto_write_chapter_started",
+                "status": "success",
+                "data": {
+                    "execution_id": execution_id,
+                    "workflow_id": workflow_id,
+                    "chapter_num": chapter_num,
+                    "chapter_outline_id": chapter_outline_id,
+                    "title": chapter_title,
+                    "goal": chapter_goal,
+                },
+            })
+            await send_log(websocket, "🚀 工作流已启动，等待执行结果...")
+            return
 
         else:
             # 无工作流，使用原有方式
@@ -1344,6 +1416,8 @@ async def handle_auto_write_chapter(websocket: WebSocket, message: dict, client_
                     "status": "success",
                     "data": {
                         "chapter_id": result.get("chapter_id"),
+                        "chapter_num": chapter_num,
+                        "chapter_outline_id": chapter_outline_id,
                         "title": result.get("title"),
                         "content": result.get("content"),
                         "word_count": result.get("word_count"),
@@ -1407,10 +1481,21 @@ async def handle_start_auto_mode(websocket: WebSocket, message: dict, client_id:
     chapter_count = message.get("chapter_count", 3)
     words_per_chapter = message.get("words_per_chapter", 2000)
     style_reference = message.get("style_reference")
+    project_id = message.get("project_id") or director.project_id
+    outline_mode = message.get("outline_mode")
+    outline_ids = message.get("outline_ids") or []
+    outline_chapter_numbers = message.get("outline_chapter_numbers") or []
+    auto_advance_outlines = bool(message.get("auto_advance_outlines"))
+    start_chapter_num = message.get("start_chapter_num")
 
     await send_log(websocket, "🚀 启动连续创作模式")
     await send_log(websocket, f"📋 使用工作流: {workflow_id}")
-    await send_log(websocket, f"📚 计划生成 {chapter_count} 个章节，每章约 {words_per_chapter} 字")
+    if outline_mode == "selected":
+        await send_log(websocket, f"📚 将按已选 {len(outline_ids) or len(outline_chapter_numbers)} 个大纲生成章节")
+    elif outline_mode == "auto_progression":
+        await send_log(websocket, f"📚 将从第 {start_chapter_num} 章起自动推进最多 {chapter_count} 个已有大纲")
+    else:
+        await send_log(websocket, f"📚 计划生成 {chapter_count} 个章节，每章约 {words_per_chapter} 字")
 
     # 定义回调函数，用于发送进度更新
     async def callback(event_type: str, data: dict):
@@ -1425,7 +1510,7 @@ async def handle_start_auto_mode(websocket: WebSocket, message: dict, client_id:
                 "type": "auto_mode_chapter_start",
                 "chapter_num": data.get("chapter_num"),
                 "title": data.get("title"),
-                "goal": data.get("goal"),
+                "chapter_outline_id": data.get("chapter_outline_id"),
             })
         elif event_type == "agent_working":
             agent = data.get("agent", "Agent")
@@ -1445,6 +1530,7 @@ async def handle_start_auto_mode(websocket: WebSocket, message: dict, client_id:
                 "title": data.get("title"),
                 "word_count": data.get("word_count"),
                 "content": data.get("content"),
+                "chapter_outline_id": data.get("chapter_outline_id"),
             })
         elif event_type == "chapter_error":
             await send_log(websocket, f"❌ 章节 {data.get('chapter_num')} 失败: {data.get('error')}")
@@ -1467,6 +1553,12 @@ async def handle_start_auto_mode(websocket: WebSocket, message: dict, client_id:
             words_per_chapter=words_per_chapter,
             style_reference=style_reference,
             callback=callback,
+            outline_mode=outline_mode,
+            outline_ids=outline_ids,
+            outline_chapter_numbers=outline_chapter_numbers,
+            auto_advance_outlines=auto_advance_outlines,
+            start_chapter_num=start_chapter_num,
+            project_id=project_id,
         )
 
         # 重置所有 Agent 状态
@@ -1696,6 +1788,53 @@ async def handle_workflow_step(websocket: WebSocket, message: dict, client_id: s
         await send_error(websocket, f"单步执行异常: {str(e)}")
 
 
+async def handle_workflow_user_input(websocket: WebSocket, message: dict, client_id: str):
+    """提交工作流用户输入节点的内容并继续执行。"""
+    from app.services.workflow_engine import get_workflow_engine
+    from app.api.app import postgres_db
+
+    execution_id = message.get("execution_id") or manager.get_execution(client_id)
+    node_id = message.get("node_id")
+    value = message.get("value")
+
+    if not execution_id:
+        await send_error(websocket, "缺少 execution_id")
+        return
+    if not node_id:
+        await send_error(websocket, "缺少 node_id")
+        return
+
+    await send_log(websocket, "📨 正在提交用户输入并恢复工作流...")
+
+    try:
+        engine = get_workflow_engine()
+        execution = await engine.get_execution_state(execution_id, postgres_db)
+        if execution:
+            director = get_or_create_director(client_id, project_id=execution.project_id)
+            setup_workflow_engine_callbacks(director)
+
+        result = await engine.submit_user_input(
+            execution_id=execution_id,
+            node_id=node_id,
+            value=value,
+            db=postgres_db,
+            user_id=client_id,
+        )
+
+        if not result.get("success"):
+            await send_error(websocket, result.get("error", "提交用户输入失败"))
+            return
+
+        await websocket.send_json({
+            "type": "workflow_user_input_received",
+            "status": "success",
+            "data": result,
+        })
+        await send_log(websocket, "✅ 用户输入已提交，工作流继续执行")
+    except Exception as e:
+        logger.error(f"提交工作流用户输入失败: {e}")
+        await send_error(websocket, f"提交用户输入异常: {str(e)}")
+
 async def handle_workflow_status(websocket: WebSocket, message: dict, client_id: str):
     """
     获取工作流状态
@@ -1722,7 +1861,7 @@ async def handle_workflow_status(websocket: WebSocket, message: dict, client_id:
             await websocket.send_json({
                 "type": "workflow_status_response",
                 "status": "success",
-                "data": execution.model_dump(),
+                "data": engine._serialize_for_json(execution),
             })
         else:
             await send_error(websocket, "执行记录不存在")

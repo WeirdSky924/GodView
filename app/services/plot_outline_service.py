@@ -1470,28 +1470,36 @@ class PlotOutlineService:
             score=max(0, score),
         )
 
-    async def delete_outline(self, outline_id: str) -> bool:
+    async def delete_outline(self, outline_id: str, soft_delete_generated_chapters: bool = False) -> Dict[str, Any]:
         """
-        删除章节大纲
+        删除章节大纲，默认保留已生成正文。
 
         Args:
             outline_id: 大纲ID
+            soft_delete_generated_chapters: 是否同步软删除该大纲生成的章节
 
         Returns:
-            bool: 是否成功
+            Dict: 删除结果
         """
         outline = self._outlines_cache.get(outline_id)
+        soft_deleted_chapters = 0
 
         if self._db:
             try:
+                if soft_delete_generated_chapters and outline:
+                    soft_deleted_chapters = await self._db.soft_delete_chapters_by_outline(
+                        outline.project_id,
+                        outline_id,
+                    )
+
                 await self._db.execute_write(
                     "DELETE FROM chapter_outlines WHERE id = :id",
                     {"id": outline_id}
                 )
-                logger.info(f"删除章节大纲: {outline_id}")
+                logger.info(f"删除章节大纲: {outline_id}，软删除关联章节: {soft_deleted_chapters}")
             except Exception as e:
                 logger.error(f"删除章节大纲失败: {e}")
-                return False
+                return {"success": False, "soft_deleted_chapters": soft_deleted_chapters}
 
         if outline_id in self._outlines_cache:
             del self._outlines_cache[outline_id]
@@ -1499,7 +1507,7 @@ class PlotOutlineService:
         if outline:
             self._mark_outline_project_dirty(outline.project_id, outline.chapter_number)
 
-        return True
+        return {"success": True, "soft_deleted_chapters": soft_deleted_chapters}
 
     async def approve_outline(self, outline_id: str, approved_by: str) -> Optional[ChapterOutline]:
         """

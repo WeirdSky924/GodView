@@ -222,6 +222,10 @@ export interface CreateCharacterDTO {
   exit_chapter?: number
   active_arc?: string
 
+  // 角色关系
+  relationships?: string[]
+  key_relationships?: Record<string, string>
+
   // 基础信息
   personality?: string
   appearance?: string

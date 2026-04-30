@@ -60,6 +60,7 @@ class CharacterSelector:
         previous_characters: List[str] = None,
         director_guidance: Dict[str, Any] = None,
         max_characters: int = None,
+        required_characters: List[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         根据场景上下文智能选择应该登场的角色
@@ -79,14 +80,26 @@ class CharacterSelector:
             return []
 
         # 1. 处理编剧指导（强制包含的角色）
-        forced_characters: Set[str] = set()
+        forced_characters: Set[str] = set(str(name) for name in (required_characters or []) if str(name).strip())
         if director_guidance:
             forced_characters.update(director_guidance.get("required_characters", []))
 
+        active_characters = [char for char in all_characters if self._is_active_for_scene(char)]
+        inactive_forced = {
+            name for name in forced_characters
+            if not any(c.get("name") == name and self._is_active_for_scene(c) for c in all_characters)
+        }
+        if inactive_forced:
+            logger.warning(f"强制角色当前不可正面登场，将不会由选择器加入表演: {sorted(inactive_forced)}")
+
+        candidate_characters = active_characters or all_characters
+
         # 2. 计算每个角色的相关性得分
         relevance_scores = await self._calculate_relevance_scores(
-            all_characters, scene_context, previous_characters or []
+            candidate_characters, scene_context, previous_characters or []
         )
+
+        forced_characters.difference_update(inactive_forced)
 
         # 3. 确定角色数量限制
         scene_limits = self._get_scene_limits(scene_context.scene_type)
@@ -264,6 +277,17 @@ class CharacterSelector:
                             break
 
         return selected
+
+    def _is_active_for_scene(self, character: Dict[str, Any]) -> bool:
+        status = str(character.get("status") or character.get("activity_status") or "active").lower()
+        if status in {"inactive", "archived", "dead", "retired", "disabled"}:
+            return False
+        presence_types = character.get("available_presence_types")
+        if isinstance(presence_types, str):
+            presence_types = [item.strip() for item in presence_types.replace("，", ",").split(",") if item.strip()]
+        if isinstance(presence_types, list) and presence_types and "present" not in {str(item).lower() for item in presence_types}:
+            return False
+        return True
 
     def _get_scene_limits(self, scene_type: str) -> Dict[str, int]:
         """获取场景的角色数量限制"""

@@ -59,8 +59,38 @@ export default function TokenStats() {
     return `$${cost.toFixed(4)}`
   }
 
+  const formatDayLabel = (date: string) => {
+    const [year, month, day] = date.split('-').map(Number)
+    if (!year || !month || !day) return date
+    return new Date(year, month - 1, day).toLocaleDateString('zh-CN', { weekday: 'short' })
+  }
+
+  const buildSevenDayStats = (items: DailyTokenStats[]) => {
+    const byDate = new Map(items.map((item) => [item.date.slice(0, 10), item]))
+    const result: DailyTokenStats[] = []
+
+    for (let offset = 6; offset >= 0; offset -= 1) {
+      const date = new Date()
+      date.setHours(0, 0, 0, 0)
+      date.setDate(date.getDate() - offset)
+      const key = date.toISOString().slice(0, 10)
+      result.push(byDate.get(key) || {
+        date: key,
+        total_tokens: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        cost: 0,
+        record_count: 0,
+      })
+    }
+
+    return result
+  }
+
+  const sevenDayStats = buildSevenDayStats(dailyStats)
+
   // 计算最大值用于柱状图
-  const maxDailyTokens = Math.max(...dailyStats.map((d) => d.total_tokens), 1)
+  const maxDailyTokens = Math.max(...sevenDayStats.map((d) => d.total_tokens), 1)
 
   if (loading) {
     return (
@@ -136,30 +166,27 @@ export default function TokenStats() {
       </div>
 
       {/* 7 天趋势柱状图 */}
-      {dailyStats.length > 0 && (
-        <div className="bg-white rounded-lg border p-4">
-          <h4 className="text-sm font-medium text-gray-700 mb-4">7 天趋势</h4>
-          <div className="flex items-end gap-2 h-32">
-            {dailyStats
-              .slice()
-              .reverse()
-              .map((day) => (
-                <div key={day.date} className="flex-1 flex flex-col items-center gap-1">
-                  <div
-                    className="w-full bg-blue-500 rounded-t transition-all hover:bg-blue-600"
-                    style={{
-                      height: `${Math.max((day.total_tokens / maxDailyTokens) * 100, 5)}%`,
-                    }}
-                    title={`${day.date}: ${formatNumber(day.total_tokens)} tokens`}
-                  />
-                  <span className="text-xs text-gray-400">
-                    {new Date(day.date).toLocaleDateString('zh-CN', { weekday: 'short' })}
-                  </span>
-                </div>
-              ))}
-          </div>
+      <div className="bg-white rounded-lg border p-4">
+        <h4 className="text-sm font-medium text-gray-700 mb-4">7 天趋势</h4>
+        <div className="flex items-end gap-2 h-32">
+          {sevenDayStats.map((day) => (
+            <div key={day.date} className="flex-1 flex flex-col items-center gap-1 h-full">
+              <div className="flex-1 w-full flex items-end">
+                <div
+                  className={`w-full rounded-t transition-all ${day.total_tokens > 0 ? 'bg-blue-500 hover:bg-blue-600' : 'bg-gray-200'}`}
+                  style={{
+                    height: day.total_tokens > 0 ? `${Math.max((day.total_tokens / maxDailyTokens) * 100, 6)}%` : '2px',
+                  }}
+                  title={`${day.date}: ${formatNumber(day.total_tokens)} tokens`}
+                />
+              </div>
+              <span className="text-xs text-gray-400">
+                {formatDayLabel(day.date)}
+              </span>
+            </div>
+          ))}
         </div>
-      )}
+      </div>
 
       {/* 使用场景分布 */}
       {summary?.by_category && Object.keys(summary.by_category).length > 0 && (

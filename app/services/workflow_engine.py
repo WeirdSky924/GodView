@@ -48,6 +48,12 @@ from app.services.workflow_replay_export_service import (
     get_workflow_replay_export_service,
 )
 from app.services.trace_service import TraceService, get_trace_service
+from app.services.workflow_state import (
+    CANONICAL_STATE_KEYS,
+    PROTECTED_CONTEXT_KEYS,
+    get_workflow_state,
+    is_protected_context_key,
+)
 from app.services.agent_config_service import get_agent_config_service
 from app.config import settings
 
@@ -75,6 +81,8 @@ class WorkflowEngine:
         self._intervention_queues: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         # 干预锁：确保线程安全
         self._intervention_locks: Dict[str, asyncio.Lock] = {}
+        # 输入完成事件：execution_id -> asyncio.Event
+        self._input_events: Dict[str, asyncio.Event] = {}
 
     def set_broadcast_callback(self, callback: Callable):
         """设置 WebSocket 广播回调"""
@@ -694,6 +702,64 @@ class WorkflowEngine:
         logger.info(f"就绪节点列表: {ready_nodes} (共 {len(ready_nodes)} 个)")
         return ready_nodes
 
+    def _get_goto_reset_nodes(
+        self,
+        workflow: WorkflowDefinition,
+        source_node_id: str,
+        target_node_id: str,
+    ) -> Set[str]:
+        """获取条件回跳时需要重置的节点集合。"""
+        successors: Dict[str, List[str]] = defaultdict(list)
+        predecessors: Dict[str, List[str]] = defaultdict(list)
+        for edge in workflow.edges:
+            successors[edge.source].append(edge.target)
+            predecessors[edge.target].append(edge.source)
+
+        reachable_from_target: Set[str] = set()
+        queue: deque[str] = deque([target_node_id])
+        while queue:
+            node_id = queue.popleft()
+            if node_id in reachable_from_target:
+                continue
+            reachable_from_target.add(node_id)
+            if node_id == source_node_id:
+                continue
+            for next_node_id in successors.get(node_id, []):
+                queue.append(next_node_id)
+
+        can_reach_source: Set[str] = set()
+        queue = deque([source_node_id])
+        while queue:
+            node_id = queue.popleft()
+            if node_id in can_reach_source:
+                continue
+            can_reach_source.add(node_id)
+            for previous_node_id in predecessors.get(node_id, []):
+                queue.append(previous_node_id)
+
+        reset_nodes = reachable_from_target & can_reach_source
+        return reset_nodes or {target_node_id}
+
+    def _reset_nodes_for_goto(
+        self,
+        execution: WorkflowExecution,
+        completed_nodes: Set[str],
+        node_ids: Set[str],
+        reason: str,
+    ) -> None:
+        """重置回跳路径上的节点，确保后续节点会重新执行。"""
+        for node_id in node_ids:
+            completed_nodes.discard(node_id)
+            state = execution.node_states.get(node_id)
+            if state:
+                state.status = NodeStatus.PENDING
+                state.started_at = None
+                state.completed_at = None
+                state.output_data = {}
+                state.error = None
+                state.duration_ms = None
+        logger.info(f"{reason}，已重置节点: {sorted(node_ids)}")
+
     async def _merge_predecessor_outputs(
         self,
         node: WorkflowNode,
@@ -714,15 +780,51 @@ class WorkflowEngine:
             Dict[str, Any]: 合并后的输入数据
         """
         merged_context = execution.context.copy()
+        state = get_workflow_state(execution)
         node_predecessors = predecessors.get(node.id, [])
+        node_outputs = merged_context.setdefault("node_outputs", {})
 
-        # 收集所有前驱节点的输出
         for pred_id in node_predecessors:
             pred_state = execution.node_states.get(pred_id)
-            if pred_state and pred_state.output_data:
-                # 合并前驱节点的输出
-                merged_context.update(pred_state.output_data)
-                logger.info(f"合并前驱节点 {pred_id} 的输出到节点 {node.id}: {list(pred_state.output_data.keys())}")
+            if not pred_state or not pred_state.output_data:
+                continue
+
+            pred_output = pred_state.output_data
+            node_outputs[pred_id] = pred_output
+            merged_context["latest_node_output"] = pred_output
+
+            allowed_updates: Dict[str, Any] = {}
+            retrieved_updates: Dict[str, Any] = {}
+            blocked_updates: Dict[str, Any] = {}
+            for key, value in pred_output.items():
+                if is_protected_context_key(key):
+                    if key in {"fixed_lore_entries", "dynamic_lore_entries", "selected_lore_entries"}:
+                        retrieved_updates[key] = value
+                        merged_context[key] = value
+                    else:
+                        blocked_updates[key] = {
+                            "existing": merged_context.get(key),
+                            "attempted": value,
+                            "reason": "protected_predecessor_output",
+                        }
+                    continue
+                allowed_updates[key] = value
+                merged_context[key] = value
+
+            if retrieved_updates:
+                state.merge_runtime_state(retrieved_updates, source=f"predecessor_retrieved_merge:{pred_id}")
+
+            if allowed_updates or retrieved_updates or blocked_updates:
+                state.record_state_transition(
+                    source="predecessor_merge",
+                    node_id=node.id,
+                    allowed_updates={**allowed_updates, **retrieved_updates},
+                    blocked_updates=blocked_updates,
+                )
+            logger.info(
+                f"合并前驱节点 {pred_id} 输出到节点 {node.id}: "
+                f"allowed={list(allowed_updates.keys())}, retrieved={list(retrieved_updates.keys())}, blocked={list(blocked_updates.keys())}"
+            )
 
         return merged_context
 
@@ -834,26 +936,55 @@ class WorkflowEngine:
 
         # ========== 自动加载章节大纲 ==========
         if db:
-            try:
-                from app.services.plot_outline_service import get_plot_outline_service
-                plot_service = get_plot_outline_service()
-                outline = await plot_service.get_chapter_outline_for_workflow(
-                    project_id=project_id,
-                    chapter_number=context.get("chapter_num")
-                )
-                if outline:
-                    context["chapter_outline"] = outline
-                    context["chapter_title"] = outline.get("title", f"第{context.get('chapter_num')}章")
-                    context["chapter_summary"] = outline.get("summary", "")
-                    logger.info(f"自动加载第 {context.get('chapter_num')} 章大纲: {outline.get('title')}")
-                else:
-                    logger.warning(f"未找到第 {context.get('chapter_num')} 章大纲，将由大纲Agent生成")
-            except Exception as e:
-                logger.warning(f"加载章节大纲失败: {e}")
+            if context.get("chapter_outline"):
+                explicit_outline = self._ensure_context_dict(context.get("chapter_outline"))
+                context.setdefault("chapter_title", explicit_outline.get("title", f"第{context.get('chapter_num')}章"))
+                context.setdefault("chapter_summary", explicit_outline.get("summary", ""))
+                outline_target_word_count = explicit_outline.get("target_word_count")
+                if outline_target_word_count and not context.get("target_word_count"):
+                    context["target_word_count"] = outline_target_word_count
+                if outline_target_word_count and not context.get("chapter_target_word_count"):
+                    context["chapter_target_word_count"] = outline_target_word_count
+                context.setdefault("chapter_outline_source", "selected_outline")
+                logger.info(f"使用显式传入的第 {context.get('chapter_num')} 章大纲: {context.get('chapter_title')}")
+            else:
+                try:
+                    from app.services.plot_outline_service import get_plot_outline_service
+                    plot_service = get_plot_outline_service()
+                    outline = await plot_service.get_chapter_outline_for_workflow(
+                        project_id=project_id,
+                        chapter_number=context.get("chapter_num")
+                    )
+                    if outline:
+                        context["chapter_outline"] = outline
+                        context["chapter_title"] = outline.get("title", f"第{context.get('chapter_num')}章")
+                        context["chapter_summary"] = outline.get("summary", "")
+                        outline_target_word_count = outline.get("target_word_count")
+                        if outline_target_word_count and not context.get("target_word_count"):
+                            context["target_word_count"] = outline_target_word_count
+                        if outline_target_word_count and not context.get("chapter_target_word_count"):
+                            context["chapter_target_word_count"] = outline_target_word_count
+                        context.setdefault("chapter_outline_source", "auto_loaded")
+                        logger.info(f"自动加载第 {context.get('chapter_num')} 章大纲: {outline.get('title')}")
+                    else:
+                        logger.warning(f"未找到第 {context.get('chapter_num')} 章大纲，将由大纲Agent生成")
+                except Exception as e:
+                    logger.warning(f"加载章节大纲失败: {e}")
 
         trace_service = get_trace_service(db)
         trace_id = str(operation.get("trace_id")) if operation and operation.get("trace_id") else str(uuid.uuid4())
         context["_trace"] = {"trace_id": trace_id, "enabled": bool(settings.trace_enabled)}
+
+        # 创建执行实例
+        state_seed = {key: context.get(key) for key in CANONICAL_STATE_KEYS if context.get(key) is not None}
+        context.setdefault("workflow_state", {})
+        context["workflow_state"]["canonical_state"] = {
+            **context["workflow_state"].get("canonical_state", {}),
+            **state_seed,
+        }
+        context.setdefault("node_outputs", {})
+        context.setdefault("state_transitions", [])
+        context.setdefault("asset_state", context["workflow_state"].setdefault("asset_state", {}))
 
         # 创建执行实例
         execution = WorkflowExecution(
@@ -1126,6 +1257,9 @@ class WorkflowEngine:
                             await self._execute_node_with_merge(
                                 execution, node, predecessors, workflow, db
                             )
+                            if execution.status == WorkflowStatus.PAUSED:
+                                logger.info(f"并行节点触发工作流暂停: {node_id} ({node.label})")
+                                return (node_id, False, "paused")
                             logger.info(f"并行节点执行完成: {node_id} ({node.label})")
                             return (node_id, True, None)
                         except Exception as e:
@@ -1158,6 +1292,9 @@ class WorkflowEngine:
                                 logger.info(f"节点 {nid} 执行成功")
                             else:
                                 logger.error(f"节点 {nid} 执行失败: {error}")
+                            if execution.status == WorkflowStatus.PAUSED:
+                                logger.info(f"工作流 {execution_id} 已暂停，等待外部输入")
+                                return
                             completed_nodes.add(nid)
 
                             # 检查条件分支的 goto
@@ -1213,14 +1350,17 @@ class WorkflowEngine:
                                         state.output_data = {}
                                         state.error = None
                             else:
-                                # 普通 goto：只重置目标节点状态
-                                completed_nodes.discard(goto_target)
-                                target_state = execution.node_states.get(goto_target)
-                                if target_state:
-                                    target_state.status = NodeStatus.PENDING
-                                    target_state.started_at = None
-                                    target_state.completed_at = None
-                                    target_state.output_data = {}
+                                reset_nodes = self._get_goto_reset_nodes(
+                                    workflow,
+                                    goto_source_node,
+                                    goto_target,
+                                )
+                                self._reset_nodes_for_goto(
+                                    execution,
+                                    completed_nodes,
+                                    reset_nodes,
+                                    f"并行执行后 goto: {goto_source_node} -> {goto_target}",
+                                )
 
                     logger.info(f"并行执行完成，已完成节点: {completed_nodes}")
 
@@ -1240,6 +1380,9 @@ class WorkflowEngine:
                         await self._execute_node_with_merge(
                             execution, node, predecessors, workflow, db
                         )
+                        if execution.status == WorkflowStatus.PAUSED:
+                            logger.info(f"工作流 {execution_id} 已暂停，等待外部输入")
+                            return
                         completed_nodes.add(node_id)
                         logger.info(f"节点 {node_id} 执行完成")
 
@@ -1290,14 +1433,17 @@ class WorkflowEngine:
                                                     state.output_data = {}
                                                     state.error = None
                                         else:
-                                            # 普通 goto：只重置目标节点状态
-                                            completed_nodes.discard(next_node_id)
-                                            target_state = execution.node_states.get(next_node_id)
-                                            if target_state:
-                                                target_state.status = NodeStatus.PENDING
-                                                target_state.started_at = None
-                                                target_state.completed_at = None
-                                                target_state.output_data = {}
+                                            reset_nodes = self._get_goto_reset_nodes(
+                                                workflow,
+                                                node_id,
+                                                next_node_id,
+                                            )
+                                            self._reset_nodes_for_goto(
+                                                execution,
+                                                completed_nodes,
+                                                reset_nodes,
+                                                f"条件分支 goto: {node_id} -> {next_node_id}",
+                                            )
 
                                         # 将目标节点添加到就绪列表
                                         ready_nodes = [next_node_id]
@@ -1406,11 +1552,18 @@ class WorkflowEngine:
                     await self._save_execution_to_db(execution, db)
 
             # 广播完成事件
-            await self._broadcast_status(execution_id, "workflow_completed", {
-                "status": execution.status.value,
-                "error": execution.error,
-                "trace_id": execution.trace_id,
-            })
+            if execution.status == WorkflowStatus.PAUSED:
+                await self._broadcast_status(execution_id, "workflow_paused", {
+                    "status": execution.status.value,
+                    "pending_user_input": execution.context.get("pending_user_input"),
+                    "trace_id": execution.trace_id,
+                })
+            else:
+                await self._broadcast_status(execution_id, "workflow_completed", {
+                    "status": execution.status.value,
+                    "error": execution.error,
+                    "trace_id": execution.trace_id,
+                })
 
     async def _execute_node_with_merge(
         self,
@@ -1601,6 +1754,11 @@ class WorkflowEngine:
             "graph_context_summary",
             "graph_context_source",
             "graph_context_warnings",
+            "workflow_state",
+            "node_outputs",
+            "asset_state",
+            "state_transitions",
+            "context_propagation_trace",
         ]
         snapshot = {
             key: source_context.get(key)
@@ -1989,6 +2147,7 @@ class WorkflowEngine:
                         value,
                         execution.project_id,
                         db,
+                        execution=execution,
                     )
                 # 同时保存到上下文
                 result[key] = value
@@ -2001,6 +2160,7 @@ class WorkflowEngine:
         data: Any,
         project_id: str,
         db,
+        execution: Optional["WorkflowExecution"] = None,
     ):
         """
         保存输出到数据库
@@ -2010,36 +2170,251 @@ class WorkflowEngine:
             data: 要保存的数据
             project_id: 项目 ID
             db: 数据库连接
+            execution: 当前工作流执行，用于上下文/资产状态追踪
         """
         try:
-            if table == "chapters":
+            table_key = str(table or "").strip().lower()
+
+            if table_key == "chapters":
                 # 保存章节
                 if isinstance(data, dict) and data.get("content"):
-                    await db.save_chapter(
-                        project_id=project_id,
-                        chapter_num=data.get("chapter_num", 1),
-                        title=data.get("title", ""),
-                        content=data.get("content", ""),
-                        summary=data.get("summary", ""),
-                    )
-                    logger.info(f"保存章节到数据库: 第 {data.get('chapter_num', 1)} 章")
+                    chapter_record = {
+                        "id": data.get("id") or str(uuid.uuid4()),
+                        "project_id": project_id,
+                        "world_id": data.get("world_id") or (execution.context.get("world_id") if execution else None),
+                        "chapter_outline_id": data.get("chapter_outline_id") or (execution.context.get("chapter_outline_id") if execution else None),
+                        "title": data.get("title") or (execution.context.get("chapter_title") if execution else "") or "未命名章节",
+                        "summary": data.get("summary") or (execution.context.get("chapter_summary") if execution else "") or "",
+                        "content": data.get("content", ""),
+                        "word_count": data.get("word_count") or len(str(data.get("content", ""))),
+                        "status": data.get("status") or "completed",
+                        "events": data.get("events", []),
+                        "hooks_planted": data.get("hooks_planted", []),
+                        "hooks_resolved": data.get("hooks_resolved", []),
+                        "main_plot_progress": data.get("main_plot_progress", {}),
+                        "reader_scores": data.get("reader_scores", {}),
+                        "created_at": data.get("created_at") or datetime.now(),
+                        "updated_at": data.get("updated_at") or datetime.now(),
+                        "completed_at": data.get("completed_at") or datetime.now(),
+                        "deleted_at": data.get("deleted_at"),
+                    }
+                    saved_id = await db.save_chapter(chapter_record)
+                    if execution:
+                        get_workflow_state(execution).set_asset_state(
+                            {"saved_chapter_id": saved_id or chapter_record["id"]},
+                            source="generic_output_persistence",
+                        )
+                    logger.info(f"保存章节到数据库: {chapter_record['title']}")
 
-            elif table == "hooks":
-                # 保存伏笔
-                if isinstance(data, list):
-                    for hook in data:
-                        await db.save_hook(project_id=project_id, hook=hook)
-                    logger.info(f"保存 {len(data)} 个伏笔到数据库")
+            elif table_key == "hooks":
+                # 保存伏笔：兼容旧 outputs.database 配置，但统一走 HookManager 持久化逻辑
+                hooks = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+                if hooks:
+                    if execution:
+                        await self._save_hooks_from_manager(
+                            execution,
+                            {"hooks_to_plant": hooks},
+                            db,
+                            source="generic_output_persistence",
+                        )
+                    else:
+                        saved_count = 0
+                        for hook in hooks:
+                            if not isinstance(hook, dict):
+                                continue
+                            title = hook.get("title") or "未命名伏笔"
+                            description = hook.get("description") or hook.get("plant_context") or ""
+                            duplicate = None
+                            if hasattr(db, "find_duplicate_hook"):
+                                duplicate = await db.find_duplicate_hook(
+                                    project_id,
+                                    title,
+                                    description,
+                                    world_id=hook.get("world_id"),
+                                    scope_type=hook.get("scope_type"),
+                                )
+                            if duplicate:
+                                logger.info(f"跳过重复伏笔: {title} -> {duplicate.get('id')}")
+                                continue
+                            hook_record = {
+                                **hook,
+                                "id": hook.get("id") or str(uuid.uuid4()),
+                                "project_id": project_id,
+                                "title": title,
+                                "description": description,
+                                "hook_type": self._normalize_hook_type(hook.get("hook_type") or hook.get("type")),
+                                "status": hook.get("status") or "planted",
+                                "priority": self._clamp_hook_priority(hook.get("priority")),
+                                "created_at": hook.get("created_at") or datetime.now(),
+                            }
+                            await db.save_hook(hook_record)
+                            saved_count += 1
+                        logger.info(f"保存 {saved_count} 个伏笔到数据库")
 
-            elif table == "events":
-                # 保存事件
-                if isinstance(data, list):
-                    for event in data:
-                        await db.save_event(project_id=project_id, event=event)
-                    logger.info(f"保存 {len(data)} 个事件到数据库")
+            elif table_key == "events":
+                events = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+                if events:
+                    saved_event_ids = []
+                    if hasattr(db, "save_event"):
+                        for event in events:
+                            if not isinstance(event, dict):
+                                continue
+                            event_record = {
+                                **event,
+                                "project_id": project_id,
+                                "workflow_execution_id": execution.id if execution else event.get("workflow_execution_id"),
+                                "workflow_id": execution.workflow_id if execution else event.get("workflow_id"),
+                                "source": event.get("source") or "workflow",
+                            }
+                            saved_event_ids.append(await db.save_event(event_record))
+                        logger.info(f"保存 {len(saved_event_ids)} 个事件到数据库")
+                    if execution:
+                        execution.context.setdefault("generated_events", []).extend(events)
+                        execution.context["event_candidates"] = events
+                        get_workflow_state(execution).set_asset_state(
+                            {
+                                "saved_event_ids": saved_event_ids,
+                                "event_persistence_state": {
+                                    "status": "saved" if saved_event_ids else "context_only",
+                                    "saved_event_ids": saved_event_ids,
+                                    "count": len(events),
+                                    "reason": None if saved_event_ids else "no_database_save_event_method_or_empty_event_payload",
+                                },
+                            },
+                            source="generic_output_persistence",
+                        )
+                    elif not saved_event_ids:
+                        logger.warning("事件输出未落库：数据库对象缺少 save_event，且没有 execution 上下文可记录")
 
         except Exception as e:
             logger.error(f"保存输出到数据库表 '{table}' 失败: {e}")
+
+    def _build_input_request_payload(
+        self,
+        node: WorkflowNode,
+        execution: WorkflowExecution,
+    ) -> Dict[str, Any]:
+        config = node.config or {}
+        input_key = config.get("input_key") or config.get("key") or f"{node.id}_input"
+        return {
+            "node_id": node.id,
+            "node_type": NodeType.INPUT.value,
+            "label": node.label,
+            "description": node.description or "",
+            "prompt": config.get("prompt") or node.description or "请补充工作流需要的用户输入。",
+            "input_key": input_key,
+            "input_type": config.get("input_type", "text"),
+            "placeholder": config.get("placeholder", "请输入补充要求或修订意见..."),
+            "required": config.get("required", True),
+            "default_value": config.get("default_value", ""),
+        }
+
+    async def submit_user_input(
+        self,
+        execution_id: str,
+        node_id: str,
+        value: Any,
+        db=None,
+        user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        execution = self._executions.get(execution_id)
+        if not execution and db:
+            execution = await self._load_execution_from_db(execution_id, db)
+            if execution:
+                self._executions[execution_id] = execution
+
+        if not execution:
+            return {"success": False, "error": "工作流执行不存在"}
+
+        if execution.status != WorkflowStatus.PAUSED:
+            return {"success": False, "error": "工作流当前不在等待用户输入状态"}
+
+        node_state = execution.node_states.get(node_id)
+        if not node_state:
+            return {"success": False, "error": "输入节点不存在"}
+
+        pending_input = execution.context.get("pending_user_input") or {}
+        if pending_input.get("node_id") and pending_input.get("node_id") != node_id:
+            return {"success": False, "error": "当前等待的不是该输入节点"}
+
+        workflow = await self.get_workflow(execution.workflow_id, db)
+        node = next((item for item in workflow.nodes if item.id == node_id), None) if workflow else None
+        if not node:
+            return {"success": False, "error": "无法加载输入节点定义"}
+
+        request_payload = self._build_input_request_payload(node, execution)
+        input_key = request_payload["input_key"]
+        required = bool(request_payload.get("required", True))
+        if required and (value is None or (isinstance(value, str) and not value.strip())):
+            return {"success": False, "error": "用户输入不能为空"}
+
+        submitted_at = datetime.now().isoformat()
+        normalized_value = value.strip() if isinstance(value, str) else value
+        output = {
+            "status": "input_received",
+            "user_input": normalized_value,
+            input_key: normalized_value,
+            "input_key": input_key,
+            "submitted_at": submitted_at,
+            "submitted_by": user_id,
+        }
+
+        node_state.status = NodeStatus.COMPLETED
+        node_state.output_data = self._make_json_safe(output)
+        node_state.completed_at = datetime.now()
+        if node_state.started_at and node_state.completed_at:
+            delta = node_state.completed_at - node_state.started_at
+            node_state.duration_ms = int(delta.total_seconds() * 1000)
+
+        execution.context[input_key] = normalized_value
+        execution.context[f"user_input_{input_key}"] = normalized_value
+        execution.context["latest_user_input"] = normalized_value
+        execution.context["user_feedback"] = normalized_value
+        execution.context.pop("pending_user_input", None)
+        execution.status = WorkflowStatus.RUNNING
+        execution.cancel_requested = False
+
+        if db:
+            processed_output = await self._process_node_outputs(node, node_state.output_data, execution, db)
+            execution.context.update(self._make_json_safe(processed_output))
+            await self._save_execution_to_db(execution, db)
+
+        await self._broadcast_status(execution.id, "user_input_received", {
+            "node_id": node.id,
+            "node_type": NodeType.INPUT.value,
+            "label": node.label,
+            "input_key": input_key,
+        })
+        await self._broadcast_status(execution.id, "node_completed", {
+            "node_id": node.id,
+            "node_type": NodeType.INPUT.value,
+            "label": node.label,
+            "status": node_state.status.value,
+            "input": node_state.input_data,
+            "output": node_state.output_data,
+            "context_updates": [input_key, f"user_input_{input_key}", "latest_user_input", "user_feedback"],
+            "duration_ms": node_state.duration_ms,
+            "error": node_state.error,
+        })
+
+        input_event = self._input_events.get(execution.id)
+        has_waiting_runner = False
+        if input_event:
+            active_task = self._running_tasks.get(execution.id)
+            has_waiting_runner = bool(active_task and not active_task.done())
+            input_event.set()
+
+        workflow = workflow or await self.get_workflow(execution.workflow_id, db)
+        if workflow and not has_waiting_runner:
+            self._start_workflow_task(execution.id, workflow, db)
+
+        return {
+            "success": True,
+            "message": "用户输入已提交",
+            "execution_id": execution.id,
+            "node_id": node.id,
+            "input_key": input_key,
+        }
 
     async def _execute_node(
         self,
@@ -2162,11 +2537,23 @@ class WorkflowEngine:
                 output = await self._execute_parallel_node(node, execution, db)
 
             elif node.node_type == NodeType.INPUT:
-                # 输入节点：暂停等待用户输入
+                request_payload = self._build_input_request_payload(node, execution)
+                execution.context["pending_user_input"] = request_payload
                 execution.status = WorkflowStatus.PAUSED
-                output = {"status": "waiting_for_input"}
+                node_state.status = NodeStatus.RUNNING
+                node_state.output_data = {"status": "waiting_for_input", **request_payload}
+                if db:
+                    await self._save_execution_to_db(execution, db)
+                await self._broadcast_status(execution.id, "user_input_required", request_payload)
+                await trace_service.record_event("user_input_required", request_payload)
+                input_event = self._input_events.setdefault(execution.id, asyncio.Event())
+                input_event.clear()
+                await input_event.wait()
+                return
 
             safe_output = self._make_json_safe(output)
+            state = get_workflow_state(execution)
+            state.record_node_output(node.id, safe_output, source="node_completed")
 
             # 更新状态
             node_state.status = NodeStatus.COMPLETED
@@ -2192,16 +2579,25 @@ class WorkflowEngine:
                 # 使用配置处理输出
                 processed_output = await self._process_node_outputs(node, safe_output, execution, db)
                 processed_output = self._make_json_safe(processed_output)
-                execution.context.update(processed_output)
-                context_updates = list(processed_output.keys())
+                state_update = get_workflow_state(execution).merge_runtime_state(
+                    processed_output,
+                    source=f"node_outputs:{node.id}",
+                )
+                context_updates = list(state_update.get("allowed_updates", {}).keys())
                 logger.info(f"节点 '{node.label}' 根据 outputs 配置处理了 {len(node.outputs)} 个输出")
             elif isinstance(safe_output, dict):
-                # 向后兼容：所有输出保存到上下文
-                execution.context.update(safe_output)
-                context_updates = list(safe_output.keys())
+                # 向后兼容：输出写入运行期状态，保护 canonical/retrieved 状态不被普通节点覆盖
+                state_update = get_workflow_state(execution).merge_runtime_state(
+                    safe_output,
+                    source=f"node_output:{node.id}",
+                )
+                context_updates = list(state_update.get("allowed_updates", {}).keys())
             elif safe_output is not None:
                 default_output_key = f"{node.id}_output"
-                execution.context[default_output_key] = safe_output
+                get_workflow_state(execution).merge_runtime_state(
+                    {default_output_key: safe_output},
+                    source=f"node_output:{node.id}",
+                )
                 context_updates = [default_output_key]
 
         except Exception as e:
@@ -2221,6 +2617,7 @@ class WorkflowEngine:
             "status": node_state.status.value,
             "input": node_state.input_data,
             "output": node_state.output_data,
+            "output_data": node_state.output_data,
             "context_updates": context_updates,
             "duration_ms": node_state.duration_ms,
             "error": node_state.error,
@@ -2721,13 +3118,45 @@ class WorkflowEngine:
             f"label={node.label}, node_id={node.id}, project_id={project_id}"
         )
 
-        if node.inputs:
-            context = execution.context.copy()
-            logger.info(
-                f"Agent '{resolved_agent_type}' 使用节点 inputs 配置的上下文，包含 {len(context)} 个字段"
+        context = execution.context.copy()
+        enrichment_required = resolved_agent_type in [
+            "writer",
+            "evaluator",
+            "master_plotter",
+            "plotter",
+            "setting",
+            "hook_manager",
+            "procgen",
+            "proc_gen",
+            "world_map_manager",
+            "event_generator",
+            "dungeon_generator",
+        ]
+        if enrichment_required or not node.inputs:
+            enhanced_context = await self._load_agent_context(resolved_agent_type, execution, db)
+            for key, value in enhanced_context.items():
+                if key not in context or context[key] is None:
+                    context[key] = value
+
+        if resolved_agent_type == "writer":
+            canonical_target = (
+                context.get("target_word_count")
+                or context.get("chapter_target_word_count")
+                or self._ensure_context_dict(context.get("chapter_outline")).get("target_word_count")
+                or context.get("word_count")
+                or 2000
             )
-        else:
-            context = await self._load_agent_context(resolved_agent_type, execution, db)
+            context["target_word_count"] = canonical_target
+            context["chapter_target_word_count"] = canonical_target
+            context["word_count"] = canonical_target
+
+        if resolved_agent_type in {"master_plotter", "plotter"} and context.get("chapter_outline"):
+            context.setdefault("task", "prepare_writing_plan")
+
+        execution.context.update(context)
+        logger.info(
+            f"Agent '{resolved_agent_type}' 使用状态化上下文，包含 {len(context)} 个字段"
+        )
 
         context = await self._maybe_attach_graph_context(node, execution, db, context, profile)
 
@@ -2856,6 +3285,33 @@ class WorkflowEngine:
                         execution.context["existing_hooks"] = hooks
                         data_loaded = True
                         logger.info(f"加载 {len(hooks)} 个已有伏笔到上下文")
+
+            if agent_type in ["world_map_manager", "event_generator"]:
+                context.setdefault("chapter_num", execution.context.get("chapter_num") or execution.context.get("chapter_number"))
+                context.setdefault("chapter_number", execution.context.get("chapter_number") or execution.context.get("chapter_num"))
+                if execution.context.get("chapter_title") and "chapter_title" not in context:
+                    context["chapter_title"] = execution.context.get("chapter_title")
+                if execution.context.get("chapter_goal") and "chapter_goal" not in context:
+                    context["chapter_goal"] = execution.context.get("chapter_goal")
+                if execution.context.get("chapter_summary") and "chapter_summary" not in context:
+                    context["chapter_summary"] = execution.context.get("chapter_summary")
+                if execution.context.get("chapter_outline") and "chapter_outline" not in context:
+                    context["chapter_outline"] = execution.context.get("chapter_outline")
+                if execution.context.get("chapter_goals") and "chapter_goals" not in context:
+                    context["chapter_goals"] = execution.context.get("chapter_goals")
+                if execution.context.get("scene_directions") and "scene_directions" not in context:
+                    context["scene_directions"] = execution.context.get("scene_directions")
+
+            if agent_type == "world_map_manager":
+                worlds = await db.get_worlds_by_project(project_id) if hasattr(db, 'get_worlds_by_project') else []
+                if worlds:
+                    world_id = worlds[0].get("id")
+                    context.setdefault("world_id", world_id)
+                    execution.context.setdefault("world_id", world_id)
+                    regions = await db.get_regions_by_world(world_id) if hasattr(db, 'get_regions_by_world') and world_id else []
+                    if regions and "existing_regions" not in context:
+                        context["existing_regions"] = regions
+                        execution.context["existing_regions"] = regions
 
             # ===== Writer Agent：需要章节历史、伏笔、角色、讨论共识、剧情意图 =====
             if agent_type == "writer":
@@ -3039,9 +3495,40 @@ class WorkflowEngine:
                 if execution.context.get("discussion_assets_committed") and "discussion_assets_committed" not in context:
                     context["discussion_assets_committed"] = execution.context.get("discussion_assets_committed")
 
+                # 传递状态化工作流上游产物，Writer 必须能看到大纲、场景演绎、总编剧计划和设定检索结果
+                for workflow_key in [
+                    "chapter_outline",
+                    "chapter_goals",
+                    "chapter_summary",
+                    "chapter_title",
+                    "scene_directions",
+                    "performance_result",
+                    "writing_plan",
+                    "plot_guidance",
+                    "scene_integration_plan",
+                    "fixed_lore_entries",
+                    "dynamic_lore_entries",
+                    "selected_lore_entries",
+                    "node_outputs",
+                    "asset_state",
+                    "workflow_state",
+                ]:
+                    if execution.context.get(workflow_key) is not None and workflow_key not in context:
+                        context[workflow_key] = execution.context.get(workflow_key)
+
+                if agent_type in {"writer", "master_plotter", "plotter", "evaluator"}:
+                    self._inject_character_constraints(context)
+
                 # ========== 关键：设置字数要求 ==========
-                # 从 execution.context 获取 target_word_count，映射到 word_count
-                target_word_count = execution.context.get("target_word_count", 2000)
+                # 从 canonical target 获取目标字数，映射到 Writer 兼容的 word_count
+                target_word_count = (
+                    execution.context.get("target_word_count")
+                    or execution.context.get("chapter_target_word_count")
+                    or chapter_outline.get("target_word_count")
+                    or 2000
+                )
+                context["target_word_count"] = target_word_count
+                context["chapter_target_word_count"] = target_word_count
                 context["word_count"] = target_word_count
                 logger.info(f"为 Writer 设置目标字数: {target_word_count}")
 
@@ -3097,8 +3584,58 @@ class WorkflowEngine:
                 context["task"] = task
                 logger.info(f"Setting Agent 任务类型: {task}")
 
-            # ===== Evaluator Agent：需要章节历史、设定 =====
+            if "character_constraints" not in context:
+                self._inject_character_constraints(context)
+
+            # ===== Evaluator Agent：需要章节历史、绑定大纲、设定、写作计划和资产状态 =====
             if agent_type == "evaluator":
+                for workflow_key in [
+                    "chapter_outline",
+                    "chapter_goals",
+                    "chapter_goal",
+                    "chapter_summary",
+                    "chapter_title",
+                    "target_word_count",
+                    "chapter_target_word_count",
+                    "scene_directions",
+                    "writing_plan",
+                    "plot_guidance",
+                    "scene_integration_plan",
+                    "fixed_lore_entries",
+                    "dynamic_lore_entries",
+                    "selected_lore_entries",
+                    "participation_trace",
+                    "participation_warnings",
+                    "map_persistence_state",
+                    "asset_persistence_state",
+                    "saved_region_ids",
+                    "saved_hook_ids",
+                    "saved_lore_ids",
+                    "workflow_state",
+                    "asset_state",
+                    "node_outputs",
+                ]:
+                    if execution.context.get(workflow_key) is not None and workflow_key not in context:
+                        context[workflow_key] = execution.context.get(workflow_key)
+
+                target_word_count = (
+                    context.get("target_word_count")
+                    or context.get("chapter_target_word_count")
+                    or self._ensure_context_dict(context.get("chapter_outline")).get("target_word_count")
+                )
+                if target_word_count:
+                    context["target_word_count"] = target_word_count
+                    context["chapter_target_word_count"] = target_word_count
+
+                if "chapter_content" not in context:
+                    chapter_content = (
+                        execution.context.get("chapter_content")
+                        or execution.context.get("written_content")
+                        or execution.context.get("content")
+                    )
+                    if chapter_content:
+                        context["chapter_content"] = chapter_content
+
                 if "previous_chapters" not in context:
                     chapters = await db.get_chapters_by_project(project_id) if hasattr(db, 'get_chapters_by_project') else []
                     if chapters:
@@ -3535,10 +4072,12 @@ class WorkflowEngine:
                     word_count_passed, _, word_count_msg = validate_word_count(
                         chapter_content, target_word_count
                     )
+                    max_word_count = int(target_word_count * 1.1)
                     word_count_check = {
                         "actual": actual_word_count,
                         "target": target_word_count,
                         "min_required": min_word_count,
+                        "max_allowed": max_word_count,
                         "passed": word_count_passed,
                         "message": word_count_msg,
                     }
@@ -3546,13 +4085,30 @@ class WorkflowEngine:
                 except ImportError:
                     word_count_check = output_data.get("word_count_check", {})
 
-            # 评估结果可以从 agent 的返回值中获取
-            evaluation_passed = output_data.get("quality_passed") or output_data.get("approved") or output_data.get("pass", True)
+            if word_count_check and not word_count_check.get("passed", True):
+                output_data["word_count_check"] = word_count_check
+                output_data["quality_passed"] = False
+                output_data["approved"] = False
+                output_data["pass"] = False
 
-            # 字数不达标直接判定为不合格
+            def _get_explicit_bool(data: Dict[str, Any], keys: List[str], default: bool) -> bool:
+                for key in keys:
+                    if key in data:
+                        return bool(data[key])
+                return default
+
+            evaluation_passed = _get_explicit_bool(output_data, ["quality_passed", "approved", "pass"], True)
+            evaluation_issues = output_data.get("issues", output_data.get("problems", []))
+            evaluation_suggestions = output_data.get("suggestions", output_data.get("recommendations", []))
+            if not isinstance(evaluation_issues, list):
+                evaluation_issues = [str(evaluation_issues)] if evaluation_issues else []
+            if not isinstance(evaluation_suggestions, list):
+                evaluation_suggestions = [str(evaluation_suggestions)] if evaluation_suggestions else []
+
+            # 字数不达标或超标直接判定为不合格
             if not word_count_check.get("passed", True):
                 evaluation_passed = False
-                logger.warning(f"字数不达标，强制判定为不合格: {word_count_check.get('message')}")
+                logger.warning(f"字数不符合要求，强制判定为不合格: {word_count_check.get('message')}")
 
             execution.context["evaluation_passed"] = evaluation_passed
             execution.context["word_count_check"] = word_count_check
@@ -3561,8 +4117,8 @@ class WorkflowEngine:
             evaluation_feedback = {
                 "passed": evaluation_passed,
                 "score": output_data.get("score", 0),
-                "issues": output_data.get("issues", output_data.get("problems", [])),
-                "suggestions": output_data.get("suggestions", output_data.get("recommendations", [])),
+                "issues": evaluation_issues,
+                "suggestions": evaluation_suggestions,
                 "summary": output_data.get("summary", output_data.get("comment", "")),
                 "word_count_check": word_count_check,
                 "coherence_check": output_data.get("coherence_check", {}),
@@ -3616,6 +4172,7 @@ class WorkflowEngine:
         # 如果是 Writer Agent，保存章节到数据库
         if node.agent_type == "writer" and result.success and output_data:
             await self._save_chapter_from_writer(execution, output_data, db)
+            await self._save_hooks_from_writer_metadata(execution, output_data, db)
 
             # ========== 角色检测与晋升 ==========
             # 在章节内容生成后，检测可能的新角色
@@ -3835,7 +4392,7 @@ class WorkflowEngine:
                 "id": chapter_id,
                 "title": chapter_title,
                 "project_id": execution.project_id,
-                "world_id": execution.context.get("world_id"),
+                "chapter_outline_id": execution.context.get("chapter_outline_id"),
                 "summary": "",  # 摘要可以后续由 Summarizer Agent 生成
                 "content": content,  # 只保存正文
                 "word_count": word_count,
@@ -3944,11 +4501,116 @@ class WorkflowEngine:
         except Exception as e:
             logger.warning(f"角色检测失败: {e}")
 
+    def _clamp_hook_priority(self, priority: Any) -> int:
+        try:
+            value = int(priority)
+        except (TypeError, ValueError):
+            value = 3
+        return max(1, min(5, value))
+
+    def _normalize_hook_type(self, hook_type: Any) -> str:
+        """将 Agent 输出的伏笔类型归一化为 Hook 模型允许的类型。"""
+        value = str(hook_type or "").strip().lower()
+        mapping = {
+            "suspense": "mystery",
+            "foreshadow": "custom",
+            "foreshadowing": "custom",
+            "twist": "event",
+            "object": "object",
+            "item": "object",
+            "character": "character",
+            "event": "event",
+            "location": "location",
+            "place": "location",
+            "relationship": "relationship",
+            "mystery": "mystery",
+            "custom": "custom",
+        }
+        return mapping.get(value, "custom")
+
+    def _coerce_writer_hook_items(self, value: Any, *, source: str) -> List[Dict[str, Any]]:
+        """把 Writer 的 hooks_embedded/future_setup 兼容转换为可持久化伏笔。"""
+        items: List[Dict[str, Any]] = []
+        if not isinstance(value, list):
+            return items
+
+        for index, item in enumerate(value):
+            if isinstance(item, dict):
+                title = item.get("title") or item.get("name") or item.get("summary")
+                description = item.get("description") or item.get("content") or item.get("detail") or title
+                hook_type = item.get("hook_type") or item.get("type")
+                resolution_hint = item.get("resolution_hint") or item.get("future_payoff") or item.get("payoff") or ""
+                related_characters = item.get("related_characters") or item.get("characters") or []
+                related_objects = item.get("related_objects") or item.get("objects") or []
+                related_locations = item.get("related_locations") or item.get("locations") or []
+                priority = item.get("priority", 3)
+            else:
+                text = str(item or "").strip()
+                title = text[:80]
+                description = text
+                hook_type = "custom"
+                resolution_hint = ""
+                related_characters = []
+                related_objects = []
+                related_locations = []
+                priority = 3
+
+            if not title and not description:
+                continue
+
+            title = str(title or description or f"{source}-{index + 1}").strip()[:120]
+            description = str(description or title).strip()
+            try:
+                priority_value = int(priority)
+            except (TypeError, ValueError):
+                priority_value = 3
+            priority_value = max(1, min(5, priority_value))
+
+            items.append({
+                "title": title,
+                "description": description,
+                "hook_type": self._normalize_hook_type(hook_type),
+                "resolution_hint": str(resolution_hint or ""),
+                "priority": priority_value,
+                "related_characters": related_characters if isinstance(related_characters, list) else [],
+                "related_objects": related_objects if isinstance(related_objects, list) else [],
+                "related_locations": related_locations if isinstance(related_locations, list) else [],
+                "source": source,
+            })
+        return items
+
+    async def _save_hooks_from_writer_metadata(
+        self,
+        execution: "WorkflowExecution",
+        writer_output: Dict[str, Any],
+        db=None,
+    ) -> Dict[str, Any]:
+        """保存 Writer 输出中实际嵌入/铺垫的伏笔，避免完整流程没有 HookManager 新建时伏笔链路为空。"""
+        if not db:
+            return {"planted": [], "resolved": [], "updated": [], "errors": ["数据库连接不存在，无法保存 Writer 伏笔"]}
+
+        hooks: List[Dict[str, Any]] = []
+        hooks.extend(self._coerce_writer_hook_items(writer_output.get("hooks_embedded"), source="writer.hooks_embedded"))
+        hooks.extend(self._coerce_writer_hook_items(writer_output.get("future_setup"), source="writer.future_setup"))
+        if not hooks:
+            return {"planted": [], "resolved": [], "updated": [], "errors": []}
+
+        result = await self._save_hooks_from_manager(
+            execution,
+            {"hooks_to_plant": hooks},
+            db,
+            source="writer_metadata",
+        )
+        if isinstance(result, dict) and result.get("planted"):
+            execution.context.setdefault("writer_created_hooks", []).extend(result["planted"])
+        return result
+
     async def _save_hooks_from_manager(
         self,
         execution: "WorkflowExecution",
         hook_output: Dict[str, Any],
         db=None,
+        source: str = "hook_manager",
     ):
         """
         保存伏笔管理 Agent 输出的伏笔到数据库
@@ -3972,13 +4634,36 @@ class WorkflowEngine:
 
             # 保存新伏笔
             planted_ids = []
+            duplicate_candidates = []
             for hook_data in hooks_to_plant:
+                title = hook_data.get("title", "未命名伏笔")
+                description = hook_data.get("description", "")
+                world_id = hook_data.get("world_id") or execution.context.get("world_id")
+                scope_type = hook_data.get("scope_type") or ("world" if world_id else "project")
+                if hasattr(db, "find_duplicate_hook"):
+                    duplicate = await db.find_duplicate_hook(
+                        execution.project_id,
+                        title,
+                        description,
+                        world_id=world_id,
+                        scope_type=scope_type,
+                    )
+                    if duplicate:
+                        existing_id = str(duplicate.get("id"))
+                        duplicate_candidates.append({
+                            "type": "hook",
+                            "title": title,
+                            "existing_id": existing_id,
+                        })
+                        planted_ids.append(existing_id)
+                        logger.info(f"跳过重复伏笔: {title} -> {existing_id}")
+                        continue
                 hook_id = str(uuid.uuid4())
                 hook_record = {
                     "id": hook_id,
-                    "title": hook_data.get("title", "未命名伏笔"),
-                    "description": hook_data.get("description", ""),
-                    "hook_type": hook_data.get("hook_type", "foreshadow"),
+                    "title": title,
+                    "description": description,
+                    "hook_type": self._normalize_hook_type(hook_data.get("hook_type")),
                     "status": "planted",
                     "related_characters": hook_data.get("related_characters", []),
                     "related_locations": hook_data.get("related_locations", []),
@@ -3988,10 +4673,16 @@ class WorkflowEngine:
                     "resolution_hint": hook_data.get("resolution_hint", ""),
                     "resolution_context": None,
                     "resolution_chapter": None,
-                    "priority": hook_data.get("priority", 5),
+                    "priority": self._clamp_hook_priority(hook_data.get("priority")),
                     "created_at": datetime.now(),
                     "resolved_at": None,
                     "project_id": execution.project_id,
+                    "world_id": world_id,
+                    "scope_type": scope_type,
+                    "character_id": hook_data.get("character_id"),
+                    "parent_hook_id": hook_data.get("parent_hook_id"),
+                    "promoted_from_hook_id": hook_data.get("promoted_from_hook_id"),
+                    "visibility": hook_data.get("visibility") or "global",
                 }
                 await db.save_hook(hook_record)
                 planted_ids.append(hook_id)
@@ -4012,15 +4703,24 @@ class WorkflowEngine:
                     await db.update_hook_status(hook_id, new_status)
                     logger.info(f"伏笔状态更新: {hook_id} -> {new_status}")
 
-            # 更新执行上下文
             if planted_ids:
+                get_workflow_state(execution).set_asset_state(
+                    {
+                        "saved_hook_ids": planted_ids,
+                        "duplicate_candidates": duplicate_candidates,
+                    },
+                    source="hook_persistence",
+                )
                 execution.context.setdefault("hooks_planted_this_run", []).extend(planted_ids)
 
             # 广播伏笔保存事件
             await self._broadcast_status(execution.id, "hooks_saved", {
-                "planted_count": len(planted_ids),
+                "source": source,
+                "planted_count": len(planted_ids) - len(duplicate_candidates),
+                "duplicate_count": len(duplicate_candidates),
                 "resolved_count": len(hooks_to_resolve),
                 "updated_count": len(hooks_status_updates),
+                "world_id": execution.context.get("world_id"),
             })
 
             return {
@@ -4062,9 +4762,24 @@ class WorkflowEngine:
             updated_lores = setting_output.get("updated_lores", [])
             validated_lores = setting_output.get("validated_lores", [])
 
-            # 保存新设定
-            created_ids = []
+            saved_lore_ids = []
+            duplicate_candidates = []
             for lore_data in new_lores:
+                if hasattr(db, "find_duplicate_lore"):
+                    duplicate = await db.find_duplicate_lore(
+                        execution.project_id,
+                        lore_data.get("title", ""),
+                        lore_data.get("content", ""),
+                    )
+                    if duplicate:
+                        duplicate_candidates.append({
+                            "type": "lore",
+                            "title": lore_data.get("title", ""),
+                            "existing_id": str(duplicate.get("id")),
+                        })
+                        saved_lore_ids.append(str(duplicate.get("id")))
+                        logger.info(f"跳过重复设定: {lore_data.get('title', '未命名')} -> {duplicate.get('id')}")
+                        continue
                 lore_id = str(uuid.uuid4())
 
                 # 确定类别和优先级
@@ -4116,7 +4831,7 @@ class WorkflowEngine:
                     )
                 """, params)
 
-                created_ids.append(lore_id)
+                saved_lore_ids.append(lore_id)
                 logger.info(f"保存新设定: {lore_data.get('title', '未命名')} (ID: {lore_id})")
 
             # 更新现有设定
@@ -4165,18 +4880,26 @@ class WorkflowEngine:
                     logger.info(f"更新设定: {lore_id}")
 
             # 更新执行上下文
-            if created_ids:
-                execution.context.setdefault("lores_created_this_run", []).extend(created_ids)
+            if saved_lore_ids:
+                get_workflow_state(execution).set_asset_state(
+                    {
+                        "saved_lore_ids": saved_lore_ids,
+                        "duplicate_candidates": duplicate_candidates,
+                    },
+                    source="lore_persistence",
+                )
+                execution.context.setdefault("lores_created_this_run", []).extend(saved_lore_ids)
 
             # 广播设定保存事件
             await self._broadcast_status(execution.id, "lores_saved", {
-                "created_count": len(created_ids),
+                "created_count": len(saved_lore_ids) - len(duplicate_candidates),
+                "duplicate_count": len(duplicate_candidates),
                 "updated_count": len(updated_lores),
                 "validated_count": len(validated_lores),
             })
 
             # 同时更新 execution.context 中的 lore_entries
-            if created_ids or updated_lores:
+            if saved_lore_ids or updated_lores:
                 # 重新加载设定列表
                 try:
                     results = await db.execute_query(
@@ -4189,7 +4912,7 @@ class WorkflowEngine:
                 except Exception as e:
                     logger.warning(f"重新加载设定列表失败: {e}")
 
-            if created_ids or updated_lores:
+            if saved_lore_ids or updated_lores:
                 try:
                     from app.api.routes.lore import _invalidate_plot_outline_context
                     _invalidate_plot_outline_context(execution.project_id)
@@ -4197,7 +4920,7 @@ class WorkflowEngine:
                     logger.warning(f"Plot Outline 缓存失效失败: {e}")
 
             return {
-                "created": created_ids,
+                "created": saved_lore_ids,
                 "updated": updated_ids,
                 "validated": [l.get("id") for l in validated_lores if isinstance(l, dict) and l.get("id")],
                 "errors": [],
@@ -4207,6 +4930,112 @@ class WorkflowEngine:
             logger.error(f"保存设定失败: {e}")
             execution.context["lore_save_error"] = str(e)
             return {"created": [], "updated": [], "validated": [], "errors": [str(e)]}
+
+    def _normalize_region_outputs(self, output_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        candidates: List[Any] = []
+        if isinstance(output_data.get("regions"), list):
+            candidates.extend(output_data.get("regions") or [])
+        if isinstance(output_data.get("region"), dict):
+            candidates.append(output_data.get("region"))
+        region_like_keys = {"name", "region_name", "terrain_type", "region_type", "landmarks", "features", "terrain_features"}
+        if region_like_keys.intersection(output_data.keys()):
+            candidates.append(output_data)
+
+        normalized: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            name = candidate.get("name") or candidate.get("region_name")
+            if not name:
+                continue
+            key = str(candidate.get("id") or name)
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append({
+                **candidate,
+                "name": name,
+                "description": candidate.get("description") or candidate.get("summary") or candidate.get("overview") or "",
+                "region_type": candidate.get("region_type") or candidate.get("type") or "custom",
+                "terrain_type": candidate.get("terrain_type") or candidate.get("terrain") or "custom",
+                "terrain_features": candidate.get("terrain_features") or candidate.get("features") or [],
+                "connections": candidate.get("connections") or candidate.get("neighbors") or [],
+            })
+        return normalized
+
+    async def _resolve_world_id_for_asset(
+        self,
+        execution: "WorkflowExecution",
+        output_data: Dict[str, Any],
+        db=None,
+    ) -> Optional[str]:
+        world_id = execution.context.get("world_id") or output_data.get("world_id")
+        if world_id:
+            return str(world_id)
+        for container in (execution.context.get("world_info"), output_data.get("world_info")):
+            if isinstance(container, dict) and container.get("id"):
+                return str(container.get("id"))
+        if db and hasattr(db, "get_default_world"):
+            default_world = await db.get_default_world(execution.project_id)
+            if default_world and default_world.get("id"):
+                return str(default_world.get("id"))
+        return None
+
+    def _normalize_event_outputs(self, procgen_output: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """兼容 EventGenerator 的多种输出形态，提取可持久化剧情事件。"""
+        raw_events: List[Any] = []
+        for key in ("events", "event_candidates"):
+            value = procgen_output.get(key)
+            if isinstance(value, list):
+                raw_events.extend(value)
+            elif isinstance(value, dict):
+                raw_events.append(value)
+
+        data_value = procgen_output.get("data")
+        if isinstance(data_value, list):
+            raw_events.extend(data_value)
+        elif isinstance(data_value, dict):
+            raw_events.append(data_value)
+
+        has_single_event_shape = any(
+            procgen_output.get(key)
+            for key in ("event_id", "event_name", "event_type", "trigger_condition", "narrative_purpose")
+        )
+        if has_single_event_shape:
+            raw_events.append(procgen_output)
+
+        normalized: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for raw_event in raw_events:
+            if not isinstance(raw_event, dict):
+                continue
+            event_name = raw_event.get("event_name") or raw_event.get("name") or raw_event.get("title")
+            event_id = raw_event.get("event_id") or raw_event.get("id")
+            description = raw_event.get("description") or raw_event.get("summary")
+            if not event_name and not event_id and not description:
+                continue
+            key = str(event_id or event_name or description)
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(raw_event)
+        return normalized
+
+    def _normalize_location_outputs(self, procgen_output: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """提取 location / sub-location 输出，避免字符串和空值污染保存流程。"""
+        raw_locations: List[Any] = []
+        for key in ("locations", "location_candidates", "sub_locations"):
+            value = procgen_output.get(key)
+            if isinstance(value, list):
+                raw_locations.extend(value)
+            elif isinstance(value, dict):
+                raw_locations.append(value)
+        normalized: List[Dict[str, Any]] = []
+        for raw_location in raw_locations:
+            if isinstance(raw_location, dict) and (raw_location.get("name") or raw_location.get("location_name") or raw_location.get("title")):
+                normalized.append(raw_location)
+        return normalized
 
     async def _save_world_data_from_procgen(
         self,
@@ -4230,29 +5059,56 @@ class WorkflowEngine:
         from datetime import datetime
 
         try:
-            # 获取生成的区域
-            regions = procgen_output.get("regions", [])
-            events = procgen_output.get("events", [])
-            locations = procgen_output.get("locations", [])
+            # 获取生成的区域/事件/地点。事件 Agent 常把候选事件放在 data 列表中，不能只读取 events 字段。
+            regions = self._normalize_region_outputs(procgen_output)
+            events = self._normalize_event_outputs(procgen_output)
+            locations = self._normalize_location_outputs(procgen_output)
+
+            if not regions and procgen_output.get("overview"):
+                regions = self._normalize_region_outputs(procgen_output)
+                if procgen_output.get("suggested_starting_location"):
+                    locations = [
+                        *locations,
+                        {
+                            "name": procgen_output.get("suggested_starting_location"),
+                            "description": procgen_output.get("overview", ""),
+                            "source": "world_map_manager",
+                        },
+                    ]
 
             # 保存区域
             saved_regions = []
+            world_id = await self._resolve_world_id_for_asset(execution, procgen_output, db)
+            if regions and not world_id:
+                error_message = "地图未落库，因为没有可关联世界"
+                execution.context.setdefault("map_persistence_state", {})["error"] = error_message
+                logger.error(error_message)
+                return {"saved": [], "events": events, "locations": locations, "errors": [error_message]}
+
             for region_data in regions:
                 region_id = region_data.get("id") or str(uuid.uuid4())
                 region_record = {
                     "id": region_id,
-                    "name": region_data.get("name", "未命名区域"),
-                    "description": region_data.get("description", ""),
+                    "name": region_data.get("name") or region_data.get("region_name") or "未命名区域",
+                    "description": region_data.get("description") or region_data.get("summary") or region_data.get("overview") or "",
                     "region_type": region_data.get("region_type", "custom"),
                     "terrain_type": region_data.get("terrain_type", "custom"),
                     "atmosphere": region_data.get("atmosphere", ""),
                     "coordinates": region_data.get("coordinates", {}),
                     "area_size": region_data.get("area_size", 0.0),
-                    "terrain_features": region_data.get("terrain_features", []),
+                    "terrain_features": region_data.get("terrain_features") or region_data.get("features", []),
                     "landmarks": region_data.get("landmarks", []),
                     "encounters": region_data.get("encounters", []),
                     "connections": region_data.get("connections") or region_data.get("neighbors", []),
                     "local_rules": region_data.get("local_rules", []),
+                    "metadata": {
+                        "asset_kind": "region",
+                        "workflow_execution_id": execution.id,
+                        "workflow_id": execution.workflow_id,
+                        "agent_type": region_data.get("agent_type") or "world_map_manager",
+                        "source": region_data.get("source") or "workflow",
+                        "source_region": region_data,
+                    },
                     "state": region_data.get("state", "normal"),
                     "state_summary": region_data.get("state_summary", ""),
                     "destroyed_at": region_data.get("destroyed_at"),
@@ -4260,40 +5116,117 @@ class WorkflowEngine:
                     "visit_count": 0,
                     "created_at": datetime.now(),
                     "updated_at": datetime.now(),
+                    "world_id": world_id,
                 }
-
-                # 如果有 world_id，添加到记录中
-                world_id = execution.context.get("world_id")
-                if world_id:
-                    region_record["world_id"] = world_id
 
                 await db.save_region(region_record)
                 saved_regions.append(region_id)
                 logger.info(f"保存世界区域: {region_record['name']}")
 
-            # 保存事件到上下文
+            # 保存事件到数据库，同时保留上下文候选，便于当前执行内即时消费。
+            saved_event_ids = []
             if events:
                 execution.context.setdefault("generated_events", []).extend(events)
+                execution.context["event_candidates"] = events
+                if hasattr(db, "save_event"):
+                    for event_data in events:
+                        if not isinstance(event_data, dict):
+                            continue
+                        event_record = {
+                            **event_data,
+                            "project_id": execution.project_id,
+                            "world_id": event_data.get("world_id") or world_id,
+                            "workflow_execution_id": execution.id,
+                            "workflow_id": execution.workflow_id,
+                            "node_id": event_data.get("node_id"),
+                            "agent_type": event_data.get("agent_type") or "event_generator",
+                            "source": event_data.get("source") or "workflow",
+                        }
+                        saved_event_ids.append(await db.save_event(event_record))
+                get_workflow_state(execution).set_asset_state(
+                    {
+                        "saved_event_ids": saved_event_ids,
+                        "event_persistence_state": {
+                            "status": "saved" if saved_event_ids else "context_only",
+                            "saved_event_ids": saved_event_ids,
+                            "count": len(events),
+                            "reason": None if saved_event_ids else "no_save_event_method_or_empty_event_payload",
+                        },
+                    },
+                    source="event_persistence",
+                )
 
-            # 保存地点到上下文
+            # 保存地点到数据库，同时保留上下文候选，便于当前执行内即时消费。
+            saved_location_ids = []
             if locations:
                 execution.context.setdefault("generated_locations", []).extend(locations)
+                execution.context["locations"] = [
+                    *self._ensure_context_list(execution.context.get("locations", [])),
+                    *locations,
+                ]
+                if not world_id:
+                    error_message = "地点未落库，因为没有可关联世界"
+                    execution.context.setdefault("location_persistence_state", {})["error"] = error_message
+                    logger.error(error_message)
+                elif hasattr(db, "save_location"):
+                    for location_data in locations:
+                        if not isinstance(location_data, dict):
+                            continue
+                        location_record = {
+                            **location_data,
+                            "world_id": location_data.get("world_id") or world_id,
+                            "metadata": {
+                                **(location_data.get("metadata") if isinstance(location_data.get("metadata"), dict) else {}),
+                                "workflow_execution_id": execution.id,
+                                "workflow_id": execution.workflow_id,
+                                "agent_type": location_data.get("agent_type") or "world_map_manager",
+                                "source": location_data.get("source") or "workflow",
+                            },
+                        }
+                        saved_location_ids.append(await db.save_location(location_record))
+                get_workflow_state(execution).set_asset_state(
+                    {
+                        "saved_location_ids": saved_location_ids,
+                        "location_persistence_state": {
+                            "status": "saved" if saved_location_ids else "context_only",
+                            "saved_location_ids": saved_location_ids,
+                            "count": len(locations),
+                            "map_visible_world_id": world_id,
+                            "reason": None if saved_location_ids else "no_world_id_or_no_save_location_method_or_empty_location_payload",
+                        },
+                    },
+                    source="location_persistence",
+                )
 
-            # 更新执行上下文
             if saved_regions:
+                get_workflow_state(execution).set_asset_state(
+                    {
+                        "saved_region_ids": saved_regions,
+                        "map_persistence_state": {
+                            "status": "saved",
+                            "saved_region_ids": saved_regions,
+                            "map_visible_world_id": world_id,
+                        },
+                    },
+                    source="world_data_persistence",
+                )
                 execution.context.setdefault("saved_regions", []).extend(saved_regions)
+                execution.context["map_visible_world_id"] = world_id
 
             # 广播世界数据保存事件
             await self._broadcast_status(execution.id, "world_data_saved", {
                 "regions_count": len(saved_regions),
                 "events_count": len(events),
                 "locations_count": len(locations),
+                "map_visible_world_id": world_id,
             })
 
             return {
                 "saved": saved_regions,
                 "events": events,
                 "locations": locations,
+                "saved_event_ids": saved_event_ids,
+                "saved_location_ids": saved_location_ids,
                 "errors": [],
             }
 
@@ -4361,7 +5294,12 @@ class WorkflowEngine:
             db: 数据库连接
         """
         try:
-            # 更新执行上下文中的剧情规划
+            # 更新执行上下文中的剧情规划。章节工作流中选中/自动加载的大纲是受保护事实源，
+            # 总编剧只能提供写作计划和修订建议，不能覆盖绑定大纲。
+            state = get_workflow_state(execution)
+            outline_source = execution.context.get("chapter_outline_source")
+            protect_bound_outline = outline_source in {"selected_outline", "auto_loaded"}
+
             plot_outline = plotter_output.get("plot_outline", [])
             chapter_outline = plotter_output.get("chapter_outline", {})
             upcoming_events = plotter_output.get("upcoming_events", [])
@@ -4369,19 +5307,46 @@ class WorkflowEngine:
             chapter_titles = plotter_output.get("chapter_titles", [])
             chapter_goals = plotter_output.get("chapter_goals", [])
             main_conflicts = plotter_output.get("main_conflicts", [])
+            runtime_updates: Dict[str, Any] = {}
 
-            if plot_outline:
-                execution.context["plot_outline"] = plot_outline
-                logger.info(f"更新剧情大纲: {len(plot_outline)} 个节点")
+            for key in (
+                "writing_plan",
+                "plot_guidance",
+                "scene_integration_plan",
+                "required_elements_check",
+                "outline_adherence_notes",
+                "setting_conflict_warnings",
+            ):
+                if plotter_output.get(key) is not None:
+                    runtime_updates[key] = plotter_output[key]
 
-            if chapter_outline:
-                execution.context["chapter_outline"] = chapter_outline
-                logger.info(f"更新章节大纲: {len(chapter_outline)} 章")
+            if protect_bound_outline:
+                suggested_outline = plotter_output.get("suggested_chapter_outline") or chapter_outline
+                suggested_goals = plotter_output.get("suggested_chapter_goals") or chapter_goals
+                if suggested_outline:
+                    runtime_updates["suggested_chapter_outline"] = suggested_outline
+                if suggested_goals:
+                    runtime_updates["suggested_chapter_goals"] = suggested_goals
+                if chapter_outline or chapter_goals:
+                    state.record_state_transition(
+                        source="plotter_outline_protection",
+                        blocked_updates={
+                            key: {"reason": "bound_chapter_outline_protected", "source": outline_source}
+                            for key, value in {"chapter_outline": chapter_outline, "chapter_goals": chapter_goals}.items()
+                            if value
+                        },
+                    )
+                    logger.info("已保护绑定章节大纲，Plotter 输出的大纲/目标保存为建议而非覆盖事实源")
+            else:
+                if chapter_outline:
+                    execution.context["chapter_outline"] = chapter_outline
+                    logger.info(f"更新章节大纲: {len(chapter_outline)} 章")
+                if chapter_goals:
+                    execution.context["chapter_goals"] = chapter_goals
+                    logger.info(f"保存章节目标: {len(chapter_goals)} 章")
 
-            # 保存章节目标（这是 Writer Agent 的关键输入）
-            if chapter_goals:
-                execution.context["chapter_goals"] = chapter_goals
-                logger.info(f"保存章节目标: {len(chapter_goals)} 章")
+            if runtime_updates:
+                state.merge_runtime_state(runtime_updates, source="plotter_guidance")
 
             if chapter_titles:
                 execution.context["chapter_titles"] = chapter_titles
@@ -4400,11 +5365,11 @@ class WorkflowEngine:
                 execution.context["chapter_num"] = 1
 
             # 设置当前章节标题
-            if chapter_titles and len(chapter_titles) >= execution.context.get("chapter_num", 1):
+            if not protect_bound_outline and chapter_titles and len(chapter_titles) >= execution.context.get("chapter_num", 1):
                 execution.context["chapter_title"] = chapter_titles[execution.context.get("chapter_num", 1) - 1]
 
-            # 设置章节目标（用于写作）
-            if chapter_goals and len(chapter_goals) >= execution.context.get("chapter_num", 1):
+            # 设置章节目标（用于写作），但不覆盖绑定章节大纲目标
+            if not protect_bound_outline and chapter_goals and len(chapter_goals) >= execution.context.get("chapter_num", 1):
                 goal = chapter_goals[execution.context.get("chapter_num", 1) - 1]
                 execution.context["chapter_goal"] = goal if isinstance(goal, str) else goal.get("goal", str(goal))
 
@@ -4458,6 +5423,21 @@ class WorkflowEngine:
             output["revision_notes"] = evaluation_feedback.get("suggestions", [])
             output["issues"] = evaluation_feedback.get("issues", [])
 
+        if not evaluation_passed:
+            execution.context["is_retry"] = True
+            revision_parts = []
+            if evaluation_feedback.get("word_count_check"):
+                revision_parts.append(str(evaluation_feedback["word_count_check"].get("message", "")))
+            if output.get("issues"):
+                revision_parts.extend(str(issue) for issue in output["issues"])
+            if output.get("revision_notes"):
+                revision_parts.extend(str(note) for note in output["revision_notes"])
+            if revision_parts:
+                retry_message = "\n".join(part for part in revision_parts if part)
+                execution.context["retry_message"] = retry_message
+                execution.context["revision_notes"] = output.get("revision_notes", [])
+                output["retry_message"] = retry_message
+
         return output
 
     def _get_latest_completed_node_output(
@@ -4477,6 +5457,129 @@ class WorkflowEngine:
 
         last_node = max(completed_nodes, key=lambda x: x[1].completed_at or datetime.min)
         return last_node[1].output_data or {}
+
+    def _extract_required_character_names(self, scene_directions: Dict[str, Any]) -> List[str]:
+        names: List[str] = []
+        for key in ("required_characters", "selected_characters", "participating_characters"):
+            value = scene_directions.get(key)
+            if isinstance(value, str):
+                names.extend([item.strip() for item in value.replace("，", ",").split(",") if item.strip()])
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        name = item.get("name") or item.get("character_name") or item.get("id")
+                        if name:
+                            names.append(str(name))
+                    elif item not in (None, ""):
+                        names.append(str(item))
+        character_roles = scene_directions.get("character_roles")
+        if isinstance(character_roles, dict):
+            names.extend(str(name) for name in character_roles.keys() if str(name).strip())
+        seen: set[str] = set()
+        deduped: List[str] = []
+        for name in names:
+            if name not in seen:
+                seen.add(name)
+                deduped.append(name)
+        return deduped
+
+    def _character_presence_types(self, character: Dict[str, Any]) -> set[str]:
+        presence_types = character.get("available_presence_types")
+        if isinstance(presence_types, str):
+            return {item.strip().lower() for item in presence_types.replace("，", ",").split(",") if item.strip()}
+        if isinstance(presence_types, list):
+            return {str(item).lower() for item in presence_types if str(item).strip()}
+        return {"present", "mentioned", "background"}
+
+    def _can_character_perform(
+        self,
+        character: Dict[str, Any],
+        chapter_num: Optional[int] = None,
+    ) -> tuple[bool, str]:
+        status = str(character.get("status") or character.get("activity_status") or "active").lower()
+        if status in {"inactive", "archived", "dead", "retired", "disabled"}:
+            return False, f"status={status}"
+        presence_types = self._character_presence_types(character)
+        if presence_types and "present" not in presence_types:
+            return False, "available_presence_types excludes present"
+        if chapter_num is not None:
+            debut = character.get("debut_chapter") or character.get("first_appearance_chapter")
+            exit_chapter = character.get("exit_chapter") or character.get("last_appearance_chapter")
+            try:
+                if debut is not None and int(chapter_num) < int(debut):
+                    return False, f"before debut_chapter={debut}"
+                if exit_chapter is not None and int(chapter_num) >= int(exit_chapter):
+                    return False, f"after exit_chapter={exit_chapter}"
+            except (TypeError, ValueError):
+                pass
+        return True, "eligible"
+
+    def _bucket_scene_participants(
+        self,
+        characters_data: List[Dict[str, Any]],
+        all_characters: List[Dict[str, Any]],
+        required_names: List[str],
+        chapter_num: Optional[int],
+    ) -> Dict[str, Any]:
+        by_name = {str(c.get("name")): c for c in all_characters if c.get("name")}
+        selected_by_name = {str(c.get("name")): c for c in characters_data if c.get("name")}
+        performers: List[Dict[str, Any]] = []
+        mentioned_characters: List[Dict[str, Any]] = []
+        background_characters: List[Dict[str, Any]] = []
+        unavailable_characters: List[Dict[str, Any]] = []
+        trace: List[Dict[str, Any]] = []
+        warnings: List[str] = []
+
+        def add_unique(bucket: List[Dict[str, Any]], character: Dict[str, Any]) -> None:
+            key = character.get("id") or character.get("name")
+            if not any((item.get("id") or item.get("name")) == key for item in bucket):
+                bucket.append(character)
+
+        for char in characters_data:
+            can_perform, reason = self._can_character_perform(char, chapter_num)
+            if can_perform:
+                add_unique(performers, char)
+                trace.append({"character": char.get("name"), "bucket": "performers", "reason": reason})
+            else:
+                presence_types = self._character_presence_types(char)
+                if "mentioned" in presence_types or str(char.get("status") or "").lower() == "inactive":
+                    add_unique(mentioned_characters, char)
+                    trace.append({"character": char.get("name"), "bucket": "mentioned_characters", "reason": reason})
+                else:
+                    add_unique(unavailable_characters, char)
+                    trace.append({"character": char.get("name"), "bucket": "unavailable_characters", "reason": reason})
+                    warnings.append(f"角色 {char.get('name')} 不满足正面出场条件：{reason}")
+
+        for name in required_names:
+            char = selected_by_name.get(name) or by_name.get(name)
+            if not char:
+                warnings.append(f"大纲要求角色 {name}，但角色库未匹配到")
+                trace.append({"character": name, "bucket": "unavailable_characters", "reason": "not_found"})
+                unavailable_characters.append({"name": name, "reason": "not_found"})
+                continue
+            can_perform, reason = self._can_character_perform(char, chapter_num)
+            if can_perform:
+                add_unique(performers, char)
+                trace.append({"character": char.get("name"), "bucket": "performers", "reason": "required_character"})
+            else:
+                add_unique(mentioned_characters, char)
+                trace.append({"character": char.get("name"), "bucket": "mentioned_characters", "reason": f"required_but_{reason}"})
+                warnings.append(f"大纲要求角色 {name}，但当前只能提及：{reason}")
+
+        for char in characters_data:
+            if char in performers or char in mentioned_characters or char in unavailable_characters:
+                continue
+            add_unique(background_characters, char)
+            trace.append({"character": char.get("name"), "bucket": "background_characters", "reason": "not_selected_for_front_stage"})
+
+        return {
+            "performers": performers,
+            "mentioned_characters": mentioned_characters,
+            "background_characters": background_characters,
+            "unavailable_characters": unavailable_characters,
+            "participation_trace": trace,
+            "participation_warnings": warnings,
+        }
 
     async def _prepare_multi_character_scene_inputs(
         self,
@@ -4569,6 +5672,10 @@ class WorkflowEngine:
                 plot_focus=scene_directions.get("plot_focus", ""),
             )
 
+            required_names = self._extract_required_character_names(scene_directions)
+            if required_names:
+                scene_ctx.involved_characters = list({*(scene_ctx.involved_characters or []), *required_names})
+
             selector = get_character_selector()
             characters_data = await selector.select_characters(
                 all_characters=all_characters,
@@ -4576,6 +5683,7 @@ class WorkflowEngine:
                 previous_characters=previous_characters,
                 director_guidance=scene_directions.get("character_guidance"),
                 max_characters=node_config.get("max_characters", 5),
+                required_characters=required_names,
             )
             logger.info(f"智能选择角色: {[c.get('name') for c in characters_data]}")
 
@@ -4598,6 +5706,34 @@ class WorkflowEngine:
                     "traits": [],
                     "role_in_scene": scene_directions.get("background_role", "背景群众"),
                 })
+
+        required_names = self._extract_required_character_names(scene_directions)
+        if characters_data or all_characters or required_names:
+            buckets = self._bucket_scene_participants(
+                characters_data=characters_data,
+                all_characters=all_characters,
+                required_names=required_names,
+                chapter_num=execution.context.get("chapter_num"),
+            )
+            characters_data = [*buckets["performers"], *buckets["background_characters"]]
+            scene_directions["performers"] = buckets["performers"]
+            scene_directions["mentioned_characters"] = buckets["mentioned_characters"]
+            scene_directions["background_characters"] = buckets["background_characters"]
+            scene_directions["unavailable_characters"] = buckets["unavailable_characters"]
+            scene_directions["participation_trace"] = buckets["participation_trace"]
+            scene_directions["participation_warnings"] = buckets["participation_warnings"]
+            get_workflow_state(execution).merge_runtime_state(
+                {
+                    "scene_directions": scene_directions,
+                    "performers": buckets["performers"],
+                    "mentioned_characters": buckets["mentioned_characters"],
+                    "background_characters": buckets["background_characters"],
+                    "unavailable_characters": buckets["unavailable_characters"],
+                    "participation_trace": buckets["participation_trace"],
+                    "participation_warnings": buckets["participation_warnings"],
+                },
+                source="scene_participant_bucketing",
+            )
 
         return {
             "node_config": node_config,
@@ -4741,6 +5877,12 @@ class WorkflowEngine:
                 "scene_type": scene_directions.get("scene_type", "interactive"),
                 "characters": performance_result.get("characters") or [c.get("name", "未知") for c in characters_data],
                 "messages": performance_messages,
+                "performers": scene_directions.get("performers", []),
+                "mentioned_characters": scene_directions.get("mentioned_characters", []),
+                "background_characters": scene_directions.get("background_characters", []),
+                "unavailable_characters": scene_directions.get("unavailable_characters", []),
+                "participation_trace": scene_directions.get("participation_trace", []),
+                "participation_warnings": scene_directions.get("participation_warnings", []),
                 "timestamp": datetime.now().isoformat(),
             })
 
@@ -4777,9 +5919,11 @@ class WorkflowEngine:
                 "messages": performance_messages,
                 "full_content": performance_result.get("full_content", ""),
                 "iteration_count": actual_iterations,
-                "word_count": actual_word_count,
-                "target_word_count": target_word_count,
+                "performance_word_count": actual_word_count,
+                "performance_target_word_count": target_word_count,
                 "performance_result": performance_result,
+                "participation_trace": scene_directions.get("participation_trace", []),
+                "participation_warnings": scene_directions.get("participation_warnings", []),
             }
         except Exception as e:
             logger.error(f"多角色场景执行失败: {e}")
@@ -5081,6 +6225,9 @@ class WorkflowEngine:
                 "participants": discussion_result.get("participants", []),
                 "timestamp": discussion_result.get("timestamp") or datetime.now().isoformat(),
                 "status": discussion_result.get("status", "completed"),
+                "constraint_warnings": discussion_result.get("constraint_warnings", []),
+                "character_constraints": discussion_result.get("character_constraints", {}),
+                "contains_unconfirmed_character_material": discussion_result.get("contains_unconfirmed_character_material", False),
             },
         }
         bundle["persistence_preview"] = self._build_discussion_asset_preview(bundle)
@@ -5106,6 +6253,8 @@ class WorkflowEngine:
             "character_count": len(bundle.get("character_candidates", [])),
             "character_location_update_count": len(bundle.get("character_location_updates", [])),
             "state_change_count": len(bundle.get("state_changes", [])),
+            "constraint_warnings": bundle.get("source_metadata", {}).get("constraint_warnings", []),
+            "contains_unconfirmed_character_material": bundle.get("source_metadata", {}).get("contains_unconfirmed_character_material", False),
         }
 
         discussion_result["discussion_assets"] = bundle
@@ -5744,6 +6893,111 @@ class WorkflowEngine:
             await self._broadcast_status(execution.id, "discussion_assets_persist_failed", self._make_json_safe(state))
             return state
 
+    def _character_name_set(self, characters: Any) -> set[str]:
+        names: set[str] = set()
+        for character in self._ensure_context_list(characters):
+            if isinstance(character, dict):
+                name = character.get("name") or character.get("character_name") or character.get("id")
+            else:
+                name = character
+            if name not in (None, ""):
+                names.add(str(name))
+        return names
+
+    def _build_character_constraint_state(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """构建下游 Agent 共享的角色出场硬约束。"""
+        scene_directions = self._ensure_context_dict(context.get("scene_directions"))
+        performers = scene_directions.get("performers") or context.get("performers") or []
+        mentioned = scene_directions.get("mentioned_characters") or context.get("mentioned_characters") or []
+        unavailable = scene_directions.get("unavailable_characters") or context.get("unavailable_characters") or []
+        background = scene_directions.get("background_characters") or context.get("background_characters") or []
+        trace = scene_directions.get("participation_trace") or context.get("participation_trace") or []
+        warnings = scene_directions.get("participation_warnings") or context.get("participation_warnings") or []
+
+        performer_names = self._character_name_set(performers)
+        background_names = self._character_name_set(background)
+        mentioned_names = self._character_name_set(mentioned)
+        unavailable_names = self._character_name_set(unavailable)
+        hard_blocked_names = sorted((mentioned_names | unavailable_names) - (performer_names | background_names))
+
+        return {
+            "performers": performers,
+            "background_characters": background,
+            "mentioned_characters": mentioned,
+            "unavailable_characters": unavailable,
+            "present_character_names": sorted(performer_names | background_names),
+            "mentioned_only_names": sorted(mentioned_names - performer_names - background_names),
+            "forbidden_direct_appearance_names": hard_blocked_names,
+            "participation_trace": trace,
+            "participation_warnings": warnings,
+            "rules": [
+                "只有 present_character_names 中的角色可以在当前正面场景中说话、行动或直接参与互动。",
+                "mentioned_only_names 只能作为传闻、回忆、姓名、势力、影响或背景信息被提及，不能直接出场、发言或行动。",
+                "forbidden_direct_appearance_names 包含死亡、未激活、退场、章节外或不可用角色；这些角色不得被写成当前场景中的活人参与者。",
+                "如果讨论素材、场景演绎或写作计划引入未授权角色，必须视为未确认素材并跳过或改写。",
+                "角色来源、历史、身份和背景必须服从 selected_lore_entries 中 category=character_setting 的设定。",
+            ],
+        }
+
+    def _inject_character_constraints(self, context: Dict[str, Any]) -> None:
+        constraints = self._build_character_constraint_state(context)
+        if any(constraints.get(key) for key in ("performers", "mentioned_characters", "unavailable_characters", "forbidden_direct_appearance_names")):
+            context["character_constraints"] = constraints
+            context.setdefault("participation_trace", constraints.get("participation_trace", []))
+            context.setdefault("participation_warnings", constraints.get("participation_warnings", []))
+
+    def _sanitize_discussion_result_against_constraints(
+        self,
+        discussion_result: Dict[str, Any],
+        constraints: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """标记讨论输出中涉及禁止正面出场角色的风险，避免下游当成已确认事实。"""
+        forbidden_names = [name for name in constraints.get("forbidden_direct_appearance_names", []) if name]
+        if not forbidden_names:
+            return discussion_result
+
+        text = "\n".join(
+            str(message.get("content") or "")
+            for message in discussion_result.get("messages", []) or []
+            if isinstance(message, dict)
+        )
+        flagged = [name for name in forbidden_names if name and name in text]
+        if flagged:
+            warnings = discussion_result.setdefault("constraint_warnings", [])
+            warnings.append(
+                "讨论内容提到了不可正面出场角色，仅允许作为背景/传闻/回忆处理，不得作为已确认正面出场事实："
+                + "、".join(flagged)
+            )
+            discussion_result["character_constraints"] = constraints
+            discussion_result["contains_unconfirmed_character_material"] = True
+        return discussion_result
+
+    def _format_context_for_prompt(self, value: Any, max_chars: int = 4000) -> str:
+        if value in (None, "", [], {}):
+            return ""
+        try:
+            text = json.dumps(value, ensure_ascii=False, indent=2)
+        except TypeError:
+            text = str(value)
+        text = text.strip()
+        if len(text) > max_chars:
+            return text[:max_chars] + "\n（因长度限制已截取，保留前部结构化信息）"
+        return text
+
+    def _format_agent_constraint_context(self, context: Dict[str, Any]) -> str:
+        constraints = self._build_character_constraint_state(context)
+        selected_lore = self._ensure_context_list(context.get("selected_lore_entries") or context.get("dynamic_lore_entries") or [])
+        character_setting_lore = [
+            entry for entry in selected_lore
+            if isinstance(entry, dict) and str(entry.get("category") or "").lower() == "character_setting"
+        ]
+        sections: List[str] = []
+        if any(constraints.get(key) for key in ("present_character_names", "mentioned_only_names", "forbidden_direct_appearance_names")):
+            sections.append("【角色出场硬约束】\n" + self._format_context_for_prompt(constraints, max_chars=3500))
+        if character_setting_lore:
+            sections.append("【角色设定库条目（来源/历史/身份必须遵守）】\n" + self._format_context_for_prompt(character_setting_lore, max_chars=3000))
+        return "\n\n".join(sections)
+
     async def _execute_group_discussion_node(
         self,
         node: WorkflowNode,
@@ -5782,6 +7036,8 @@ class WorkflowEngine:
             result = await self._execute_meeting_discussion(node, execution, db)
 
         if result.get("status") in {"completed", "waiting_confirmation"}:
+            discussion_constraints = self._build_character_constraint_state(execution.context)
+            result = self._sanitize_discussion_result_against_constraints(result, discussion_constraints)
             discussion_bundle = self._build_discussion_asset_bundle(
                 execution=execution,
                 discussion_result=result,
@@ -6059,15 +7315,25 @@ class WorkflowEngine:
                     "is_leader": agent_type == LEADER_AGENT,
                 })
 
-            # 获取角色列表
-            characters = execution.context.get("characters", [])
-            if characters and isinstance(characters[0], dict):
-                characters = [c.get("name", "未知角色") for c in characters]
+            # 获取角色列表：讨论阶段只能把可正面出场的角色作为参会/分析对象，死亡或未激活角色仅进入约束说明。
+            constraints = self._build_character_constraint_state(execution.context)
+            present_names = constraints.get("present_character_names") or []
+            characters = present_names
+            if not characters:
+                characters = [
+                    c.get("name", "未知角色")
+                    for c in self._ensure_context_list(execution.context.get("characters", []))
+                    if isinstance(c, dict) and self._can_character_perform(c, execution.context.get("chapter_num"))[0]
+                ]
 
             if not characters and db:
                 try:
                     chars = await db.get_all_characters(execution.project_id)
-                    characters = [c.get("name", "未知角色") for c in chars] if chars else []
+                    characters = [
+                        c.get("name", "未知角色")
+                        for c in (chars or [])
+                        if isinstance(c, dict) and self._can_character_perform(c, execution.context.get("chapter_num"))[0]
+                    ]
                 except Exception as e:
                     logger.warning(f"获取角色失败: {e}")
 
@@ -6105,7 +7371,8 @@ class WorkflowEngine:
             if leader_agent:
                 opening_message = await self._generate_leader_opening(
                     leader_agent, chapter_title, current_plot_summary,
-                    written_content, plot_outline, evaluation_result, participants
+                    written_content, plot_outline, evaluation_result, participants,
+                    context=execution.context,
                 )
                 if opening_message:
                     discussion_messages.append(opening_message)
@@ -6348,6 +7615,7 @@ class WorkflowEngine:
         plot_outline: List,
         evaluation_result: Dict,
         participants: List[Dict],
+        context: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         领头人开启会话
@@ -6359,7 +7627,8 @@ class WorkflowEngine:
         """
         try:
             participant_names = [p["name"] for p in participants if not p.get("is_leader")]
-
+            context = context or {}
+            constraint_text = self._format_agent_constraint_context(context)
             prompt = f"""你是总编剧（讨论领头人），现在正式开启《{chapter_title}》创作讨论会。
 
 【参会人员】
@@ -6371,6 +7640,15 @@ class WorkflowEngine:
 
 【评估结果】
 评分: {evaluation_result.get('score', 'N/A')}/10
+
+【工作流角色/设定约束】
+{constraint_text if constraint_text else '当前未形成额外角色出场约束。'}
+
+【讨论要求】
+- 本次讨论只能围绕绑定章节大纲、已检索设定和已有工作流状态提出建议。
+- 不要把未在大纲、角色库、设定库或已确认资产中出现的人名/组织/概念当成事实。
+- 死亡、未激活、退场或不可用角色不能作为当前场景参与者，只能按约束作为传闻、回忆、势力影响或姓名被提及。
+- 角色来源、历史、身份必须遵守角色设定库条目；如果缺少角色设定，应标记“缺失设定”，不要自行补写。
 
 请输出你的开场发言，宣布讨论开始，说明本次讨论的目标和重点。
 格式要求：
@@ -6796,8 +8074,13 @@ class WorkflowEngine:
                 characters=characters_formatted,
             )
 
+            context_constraint_text = self._format_agent_constraint_context(context)
+
             # 添加章节内容（重要：让Agent有具体的分析对象）
-            if written_content:
+            if context_constraint_text:
+                prompt += f"\n\n{context_constraint_text}\n\n【硬性讨论边界】\n- 讨论建议必须服从上述角色出场硬约束和角色设定库。\n- 不得把死亡、未激活、退场或不可用角色写成当前场景的正面参与者。\n- 不得新增未在大纲、角色库、设定库或已确认资产中出现的人名/组织/概念作为事实。\n- 如果发现上游素材违反角色状态或角色设定，应明确要求跳过或改写。"
+
+            # 添加章节内容（重要：让Agent有具体的分析对象）
                 prompt += f"\n\n【章节内容（用于分析）】\n{written_content}"
 
             # 添加世界观设定
@@ -8341,7 +9624,7 @@ class WorkflowEngine:
 
             workflow = await self.get_workflow(execution.workflow_id, db)
             if workflow:
-                asyncio.create_task(self._run_workflow(execution_id, workflow, db))
+                self._start_workflow_task(execution_id, workflow, db)
 
             return {
                 "success": True,
@@ -8602,13 +9885,21 @@ class WorkflowEngine:
     def _serialize_for_json(self, obj: Any) -> Any:
         """递归序列化对象，处理 UUID 等非 JSON 类型"""
         import uuid
-        from datetime import datetime
+        from datetime import date, datetime
+        from decimal import Decimal
+        from enum import Enum
         from types import MappingProxyType
 
-        if isinstance(obj, uuid.UUID):
+        if isinstance(obj, uuid.UUID) or obj.__class__.__name__ == 'UUID':
             return str(obj)
         elif isinstance(obj, datetime):
             return obj.isoformat()
+        elif isinstance(obj, date):
+            return obj.isoformat()
+        elif isinstance(obj, Decimal):
+            return float(obj)
+        elif isinstance(obj, Enum):
+            return obj.value
         elif isinstance(obj, MappingProxyType):
             # 处理 mappingproxy 类型
             return dict(obj)

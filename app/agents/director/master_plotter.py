@@ -12,6 +12,7 @@ from app.agents.base import BaseAgent, AgentResponse
 from app.models.agent_output_schemas import (
     MasterPlotterAdvanceSchema,
     MasterPlotterPlanSchema,
+    MasterPlotterWritingPlanSchema,
 )
 from app.models.agent_template import AgentType
 from app.models.token_usage import UsageCategory
@@ -251,6 +252,8 @@ class MasterPlotterAgent(BaseAgent):
 
             if task == "plan_plot":
                 return await self._execute_plot_planning(input_data)
+            if task in {"prepare_writing_plan", "writing_plan", "chapter_workflow_plan"}:
+                return await self._execute_writing_plan(input_data)
 
             # 默认：剧情推进评估
             main_plot_progress = input_data.get("main_plot_progress", 0.0)
@@ -302,6 +305,129 @@ class MasterPlotterAgent(BaseAgent):
         except Exception as e:
             logger.error(f"MasterPlotterAgent 执行失败：{e}")
             return AgentResponse(success=False, error=str(e))
+
+    def _format_context_block(self, title: str, value: Any, max_chars: Optional[int] = None) -> str:
+        if value in (None, "", [], {}):
+            return ""
+        if isinstance(value, str):
+            text = value
+        else:
+            try:
+                import json
+                text = json.dumps(value, ensure_ascii=False, indent=2)
+            except TypeError:
+                text = str(value)
+        text = text.strip()
+        if not text:
+            return ""
+        return f"【{title}】\n{text}"
+
+    async def _execute_writing_plan(self, input_data: Dict[str, Any]) -> AgentResponse:
+        """为章节写作工作流生成索引/检查/写作计划，不覆盖章节事实源。"""
+        chapter_outline = self._as_dict(input_data.get("chapter_outline", {}))
+        chapter_goals = input_data.get("chapter_goals") or input_data.get("chapter_goal")
+        scene_directions = input_data.get("scene_directions")
+        performance_result = input_data.get("performance_result")
+        fixed_lore_entries = self._as_list(input_data.get("fixed_lore_entries", []))
+        dynamic_lore_entries = self._as_list(
+            input_data.get("dynamic_lore_entries") or input_data.get("selected_lore_entries") or []
+        )
+        previous_chapters = self._as_list(input_data.get("previous_chapters", []))
+        existing_hooks = self._as_list(input_data.get("existing_hooks", input_data.get("hooks", [])))
+        characters = self._as_list(input_data.get("characters", []))
+        target_word_count = input_data.get("target_word_count") or input_data.get("chapter_target_word_count")
+        world_info = self._as_dict(input_data.get("world_info", {}))
+
+        character_constraints = input_data.get("character_constraints")
+
+        blocks = [
+            self._format_context_block("绑定章节大纲（事实源，不可改写）", chapter_outline),
+            self._format_context_block("章节目标", chapter_goals),
+            self._format_context_block("目标字数", target_word_count),
+            self._format_context_block("世界/项目规则", world_info),
+            self._format_context_block("固定最高级设定", fixed_lore_entries),
+            self._format_context_block("本章动态设定", dynamic_lore_entries),
+            self._format_context_block("角色出场硬约束", character_constraints),
+            self._format_context_block("场景方向", scene_directions),
+            self._format_context_block("场景演绎素材", performance_result),
+            self._format_context_block("前文概要", previous_chapters, max_chars=2500),
+            self._format_context_block("现有伏笔", existing_hooks, max_chars=2500),
+            self._format_context_block("角色状态", characters, max_chars=2500),
+        ]
+        context_text = "\n\n".join(block for block in blocks if block)
+
+        prompt = f"""你是章节工作流中的总编剧索引员。你的职责是整理上游状态，给 Writer 提供写作计划、检查清单和冲突提示。
+
+{context_text if context_text else '（暂无上游上下文）'}
+
+【硬性规则】
+1. 绑定章节大纲是事实输入源，不能改写、替换或另起剧情。
+2. 固定最高级设定优先于动态设定；动态设定优先于场景演绎素材。
+3. 场景演绎素材只能作为写作素材，若与绑定大纲或固定设定冲突，必须标记冲突而不是采纳。
+4. 不要输出顶层 chapter_outline 或 chapter_goals；如确实需要修订，只能放入 suggested_chapter_outline / suggested_chapter_goals。
+5. 角色出场硬约束优先级高于场景演绎素材和集体讨论素材：只有 present_character_names 可作为当前场景正面参与者。
+6. mentioned_only_names / forbidden_direct_appearance_names 中的角色只能作为传闻、回忆、姓名、势力或影响被提及，不能安排其直接出场、发言或行动。
+7. 角色来源、历史、身份和背景必须遵守 category=character_setting 的设定；如素材冲突，写入 rewrite_or_skip / avoid，而不是采纳。
+8. 不要引入项目设定中不存在的通用修真/玄幻规则。
+
+请输出 JSON：
+{{
+  "writing_plan": {{
+    "chapter_focus": "本章核心焦点",
+    "opening": "开篇承接方式",
+    "middle_beats": ["中段剧情节拍"],
+    "ending": "收束方式",
+    "target_word_count": {target_word_count or 0}
+  }},
+  "plot_guidance": {{
+    "must_include": ["必须出现的大纲要点"],
+    "avoid": ["必须避免的偏离/冲突"],
+    "hook_usage": ["可承接或新埋伏笔建议"]
+  }},
+  "scene_integration_plan": {{
+    "use_from_performance": ["可整合的场景演绎素材"],
+    "rewrite_or_skip": ["需改写或跳过的素材"]
+  }},
+  "required_elements_check": {{
+    "outline_elements": [{{"item": "要素", "status": "covered/missing/conflict", "note": "说明"}}],
+    "setting_elements": [{{"item": "设定", "status": "covered/missing/conflict", "note": "说明"}}]
+  }},
+  "outline_adherence_notes": ["大纲遵循提示"],
+  "setting_conflict_warnings": ["设定冲突警告"],
+  "suggested_chapter_outline": null,
+  "suggested_chapter_goals": null
+}}"""
+
+        try:
+            parsed = await self._call_structured(
+                MasterPlotterWritingPlanSchema,
+                messages=[HumanMessage(content=prompt)],
+                temperature=0.4,
+                category=UsageCategory.PLOT,
+            )
+            result = parsed.model_dump()
+            result.pop("chapter_outline", None)
+            result.pop("chapter_goals", None)
+            return AgentResponse(success=True, data=result)
+        except StructuredOutputError as e:
+            logger.error(f"章节写作计划 structured 失败: {e}")
+            return AgentResponse(success=False, error=str(e))
+        except Exception as e:
+            logger.error(f"章节写作计划失败: {e}")
+            return AgentResponse(
+                success=True,
+                data={
+                    "writing_plan": {
+                        "chapter_focus": chapter_outline.get("summary") or self._as_text(chapter_goals),
+                        "target_word_count": target_word_count,
+                    },
+                    "plot_guidance": {"must_include": [], "avoid": []},
+                    "scene_integration_plan": {"use_from_performance": [], "rewrite_or_skip": []},
+                    "required_elements_check": {},
+                    "outline_adherence_notes": ["写作计划生成失败，使用绑定大纲作为保底事实源"],
+                    "setting_conflict_warnings": [],
+                },
+            )
 
     async def _execute_plot_planning(self, input_data: Dict[str, Any]) -> AgentResponse:
         """

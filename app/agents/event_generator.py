@@ -117,9 +117,12 @@ class EventGeneratorAgent(BaseAgent):
         """
         task = input_data.get("task", "generate")
         event_type = input_data.get("event_type", "random")
-        context = input_data.get("context", {})
-        characters = input_data.get("characters", [])
-        world_info = input_data.get("world_info", {})
+        raw_context = input_data.get("context")
+        context = dict(input_data)
+        if isinstance(raw_context, dict):
+            context.update(raw_context)
+        characters = input_data.get("characters") or context.get("characters", [])
+        world_info = input_data.get("world_info") or context.get("world_info", {})
 
         try:
             if task == "pool":
@@ -161,6 +164,38 @@ class EventGeneratorAgent(BaseAgent):
             logger.error(f"事件生成失败: {e}")
             return AgentResponse(success=False, error=str(e))
 
+    def _format_outline_text(self, outline: Any) -> str:
+        if isinstance(outline, dict):
+            parts = []
+            title = outline.get("title")
+            summary = outline.get("summary")
+            goals = outline.get("chapter_goals") or []
+            hooks = outline.get("hooks_planted") or []
+            scenes = outline.get("scenes") or []
+
+            if title:
+                parts.append(f"标题：{title}")
+            if summary:
+                parts.append(f"摘要：{summary}")
+            if goals:
+                parts.append("章节目标：" + "；".join(str(goal) for goal in goals if goal))
+            if hooks:
+                parts.append("计划伏笔：" + "；".join(str(hook) for hook in hooks if hook))
+            if scenes:
+                scene_lines = []
+                for scene in scenes:
+                    if not isinstance(scene, dict):
+                        continue
+                    scene_title = scene.get("title") or f"场景{scene.get('scene_number', '')}"
+                    scene_summary = scene.get("summary") or ""
+                    key_events = scene.get("key_events") or []
+                    event_text = f"；关键事件：{'、'.join(str(event) for event in key_events if event)}" if key_events else ""
+                    scene_lines.append(f"- {scene_title}: {scene_summary}{event_text}")
+                if scene_lines:
+                    parts.append("场景安排：\n" + "\n".join(scene_lines))
+            return "\n".join(parts) if parts else str(outline)
+        return str(outline) if outline else "无章节大纲"
+
     def _build_generation_prompt(
         self,
         event_type: str,
@@ -177,7 +212,10 @@ class EventGeneratorAgent(BaseAgent):
             if c
         ]
 
+        chapter_num = context.get("chapter_num") or context.get("chapter_number")
+        chapter_title = context.get("chapter_title")
         chapter_outline = context.get("chapter_outline") or context.get("main_scene") or context.get("plot_focus") or "无章节大纲"
+        outline_text = self._format_outline_text(chapter_outline)
         chapter_goals = context.get("chapter_goals") or []
         lore_entries = context.get("lore_entries") or []
         lore_titles = []
@@ -189,7 +227,11 @@ class EventGeneratorAgent(BaseAgent):
             elif isinstance(entry, str):
                 lore_titles.append(entry)
 
-        prompt = f"""请基于当前项目上下文生成一个事件。
+        prompt = f"""请基于当前项目上下文生成一个服务于当前章节的事件。
+
+【当前章节】
+- 章节号：{chapter_num or '未提供'}
+- 章节标题：{chapter_title or (chapter_outline.get('title') if isinstance(chapter_outline, dict) else '未提供')}
 
 【世界观】
 - 世界：{world_name}
@@ -198,8 +240,8 @@ class EventGeneratorAgent(BaseAgent):
 【章节目标】
 {chapter_goals if chapter_goals else '未提供'}
 
-【当前剧情焦点】
-{chapter_outline}
+【当前章节大纲】
+{outline_text}
 
 【相关角色】
 {', '.join(character_names) if character_names else '无特定角色'}
@@ -211,9 +253,11 @@ class EventGeneratorAgent(BaseAgent):
 {context.get('situation', '无特定情境')}
 
 要求：
-1. 事件必须严格贴合当前世界观与章节目标，禁止套用默认奇幻冒险套路。
-2. 如果上下文体现了明确题材（如赛博朋克、科幻、都市、武侠等），事件必须使用对应题材语言和要素。
-3. 参与者、触发条件、后果要尽量引用已有角色、设定和剧情目标。
-4. 输出 JSON 格式。"""
+1. 事件必须严格贴合当前章节大纲与章节目标，只能服务当前章节写作。
+2. 不要生成跨到后续章节的重大新主线；如果字段需要 suggested_chapter，必须填写当前章节号或当前章节标题。
+3. 不得把中后期高潮事件提前到当前章节；不得覆盖大纲中的既定事件。
+4. 参与者、触发条件、后果要优先引用大纲中的角色、场景、关键事件和计划伏笔。
+5. 如果当前章节只是铺垫/觉醒/初遇，事件也应保持相同叙事阶段，不要升级为最终阴谋揭示。
+6. 输出 JSON 格式。"""
 
         return prompt

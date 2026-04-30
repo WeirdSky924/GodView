@@ -112,6 +112,7 @@ async def get_lore_categories():
         {"value": "culture", "label": "文化习俗"},
         {"value": "race", "label": "种族设定"},
         {"value": "profession", "label": "职业/阶层"},
+        {"value": "character_setting", "label": "角色设定"},
         {"value": "item", "label": "物品/装备"},
         {"value": "skill", "label": "技能/能力"},
         {"value": "custom", "label": "自定义"},
@@ -213,6 +214,17 @@ async def create_lore(lore: LoreEntry):
 
     if not postgres_db:
         raise HTTPException(status_code=503, detail="数据库未连接")
+
+    duplicate = None
+    if hasattr(postgres_db, "find_duplicate_lore"):
+        duplicate = await postgres_db.find_duplicate_lore(lore.project_id, lore.title, lore.content)
+    if duplicate:
+        return {
+            "success": True,
+            "id": str(duplicate.get("id")),
+            "duplicate": True,
+            "message": f"设定 '{lore.title}' 已存在，已复用现有条目",
+        }
 
     # 始终生成新的 UUID（忽略前端传入的 ID）
     lore_id = str(uuid.uuid4())

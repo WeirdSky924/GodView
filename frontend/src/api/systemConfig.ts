@@ -15,6 +15,41 @@ export interface SystemConfig {
 // 缓存配置，避免重复请求
 let cachedConfig: SystemConfig | null = null
 
+function sameMachineWsBaseUrl() {
+  return `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`
+}
+
+function resolveBrowserWsBaseUrl(configuredUrl?: string) {
+  if (!configuredUrl) return sameMachineWsBaseUrl()
+
+  try {
+    const url = new URL(configuredUrl)
+    const browserHost = window.location.hostname
+    const configuredHost = url.hostname
+    const configuredPort = url.port
+
+    if (
+      configuredHost === 'localhost' ||
+      configuredHost === '127.0.0.1' ||
+      configuredHost === '0.0.0.0'
+    ) {
+      return sameMachineWsBaseUrl()
+    }
+
+    if (window.location.protocol === 'https:' && url.protocol === 'ws:') {
+      url.protocol = 'wss:'
+    }
+
+    if (configuredPort === '80' || configuredPort === '443') {
+      url.port = ''
+    }
+
+    return url.toString().replace(/\/$/, '')
+  } catch {
+    return sameMachineWsBaseUrl()
+  }
+}
+
 /**
  * 获取系统配置
  */
@@ -33,7 +68,7 @@ export async function getSystemConfig(): Promise<SystemConfig> {
       app_name: 'Godview',
       app_version: '1.0.0',
       api_base_url: window.location.origin,
-      ws_base_url: `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`,
+      ws_base_url: sameMachineWsBaseUrl(),
     }
     cachedConfig = defaultConfig
     return defaultConfig
@@ -45,7 +80,7 @@ export async function getSystemConfig(): Promise<SystemConfig> {
  */
 export async function getWsBaseUrl(): Promise<string> {
   const config = await getSystemConfig()
-  return config.ws_base_url
+  return resolveBrowserWsBaseUrl(config.ws_base_url)
 }
 
 /**

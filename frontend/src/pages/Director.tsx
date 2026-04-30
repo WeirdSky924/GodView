@@ -5,6 +5,7 @@ import { useDynamicWebSocket } from '@/hooks/useWebSocket'
 import { getDirectorState, getSnapshotTree } from '@/api/director'
 import { getCharacters } from '@/api/characters'
 import {
+  getActiveWorkflowExecution,
   getWorkflows,
   getExecution,
   createWorkflowExecutionEventSource,
@@ -12,11 +13,12 @@ import {
   type WorkflowExecution,
   type WorkflowEventMessage,
 } from '@/api/workflows'
+import { getOutlines, type ChapterOutline, type OutlineStatus } from '@/api/outlines'
 import { useWorkflowAgents, type AgentStatus, getAgentDisplayName } from '@/hooks/useWorkflowAgents'
 import {
   Play, Pause, RotateCcw, Target, BookOpen, MessageSquare, GitBranch, Settings,
   Sparkles, FileText, Network, FolderOpen, UserPlus, UserMinus, Users, ChevronDown,
-  ChevronUp, Send, X, Circle, Copy, Check, Shield, Zap, Brain
+  ChevronUp, Send, X, Circle, Copy, Check, Shield, Zap, Brain, Keyboard
 } from 'lucide-react'
 import { useProject } from '@/contexts/ProjectContext'
 import { useTheme } from '@/contexts/ThemeContext'
@@ -32,6 +34,33 @@ import VolumePlanner from '@/components/VolumePlanner'
 // ==================== Types ====================
 
 type WorkflowOrigin = 'project' | 'global_template'
+type AutoOutlineMode = 'selected' | 'auto_progression'
+
+type PendingUserInput = {
+  node_id: string
+  node_type?: string
+  label?: string
+  description?: string
+  prompt?: string
+  input_key?: string
+  input_type?: string
+  placeholder?: string
+  required?: boolean
+  default_value?: string
+}
+
+
+const OUTLINE_STATUS_CONFIG: Record<OutlineStatus, { label: string; className: string }> = {
+  draft: { label: '草稿', className: 'bg-gray-100 text-gray-700' },
+  approved: { label: '已审批', className: 'bg-green-100 text-green-700' },
+  in_writing: { label: '写作中', className: 'bg-blue-100 text-blue-700' },
+  completed: { label: '已完成', className: 'bg-purple-100 text-purple-700' },
+  revision: { label: '需修改', className: 'bg-orange-100 text-orange-700' },
+}
+
+function isOutlineWritable(outline?: ChapterOutline | null) {
+  return !!outline && ['draft', 'approved', 'revision'].includes(outline.status)
+}
 
 interface SnapshotNode {
   id: string
@@ -183,23 +212,31 @@ function isWorkflowExecutionEventType(type?: string): boolean {
     'group_discussion_started',
     'discussion_message',
     'discussion_ended',
+    'user_input_required',
+    'user_input_received',
     'intervention_queued',
     'intervention_applied',
   ].includes(type || '')
 }
 
-function extractNodeOutputText(outputData?: Record<string, any>): string | null {
-  if (!outputData || Object.keys(outputData).length === 0) {
+function extractNodeOutputText(outputData?: unknown): string | null {
+  if (typeof outputData === 'string') {
+    return outputData.trim() ? outputData : null
+  }
+
+  if (!outputData || typeof outputData !== 'object' || Object.keys(outputData).length === 0) {
     return null
   }
 
+  const data = outputData as Record<string, any>
   const preferredOutput =
-    outputData.output ??
-    outputData.content ??
-    outputData.result ??
-    outputData.response ??
-    outputData.text ??
-    outputData.chapter_content
+    data.output ??
+    data.content ??
+    data.result ??
+    data.response ??
+    data.text ??
+    data.message ??
+    data.chapter_content
 
   if (typeof preferredOutput === 'string' && preferredOutput.trim()) {
     return preferredOutput
@@ -211,7 +248,7 @@ function extractNodeOutputText(outputData?: Record<string, any>): string | null 
       : JSON.stringify(preferredOutput, null, 2)
   }
 
-  return JSON.stringify(outputData, null, 2)
+  return JSON.stringify(data, null, 2)
 }
 
 function getExecutionIdFromPayload(payload: any): string | null {
@@ -272,6 +309,18 @@ function getPreferredWorkflowId(workflows: WorkflowDefinition[], currentWorkflow
   }
 
   return workflows[0]?.id || ''
+}
+
+function getDirectorStorageKey(projectId: string, key: 'workflow' | 'execution'): string {
+  return `godview.director.${projectId}.${key}`
+}
+
+function isTerminalExecutionStatus(status?: string): boolean {
+  return ['completed', 'failed', 'cancelled'].includes(status || '')
+}
+
+function isActiveExecutionStatus(status?: string): boolean {
+  return ['running', 'paused', 'pending'].includes(status || '')
 }
 
 // Agent 状态指示器
@@ -759,6 +808,7 @@ export default function Director() {
   const [selectedWorkflowId, setSelectedWorkflowId] = useState('')
   const [executionId, setExecutionId] = useState('')
   const [isExecutionStreamReady, setIsExecutionStreamReady] = useState(false)
+  const pendingSnapshotRef = useRef<{ execution: WorkflowExecution; workflow: WorkflowDefinition | null } | null>(null)
 
   const selectedWorkflow = useMemo(
     () => getSelectedWorkflow(savedWorkflows, selectedWorkflowId),
@@ -804,9 +854,18 @@ export default function Director() {
     words_per_chapter: 2000,
     style_reference: '',
   })
+  const [chapterOutlines, setChapterOutlines] = useState<ChapterOutline[]>([])
+  const [outlinesLoading, setOutlinesLoading] = useState(false)
+  const [selectedSingleOutlineId, setSelectedSingleOutlineId] = useState('')
+  const [selectedAutoOutlineIds, setSelectedAutoOutlineIds] = useState<string[]>([])
+  const [autoOutlineMode, setAutoOutlineMode] = useState<AutoOutlineMode>('selected')
+  const [autoStartOutlineId, setAutoStartOutlineId] = useState('')
 
   // UI state
   const [showLogs, setShowLogs] = useState(true)
+
+  const [pendingUserInput, setPendingUserInput] = useState<PendingUserInput | null>(null)
+  const [workflowUserInput, setWorkflowUserInput] = useState('')
 
   // Character state
   const [availableCharacters, setAvailableCharacters] = useState<Array<{ id: string; name: string }>>([])
@@ -821,8 +880,6 @@ export default function Director() {
   // 生成单章 state
   const [showWriteChapterModal, setShowWriteChapterModal] = useState(false)
   const [chapterForm, setChapterForm] = useState({
-    title: '',
-    goal: '',
     targetWordCount: 2000,
   })
 
@@ -909,6 +966,18 @@ export default function Director() {
 
     setExecutionId(execution.id)
 
+    const pendingInput = execution.status === 'paused'
+      ? execution.context?.pending_user_input
+      : null
+    if (pendingInput?.node_id) {
+      setPendingUserInput(pendingInput as PendingUserInput)
+      setWorkflowUserInput(String(pendingInput.default_value || ''))
+      setIsGenerating(true)
+    } else {
+      setPendingUserInput(null)
+      setWorkflowUserInput('')
+    }
+
     Object.entries(execution.node_states || {}).forEach(([nodeId, nodeState]) => {
       const nodeData = getNodeDataFromWorkflowExecution(execution, nodeId, workflow)
       const nodeKey = getAgentStateKey(nodeData)
@@ -936,10 +1005,20 @@ export default function Director() {
       }
     })
 
-    if (execution.status === 'completed') {
+    if (isTerminalExecutionStatus(execution.status)) {
       setIsGenerating(false)
+    } else if (isActiveExecutionStatus(execution.status)) {
+      setIsGenerating(true)
     }
   }, [clearAgentStreaming, setAgentOutput, updateAgentFromNode, updateAgentStreaming])
+
+  useEffect(() => {
+    const pendingSnapshot = pendingSnapshotRef.current
+    if (!pendingSnapshot || pendingSnapshot.workflow?.id !== selectedWorkflowId) return
+
+    pendingSnapshotRef.current = null
+    applyWorkflowExecutionSnapshot(pendingSnapshot.execution, pendingSnapshot.workflow)
+  }, [applyWorkflowExecutionSnapshot, selectedWorkflowId])
 
   const applyDirectorEvent = useCallback((payload: any) => {
     const eventType = payload?.type
@@ -963,6 +1042,8 @@ export default function Director() {
       case 'workflow_completed': {
         addLog('✅ 工作流执行完成')
         setIsGenerating(false)
+        setPendingUserInput(null)
+        setWorkflowUserInput('')
         return true
       }
       case 'workflow_failed': {
@@ -971,7 +1052,14 @@ export default function Director() {
         return true
       }
       case 'workflow_paused': {
-        addLog('⏸️ 工作流已暂停')
+        const pendingInput = eventData?.pending_user_input || eventData?.pending_input
+        if (pendingInput?.node_id) {
+          setPendingUserInput(pendingInput as PendingUserInput)
+          setWorkflowUserInput(String(pendingInput.default_value || ''))
+          addLog(`⌨️ 工作流等待用户输入：${pendingInput.label || '用户输入'}`)
+        } else {
+          addLog('⏸️ 工作流已暂停')
+        }
         return true
       }
       case 'workflow_resumed': {
@@ -1057,6 +1145,19 @@ export default function Director() {
         }
         return true
       }
+      case 'user_input_required': {
+        setPendingUserInput(eventData as PendingUserInput)
+        setWorkflowUserInput(String(eventData?.default_value || ''))
+        addLog(`⌨️ 工作流等待用户输入：${eventData?.label || '用户输入'}`)
+        updateAgentFromNode(eventData, { status: 'working', message: '等待用户输入' })
+        return true
+      }
+      case 'user_input_received': {
+        setPendingUserInput(null)
+        setWorkflowUserInput('')
+        addLog('✅ 用户输入已提交，工作流继续执行')
+        return true
+      }
       case 'node_started': {
         const displayName = getNodeDisplayName(eventData)
         addLog(`🔄 ${displayName} 开始执行`)
@@ -1074,7 +1175,7 @@ export default function Director() {
       case 'node_completed': {
         const displayName = getNodeDisplayName(eventData)
         const nodeKey = getAgentStateKey(eventData)
-        const outputText = extractNodeOutputText(eventData.output_data)
+        const outputText = extractNodeOutputText(eventData.output_data ?? eventData.output)
 
         if (eventData.status === 'failed' || eventData.error) {
           addLog(`❌ ${displayName} 执行失败: ${eventData.error || '未知错误'}`)
@@ -1219,11 +1320,17 @@ export default function Director() {
             loadRuntimePanels()
             break
           case 'session_stopped':
-            addLog('会话已停止')
+            addLog('✅ 后端确认：导演会话已停止')
             setIsGenerating(false)
             setExecutionId('')
+            setPendingUserInput(null)
+            setWorkflowUserInput('')
             setIsExecutionStreamReady(false)
             setIsConnected(false)
+            if (currentProject) {
+              localStorage.removeItem(getDirectorStorageKey(currentProject.id, 'execution'))
+            }
+            sessionStartAttempted.current = false
             loadRuntimePanels()
             break
           case 'hooks_managed':
@@ -1252,6 +1359,13 @@ export default function Director() {
             setAutoModeRunning(false)
             addLog(`❌ 错误: ${data.error}`)
             break
+          case 'auto_write_chapter_started':
+            if (data.data?.execution_id) {
+              setExecutionId(data.data.execution_id)
+            }
+            setIsGenerating(true)
+            addLog(`🚀 章节工作流已启动: ${data.data?.title || '未命名章节'}`)
+            break
           case 'auto_write_chapter_result':
             if (data.status === 'success') {
               addLog(`✅ 章节生成完成: ${data.data?.title} (${data.data?.word_count} 字)`)
@@ -1273,6 +1387,11 @@ export default function Director() {
           case 'character_removed':
             addLog('👤 角色已移除')
             if (currentProject) loadCharacters()
+            break
+          case 'workflow_user_input_received':
+            setPendingUserInput(null)
+            setWorkflowUserInput('')
+            addLog('✅ 用户输入已提交')
             break
           case 'agent_response':
           case 'intervention_response':
@@ -1334,16 +1453,150 @@ export default function Director() {
     try {
       const workflows = await getWorkflows(currentProject.id, true)
       setSavedWorkflows(workflows)
-      setSelectedWorkflowId((currentId) => getPreferredWorkflowId(workflows, currentId))
+      const storedWorkflowId = localStorage.getItem(getDirectorStorageKey(currentProject.id, 'workflow')) || ''
+      setSelectedWorkflowId((currentId) => getPreferredWorkflowId(workflows, currentId || storedWorkflowId))
     } catch (error) {
       console.error('Failed to load workflows:', error)
     }
   }, [currentProject])
 
+  const loadChapterOutlines = useCallback(async () => {
+    if (!currentProject) {
+      setChapterOutlines([])
+      return
+    }
+
+    setOutlinesLoading(true)
+    try {
+      const result = await getOutlines(currentProject.id)
+      const sorted = [...result.outlines].sort((a, b) => a.chapter_number - b.chapter_number)
+      setChapterOutlines(sorted)
+      setSelectedSingleOutlineId((currentId) => {
+        if (currentId && sorted.some(outline => outline.id === currentId)) return currentId
+        return sorted.find(isOutlineWritable)?.id || ''
+      })
+      setAutoStartOutlineId((currentId) => {
+        if (currentId && sorted.some(outline => outline.id === currentId)) return currentId
+        return sorted.find(isOutlineWritable)?.id || ''
+      })
+      setSelectedAutoOutlineIds((currentIds) => currentIds.filter(id => sorted.some(outline => outline.id === id)))
+    } catch (error) {
+      console.error('Failed to load chapter outlines:', error)
+      addLog('❌ 加载章节大纲失败')
+    } finally {
+      setOutlinesLoading(false)
+    }
+  }, [addLog, currentProject])
+
+  const selectedSingleOutline = useMemo(
+    () => chapterOutlines.find(outline => outline.id === selectedSingleOutlineId) || null,
+    [chapterOutlines, selectedSingleOutlineId],
+  )
+
+  const selectedAutoOutlines = useMemo(
+    () => chapterOutlines
+      .filter(outline => selectedAutoOutlineIds.includes(outline.id))
+      .sort((a, b) => a.chapter_number - b.chapter_number),
+    [chapterOutlines, selectedAutoOutlineIds],
+  )
+
+  const selectedAutoStartOutline = useMemo(
+    () => chapterOutlines.find(outline => outline.id === autoStartOutlineId) || null,
+    [autoStartOutlineId, chapterOutlines],
+  )
+
+  const toggleAutoOutline = (outlineId: string) => {
+    setSelectedAutoOutlineIds((currentIds) => (
+      currentIds.includes(outlineId)
+        ? currentIds.filter(id => id !== outlineId)
+        : [...currentIds, outlineId]
+    ))
+  }
+
+  const openWriteChapterModal = () => {
+    void loadChapterOutlines()
+    setShowWriteChapterModal(true)
+  }
+
+  const openAutoModeModal = () => {
+    void loadChapterOutlines()
+    setShowAutoModeModal(true)
+  }
+
   useEffect(() => { loadCharacters() }, [currentProject])
   useEffect(() => { loadWorkflows() }, [loadWorkflows])
+  useEffect(() => { loadChapterOutlines() }, [loadChapterOutlines])
   useEffect(() => { if (sessionId.trim()) loadRuntimePanels() }, [sessionId])
 
+  useEffect(() => {
+    if (!currentProject || !selectedWorkflowId) return
+    localStorage.setItem(getDirectorStorageKey(currentProject.id, 'workflow'), selectedWorkflowId)
+  }, [currentProject, selectedWorkflowId])
+
+  useEffect(() => {
+    if (!currentProject) return
+    const storageKey = getDirectorStorageKey(currentProject.id, 'execution')
+    if (executionId) {
+      localStorage.setItem(storageKey, executionId)
+    }
+  }, [currentProject, executionId])
+
+  useEffect(() => {
+    if (!currentProject || savedWorkflows.length === 0 || !selectedWorkflowId) return
+
+    let active = true
+
+    const hydrateActiveExecution = async () => {
+      const storedExecutionId = localStorage.getItem(getDirectorStorageKey(currentProject.id, 'execution')) || ''
+      const workflowId = selectedWorkflowId || localStorage.getItem(getDirectorStorageKey(currentProject.id, 'workflow')) || undefined
+
+      try {
+        let execution: WorkflowExecution | null = null
+
+        try {
+          const activeResult = await getActiveWorkflowExecution(currentProject.id, workflowId)
+          execution = activeResult.execution
+        } catch (error) {
+          console.warn('Active workflow execution could not be loaded:', error)
+        }
+
+        if (!execution && storedExecutionId) {
+          try {
+            const storedExecution = await getExecution(storedExecutionId)
+            execution = storedExecution
+          } catch (error) {
+            console.warn('Stored workflow execution could not be loaded:', error)
+          }
+        }
+
+        if (!active || !execution) return
+
+        const workflow = savedWorkflows.find(item => item.id === execution.workflow_id) || selectedWorkflowRef.current
+        if (execution.workflow_id && savedWorkflows.some(item => item.id === execution.workflow_id)) {
+          if (execution.workflow_id !== selectedWorkflowId) {
+            pendingSnapshotRef.current = { execution, workflow }
+            setSelectedWorkflowId(execution.workflow_id)
+            return
+          }
+        }
+        applyWorkflowExecutionSnapshot(execution, workflow)
+        if (isActiveExecutionStatus(execution.status)) {
+          addLog(`已恢复后台执行：${execution.id}`)
+        } else if (isTerminalExecutionStatus(execution.status)) {
+          addLog(`已恢复最近执行快照：${execution.id}`)
+        }
+      } catch (error) {
+        if (!active) return
+        console.error('Failed to restore workflow execution:', error)
+      }
+    }
+
+    void hydrateActiveExecution()
+
+    return () => {
+      active = false
+    }
+  }, [addLog, applyWorkflowExecutionSnapshot, currentProject, savedWorkflows, selectedWorkflowId])
   useEffect(() => {
     if (!executionId) {
       setIsExecutionStreamReady(false)
@@ -1434,6 +1687,9 @@ export default function Director() {
     if (!sessionId.trim()) return addLog('请输入会话 ID')
     if (!currentProject) return addLog('请先选择项目')
     setExecutionId('')
+    localStorage.removeItem(getDirectorStorageKey(currentProject.id, 'execution'))
+    setPendingUserInput(null)
+    setWorkflowUserInput('')
     setIsExecutionStreamReady(false)
     // 重置标志并设置连接状态，触发 WebSocket 连接
     sessionStartAttempted.current = false
@@ -1441,12 +1697,23 @@ export default function Director() {
   }
 
   const stopSession = () => {
-    send({ type: 'stop_session' }) // 先发送停止消息
+    const sent = send({ type: 'stop_session' })
+    if (!sent) {
+      addLog('❌ 停止请求发送失败：WebSocket 未连接')
+      setIsGenerating(false)
+      setExecutionId('')
+      if (currentProject) {
+        localStorage.removeItem(getDirectorStorageKey(currentProject.id, 'execution'))
+      }
+      setIsExecutionStreamReady(false)
+      setIsConnected(false)
+      sessionStartAttempted.current = false
+      return
+    }
+
+    addLog('⏹️ 已发送停止请求，等待后端确认...')
     setIsGenerating(false)
-    setExecutionId('')
     setIsExecutionStreamReady(false)
-    setIsConnected(false) // 然后断开 WebSocket
-    sessionStartAttempted.current = false // 重置以便下次启动
   }
 
   const resetAll = () => {
@@ -1456,6 +1723,11 @@ export default function Director() {
     setSnapshotTree([])
     setAutoModeChapters([])
     setExecutionId('')
+    if (currentProject) {
+      localStorage.removeItem(getDirectorStorageKey(currentProject.id, 'execution'))
+    }
+    setPendingUserInput(null)
+    setWorkflowUserInput('')
     setIsExecutionStreamReady(false)
     setIsConnected(false)
     setIsGenerating(false)
@@ -1464,17 +1736,52 @@ export default function Director() {
 
   const handleStartAutoMode = () => {
     if (!selectedWorkflowId) return addLog('请先选择工作流')
+    if (!currentProject) return addLog('请先选择项目')
+
+    if (autoOutlineMode === 'selected') {
+      if (selectedAutoOutlines.length === 0) return addLog('请至少选择一个可写章节大纲')
+    } else {
+      if (!selectedAutoStartOutline || !isOutlineWritable(selectedAutoStartOutline)) return addLog('请选择可写的起始章节大纲')
+    }
+
     setAutoModeRunning(true)
     setAutoModeChapters([])
-    send({
-      type: 'start_auto_mode',
-      workflow_id: selectedWorkflowId,
-      chapter_count: autoModeForm.chapter_count,
-      words_per_chapter: autoModeForm.words_per_chapter,
-      style_reference: autoModeForm.style_reference,
-    })
+
+    if (autoOutlineMode === 'selected') {
+      send({
+        type: 'start_auto_mode',
+        workflow_id: selectedWorkflowId,
+        project_id: currentProject.id,
+        outline_mode: 'selected',
+        outline_ids: selectedAutoOutlines.map(outline => outline.id),
+        outline_chapter_numbers: selectedAutoOutlines.map(outline => outline.chapter_number),
+        style_reference: autoModeForm.style_reference,
+      })
+      addLog(`🚀 开始按 ${selectedAutoOutlines.length} 个大纲连续创作`)
+    } else {
+      const startOutline = selectedAutoStartOutline
+      if (!startOutline || !isOutlineWritable(startOutline)) return addLog('请选择可写的起始章节大纲')
+      send({
+        type: 'start_auto_mode',
+        workflow_id: selectedWorkflowId,
+        project_id: currentProject.id,
+        outline_mode: 'auto_progression',
+        auto_advance_outlines: true,
+        start_chapter_num: startOutline.chapter_number,
+        chapter_count: autoModeForm.chapter_count,
+        style_reference: autoModeForm.style_reference,
+      })
+      addLog(`🚀 从第 ${startOutline.chapter_number} 章大纲开始自动推进`)
+    }
+
     setShowAutoModeModal(false)
   }
+
+  useEffect(() => {
+    if (selectedSingleOutline) {
+      setChapterForm({ targetWordCount: selectedSingleOutline.target_word_count || 2000 })
+    }
+  }, [selectedSingleOutline])
 
   const handleStopAutoMode = () => {
     send({ type: 'stop_auto_mode' })
@@ -1512,17 +1819,47 @@ export default function Director() {
     send({ type: 'remove_character', character_id: characterId })
   }
 
+  const handleSubmitWorkflowUserInput = () => {
+    if (!pendingUserInput) return
+    if (pendingUserInput.required !== false && !workflowUserInput.trim()) {
+      addLog('请填写用户输入内容')
+      return
+    }
+    if (!executionId) {
+      addLog('❌ 当前没有可提交输入的工作流执行')
+      return
+    }
+
+    const sent = send({
+      type: 'workflow_user_input',
+      execution_id: executionId,
+      node_id: pendingUserInput.node_id,
+      input_key: pendingUserInput.input_key,
+      value: workflowUserInput,
+    })
+    if (!sent) {
+      addLog('❌ 用户输入提交失败：WebSocket 未连接')
+      return
+    }
+    addLog(`📨 已提交用户输入：${pendingUserInput.label || '用户输入'}`)
+  }
+
   const handleWriteChapter = () => {
-    if (!chapterForm.title.trim() || !chapterForm.goal.trim() || !selectedWorkflowId) return
+    if (!selectedWorkflowId) return addLog('请先选择工作流')
+    if (!currentProject) return addLog('请先选择项目')
+    if (!selectedSingleOutline || !isOutlineWritable(selectedSingleOutline)) return addLog('请选择可写章节大纲')
+
     send({
       type: 'auto_write_chapter',
       workflow_id: selectedWorkflowId,
-      chapter_title: chapterForm.title.trim(),
-      chapter_goal: chapterForm.goal.trim(),
-      target_word_count: chapterForm.targetWordCount,
+      project_id: currentProject.id,
+      chapter_outline_id: selectedSingleOutline.id,
+      chapter_num: selectedSingleOutline.chapter_number,
+      target_word_count: chapterForm.targetWordCount || selectedSingleOutline.target_word_count,
     })
-    addLog(`📝 开始生成章节: ${chapterForm.title}`)
-    setChapterForm({ title: '', goal: '', targetWordCount: 2000 })
+    addLog(`📝 开始根据大纲生成章节: 第 ${selectedSingleOutline.chapter_number} 章《${selectedSingleOutline.title}》`)
+    setSelectedSingleOutlineId('')
+    setChapterForm({ targetWordCount: 2000 })
     setShowWriteChapterModal(false)
   }
 
@@ -1654,7 +1991,7 @@ export default function Director() {
                     ))}
                   </select>
                   <button
-                    onClick={() => setShowWriteChapterModal(true)}
+                    onClick={openWriteChapterModal}
                     disabled={!selectedWorkflowId || !isGenerating || wsStatus !== 'connected' || autoModeRunning}
                     className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg transition-colors disabled:opacity-50"
                     title={!selectedWorkflowId ? '请先选择工作流' : ''}
@@ -1662,7 +1999,7 @@ export default function Director() {
                     <FileText size={16} /> 生成单章
                   </button>
                   <button
-                    onClick={() => setShowAutoModeModal(true)}
+                    onClick={openAutoModeModal}
                     disabled={!selectedWorkflowId || !isGenerating || wsStatus !== 'connected'}
                     className="flex items-center gap-2 px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white text-sm font-medium rounded-lg transition-colors disabled:opacity-50"
                     title={!selectedWorkflowId ? '请先选择工作流' : ''}
@@ -1705,6 +2042,52 @@ export default function Director() {
             )}
           </AnimatePresence>
         </div>
+
+        {pendingUserInput && (
+          <Card className={`border-2 ${isDark ? 'border-amber-800 bg-amber-900/20' : 'border-amber-300 bg-amber-50'}`}>
+            <div className="p-4 space-y-3">
+              <div className="flex items-start gap-3">
+                <div className={`p-2 rounded-lg ${isDark ? 'bg-amber-800' : 'bg-amber-100'}`}>
+                  <Keyboard size={20} className={isDark ? 'text-amber-200' : 'text-amber-700'} />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <h3 className={`font-semibold ${isDark ? 'text-amber-100' : 'text-amber-800'}`}>
+                    工作流等待用户输入：{pendingUserInput.label || '用户输入'}
+                  </h3>
+                  <p className={`mt-1 text-sm ${isDark ? 'text-amber-200/80' : 'text-amber-700'}`}>
+                    {pendingUserInput.prompt || pendingUserInput.description || '请补充信息后继续工作流。'}
+                  </p>
+                  {pendingUserInput.input_key && (
+                    <p className={`mt-1 text-xs ${isDark ? 'text-amber-300/70' : 'text-amber-600'}`}>
+                      写入上下文字段：{pendingUserInput.input_key}
+                    </p>
+                  )}
+                </div>
+              </div>
+              <TextArea
+                label="输入内容"
+                value={workflowUserInput}
+                onChange={(e) => setWorkflowUserInput(e.target.value)}
+                placeholder={pendingUserInput.placeholder || '请输入补充要求或修订意见...'}
+                rows={4}
+              />
+              <div className="flex justify-end gap-2">
+                <Button
+                  variant="secondary"
+                  onClick={() => setWorkflowUserInput(String(pendingUserInput.default_value || ''))}
+                >
+                  重置输入
+                </Button>
+                <Button
+                  onClick={handleSubmitWorkflowUserInput}
+                  disabled={pendingUserInput.required !== false && !workflowUserInput.trim()}
+                >
+                  <Send size={16} className="mr-1" /> 提交并继续
+                </Button>
+              </div>
+            </div>
+          </Card>
+        )}
 
         {/* ========== 连续创作进度 ========== */}
         {autoModeRunning && (
@@ -2159,7 +2542,7 @@ export default function Director() {
         <div className="space-y-4">
           <div className={`p-4 rounded-lg ${isDark ? 'bg-purple-900/30' : 'bg-purple-50'}`}>
             <p className={`text-sm ${isDark ? 'text-purple-300' : 'text-purple-700'}`}>
-              连续创作将循环执行选中的工作流，每执行一次生成一个章节。
+              连续创作将按已经生成好的章节大纲执行工作流。可以手动选择多个大纲，也可以从某一章开始自动推进已有大纲。
             </p>
           </div>
 
@@ -2172,37 +2555,113 @@ export default function Director() {
             </div>
           )}
 
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
-                章节数量
-              </label>
-              <input
-                type="number"
-                value={autoModeForm.chapter_count}
-                onChange={(e) => setAutoModeForm({ ...autoModeForm, chapter_count: parseInt(e.target.value) || 3 })}
-                className={`w-full px-3 py-2 rounded-lg border ${
-                  isDark ? 'bg-gray-800 border-gray-700 text-white' : 'border-gray-200'
+          <div className="grid grid-cols-2 gap-2">
+            {[
+              { key: 'selected' as AutoOutlineMode, label: '手动选择大纲序列' },
+              { key: 'auto_progression' as AutoOutlineMode, label: '从起始大纲自动推进' },
+            ].map(option => (
+              <button
+                key={option.key}
+                type="button"
+                onClick={() => setAutoOutlineMode(option.key)}
+                className={`rounded-lg border px-3 py-2 text-sm font-medium transition-colors ${
+                  autoOutlineMode === option.key
+                    ? isDark ? 'border-purple-500 bg-purple-900/40 text-purple-200' : 'border-purple-500 bg-purple-50 text-purple-700'
+                    : isDark ? 'border-gray-700 bg-gray-800 text-gray-300 hover:bg-gray-700' : 'border-gray-200 bg-white text-gray-600 hover:bg-gray-50'
                 }`}
-                min={1}
-                max={20}
-              />
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+
+          <div className={`rounded-lg border ${isDark ? 'border-gray-700 bg-gray-900/40' : 'border-gray-200 bg-gray-50'}`}>
+            <div className="flex items-center justify-between border-b px-3 py-2 text-sm font-medium border-inherit">
+              <span className={isDark ? 'text-gray-200' : 'text-gray-700'}>章节大纲</span>
+              <button
+                type="button"
+                onClick={() => void loadChapterOutlines()}
+                className={`text-xs ${isDark ? 'text-blue-300 hover:text-blue-200' : 'text-blue-600 hover:text-blue-700'}`}
+              >
+                {outlinesLoading ? '加载中...' : '刷新'}
+              </button>
             </div>
-            <div>
-              <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
-                每章字数
-              </label>
-              <input
-                type="number"
-                value={autoModeForm.words_per_chapter}
-                onChange={(e) => setAutoModeForm({ ...autoModeForm, words_per_chapter: parseInt(e.target.value) || 2000 })}
-                className={`w-full px-3 py-2 rounded-lg border ${
-                  isDark ? 'bg-gray-800 border-gray-700 text-white' : 'border-gray-200'
-                }`}
-                min={500}
-                max={5000}
-              />
-            </div>
+
+            {chapterOutlines.length === 0 ? (
+              <div className={`p-4 text-sm ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+                暂无已生成的章节大纲，请先到“大纲”页面生成并保存章节大纲。
+              </div>
+            ) : autoOutlineMode === 'selected' ? (
+              <div className="max-h-72 overflow-y-auto p-3 space-y-2">
+                {chapterOutlines.map(outline => {
+                  const writable = isOutlineWritable(outline)
+                  const status = OUTLINE_STATUS_CONFIG[outline.status]
+                  const checked = selectedAutoOutlineIds.includes(outline.id)
+                  return (
+                    <label
+                      key={outline.id}
+                      className={`flex gap-3 rounded-lg border p-3 text-sm transition-colors ${
+                        writable
+                          ? isDark ? 'cursor-pointer border-gray-700 bg-gray-800 hover:border-purple-600' : 'cursor-pointer border-gray-200 bg-white hover:border-purple-300'
+                          : isDark ? 'cursor-not-allowed border-gray-800 bg-gray-900 opacity-60' : 'cursor-not-allowed border-gray-100 bg-gray-100 opacity-60'
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        disabled={!writable}
+                        onChange={() => toggleAutoOutline(outline.id)}
+                        className="mt-1"
+                      />
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>第 {outline.chapter_number} 章：{outline.title}</span>
+                          <span className={`rounded px-2 py-0.5 text-xs ${status.className}`}>{status.label}</span>
+                        </div>
+                        <p className={`mt-1 line-clamp-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>{outline.summary || '暂无摘要'}</p>
+                        <p className={`mt-1 text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>{outline.scenes.length} 个场景 · 目标 {outline.target_word_count} 字</p>
+                      </div>
+                    </label>
+                  )
+                })}
+              </div>
+            ) : (
+              <div className="p-3 space-y-3">
+                <div>
+                  <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+                    起始大纲
+                  </label>
+                  <select
+                    value={autoStartOutlineId}
+                    onChange={(e) => setAutoStartOutlineId(e.target.value)}
+                    className={`w-full px-3 py-2 rounded-lg border text-sm ${isDark ? 'bg-gray-800 border-gray-700 text-white' : 'bg-white border-gray-200 text-gray-800'}`}
+                  >
+                    <option value="">选择起始章节大纲...</option>
+                    {chapterOutlines.map(outline => (
+                      <option key={outline.id} value={outline.id} disabled={!isOutlineWritable(outline)}>
+                        第 {outline.chapter_number} 章：{outline.title}（{OUTLINE_STATUS_CONFIG[outline.status].label}）
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+                    最多推进章节数
+                  </label>
+                  <input
+                    type="number"
+                    value={autoModeForm.chapter_count}
+                    onChange={(e) => setAutoModeForm({ ...autoModeForm, chapter_count: parseInt(e.target.value) || 1 })}
+                    className={`w-full px-3 py-2 rounded-lg border ${isDark ? 'bg-gray-800 border-gray-700 text-white' : 'border-gray-200'}`}
+                    min={1}
+                    max={20}
+                  />
+                  <p className={`mt-1 text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+                    后端只会推进当前项目中已经存在且可写的章节大纲。
+                  </p>
+                </div>
+              </div>
+            )}
           </div>
 
           <TextArea
@@ -2214,7 +2673,13 @@ export default function Director() {
 
           <div className="flex justify-end gap-3 pt-2">
             <Button variant="secondary" onClick={() => setShowAutoModeModal(false)}>取消</Button>
-            <Button onClick={handleStartAutoMode}>
+            <Button
+              onClick={handleStartAutoMode}
+              disabled={
+                outlinesLoading ||
+                (autoOutlineMode === 'selected' ? selectedAutoOutlines.length === 0 : !isOutlineWritable(selectedAutoStartOutline))
+              }
+            >
               <Play size={16} className="mr-1" /> 开始
             </Button>
           </div>
@@ -2225,7 +2690,7 @@ export default function Director() {
         <div className="space-y-4">
           <div className={`p-4 rounded-lg ${isDark ? 'bg-green-900/30' : 'bg-green-50'}`}>
             <p className={`text-sm ${isDark ? 'text-green-300' : 'text-green-700'}`}>
-              执行一次工作流生成单个章节，适合快速测试或补充章节。
+              选择一个已经生成好的章节大纲，工作流会使用该大纲的章节号、摘要、目标和场景信息生成正文。
             </p>
           </div>
 
@@ -2238,20 +2703,65 @@ export default function Director() {
             </div>
           )}
 
-          <Input
-            label="章节标题 *"
-            value={chapterForm.title}
-            onChange={(e) => setChapterForm({ ...chapterForm, title: e.target.value })}
-            placeholder="输入章节标题..."
-          />
+          <div>
+            <div className="mb-2 flex items-center justify-between">
+              <label className={`block text-sm font-medium ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+                章节大纲 *
+              </label>
+              <button
+                type="button"
+                onClick={() => void loadChapterOutlines()}
+                className={`text-xs ${isDark ? 'text-blue-300 hover:text-blue-200' : 'text-blue-600 hover:text-blue-700'}`}
+              >
+                {outlinesLoading ? '加载中...' : '刷新'}
+              </button>
+            </div>
+            <select
+              value={selectedSingleOutlineId}
+              onChange={(e) => setSelectedSingleOutlineId(e.target.value)}
+              className={`w-full px-3 py-2 rounded-lg border text-sm ${isDark ? 'bg-gray-800 border-gray-700 text-white' : 'bg-white border-gray-200 text-gray-800'}`}
+            >
+              <option value="">选择章节大纲...</option>
+              {chapterOutlines.map(outline => (
+                <option key={outline.id} value={outline.id} disabled={!isOutlineWritable(outline)}>
+                  第 {outline.chapter_number} 章：{outline.title}（{OUTLINE_STATUS_CONFIG[outline.status].label}）
+                </option>
+              ))}
+            </select>
+            {chapterOutlines.length === 0 && (
+              <p className={`mt-2 text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+                暂无已生成的章节大纲，请先到“大纲”页面生成并保存章节大纲。
+              </p>
+            )}
+          </div>
 
-          <TextArea
-            label="章节目标 *"
-            value={chapterForm.goal}
-            onChange={(e) => setChapterForm({ ...chapterForm, goal: e.target.value })}
-            placeholder="描述本章要完成的剧情目标、要发生的冲突或转折..."
-            rows={3}
-          />
+          {selectedSingleOutline && (
+            <div className={`rounded-lg border p-4 ${isDark ? 'border-gray-700 bg-gray-900/50' : 'border-gray-200 bg-gray-50'}`}>
+              <div className="mb-2 flex items-center gap-2">
+                <h4 className={`font-semibold ${isDark ? 'text-white' : 'text-gray-800'}`}>
+                  第 {selectedSingleOutline.chapter_number} 章：{selectedSingleOutline.title}
+                </h4>
+                <span className={`rounded px-2 py-0.5 text-xs ${OUTLINE_STATUS_CONFIG[selectedSingleOutline.status].className}`}>
+                  {OUTLINE_STATUS_CONFIG[selectedSingleOutline.status].label}
+                </span>
+              </div>
+              <p className={`text-sm ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
+                {selectedSingleOutline.summary || '暂无摘要'}
+              </p>
+              {selectedSingleOutline.chapter_goals.length > 0 && (
+                <div className="mt-3">
+                  <p className={`mb-1 text-xs font-medium ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>章节目标</p>
+                  <ul className={`list-disc space-y-1 pl-5 text-sm ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
+                    {selectedSingleOutline.chapter_goals.map((goal, index) => <li key={index}>{goal}</li>)}
+                  </ul>
+                </div>
+              )}
+              <div className={`mt-3 flex gap-4 text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+                <span>{selectedSingleOutline.scenes.length} 个场景</span>
+                <span>目标 {selectedSingleOutline.target_word_count} 字</span>
+              </div>
+            </div>
+          )}
 
           <div>
             <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
@@ -2269,13 +2779,13 @@ export default function Director() {
               step={100}
             />
             <p className={`mt-1 text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
-              建议 1500-3000 字
+              默认使用所选大纲的目标字数，可在生成前临时覆盖。
             </p>
           </div>
 
           <div className="flex justify-end gap-3 pt-2">
             <Button variant="secondary" onClick={() => setShowWriteChapterModal(false)}>取消</Button>
-            <Button onClick={handleWriteChapter} disabled={!chapterForm.title.trim() || !chapterForm.goal.trim()}>
+            <Button onClick={handleWriteChapter} disabled={outlinesLoading || !isOutlineWritable(selectedSingleOutline)}>
               <FileText size={16} className="mr-1" /> 生成章节
             </Button>
           </div>

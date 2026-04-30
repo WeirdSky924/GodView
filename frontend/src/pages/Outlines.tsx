@@ -162,11 +162,22 @@ export default function Outlines() {
 
   const handleDelete = async () => {
     if (!currentProject?.id || !selectedChapter) return
-    if (!confirm(`确定要删除第${selectedChapter}章大纲吗？此操作不可撤销。`)) return
+    const keepContent = confirm(
+      `删除第${selectedChapter}章大纲时，默认保留已经生成的小说正文。\n\n点击“确定”：仅删除大纲，保留正文。\n点击“取消”：继续选择是否同时软删除正文。`
+    )
+    let softDeleteGeneratedChapters = false
+
+    if (!keepContent) {
+      softDeleteGeneratedChapters = confirm(
+        `是否同时软删除第${selectedChapter}章大纲关联生成的小说正文？\n\n正文会被标记为已删除，默认列表不再显示，但不是物理删除。`
+      )
+      if (!softDeleteGeneratedChapters) return
+    }
 
     try {
-      await deleteOutline(currentProject.id, selectedChapter)
+      const result = await deleteOutline(currentProject.id, selectedChapter, { softDeleteGeneratedChapters })
       removeOutlineFromState(selectedChapter)
+      alert(result.message)
     } catch (error) {
       console.error('Failed to delete outline:', error)
       alert('删除失败，请稍后再试')

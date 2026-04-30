@@ -7,8 +7,9 @@ import asyncio
 import json
 import logging
 import uuid as uuid_module
+from collections import defaultdict
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, date
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from sqlalchemy.ext.asyncio import (
@@ -35,14 +36,29 @@ def _validate_uuid(value: Any) -> Optional[str]:
     if value is None:
         return None
     try:
-        # 如果是 UUID 对象，转为字符串
-        if hasattr(value, 'hex'):
-            return str(value)
-        # 验证是否为有效 UUID 字符串
-        uuid_module.UUID(str(value))
-        return str(value)
+        # asyncpg UUID、uuid.UUID 等对象都先统一转字符串，避免直接传入 uuid.UUID()
+        # 时触发对象内部的 .replace() 路径。
+        uuid_text = str(value)
+        uuid_module.UUID(uuid_text)
+        return uuid_text
     except (ValueError, TypeError, AttributeError):
         return None
+
+
+def _normalize_datetime(value: Any, default: Optional[datetime] = None) -> Optional[datetime]:
+    """将字符串/日期时间对象归一化为 datetime。"""
+    if value is None:
+        return default
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time())
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace('Z', '+00:00'))
+        except ValueError:
+            return default
+    return default
 
 
 def _prepare_json_params(data: Dict[str, Any], json_fields: List[str]) -> Dict[str, Any]:
@@ -118,6 +134,7 @@ class PostgresDatabase:
         self.pool_size = pool_size
         self._engine: Optional[AsyncEngine] = None
         self._session_maker: Optional[async_sessionmaker] = None
+        self._workflow_event_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
     async def connect(self):
         """建立数据库连接"""
@@ -192,6 +209,7 @@ class PostgresDatabase:
                 'completed_events', 'character_locations',
                 'memories', 'knowledge', 'working_memory',
                 'keywords', 'tags', 'constraints', 'related_characters', 'related_locations', 'related_items', 'forbidden_actions',
+                'participants', 'consequences', 'effects', 'related_regions',
                 # project_writing_configs 表的 JSONB 字段
                 'enabled_rule_ids', 'enabled_rule_set_ids', 'rule_overrides', 'rule_priorities',
                 # writing_rules 表的 JSONB 字段
@@ -751,6 +769,9 @@ class PostgresDatabase:
             query = "SELECT * FROM worlds ORDER BY created_at DESC LIMIT :limit"
             return await self.execute_query(query, {"limit": limit})
 
+    async def get_worlds_by_project(self, project_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+        """兼容旧调用：按项目获取世界列表。"""
+        return await self.get_all_worlds(project_id=project_id, limit=limit)
     async def get_default_world(self, project_id: str) -> Optional[Dict[str, Any]]:
         """获取项目默认世界，兼容 projects.world_id。"""
         project = await self.get_project(project_id)
@@ -852,6 +873,8 @@ class PostgresDatabase:
             region_data["state"] = "normal"
         if region_data.get("state_summary") is None:
             region_data["state_summary"] = ""
+        if region_data.get("metadata") is None:
+            region_data["metadata"] = {}
         logger.info(f"save_region after fix: area_size={region_data.get('area_size')}")
 
         # 验证 id 字段（必须是有效 UUID）
@@ -864,7 +887,7 @@ class PostgresDatabase:
         region_data['world_id'] = _validate_uuid(region_data.get('world_id'))
 
         # 处理 JSONB 字段 - 转换为 JSON 字符串
-        json_fields = ['coordinates', 'terrain_features', 'landmarks', 'encounters', 'connections', 'local_rules']
+        json_fields = ['coordinates', 'terrain_features', 'landmarks', 'encounters', 'connections', 'local_rules', 'metadata']
         for field in json_fields:
             if field in region_data and region_data[field] is not None:
                 value = region_data[field]
@@ -893,12 +916,12 @@ class PostgresDatabase:
         query = """
         INSERT INTO regions (id, name, world_id, region_type, terrain_type, description,
                             atmosphere, coordinates, area_size, terrain_features, landmarks,
-                            encounters, connections, local_rules, state, state_summary, destroyed_at,
+                            encounters, connections, local_rules, metadata, state, state_summary, destroyed_at,
                             is_generated, visit_count, created_at, updated_at)
-        VALUES (:id, :name, """ + world_id_sql + """, :region_type, :terrain_type, :description,
+        VALUES (:id, :name,""" + world_id_sql + """, :region_type, :terrain_type, :description,
                 :atmosphere, CAST(:coordinates AS jsonb), :area_size, CAST(:terrain_features AS jsonb),
                 CAST(:landmarks AS jsonb), CAST(:encounters AS jsonb), CAST(:connections AS jsonb),
-                CAST(:local_rules AS jsonb), :state, :state_summary, :destroyed_at,
+                CAST(:local_rules AS jsonb), CAST(:metadata AS jsonb), :state, :state_summary, :destroyed_at,
                 :is_generated, :visit_count, :created_at, :updated_at)
         ON CONFLICT (id) DO UPDATE SET
             name = EXCLUDED.name,
@@ -914,6 +937,7 @@ class PostgresDatabase:
             encounters = EXCLUDED.encounters,
             connections = EXCLUDED.connections,
             local_rules = EXCLUDED.local_rules,
+            metadata = EXCLUDED.metadata,
             state = EXCLUDED.state,
             state_summary = EXCLUDED.state_summary,
             destroyed_at = EXCLUDED.destroyed_at,
@@ -930,16 +954,91 @@ class PostgresDatabase:
         results = await self.execute_query(query, {"id": region_id})
         return results[0] if results else None
 
+    async def save_location(self, location_data: Dict[str, Any]) -> str:
+        """将地点作为特殊区域保存，复用现有地图/区域体系。"""
+        raw = location_data.copy()
+        metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+        reserved_keys = {
+            "id", "name", "location_name", "title", "world_id", "region_id", "parent_region_id",
+            "description", "summary", "overview", "location_type", "region_type", "terrain_type",
+            "atmosphere", "coordinates", "area_size", "terrain_features", "features", "landmarks",
+            "encounters", "connections", "neighbors", "local_rules", "state", "state_summary",
+            "destroyed_at", "is_generated", "visit_count", "created_at", "updated_at", "metadata",
+        }
+        extra_fields = {key: value for key, value in raw.items() if key not in reserved_keys}
+        metadata = {
+            **metadata,
+            "asset_kind": "location",
+            "parent_region_id": raw.get("parent_region_id") or raw.get("region_id"),
+            "source_location": raw,
+            "extra_fields": extra_fields,
+        }
+        location_type = raw.get("location_type") or raw.get("region_type") or "location"
+        if raw.get("parent_region_id") or raw.get("region_id"):
+            location_type = raw.get("location_type") or "sub_location"
+
+        region_record = {
+            "id": raw.get("id"),
+            "name": raw.get("name") or raw.get("location_name") or raw.get("title") or "未命名地点",
+            "world_id": raw.get("world_id"),
+            "region_type": location_type,
+            "terrain_type": raw.get("terrain_type") or raw.get("location_type") or "location",
+            "description": raw.get("description") or raw.get("summary") or raw.get("overview") or "",
+            "atmosphere": raw.get("atmosphere") or "",
+            "coordinates": raw.get("coordinates") or {},
+            "area_size": raw.get("area_size") or 0.0,
+            "terrain_features": raw.get("terrain_features") or raw.get("features") or [],
+            "landmarks": raw.get("landmarks") or [],
+            "encounters": raw.get("encounters") or [],
+            "connections": raw.get("connections") or raw.get("neighbors") or [],
+            "local_rules": raw.get("local_rules") or [],
+            "metadata": metadata,
+            "state": raw.get("state") or "normal",
+            "state_summary": raw.get("state_summary") or "",
+            "destroyed_at": raw.get("destroyed_at"),
+            "is_generated": raw.get("is_generated", True),
+            "visit_count": raw.get("visit_count", 0),
+            "created_at": raw.get("created_at") or datetime.now(),
+            "updated_at": raw.get("updated_at") or datetime.now(),
+        }
+        return await self.save_region(region_record)
+
+    async def get_locations(
+        self,
+        project_id: str,
+        world_id: Optional[str] = None,
+        region_id: Optional[str] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """获取作为区域保存的地点/子地点。"""
+        params: Dict[str, Any] = {"project_id": project_id, "limit": limit}
+        conditions = [
+            "w.project_id = CAST(:project_id AS UUID)",
+            "(r.region_type IN ('location', 'sub_location') OR r.metadata->>'asset_kind' = 'location')",
+        ]
+        if world_id:
+            conditions.append("r.world_id = CAST(:world_id AS UUID)")
+            params["world_id"] = world_id
+        if region_id:
+            conditions.append("r.metadata->>'parent_region_id' = :region_id")
+            params["region_id"] = region_id
+        query = f"""
+        SELECT r.*
+        FROM regions r
+        JOIN worlds w ON w.id = r.world_id
+        WHERE {' AND '.join(conditions)}
+        ORDER BY r.created_at DESC, r.name ASC
+        LIMIT :limit
+        """
+        return await self.execute_query(query, params)
+
     async def get_regions_by_world(self, world_id: str) -> List[Dict[str, Any]]:
         """获取世界的所有区域"""
-        # 验证 world_id 是否为有效的 UUID 格式
-        import uuid
-        try:
-            uuid.UUID(world_id)
-        except (ValueError, TypeError):
+        valid_world_id = _validate_uuid(world_id)
+        if not valid_world_id:
             return []
         query = "SELECT * FROM regions WHERE world_id = CAST(:world_id AS UUID) ORDER BY created_at ASC, name ASC"
-        return await self.execute_query(query, {"world_id": world_id})
+        return await self.execute_query(query, {"world_id": valid_world_id})
 
     async def delete_region(self, region_id: str) -> bool:
         """删除区域"""
@@ -1121,6 +1220,73 @@ class PostgresDatabase:
     # ==================== 伏笔相关操作 ====================
 
 
+    async def find_duplicate_hook(
+        self,
+        project_id: str,
+        title: str,
+        description: str = "",
+        world_id: Optional[str] = None,
+        scope_type: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """按自然键查找可能重复的伏笔。"""
+        title_key = " ".join(str(title or "").lower().split())
+        description_key = " ".join(str(description or "").lower().split())
+        if not title_key:
+            return None
+        conditions = ["project_id = CAST(:project_id AS UUID)", "LOWER(TRIM(title)) = :title"]
+        params: Dict[str, Any] = {"project_id": project_id, "title": title_key}
+        if world_id:
+            conditions.append("world_id = CAST(:world_id AS UUID)")
+            params["world_id"] = world_id
+        if scope_type:
+            conditions.append("scope_type = :scope_type")
+            params["scope_type"] = scope_type
+        if description_key:
+            conditions.append("(LOWER(TRIM(description)) = :description OR LOWER(TRIM(plant_context)) = :description)")
+            params["description"] = description_key
+        rows = await self.execute_query(
+            f"""
+            SELECT * FROM hooks
+            WHERE {' AND '.join(conditions)}
+            ORDER BY created_at ASC
+            LIMIT 1
+            """,
+            params,
+        )
+        return rows[0] if rows else None
+
+    async def find_duplicate_lore(
+        self,
+        project_id: str,
+        title: str,
+        content: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """按标题或正文查找可能重复的设定。"""
+        title_key = " ".join(str(title or "").lower().split())
+        content_key = " ".join(str(content or "").lower().split())
+        if not title_key and not content_key:
+            return None
+        conditions = ["project_id = CAST(:project_id AS UUID)"]
+        params: Dict[str, Any] = {"project_id": project_id}
+        duplicate_conditions: List[str] = []
+        if title_key:
+            duplicate_conditions.append("LOWER(TRIM(title)) = :title")
+            params["title"] = title_key
+        if content_key:
+            duplicate_conditions.append("LOWER(TRIM(content)) = :content")
+            params["content"] = content_key
+        conditions.append(f"({' OR '.join(duplicate_conditions)})")
+        rows = await self.execute_query(
+            f"""
+            SELECT * FROM lore_entries
+            WHERE {' AND '.join(conditions)}
+            ORDER BY created_at ASC
+            LIMIT 1
+            """,
+            params,
+        )
+        return rows[0] if rows else None
+
     async def save_hook(self, hook_data: Dict[str, Any]) -> str:
         """保存伏笔数据"""
         # 处理可选字段，设置默认值
@@ -1145,26 +1311,30 @@ class PostgresDatabase:
 
         for field in ['title', 'description', 'hook_type', 'status', 'plant_context', 'resolution_hint', 'resolution_context']:
             params[field] = params.get(field) or ''
-        params['priority'] = int(params.get('priority') or 5)
+        raw_priority = params.get('priority')
+        try:
+            params['priority'] = int(raw_priority or 3)
+        except (TypeError, ValueError):
+            params['priority'] = 3
+        params['priority'] = max(1, min(5, params['priority']))
         for field in ['related_characters', 'related_locations', 'related_objects']:
             value = params.get(field)
             if isinstance(value, str):
                 try:
                     value = json.loads(value)
                 except Exception:
-                    value = []
+                    value = [value] if value.strip() else []
             if value is None:
                 value = []
-            params[field] = value
+            elif not isinstance(value, list):
+                value = [value]
+            params[field] = json.dumps(value)
         params['resolved_at'] = params.get('resolved_at')
 
         # 确保 datetime 字段是 datetime 对象
         for field in ['created_at', 'resolved_at']:
-            if field in params and isinstance(params[field], str):
-                try:
-                    params[field] = datetime.fromisoformat(params[field].replace('Z', '+00:00'))
-                except:
-                    params[field] = datetime.now()
+            if field in params and params[field] is not None:
+                params[field] = _normalize_datetime(params[field], datetime.now())
             elif field == 'created_at' and (field not in params or params[field] is None):
                 params[field] = datetime.now()
 
@@ -1186,8 +1356,8 @@ class PostgresDatabase:
                           created_at, resolved_at)
         VALUES (:id, :title, """ + project_id_sql + """, """ + world_id_sql + """, :scope_type, """ + character_id_sql + """,
                 """ + parent_hook_id_sql + """, """ + promoted_from_hook_id_sql + """, :visibility,
-                :description, :hook_type, :status, :related_characters,
-                :related_locations, :related_objects, :plant_context, """ + plant_chapter_sql + """,
+                :description, :hook_type, :status, CAST(:related_characters AS jsonb),
+                CAST(:related_locations AS jsonb), CAST(:related_objects AS jsonb), :plant_context,""" + plant_chapter_sql + """,
                 :resolution_hint, :resolution_context, """ + resolution_chapter_sql + """, :priority,
                 :created_at, :resolved_at)
         ON CONFLICT (id) DO UPDATE SET
@@ -1214,7 +1384,7 @@ class PostgresDatabase:
             resolved_at = EXCLUDED.resolved_at
         """
         await self.execute_write(query, params)
-        return hook_data.get("id", "")
+        return params["id"]
 
     async def get_hook(self, hook_id: str) -> Optional[Dict[str, Any]]:
         """获取伏笔数据"""
@@ -1436,6 +1606,8 @@ class PostgresDatabase:
             else:
                 params[field] = None
 
+        params['chapter_outline_id'] = str(params.get('chapter_outline_id')) if params.get('chapter_outline_id') else None
+
         # 确保 datetime 字段是 datetime 对象
         for field in ['created_at', 'updated_at', 'completed_at']:
             if field in params and isinstance(params[field], str):
@@ -1446,21 +1618,23 @@ class PostgresDatabase:
             elif field in ['created_at', 'updated_at'] and (field not in params or params[field] is None):
                 params[field] = datetime.now()
 
-        # 构建 SQL，world_id 和 project_id 可能为 NULL
+        # 构建 SQL，world_id、project_id 和 chapter_outline_id 可能为 NULL
         world_id_value = params.get('world_id')
         project_id_value = params.get('project_id')
+        chapter_outline_id_value = params.get('chapter_outline_id')
 
         query = """
-        INSERT INTO chapters (id, title, project_id, world_id, summary, content, word_count, status, events,
+        INSERT INTO chapters (id, title, project_id, world_id, chapter_outline_id, summary, content, word_count, status, events,
                              hooks_planted, hooks_resolved, main_plot_progress, reader_scores,
-                             created_at, updated_at, completed_at)
-        VALUES (:id, :title, """ + (f"CAST(:project_id AS UUID)" if project_id_value else "NULL") + """, """ + (f"CAST(:world_id AS UUID)" if world_id_value else "NULL") + """, :summary, :content, :word_count, :status, :events,
+                             created_at, updated_at, completed_at, deleted_at)
+        VALUES (:id, :title, """ + (f"CAST(:project_id AS UUID)" if project_id_value else "NULL") + """, """ + (f"CAST(:world_id AS UUID)" if world_id_value else "NULL") + """, :chapter_outline_id, :summary, :content, :word_count, :status, :events,
                 :hooks_planted, :hooks_resolved, :main_plot_progress, :reader_scores,
-                :created_at, :updated_at, :completed_at)
+                :created_at, :updated_at, :completed_at, :deleted_at)
         ON CONFLICT (id) DO UPDATE SET
             title = EXCLUDED.title,
             project_id = EXCLUDED.project_id,
             world_id = EXCLUDED.world_id,
+            chapter_outline_id = EXCLUDED.chapter_outline_id,
             summary = EXCLUDED.summary,
             content = EXCLUDED.content,
             word_count = EXCLUDED.word_count,
@@ -1471,8 +1645,10 @@ class PostgresDatabase:
             main_plot_progress = EXCLUDED.main_plot_progress,
             reader_scores = EXCLUDED.reader_scores,
             updated_at = EXCLUDED.updated_at,
-            completed_at = EXCLUDED.completed_at
+            completed_at = EXCLUDED.completed_at,
+            deleted_at = EXCLUDED.deleted_at
         """
+        params.setdefault('deleted_at', None)
         await self.execute_write(query, params)
         return chapter_data.get("id", "")
 
@@ -1484,14 +1660,11 @@ class PostgresDatabase:
 
     async def get_chapters_by_world(self, world_id: str) -> List[Dict[str, Any]]:
         """获取世界的所有章节"""
-        # 验证 world_id 是否为有效的 UUID 格式
-        import uuid
-        try:
-            uuid.UUID(world_id)
-        except (ValueError, TypeError):
+        valid_world_id = _validate_uuid(world_id)
+        if not valid_world_id:
             return []
         query = "SELECT * FROM chapters WHERE world_id = CAST(:world_id AS UUID) ORDER BY created_at ASC"
-        return await self.execute_query(query, {"world_id": world_id})
+        return await self.execute_query(query, {"world_id": valid_world_id})
 
     async def get_chapters_by_project(
         self,
@@ -1510,7 +1683,7 @@ class PostgresDatabase:
         Returns:
             List: 章节列表
         """
-        conditions = ["project_id = :project_id"]
+        conditions = ["project_id = :project_id", "deleted_at IS NULL"]
         params: Dict[str, Any] = {"project_id": project_id, "limit": limit}
 
         if status:
@@ -1521,6 +1694,33 @@ class PostgresDatabase:
         query = f"SELECT * FROM chapters {where_clause} ORDER BY created_at ASC LIMIT :limit"
 
         return await self.execute_query(query, params)
+
+    async def soft_delete_chapters_by_outline(self, project_id: str, chapter_outline_id: str) -> int:
+        """软删除指定大纲生成的章节。"""
+        query = """
+        UPDATE chapters
+        SET deleted_at = CURRENT_TIMESTAMP,
+            status = 'deleted',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE project_id = CAST(:project_id AS UUID)
+          AND chapter_outline_id = :chapter_outline_id
+          AND deleted_at IS NULL
+        """
+        await self.execute_write(query, {
+            "project_id": project_id,
+            "chapter_outline_id": chapter_outline_id,
+        })
+        result = await self.execute_query(
+            """
+            SELECT COUNT(*) as count
+            FROM chapters
+            WHERE project_id = CAST(:project_id AS UUID)
+              AND chapter_outline_id = :chapter_outline_id
+              AND deleted_at IS NOT NULL
+            """,
+            {"project_id": project_id, "chapter_outline_id": chapter_outline_id},
+        )
+        return int(result[0]["count"]) if result else 0
 
     # ==================== 世界快照相关操作 ====================
 
@@ -1624,7 +1824,158 @@ class PostgresDatabase:
 
         return snapshot
 
+    def _normalize_json_value(self, value: Any, default: Any) -> Any:
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (json.JSONDecodeError, TypeError):
+                return default
+        if isinstance(value, (list, dict)):
+            return value
+        if value is None:
+            return default
+        return [value]
+
+    async def save_event(self, event_data: Dict[str, Any]) -> str:
+        """保存工作流/事件 Agent 生成的领域剧情事件。"""
+        params = event_data.copy()
+        event_pk = _validate_uuid(params.get("id")) or str(uuid_module.uuid4())
+        external_event_id = params.get("event_id")
+        if not external_event_id and params.get("id") and not _validate_uuid(params.get("id")):
+            external_event_id = str(params.get("id"))
+
+        event_name = (
+            params.get("event_name")
+            or params.get("name")
+            or params.get("title")
+            or params.get("summary")
+            or "未命名事件"
+        )
+        known_fields = {
+            "id", "project_id", "world_id", "chapter_id", "event_id", "event_name", "name", "title",
+            "summary", "event_type", "type", "status", "description", "trigger_condition", "trigger",
+            "participants", "characters", "consequences", "effects", "related_regions", "regions",
+            "related_locations", "locations", "narrative_purpose", "purpose", "suggested_chapter",
+            "source", "workflow_execution_id", "workflow_id", "node_id", "agent_type", "metadata",
+            "created_at", "updated_at",
+        }
+        metadata = params.get("metadata") if isinstance(params.get("metadata"), dict) else {}
+        metadata = {
+            **metadata,
+            "source_event": event_data,
+            "extra_fields": {key: value for key, value in event_data.items() if key not in known_fields},
+        }
+        record = {
+            "id": event_pk,
+            "project_id": _validate_uuid(params.get("project_id")),
+            "world_id": _validate_uuid(params.get("world_id")),
+            "chapter_id": _validate_uuid(params.get("chapter_id")),
+            "event_id": str(external_event_id) if external_event_id else None,
+            "event_name": event_name,
+            "event_type": params.get("event_type") or params.get("type") or "custom",
+            "status": params.get("status") or "planned",
+            "description": params.get("description") or params.get("summary") or "",
+            "trigger_condition": params.get("trigger_condition") or params.get("trigger") or "",
+            "participants": self._normalize_json_value(params.get("participants") or params.get("characters"), []),
+            "consequences": self._normalize_json_value(params.get("consequences"), []),
+            "effects": self._normalize_json_value(params.get("effects"), []),
+            "related_regions": self._normalize_json_value(params.get("related_regions") or params.get("regions"), []),
+            "related_locations": self._normalize_json_value(params.get("related_locations") or params.get("locations"), []),
+            "narrative_purpose": params.get("narrative_purpose") or params.get("purpose") or "",
+            "suggested_chapter": str(params.get("suggested_chapter")) if params.get("suggested_chapter") is not None else "",
+            "source": params.get("source") or "workflow",
+            "workflow_execution_id": params.get("workflow_execution_id"),
+            "workflow_id": params.get("workflow_id"),
+            "node_id": params.get("node_id"),
+            "agent_type": params.get("agent_type"),
+            "metadata": metadata,
+            "created_at": params.get("created_at") or datetime.now(),
+            "updated_at": params.get("updated_at") or datetime.now(),
+        }
+        if not record["project_id"]:
+            raise ValueError("事件缺少有效 project_id")
+        for field in [
+            "participants", "consequences", "effects", "related_regions", "related_locations", "metadata",
+        ]:
+            record[field] = json.dumps(record[field])
+        world_id_sql = "CAST(:world_id AS UUID)" if record.get("world_id") else "NULL"
+        chapter_id_sql = "CAST(:chapter_id AS UUID)" if record.get("chapter_id") else "NULL"
+        query = """
+        INSERT INTO events (
+            id, project_id, world_id, chapter_id, event_id, event_name, event_type, status,
+            description, trigger_condition, participants, consequences, effects, related_regions,
+            related_locations, narrative_purpose, suggested_chapter, source, workflow_execution_id,
+            workflow_id, node_id, agent_type, metadata, created_at, updated_at
+        ) VALUES (
+            CAST(:id AS UUID), CAST(:project_id AS UUID), """ + world_id_sql + ", " + chapter_id_sql + """,
+            :event_id, :event_name, :event_type, :status, :description, :trigger_condition,
+            CAST(:participants AS jsonb), CAST(:consequences AS jsonb), CAST(:effects AS jsonb),
+            CAST(:related_regions AS jsonb), CAST(:related_locations AS jsonb), :narrative_purpose,
+            :suggested_chapter, :source, :workflow_execution_id, :workflow_id, :node_id,
+            :agent_type, CAST(:metadata AS jsonb), :created_at, :updated_at
+        )
+        ON CONFLICT (id) DO UPDATE SET
+            project_id = EXCLUDED.project_id,
+            world_id = EXCLUDED.world_id,
+            chapter_id = EXCLUDED.chapter_id,
+            event_id = EXCLUDED.event_id,
+            event_name = EXCLUDED.event_name,
+            event_type = EXCLUDED.event_type,
+            status = EXCLUDED.status,
+            description = EXCLUDED.description,
+            trigger_condition = EXCLUDED.trigger_condition,
+            participants = EXCLUDED.participants,
+            consequences = EXCLUDED.consequences,
+            effects = EXCLUDED.effects,
+            related_regions = EXCLUDED.related_regions,
+            related_locations = EXCLUDED.related_locations,
+            narrative_purpose = EXCLUDED.narrative_purpose,
+            suggested_chapter = EXCLUDED.suggested_chapter,
+            source = EXCLUDED.source,
+            workflow_execution_id = EXCLUDED.workflow_execution_id,
+            workflow_id = EXCLUDED.workflow_id,
+            node_id = EXCLUDED.node_id,
+            agent_type = EXCLUDED.agent_type,
+            metadata = EXCLUDED.metadata,
+            updated_at = EXCLUDED.updated_at
+        """
+        await self.execute_write(query, record)
+        return event_pk
+
+    async def get_event(self, event_id: str) -> Optional[Dict[str, Any]]:
+        """按主键或外部 event_id 获取剧情事件。"""
+        if _validate_uuid(event_id):
+            rows = await self.execute_query("SELECT * FROM events WHERE id = CAST(:id AS UUID)", {"id": event_id})
+        else:
+            rows = await self.execute_query("SELECT * FROM events WHERE event_id = :id LIMIT 1", {"id": event_id})
+        return rows[0] if rows else None
+
+    async def get_events(
+        self,
+        project_id: str,
+        world_id: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """获取项目/世界下的剧情事件。"""
+        params: Dict[str, Any] = {"project_id": project_id, "limit": limit}
+        conditions = ["project_id = CAST(:project_id AS UUID)"]
+        if world_id:
+            conditions.append("world_id = CAST(:world_id AS UUID)")
+            params["world_id"] = world_id
+        if status:
+            conditions.append("status = :status")
+            params["status"] = status
+        query = f"""
+        SELECT * FROM events
+        WHERE {' AND '.join(conditions)}
+        ORDER BY created_at DESC, event_name ASC
+        LIMIT :limit
+        """
+        return await self.execute_query(query, params)
+
     # ==================== 干预日志相关操作 ====================
+
 
     async def log_intervention(self, intervention_data: Dict[str, Any]) -> str:
         """记录干预日志"""
@@ -1791,6 +2142,7 @@ class PostgresDatabase:
                 encounters JSONB DEFAULT '[]',
                 connections JSONB DEFAULT '[]',
                 local_rules JSONB DEFAULT '[]',
+                metadata JSONB NOT NULL DEFAULT '{}',
                 state TEXT DEFAULT 'normal',
                 state_summary TEXT,
                 destroyed_at TIMESTAMP WITH TIME ZONE,
@@ -1867,6 +2219,42 @@ class PostgresDatabase:
             CREATE INDEX IF NOT EXISTS idx_event_summaries_chapter_id ON event_summaries(chapter_id);
             """)
 
+        # 领域剧情事件表
+        if 'events' not in existing_tables:
+            tables_to_create.append("""
+            CREATE TABLE events (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                world_id UUID REFERENCES worlds(id) ON DELETE SET NULL,
+                chapter_id UUID REFERENCES chapters(id) ON DELETE SET NULL,
+                event_id TEXT,
+                event_name TEXT NOT NULL,
+                event_type TEXT DEFAULT 'custom',
+                status TEXT DEFAULT 'planned',
+                description TEXT,
+                trigger_condition TEXT,
+                participants JSONB DEFAULT '[]',
+                consequences JSONB DEFAULT '[]',
+                effects JSONB DEFAULT '[]',
+                related_regions JSONB DEFAULT '[]',
+                related_locations JSONB DEFAULT '[]',
+                narrative_purpose TEXT,
+                suggested_chapter TEXT,
+                source TEXT DEFAULT 'workflow',
+                workflow_execution_id TEXT,
+                workflow_id TEXT,
+                node_id TEXT,
+                agent_type TEXT,
+                metadata JSONB DEFAULT '{}',
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_events_project_created ON events(project_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_events_project_type ON events(project_id, event_type);
+            CREATE INDEX IF NOT EXISTS idx_events_project_status ON events(project_id, status);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_events_project_event_id ON events(project_id, event_id) WHERE event_id IS NOT NULL;
+            """)
+
         # 剧情状态变更表
         if 'narrative_state_changes' not in existing_tables:
             tables_to_create.append("""
@@ -1917,6 +2305,46 @@ class PostgresDatabase:
                             await session.execute(text(statement))
                         except Exception as e:
                             logger.warning(f"创建表时出错（可能已存在）: {str(e)[:100]}")
+
+            event_schema_sql = """
+            CREATE TABLE IF NOT EXISTS events (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                world_id UUID REFERENCES worlds(id) ON DELETE SET NULL,
+                chapter_id UUID REFERENCES chapters(id) ON DELETE SET NULL,
+                event_id TEXT,
+                event_name TEXT NOT NULL,
+                event_type TEXT DEFAULT 'custom',
+                status TEXT DEFAULT 'planned',
+                description TEXT,
+                trigger_condition TEXT,
+                participants JSONB DEFAULT '[]',
+                consequences JSONB DEFAULT '[]',
+                effects JSONB DEFAULT '[]',
+                related_regions JSONB DEFAULT '[]',
+                related_locations JSONB DEFAULT '[]',
+                narrative_purpose TEXT,
+                suggested_chapter TEXT,
+                source TEXT DEFAULT 'workflow',
+                workflow_execution_id TEXT,
+                workflow_id TEXT,
+                node_id TEXT,
+                agent_type TEXT,
+                metadata JSONB DEFAULT '{}',
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_events_project_created ON events(project_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_events_project_type ON events(project_id, event_type);
+            CREATE INDEX IF NOT EXISTS idx_events_project_status ON events(project_id, status);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_events_project_event_id ON events(project_id, event_id) WHERE event_id IS NOT NULL;
+            """
+            for statement in event_schema_sql.split(';'):
+                if statement.strip():
+                    try:
+                        await session.execute(text(statement))
+                    except Exception as e:
+                        logger.warning(f"创建领域剧情事件表结构时出错: {str(e)[:100]}")
 
             operation_schema_sql = """
             CREATE TABLE IF NOT EXISTS operation_requests (
@@ -2047,6 +2475,8 @@ class PostgresDatabase:
                 "ALTER TABLE workflow_executions ADD COLUMN IF NOT EXISTS cancel_requested BOOLEAN DEFAULT FALSE",
                 "ALTER TABLE workflow_executions ADD COLUMN IF NOT EXISTS resume_cursor JSONB DEFAULT '{}'",
                 "CREATE INDEX IF NOT EXISTS idx_workflow_executions_project_workflow_status ON workflow_executions(project_id, workflow_id, status)",
+                "CREATE INDEX IF NOT EXISTS idx_workflow_executions_active_project ON workflow_executions(project_id, status, last_heartbeat_at DESC, started_at DESC)",
+                "CREATE INDEX IF NOT EXISTS idx_workflow_executions_active_project_workflow ON workflow_executions(project_id, workflow_id, status, last_heartbeat_at DESC, started_at DESC)",
                 "CREATE INDEX IF NOT EXISTS idx_workflow_executions_request ON workflow_executions(request_id)",
                 "CREATE INDEX IF NOT EXISTS idx_workflow_executions_trace ON workflow_executions(trace_id)",
             ]
@@ -2187,6 +2617,19 @@ class PostgresDatabase:
                 except Exception as e:
                     logger.warning(f"更新关系图投影任务表结构时出错: {str(e)[:100]}")
 
+            chapter_schema_updates = [
+                "ALTER TABLE chapters ADD COLUMN IF NOT EXISTS chapter_outline_id TEXT",
+                "ALTER TABLE chapters ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP WITH TIME ZONE",
+                "CREATE INDEX IF NOT EXISTS idx_chapters_outline_id ON chapters(chapter_outline_id)",
+                "CREATE INDEX IF NOT EXISTS idx_chapters_deleted_at ON chapters(deleted_at)",
+            ]
+            if 'chapters' in existing_tables:
+                for statement in chapter_schema_updates:
+                    try:
+                        await session.execute(text(statement))
+                    except Exception as e:
+                        logger.warning(f"更新章节表软删除结构时出错: {str(e)[:100]}")
+
             project_schema_updates = [
                 "ALTER TABLE projects ADD COLUMN IF NOT EXISTS user_id TEXT",
                 "ALTER TABLE projects ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'draft'",
@@ -2236,7 +2679,7 @@ class PostgresDatabase:
                 "ALTER TABLE hooks ADD COLUMN IF NOT EXISTS resolution_hint TEXT",
                 "ALTER TABLE hooks ADD COLUMN IF NOT EXISTS resolution_context TEXT",
                 "ALTER TABLE hooks ADD COLUMN IF NOT EXISTS resolution_chapter UUID REFERENCES chapters(id) ON DELETE SET NULL",
-                "ALTER TABLE hooks ADD COLUMN IF NOT EXISTS priority INTEGER DEFAULT 5",
+                "ALTER TABLE hooks ADD COLUMN IF NOT EXISTS priority INTEGER DEFAULT 3",
                 "ALTER TABLE hooks ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMP WITH TIME ZONE",
                 "ALTER TABLE hooks ADD COLUMN IF NOT EXISTS scope_type TEXT NOT NULL DEFAULT 'project'",
                 "ALTER TABLE hooks ADD COLUMN IF NOT EXISTS character_id UUID REFERENCES characters(id) ON DELETE SET NULL",
@@ -2253,6 +2696,53 @@ class PostgresDatabase:
                         await session.execute(text(statement))
                     except Exception as e:
                         logger.warning(f"更新伏笔表作用域结构时出错: {str(e)[:100]}")
+                hook_jsonb_migration = """
+                DO $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'hooks'
+                          AND column_name = 'related_characters'
+                          AND data_type <> 'jsonb'
+                    ) THEN
+                        ALTER TABLE hooks
+                        ALTER COLUMN related_characters DROP DEFAULT,
+                        ALTER COLUMN related_characters TYPE JSONB
+                        USING COALESCE(to_jsonb(related_characters), '[]'::jsonb),
+                        ALTER COLUMN related_characters SET DEFAULT '[]'::jsonb;
+                    END IF;
+
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'hooks'
+                          AND column_name = 'related_locations'
+                          AND data_type <> 'jsonb'
+                    ) THEN
+                        ALTER TABLE hooks
+                        ALTER COLUMN related_locations DROP DEFAULT,
+                        ALTER COLUMN related_locations TYPE JSONB
+                        USING COALESCE(to_jsonb(related_locations), '[]'::jsonb),
+                        ALTER COLUMN related_locations SET DEFAULT '[]'::jsonb;
+                    END IF;
+
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'hooks'
+                          AND column_name = 'related_objects'
+                          AND data_type <> 'jsonb'
+                    ) THEN
+                        ALTER TABLE hooks
+                        ALTER COLUMN related_objects DROP DEFAULT,
+                        ALTER COLUMN related_objects TYPE JSONB
+                        USING COALESCE(to_jsonb(related_objects), '[]'::jsonb),
+                        ALTER COLUMN related_objects SET DEFAULT '[]'::jsonb;
+                    END IF;
+                END $$
+                """
+                try:
+                    await session.execute(text(hook_jsonb_migration))
+                except Exception as e:
+                    logger.warning(f"迁移伏笔关联字段为 JSONB 时出错: {str(e)[:100]}")
 
             character_world_profile_schema = """
             CREATE TABLE IF NOT EXISTS character_world_profiles (
@@ -2300,6 +2790,7 @@ class PostgresDatabase:
                 "ALTER TABLE regions ADD COLUMN IF NOT EXISTS state TEXT DEFAULT 'normal'",
                 "ALTER TABLE regions ADD COLUMN IF NOT EXISTS state_summary TEXT",
                 "ALTER TABLE regions ADD COLUMN IF NOT EXISTS destroyed_at TIMESTAMP WITH TIME ZONE",
+                "ALTER TABLE regions ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'",
             ]
             if 'regions' in existing_tables or tables_to_create:
                 for statement in region_schema_updates:
@@ -2847,7 +3338,20 @@ class PostgresDatabase:
         query = f"""
         SELECT * FROM workflow_executions
         WHERE {' AND '.join(conditions)}
-        ORDER BY started_at DESC
+        ORDER BY
+            CASE status
+                WHEN 'running' THEN 1
+                WHEN 'paused' THEN 2
+                WHEN 'pending' THEN 3
+                ELSE 4
+            END ASC,
+            CASE
+                WHEN lease_expires_at IS NOT NULL AND lease_expires_at > CURRENT_TIMESTAMP THEN 0
+                ELSE 1
+            END ASC,
+            COALESCE(last_heartbeat_at, started_at) DESC,
+            started_at DESC,
+            id DESC
         LIMIT 1
         """
         results = await self.execute_query(query, params)
@@ -2874,10 +3378,11 @@ class PostgresDatabase:
         SELECT :execution_id, :event_type, :event_data, sequence_no FROM next_seq
         RETURNING sequence_no
         """
-        results = await self.execute_query(
-            query,
-            {"execution_id": execution_id, "event_type": event_type, "event_data": payload},
-        )
+        async with self._workflow_event_locks[execution_id]:
+            results = await self.execute_query(
+                query,
+                {"execution_id": execution_id, "event_type": event_type, "event_data": payload},
+            )
         return int(results[0]["sequence_no"]) if results else 0
 
     async def get_workflow_execution_events_since(

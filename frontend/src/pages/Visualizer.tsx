@@ -20,7 +20,8 @@ import ReactFlow, {
 } from 'reactflow'
 import 'reactflow/dist/style.css'
 import { getVisualizationData } from '@/api/visualization'
-import { getWorlds, type World } from '@/api/worlds'
+import { getWorlds, getRegions, type Region, type World } from '@/api/worlds'
+import { getCharacters, type Character } from '@/api/characters'
 import {
   getWorkflows,
   createWorkflow,
@@ -43,10 +44,12 @@ import {
 import { getWorkflowNodeTypes, type NodeTypeInfo, type WorkflowNodeTypes } from '@/api/nodeTypes'
 import WorkflowMonitor from '@/components/workflow/WorkflowMonitor'
 import WorkflowTrace from '@/components/workflow/WorkflowTrace'
-import { Network, Users, GitBranch, Play, Save, Trash2, Plus, Loader2, Pause, Square, RotateCcw } from 'lucide-react'
+import { Network, Users, GitBranch, Play, Save, Trash2, Plus, Loader2, Pause, Square, RotateCcw, Orbit, Map } from 'lucide-react'
 import { useTheme } from '@/contexts/ThemeContext'
 import { useProject } from '@/contexts/ProjectContext'
 import WorkflowHelp from '@/components/workflow/WorkflowHelp'
+import WorldMap3D from '@/components/visualizer/WorldMap3D'
+import CharacterRelationshipGraph3D from '@/components/visualizer/CharacterRelationshipGraph3D'
 
 function AgentNode({ data }: { data: any }) {
   const { theme } = useTheme()
@@ -161,7 +164,7 @@ const nodeTypes: NodeTypes = {
   input: InputNode,
 }
 
-type TabType = 'workflow' | 'plots' | 'snapshots'
+type TabType = 'workflow' | 'plots' | 'snapshots' | 'world3d' | 'relationships3d'
 
 type VisualNodeData = {
   label?: string
@@ -254,6 +257,8 @@ const standardAllNodesDefinition = {
       ],
       outputs: [
         { name: 'lore_entries', target: 'context', key: 'lore_entries', save_to_db: false },
+        { name: 'fixed_lore_entries', target: 'context', key: 'fixed_lore_entries', save_to_db: false },
+        { name: 'dynamic_lore_entries', target: 'context', key: 'dynamic_lore_entries', save_to_db: false },
         { name: 'selected_lore_entries', target: 'context', key: 'selected_lore_entries', save_to_db: false },
         { name: 'setting_updates', target: 'context', key: 'setting_updates', save_to_db: false },
         { name: 'setting_query', target: 'context', key: 'setting_query', save_to_db: false },
@@ -345,7 +350,7 @@ const standardAllNodesDefinition = {
         { name: 'chapter_outline', source: 'upstream', upstream_node: 'plot_outline', upstream_field: 'chapter_outline', required: false },
         { name: 'chapter_goals', source: 'upstream', upstream_node: 'plot_outline', upstream_field: 'chapter_goals', required: false },
         { name: 'events', source: 'upstream', upstream_node: 'event_generator', upstream_field: 'events', required: false },
-        { name: 'lore_entries', source: 'upstream', upstream_node: 'setting', upstream_field: 'lore_entries', required: false },
+        { name: 'selected_lore_entries', source: 'upstream', upstream_node: 'setting', upstream_field: 'selected_lore_entries', required: false },
         { name: 'locations', source: 'upstream', upstream_node: 'world_map_manager', upstream_field: 'locations', required: false },
         { name: 'regions', source: 'upstream', upstream_node: 'proc_gen', upstream_field: 'regions', required: false },
         { name: 'dungeon_plan', source: 'upstream', upstream_node: 'dungeon_generator', upstream_field: 'dungeon_plan', required: false },
@@ -473,6 +478,7 @@ const standardAllNodesDefinition = {
         { name: 'summary', source: 'context', key: 'summary', required: false },
         { name: 'scene_directions', source: 'context', key: 'scene_directions', required: false },
         { name: 'hooks', source: 'context', key: 'hooks', required: false },
+        { name: 'selected_lore_entries', source: 'context', key: 'selected_lore_entries', required: false },
         { name: 'retry_message', source: 'context', key: 'retry_message', required: false },
       ],
       outputs: [
@@ -492,7 +498,7 @@ const standardAllNodesDefinition = {
         { name: 'chapter_content', source: 'context', key: 'chapter_content', required: false },
         { name: 'chapter_outline', source: 'context', key: 'chapter_outline', required: false },
         { name: 'chapter_goals', source: 'context', key: 'chapter_goals', required: false },
-        { name: 'lore_entries', source: 'context', key: 'lore_entries', required: false },
+        { name: 'selected_lore_entries', source: 'context', key: 'selected_lore_entries', required: false },
       ],
       outputs: [
         { name: 'quality_passed', target: 'context', key: 'quality_passed', save_to_db: false },
@@ -703,6 +709,10 @@ export default function Visualizer() {
   const [data, setData] = useState<any>(null)
   const [worlds, setWorlds] = useState<World[]>([])
   const [selectedWorldId, setSelectedWorldId] = useState('')
+  const [regionsByWorldId, setRegionsByWorldId] = useState<Record<string, Region[]>>({})
+  const [characters, setCharacters] = useState<Character[]>([])
+  const [loadingSceneData, setLoadingSceneData] = useState(false)
+  const [selectedRelationshipNodeId, setSelectedRelationshipNodeId] = useState('')
   const [nodeTypesData, setNodeTypesData] = useState<WorkflowNodeTypes>({
     agent_nodes: [],
     interaction_nodes: [],
@@ -770,6 +780,15 @@ export default function Visualizer() {
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [setNodes, setEdges])
 
+  useEffect(() => {
+    if (!currentProject || (activeTab !== 'world3d' && activeTab !== 'relationships3d')) return
+    void loadSceneData()
+  }, [currentProject, worlds, activeTab])
+
+  useEffect(() => {
+    setSelectedRelationshipNodeId('')
+  }, [selectedWorldId])
+
   const loadWorlds = async () => {
     if (!currentProject) return
     try {
@@ -793,6 +812,34 @@ export default function Visualizer() {
       setWorkflows(result)
     } catch (error) {
       console.error('Failed to load workflows:', error)
+    }
+  }
+
+  const loadSceneData = async () => {
+    if (!currentProject) return
+    setLoadingSceneData(true)
+    try {
+      const [characterResult, regionEntries] = await Promise.all([
+        getCharacters(currentProject.id),
+        Promise.all(
+          worlds
+            .filter((world) => world.id)
+            .map(async (world) => {
+              try {
+                return [world.id as string, await getRegions(world.id as string)] as const
+              } catch (error) {
+                console.warn('Failed to load regions for world:', world.id, error)
+                return [world.id as string, []] as const
+              }
+            }),
+        ),
+      ])
+      setCharacters(characterResult)
+      setRegionsByWorldId(Object.fromEntries(regionEntries))
+    } catch (error) {
+      console.error('Failed to load 3D scene data:', error)
+    } finally {
+      setLoadingSceneData(false)
     }
   }
 
@@ -1178,12 +1225,14 @@ export default function Visualizer() {
     { key: 'workflow', label: '工作流', icon: <Network size={18} /> },
     { key: 'plots', label: '剧情树', icon: <Users size={18} /> },
     { key: 'snapshots', label: '版本树', icon: <GitBranch size={18} /> },
+    { key: 'world3d', label: '3D地图', icon: <Map size={18} /> },
+    { key: 'relationships3d', label: '3D关系', icon: <Orbit size={18} /> },
   ]
 
   return (
     <PageLayout
       title="可视化工作台"
-      description="可视化展示工作流、剧情树和版本树"
+      description="可视化展示工作流、剧情树、版本树、多位面地图和角色关系网"
       tabs={tabs}
       activeTab={activeTab}
       onTabChange={(key) => setActiveTab(key as TabType)}
@@ -1566,6 +1615,49 @@ export default function Visualizer() {
             </div>
           </div>
         </div>
+      ) : activeTab === 'world3d' ? (
+        <Card className="min-h-[650px] overflow-hidden p-0">
+          {loadingSceneData ? (
+            <div className={`h-[650px] flex items-center justify-center gap-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+              <Loader2 size={22} className="animate-spin text-blue-500" />
+              正在加载多位面地图数据...
+            </div>
+          ) : selectedWorldId && currentWorld ? (
+            <WorldMap3D
+              worlds={worlds}
+              regionsByWorldId={regionsByWorldId}
+              characters={characters}
+              selectedWorldId={selectedWorldId}
+              onWorldSelect={setSelectedWorldId}
+              isDark={isDark}
+            />
+          ) : (
+            <div className={`h-[650px] flex items-center justify-center ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+              暂无世界数据，请先创建世界
+            </div>
+          )}
+        </Card>
+      ) : activeTab === 'relationships3d' ? (
+        <Card className="min-h-[650px] overflow-hidden p-0">
+          {loadingSceneData ? (
+            <div className={`h-[650px] flex items-center justify-center gap-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+              <Loader2 size={22} className="animate-spin text-blue-500" />
+              正在加载角色关系数据...
+            </div>
+          ) : selectedWorldId && currentWorld ? (
+            <CharacterRelationshipGraph3D
+              worldId={selectedWorldId}
+              characters={characters}
+              selectedCharacterId={selectedRelationshipNodeId}
+              onCharacterSelect={setSelectedRelationshipNodeId}
+              isDark={isDark}
+            />
+          ) : (
+            <div className={`h-[650px] flex items-center justify-center ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+              暂无世界数据，请先创建世界
+            </div>
+          )}
+        </Card>
       ) : (
         <Card className="min-h-[600px]">
           {selectedWorldId && currentWorld ? (
