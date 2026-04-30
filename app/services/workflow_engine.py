@@ -3152,6 +3152,9 @@ class WorkflowEngine:
             context["chapter_target_word_count"] = canonical_target
             context["word_count"] = canonical_target
 
+        if resolved_agent_type in {"writer", "evaluator", "master_plotter", "plotter"}:
+            self._attach_upcoming_outline_context(context)
+
         if resolved_agent_type in {"master_plotter", "plotter"} and context.get("chapter_outline"):
             context.setdefault("task", "prepare_writing_plan")
 
@@ -3511,6 +3514,8 @@ class WorkflowEngine:
                     "fixed_lore_entries",
                     "dynamic_lore_entries",
                     "selected_lore_entries",
+                    "upcoming_outline_context",
+                    "upcoming_outline_policy",
                     "node_outputs",
                     "asset_state",
                     "workflow_state",
@@ -3591,6 +3596,7 @@ class WorkflowEngine:
 
             # ===== Evaluator Agent：需要章节历史、绑定大纲、设定、写作计划和资产状态 =====
             if agent_type == "evaluator":
+                self._attach_upcoming_outline_context(context)
                 for workflow_key in [
                     "chapter_outline",
                     "chapter_goals",
@@ -3606,6 +3612,8 @@ class WorkflowEngine:
                     "fixed_lore_entries",
                     "dynamic_lore_entries",
                     "selected_lore_entries",
+                    "upcoming_outline_context",
+                    "upcoming_outline_policy",
                     "participation_trace",
                     "participation_warnings",
                     "map_persistence_state",
@@ -4190,6 +4198,22 @@ class WorkflowEngine:
                     db=db,
                     llm_model=writer_model,
                 )
+
+        # 如果 Writer 按已确认计划输出了首次出场角色候选，复用讨论资产角色落库路径
+        if node.agent_type == "writer" and result.success and output_data:
+            writer_character_candidates = self._ensure_context_list(
+                output_data.get("character_candidates")
+                or output_data.get("new_characters")
+                or output_data.get("characters_to_create")
+            )
+            if writer_character_candidates:
+                character_result = await self._persist_discussion_characters(
+                    execution,
+                    writer_character_candidates,
+                    db,
+                )
+                execution.context["writer_created_characters"] = character_result.get("created", [])
+                execution.context["writer_character_persistence_state"] = character_result
 
         # 如果是伏笔管理 Agent，保存伏笔到数据库
         if node.agent_type == "hook_manager" and result.success and output_data:
@@ -5342,9 +5366,25 @@ class WorkflowEngine:
                 "required_elements_check",
                 "outline_adherence_notes",
                 "setting_conflict_warnings",
+                "supporting_character_plan",
             ):
                 if plotter_output.get(key) is not None:
                     runtime_updates[key] = plotter_output[key]
+
+            character_candidates = self._ensure_context_list(
+                plotter_output.get("character_candidates")
+                or plotter_output.get("new_characters")
+                or plotter_output.get("characters_to_create")
+            )
+            if character_candidates:
+                character_result = await self._persist_discussion_characters(
+                    execution,
+                    character_candidates,
+                    db,
+                )
+                execution.context["plotter_created_characters"] = character_result.get("created", [])
+                execution.context["plotter_character_persistence_state"] = character_result
+                runtime_updates["character_candidates"] = character_candidates
 
             if protect_bound_outline:
                 suggested_outline = plotter_output.get("suggested_chapter_outline") or chapter_outline
@@ -6029,6 +6069,100 @@ class WorkflowEngine:
         if isinstance(value, (int, float, bool)):
             return str(value)
         return fallback
+
+    def _parse_chapter_number(self, value: Any) -> Optional[int]:
+        """安全解析章节序号。"""
+        try:
+            if value in (None, ""):
+                return None
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _chapter_number_from_outline_item(self, item: Any) -> Optional[int]:
+        """从大纲项中提取章节序号。"""
+        if not isinstance(item, dict):
+            return None
+        for key in ("chapter_num", "chapter_number", "number", "index", "order"):
+            chapter_number = self._parse_chapter_number(item.get(key))
+            if chapter_number is not None:
+                return chapter_number
+        return None
+
+    def _outline_item_summary(self, item: Any) -> str:
+        """提取大纲项的紧凑摘要。"""
+        if isinstance(item, dict):
+            title = self._extract_context_item_text(item, "title", "name")
+            summary = self._extract_context_item_text(
+                item,
+                "goal",
+                "summary",
+                "description",
+                "content",
+                "event",
+                "events",
+                "key_points",
+            )
+            if title and summary:
+                return f"{title}: {summary}"
+            return title or summary
+        return self._coerce_context_text(item).strip()
+
+    def _build_upcoming_outline_context(
+        self,
+        context: Dict[str, Any],
+        *,
+        limit: int = 3,
+    ) -> List[Dict[str, Any]]:
+        """基于已有后续大纲构建 Writer/Evaluator 可用的后续剧情参考。"""
+        chapter_num = self._parse_chapter_number(context.get("chapter_num") or context.get("chapter_number")) or 1
+        candidates: List[tuple[Optional[int], Any]] = []
+
+        chapter_goals = self._ensure_context_list(context.get("chapter_goals"))
+        for index, goal in enumerate(chapter_goals, start=1):
+            if index > chapter_num:
+                candidates.append((index, goal))
+
+        plot_outline = self._ensure_context_list(context.get("plot_outline"))
+        for index, item in enumerate(plot_outline, start=1):
+            item_chapter = self._chapter_number_from_outline_item(item) or index
+            if item_chapter > chapter_num:
+                candidates.append((item_chapter, item))
+
+        chapter_outline = context.get("chapter_outline")
+        if isinstance(chapter_outline, dict):
+            for key, item in chapter_outline.items():
+                item_chapter = self._parse_chapter_number(key) or self._chapter_number_from_outline_item(item)
+                if item_chapter is not None and item_chapter > chapter_num:
+                    candidates.append((item_chapter, item))
+
+        seen: set[tuple[Optional[int], str]] = set()
+        upcoming: List[Dict[str, Any]] = []
+        for chapter_number, item in sorted(candidates, key=lambda pair: pair[0] or 999999):
+            summary = self._outline_item_summary(item)
+            if not summary:
+                continue
+            fingerprint = (chapter_number, summary)
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            upcoming.append({
+                "chapter_num": chapter_number,
+                "summary": summary,
+            })
+            if len(upcoming) >= limit:
+                break
+        return upcoming
+
+    def _attach_upcoming_outline_context(self, context: Dict[str, Any]) -> None:
+        """把后续大纲参考写入上下文；没有后续大纲时显式标记为 none。"""
+        if context.get("upcoming_outline_context"):
+            return
+        upcoming = self._build_upcoming_outline_context(context)
+        context["upcoming_outline_context"] = upcoming
+        context["upcoming_outline_policy"] = (
+            "use_existing_upcoming_outline" if upcoming else "no_upcoming_outline_follow_current_outline"
+        )
 
     def _extract_context_item_text(self, item: Any, *keys: str) -> str:
         """从 dict 或文本项中提取用于上下文的文本。"""

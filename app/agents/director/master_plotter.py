@@ -338,6 +338,8 @@ class MasterPlotterAgent(BaseAgent):
         target_word_count = input_data.get("target_word_count") or input_data.get("chapter_target_word_count")
         world_info = self._as_dict(input_data.get("world_info", {}))
 
+        upcoming_outline_context = self._as_list(input_data.get("upcoming_outline_context", []))
+        upcoming_outline_policy = input_data.get("upcoming_outline_policy")
         character_constraints = input_data.get("character_constraints")
 
         blocks = [
@@ -346,7 +348,8 @@ class MasterPlotterAgent(BaseAgent):
             self._format_context_block("目标字数", target_word_count),
             self._format_context_block("世界/项目规则", world_info),
             self._format_context_block("固定最高级设定", fixed_lore_entries),
-            self._format_context_block("本章动态设定", dynamic_lore_entries),
+            self._format_context_block("后续大纲参考", upcoming_outline_context),
+            self._format_context_block("后续大纲策略", upcoming_outline_policy),
             self._format_context_block("角色出场硬约束", character_constraints),
             self._format_context_block("场景方向", scene_directions),
             self._format_context_block("场景演绎素材", performance_result),
@@ -368,7 +371,9 @@ class MasterPlotterAgent(BaseAgent):
 5. 角色出场硬约束优先级高于场景演绎素材和集体讨论素材：只有 present_character_names 可作为当前场景正面参与者。
 6. mentioned_only_names / forbidden_direct_appearance_names 中的角色只能作为传闻、回忆、姓名、势力或影响被提及，不能安排其直接出场、发言或行动。
 7. 角色来源、历史、身份和背景必须遵守 category=character_setting 的设定；如素材冲突，写入 rewrite_or_skip / avoid，而不是采纳。
-8. 不要引入项目设定中不存在的通用修真/玄幻规则。
+8. 如果已有后续大纲参考，写作计划和新角色候选必须服务后续剧情发展，不能只解决本章即时推进。
+9. 如果没有后续大纲，不要擅自新建完整后续大纲；只按当前绑定大纲推进，并可在 future_setup / hook_usage 中提出轻量后续铺垫建议。
+10. 当 present_character_names 中的主要角色不足以推动本章事件时，可以提出新的 supporting/recurring/catalyst/informant/npc 次要角色候选，但候选必须避开 mentioned_only_names / forbidden_direct_appearance_names，且必须给出可落库的姓名、定位、背景、目标和出场理由。
 
 请输出 JSON：
 {{
@@ -392,6 +397,15 @@ class MasterPlotterAgent(BaseAgent):
     "outline_elements": [{{"item": "要素", "status": "covered/missing/conflict", "note": "说明"}}],
     "setting_elements": [{{"item": "设定", "status": "covered/missing/conflict", "note": "说明"}}]
   }},
+  "supporting_character_plan": {{
+    "needed": true/false,
+    "reason": "如果主要角色不足以推进剧情，说明需要次要角色辅助的原因；否则说明不需要",
+    "avoid_names": ["不得正面出场或不得借用的角色名"],
+    "use_with_upcoming_outline": "如有后续大纲，说明候选角色如何服务后续章节；没有则写'无后续大纲，仅服务当前绑定大纲与轻量铺垫'"
+  }},
+  "character_candidates": [
+    {{"name": "新次要角色姓名", "importance_tier": "supporting/recurring/catalyst/informant/npc", "description": "剧情功能定位", "appearance": "外貌", "personality": "性格", "background_story": "来源背景，必须符合设定", "goals": ["短期目标"], "reason_for_arrival": "为何此时出现并能推动剧情", "future_plot_usage": "如有后续大纲，说明后续用途"}}
+  ],
   "outline_adherence_notes": ["大纲遵循提示"],
   "setting_conflict_warnings": ["设定冲突警告"],
   "suggested_chapter_outline": null,
@@ -421,7 +435,14 @@ class MasterPlotterAgent(BaseAgent):
                         "chapter_focus": chapter_outline.get("summary") or self._as_text(chapter_goals),
                         "target_word_count": target_word_count,
                     },
-                    "plot_guidance": {"must_include": [], "avoid": []},
+                    "plot_guidance": {"must_include": [], "avoid": [], "hook_usage": []},
+                    "supporting_character_plan": {
+                        "needed": False,
+                        "reason": "写作计划生成失败，未自动创建次要角色",
+                        "avoid_names": [],
+                        "use_with_upcoming_outline": "按当前绑定大纲保守推进",
+                    },
+                    "character_candidates": [],
                     "scene_integration_plan": {"use_from_performance": [], "rewrite_or_skip": []},
                     "required_elements_check": {},
                     "outline_adherence_notes": ["写作计划生成失败，使用绑定大纲作为保底事实源"],

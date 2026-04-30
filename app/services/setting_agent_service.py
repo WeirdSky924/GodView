@@ -6,6 +6,7 @@ v6 核心需求：持续设定管理、冲突检测、协商解决
 import hashlib
 import json
 import logging
+import re
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -955,21 +956,13 @@ class SettingAgentService:
                 full_context = "\n\n".join([f"【{k}】\n{v}" for k, v in sections.items() if v and not k.startswith("_")])
                 key_info_index = "（分段分析失败，直接使用原始上下文）"
 
-            # 构建最终上下文：关键信息索引 + 完整原始上下文 + 最近对话
-            context_str = f"""【关键信息索引】
-{key_info_index}
+            # 构建最终上下文：跨段综合要求 + 关键信息索引 + 完整原始上下文 + 最近对话
+            context_str = f"""【设定生成综合要求】
+请优先综合所有分段信息，而不是只依据最后一段或用户最新一句话生成孤立设定。
+新设定应保持相对独立、边界清晰，但必须主动说明它与既有角色、世界规则、势力、地点、伏笔或章节大纲的连接关系。
+如果输入中存在多个相关设定，请分析它们的互补关系、潜在冲突和可复用接口；不要让后面的分段覆盖前面的分段。
 
-【项目完整信息】
-{full_context}
-
-【最近对话】
-""" + "\n".join([
-                f"{msg['role']}: {msg['content']}"
-                for msg in session.conversation_history[-6:]
-            ])
-
-            # 构建最终上下文：关键信息索引 + 完整原始上下文 + 最近对话
-            context_str = f"""【关键信息索引】
+【关键信息索引】
 {key_info_index}
 
 【项目完整信息】
@@ -3386,17 +3379,122 @@ class SettingAgentService:
             if not result or result == "[]":
                 return []
 
-            key_points = json.loads(result)
-            if isinstance(key_points, list):
+            key_points = self._parse_segment_key_points(result)
+            if key_points:
                 return key_points
+            logger.warning("[分段分析] 未能从 LLM 响应中解析出关键信息点")
             return []
 
-        except json.JSONDecodeError as e:
-            logger.warning(f"[分段分析] JSON解析失败: {e}")
-            return []
         except Exception as e:
             logger.warning(f"[分段分析] 关键信息提取失败: {e}")
             return []
+
+    def _parse_segment_key_points(self, result: str) -> List[Dict[str, Any]]:
+        """解析分段关键信息提取结果，尽量避免单个 JSON 格式瑕疵导致整段丢失。"""
+        if not result:
+            return []
+
+        candidates = self._segment_json_candidates(result)
+        for candidate in candidates:
+            parsed = self._load_segment_key_points_json(candidate)
+            if parsed:
+                return parsed
+
+        return []
+
+    def _segment_json_candidates(self, text: str) -> List[str]:
+        """从 LLM 响应中提取可能的 JSON 数组候选。"""
+        text = (text or "").strip()
+        if not text:
+            return []
+
+        candidates: List[str] = []
+
+        fenced_blocks = re.findall(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.IGNORECASE)
+        for block in fenced_blocks:
+            block = block.strip()
+            if block:
+                candidates.append(block)
+
+        if text not in candidates:
+            candidates.append(text)
+
+        array_start = text.find("[")
+        array_end = text.rfind("]")
+        if 0 <= array_start < array_end:
+            array_candidate = text[array_start:array_end + 1].strip()
+            if array_candidate and array_candidate not in candidates:
+                candidates.append(array_candidate)
+
+        return candidates
+
+    def _load_segment_key_points_json(self, candidate: str) -> List[Dict[str, Any]]:
+        """加载关键信息 JSON，并对常见 LLM 格式错误做有限修复。"""
+        normalized = self._normalize_segment_json(candidate)
+        attempts = [normalized]
+        repaired = self._repair_segment_json(normalized)
+        if repaired != normalized:
+            attempts.append(repaired)
+
+        for payload in attempts:
+            try:
+                data = json.loads(payload)
+            except json.JSONDecodeError as e:
+                logger.warning(f"[分段分析] JSON解析失败: {e}")
+                continue
+
+            if isinstance(data, dict):
+                data = data.get("key_points") or data.get("items") or data.get("data") or []
+
+            if not isinstance(data, list):
+                continue
+
+            key_points: List[Dict[str, Any]] = []
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                key_fact = str(item.get("key_fact") or item.get("fact") or item.get("summary") or "").strip()
+                entity = str(item.get("entity") or item.get("name") or "").strip()
+                category = str(item.get("category") or item.get("type") or "其他").strip()
+                relevance = str(item.get("relevance") or "中").strip()
+                if not key_fact and not entity:
+                    continue
+                key_points.append({
+                    "category": category or "其他",
+                    "entity": entity or "未命名实体",
+                    "key_fact": key_fact or entity,
+                    "relevance": relevance if relevance in {"高", "中", "低"} else "中",
+                })
+            return key_points
+
+        return []
+
+    def _normalize_segment_json(self, payload: str) -> str:
+        """规范化 JSON 文本，清理常见包裹和智能标点。"""
+        payload = (payload or "").strip()
+        if payload.startswith("```"):
+            payload = payload.strip("`").strip()
+            if payload.lower().startswith("json"):
+                payload = payload[4:].strip()
+        return (
+            payload
+            .replace("\ufeff", "")
+            .replace("，", ",")
+            .replace("：", ":")
+            .replace("“", '"')
+            .replace("”", '"')
+            .replace("‘", "'")
+            .replace("’", "'")
+        )
+
+    def _repair_segment_json(self, payload: str) -> str:
+        """对 LLM 常见 JSON 错误做保守修复。"""
+        repaired = payload.strip()
+        repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+        repaired = re.sub(r"}\s*{", "}, {", repaired)
+        repaired = re.sub(r'("\s*)\n\s*(")', r"\1,\n\2", repaired)
+        repaired = re.sub(r"'([^'\\]*(?:\\.[^'\\]*)*)'", lambda m: json.dumps(m.group(1), ensure_ascii=False), repaired)
+        return repaired
 
     def _merge_key_points(self, all_key_points: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """

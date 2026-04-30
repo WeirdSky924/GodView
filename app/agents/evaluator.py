@@ -124,6 +124,18 @@ class EvaluatorAgent(BaseAgent):
                     break
             if any(any(marker in snippet for marker in direct_markers) for snippet in snippets):
                 issues.append(f"不可正面出场角色 {name} 疑似被写成当前场景行动/发言者：{' / '.join(snippets[:2])}")
+        declared_new_names = self._character_name_set(
+            input_data.get("character_candidates")
+            or input_data.get("new_characters")
+            or input_data.get("characters_to_create")
+            or input_data.get("writer_created_characters")
+            or input_data.get("plotter_created_characters")
+        )
+        if declared_new_names:
+            for name in declared_new_names:
+                if name in forbidden or name in unavailable or name in mentioned_only:
+                    issues.append(f"新增次要角色候选 {name} 与不可正面出场/仅可提及角色冲突")
+
         return issues
 
     async def execute(self, input_data: Dict[str, Any]) -> AgentResponse:
@@ -164,6 +176,8 @@ class EvaluatorAgent(BaseAgent):
         context_blocks = [
             self._format_context_block("绑定章节大纲", input_data.get("chapter_outline")),
             self._format_context_block("章节目标", input_data.get("chapter_goals") or input_data.get("chapter_goal")),
+            self._format_context_block("后续大纲参考", input_data.get("upcoming_outline_context")),
+            self._format_context_block("后续大纲策略", input_data.get("upcoming_outline_policy")),
             self._format_context_block("场景方向", input_data.get("scene_directions")),
             self._format_context_block("总编剧写作计划", input_data.get("writing_plan") or input_data.get("plot_guidance")),
             self._format_context_block("固定最高级设定", input_data.get("fixed_lore_entries")),
@@ -191,6 +205,9 @@ class EvaluatorAgent(BaseAgent):
 - 如果正文偏离绑定章节大纲、违反固定设定、缺少上游要求的角色/场景/伏笔，quality_passed 必须为 false。
 - 如果角色出场硬约束中的 mentioned_only_names / forbidden_direct_appearance_names 被写成当前场景的活人参与者、发言者或行动者，quality_passed 必须为 false。
 - 如果正文违反 category=character_setting 的角色来源、历史、身份或背景设定，quality_passed 必须为 false。
+- 如果提供了后续大纲参考，需要评估本章新增角色、伏笔、转折是否为后续剧情留出合理接口；若正文堵死后续大纲或提前替代后续章节事件，quality_passed 必须为 false。
+- 如果没有后续大纲参考，不应要求正文凭空服务不存在的后续大纲；只评估它是否按当前绑定大纲推进并留下合理的轻量可持续空间。
+- 如果正文出现首次正面出场的新命名次要角色，需要确认其来自已确认次要角色计划/character_candidates 或已落库角色；否则应要求先创建角色信息或改写为无名背景人物。
 - 集体讨论或场景演绎素材若引入未授权角色或违反角色状态，不能作为通过依据，必须指出并要求改写。
 - 字数需达到目标字数的 80%，且通常不超过目标字数的 125%；目标字数为 {target_word_count or '未提供'}。
 - 如果缺少必要上下文，应在 upstream_context_usage_check 中说明，不能凭空补设定。

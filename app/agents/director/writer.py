@@ -138,9 +138,10 @@ class WriterAgent(BaseAgent):
 1. **可持续发展**：所有剧情、设定、伏笔都要能够支撑后续几百章的发展
 2. **渐进式展开**：不要一次性揭露所有设定和秘密，要留有余地
 3. **避免急躁感**：不要让读者感觉"开头就是高潮，马上要大结局"
-4. **埋下长线伏笔**：为后续剧情埋下可回收的伏笔，不是所有伏笔都要立刻揭晓
-5. **角色成长空间**：主角和配角都要有成长的空间，不要一开始就无敌
-6. **世界观层次**：世界观要有多层次，让读者感觉还有更深的内容待探索
+4. **承接后续大纲**：如果已有后续大纲，本章新增角色、伏笔和事件要服务后续剧情，不要堵死后续发展；如果没有后续大纲，不要自行创建完整后续大纲，只按当前绑定大纲推进并做轻量铺垫
+5. **埋下长线伏笔**：为后续剧情埋下可回收的伏笔，不是所有伏笔都要立刻揭晓
+6. **角色成长空间**：主角和配角都要有成长的空间，不要一开始就无敌
+7. **世界观层次**：世界观要有多层次，让读者感觉还有更深的内容待探索
 
 【网文写作技巧】
 1. 展示，而不是告知 (Show, Don't Tell)
@@ -172,7 +173,8 @@ class WriterAgent(BaseAgent):
     },
     "climax_points": ["本章爽点描述"],
     "hooks_embedded": ["嵌入的伏笔描述"],
-    "future_setup": ["为后续剧情埋下的铺垫"]
+    "future_setup": ["为后续剧情埋下的铺垫"],
+    "character_candidates": [{"name": "仅当总编剧计划允许且首次出场时填写", "importance_tier": "supporting/recurring/catalyst/informant/npc", "description": "剧情功能", "background_story": "符合设定的背景", "goals": ["目标"], "future_plot_usage": "如有后续大纲，说明后续用途"}]
 }"""
 
     def _extract_discussion_summary(self, input_data: Dict[str, Any]) -> str:
@@ -1199,10 +1201,14 @@ class WriterAgent(BaseAgent):
         binding_blocks = [
             ("绑定章节大纲（必须遵循，不可替换）", workflow_context.get("chapter_outline")),
             ("章节目标", workflow_context.get("chapter_goals") or workflow_context.get("chapter_goal")),
+            ("后续大纲参考（只参考已存在的大纲，不可擅自新建）", workflow_context.get("upcoming_outline_context")),
+            ("后续大纲策略", workflow_context.get("upcoming_outline_policy")),
             ("角色出场硬约束", workflow_context.get("character_constraints")),
             ("场景方向", workflow_context.get("scene_directions")),
             ("场景演绎素材（参考材料，不得照抄或覆盖大纲）", workflow_context.get("performance_result")),
             ("总编剧写作计划", workflow_context.get("writing_plan") or workflow_context.get("plot_guidance")),
+            ("次要角色辅助计划", workflow_context.get("supporting_character_plan")),
+            ("已确认/待使用次要角色", workflow_context.get("plotter_created_characters") or workflow_context.get("character_candidates")),
             ("固定最高级设定", workflow_context.get("fixed_lore_entries")),
             ("本章动态设定", workflow_context.get("dynamic_lore_entries") or workflow_context.get("selected_lore_entries")),
             ("上一轮评估修订要求", workflow_context.get("retry_message") or workflow_context.get("revision_notes")),
@@ -1219,10 +1225,13 @@ class WriterAgent(BaseAgent):
                 "【工作流状态使用要求】\n"
                 "- 绑定章节大纲、固定设定和动态设定是事实输入源，必须承接，不能改写为另一套剧情。\n"
                 "- 当章节大纲明确要求某个能力觉醒、融合、警告、线索或场景在本章发生时，必须执行；不得以长篇渐进展开为理由延后或替换。\n"
+                "- 如果提供了后续大纲参考，本章新增人物、伏笔和转折必须兼顾后续章节可持续发展，避免堵死后续大纲；但不得提前剧透或替代后续章节应发生的事件。\n"
+                "- 如果没有后续大纲参考，不要自行新建完整后续大纲；按当前绑定章节大纲写作，只做轻量伏笔/悬念铺垫。\n"
                 "- 场景演绎素材和讨论素材只作为参考材料/写作索引，不是必须逐字照抄的正文脚本；如与绑定大纲或固定设定冲突，以绑定大纲和固定设定为准。\n"
                 "- 角色出场硬约束只限制谁能正面出场、说话或行动；它不是把章节写成室内聊天或静态群像的理由。\n"
-                "- 只有 present_character_names 中的角色可以正面出场、说话或行动。\n"
+                "- 只有 present_character_names 和已确认/已创建的次要角色可以正面出场、说话或行动。\n"
                 "- mentioned_only_names / forbidden_direct_appearance_names 中的角色只能作为传闻、回忆、姓名、势力或影响被提及；不得写成当前场景的活人参与者、发言者或行动者。\n"
+                "- 如果总编剧已提供次要角色辅助计划，可使用其中已确认或已创建的 supporting/recurring/catalyst/informant/npc 角色推动剧情；不要临场发明未落库的新命名角色。\n"
                 "- 如果讨论资产、场景演绎素材或写作计划引入未授权角色，必须跳过或改写，不得作为事实承接。\n"
                 "- 角色来源、历史、身份和背景必须遵守 category=character_setting 的设定库条目；缺失时不要自行补写。\n"
                 "- 不要引入项目设定中不存在的通用修真/玄幻规则、组织、角色或专有概念。\n"
