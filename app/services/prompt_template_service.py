@@ -61,6 +61,51 @@ class PromptTemplateService:
             except Exception as e:
                 logger.warning(f"从数据库加载 Prompt 模板失败: {e}")
 
+        if not self._db or not self._templates:
+            self._load_md_templates_to_cache()
+            self._cache_valid = True
+
+    def _load_md_templates_to_cache(self):
+        """无数据库或数据库为空时，直接从 prompts/**/*.md 构建运行时缓存。"""
+        try:
+            from app.services.md_file_service import get_md_file_service
+
+            md_service = get_md_file_service()
+            for prompt in md_service.list_prompts():
+                category_value = prompt.get("category") or "function"
+                category_mapping = {
+                    "identity": PromptCategory.ROLE,
+                    "instruction": PromptCategory.FUNCTION,
+                    "constraint": PromptCategory.CONSTRAINT,
+                    "output": PromptCategory.OUTPUT,
+                    "base": PromptCategory.BASE,
+                    "role": PromptCategory.ROLE,
+                    "function": PromptCategory.FUNCTION,
+                    "value": PromptCategory.VALUE,
+                }
+                variables = prompt.get("variables") or []
+                default_values = {
+                    item.get("name"): item.get("default")
+                    for item in variables
+                    if isinstance(item, dict) and "name" in item and "default" in item
+                }
+                template = PromptTemplate(
+                    id=prompt["id"],
+                    name=prompt.get("name") or prompt["id"],
+                    description=prompt.get("description", ""),
+                    category=category_mapping.get(str(category_value), PromptCategory.FUNCTION),
+                    tags=prompt.get("tags") or [],
+                    content=prompt.get("content") or "",
+                    variables=variables,
+                    default_values=default_values,
+                    priority=prompt.get("priority", 50),
+                    is_system=prompt.get("is_system", False),
+                )
+                self._templates[template.id] = template
+            logger.info(f"从 MD 文件加载 {len(self._templates)} 个 Prompt 模板到运行时缓存")
+        except Exception as e:
+            logger.warning(f"从 MD 文件加载 Prompt 模板缓存失败: {e}")
+
     def _row_to_template(self, row: Dict) -> PromptTemplate:
         """将数据库行转换为 PromptTemplate 对象"""
         # category 映射：数据库中可能的值 -> PromptCategory 枚举
@@ -226,9 +271,11 @@ class PromptTemplateService:
             search_lower = filters.search.lower()
             templates = [
                 t for t in templates
-                if (search_lower in t.name.lower() or
+                if (search_lower in t.id.lower() or
+                    search_lower in t.name.lower() or
                     search_lower in t.description.lower() or
-                    search_lower in t.content.lower())
+                    search_lower in t.content.lower() or
+                    any(search_lower in tag.lower() for tag in t.tags))
             ]
 
         # 排序：按优先级降序，然后按创建时间降序
@@ -334,6 +381,10 @@ class PromptTemplateService:
         scored_templates = []
         for template in templates:
             score = 0
+
+            # ID 匹配（前端常用 md prompt_id 搜索）
+            if query_lower in template.id.lower():
+                score += 12
 
             # 名称匹配
             if query_lower in template.name.lower():
@@ -663,8 +714,9 @@ class PromptTemplateService:
                     errors += 1
                     logger.error(f"同步 Prompt {prompt_id} 失败: {e}")
 
-            # 刷新缓存
+            # 刷新缓存，并立即重新加载同步后的 DB 数据，确保启动阶段后续服务可直接解析新增 md prompt。
             self.invalidate_cache()
+            await self._ensure_cache()
 
             logger.info(f"MD 文件同步完成: {synced} 个成功, {skipped} 个跳过, {errors} 个错误")
             return {"synced": synced, "skipped": skipped, "errors": errors}

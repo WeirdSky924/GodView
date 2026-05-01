@@ -67,6 +67,7 @@ class OrchestrationContext:
     initial_goal: str
     variables: Dict[str, Any] = field(default_factory=dict)
     call_history: List[SkillCall] = field(default_factory=list)
+    scenario: Optional[str] = None
     max_iterations: int = 10
     current_iteration: int = 0
 
@@ -87,6 +88,7 @@ class OrchestrationContext:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "agent_type": self.agent_type,
+            "scenario": self.scenario,
             "initial_goal": self.initial_goal,
             "variables": self.variables,
             "call_history": [c.to_dict() for c in self.call_history],
@@ -140,6 +142,7 @@ class SkillOrchestrator:
         initial_params: Optional[Dict[str, Any]] = None,
         available_skills: Optional[List[Skill]] = None,
         max_iterations: int = 10,
+        scenario: Optional[str] = None,
     ) -> OrchestrationContext:
         """
         执行 Skill 编排
@@ -150,6 +153,7 @@ class SkillOrchestrator:
             initial_params: 初始参数
             available_skills: 可用的 Skills（None 则自动加载）
             max_iterations: 最大迭代次数
+            scenario: Agent 使用场景
 
         Returns:
             OrchestrationContext: 编排上下文（包含所有调用记录）
@@ -159,12 +163,13 @@ class SkillOrchestrator:
             agent_type=agent_type,
             initial_goal=goal,
             variables=initial_params or {},
+            scenario=scenario,
             max_iterations=max_iterations,
         )
 
         # 获取可用的 Skills
         if available_skills is None:
-            available_skills = await self._get_available_skills(agent_type)
+            available_skills = await self._get_available_skills(agent_type, scenario)
 
         if not available_skills:
             logger.warning(f"Agent {agent_type} 没有可用的 Skills")
@@ -477,13 +482,13 @@ class SkillOrchestrator:
 
         return resolved
 
-    async def _get_available_skills(self, agent_type: str) -> List[Skill]:
+    async def _get_available_skills(self, agent_type: str, scenario: Optional[str] = None) -> List[Skill]:
         """获取 Agent 可用的 Skills"""
         if not self.skill_service:
             return []
 
         try:
-            assigned = await self.skill_service.get_assigned_skills_for_agent(agent_type)
+            assigned = await self.skill_service.get_assigned_skills_for_agent(agent_type, scenario)
             return [skill for skill, _ in assigned]
         except Exception as e:
             logger.error(f"获取可用 Skills 失败: {e}")

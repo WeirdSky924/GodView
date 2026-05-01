@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import settings
+from app.models.agent_template import AgentType
 from app.models.bootstrap import BootstrapSession, BootstrapStage, BootstrapMessage
 from app.models.setting_agent import (
     SettingAgentMode,
@@ -78,6 +79,80 @@ class SettingAgentService:
         self._max_consecutive_failures = 5  # 最大连续失败次数，超过后暂停调用
         self._failure_reset_time = 60  # 失败计数重置时间（秒）
         self._last_failure_time = None  # 上次失败时间
+
+        self._setting_config_prompt_cache: Dict[str, str] = {}
+        self._setting_config_prompt_source_cache: Dict[str, str] = {}
+
+    def _setting_scenario_for_mode(self, session: Optional[SettingAgentSession]) -> str:
+        if session and session.mode == SettingAgentMode.MANAGEMENT:
+            return "resource_management"
+        return "workflow_context"
+
+    async def _get_setting_config_prompt(
+        self,
+        project_id: Optional[str],
+        scenario: str,
+        variables: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        cache_key = f"{project_id or 'global'}::{scenario or 'workflow_context'}"
+        if cache_key in self._setting_config_prompt_cache:
+            return self._setting_config_prompt_cache[cache_key]
+
+        prompt = ""
+        if project_id:
+            try:
+                from app.services.agent_prompt_service import get_agent_prompt_service
+
+                service = get_agent_prompt_service()
+                prompt = await service.build_agent_prompt(
+                    agent_type=AgentType.SETTING,
+                    project_id=project_id,
+                    scenario=scenario,
+                    variables=variables or {},
+                )
+            except Exception as e:
+                logger.warning(f"[SettingAgent] 加载 Setting Agent Template prompt 失败: {e}")
+
+        if prompt:
+            self._setting_config_prompt_cache[cache_key] = prompt
+            self._setting_config_prompt_source_cache[cache_key] = "agent_template_runtime"
+            return prompt
+
+        fallback = self._build_md_setting_fallback_prompt()
+        if fallback:
+            self._setting_config_prompt_cache[cache_key] = fallback
+            self._setting_config_prompt_source_cache[cache_key] = "md_prompt_fallback"
+            return fallback
+
+        self._setting_config_prompt_cache[cache_key] = ""
+        self._setting_config_prompt_source_cache[cache_key] = "missing"
+        return ""
+
+    def _build_md_setting_fallback_prompt(self) -> str:
+        prompt_ids = [
+            "role_setting",
+            "function_setting_resource_management",
+            "function_setting_segmented_context_synthesis",
+            "function_setting_lore_interconnection",
+            "function_setting_requirement_resolution",
+        ]
+        parts = [content for prompt_id in prompt_ids if (content := self._load_md_prompt_content(prompt_id))]
+        return "\n\n".join(parts).strip()
+
+    def _load_md_prompt_content(self, prompt_id: str) -> str:
+        try:
+            from app.services.md_file_service import get_md_file_service
+
+            md_service = get_md_file_service()
+            prompt = md_service.get_prompt(prompt_id)
+            if prompt:
+                content = prompt.get("content") or prompt.get("raw_content") or ""
+                if content:
+                    return content.strip()
+        except Exception as e:
+            logger.warning(f"加载 {prompt_id} prompt 失败: {e}")
+
+        return ""
 
     def reset_failure_state(self):
         """重置 LLM 失败状态（可由外部调用）"""
@@ -903,7 +978,21 @@ class SettingAgentService:
             await postgres_db.append_setting_agent_message(session.id, "user", message, request_id=request_id)
 
         # 构建系统提示（异步）
+        scenario = self._setting_scenario_for_mode(session)
         system_prompt = await self._build_management_system_prompt(session)
+        config_prompt = await self._get_setting_config_prompt(
+            project_id,
+            scenario,
+            variables={"scenario": scenario, "mode": session.mode.value if hasattr(session.mode, "value") else str(session.mode)},
+        )
+        if config_prompt:
+            system_prompt = (
+                "【Setting 配置规则】\n"
+                "以下内容来自 Agent Template 绑定的 md prompt / skills / writing-rules，是本次设定管理的稳定规则来源。\n"
+                f"{config_prompt}\n\n"
+                "【当前运行任务补充】\n"
+                f"{system_prompt}"
+            )
 
         # ========== 优化2：增量上下文加载 ==========
         # 第一次消息加载完整项目上下文并缓存；后续消息复用缓存

@@ -867,6 +867,51 @@ class WritingRuleService:
             "rules": rules,
         }
 
+    def _rule_matches_runtime_context(self, rule: WritingRule, context: Optional[Dict[str, Any]] = None) -> bool:
+        """按 rule.conditions 中的 agent_type/scenario/scope 条件过滤运行时规则。"""
+        payload = context or {}
+        agent_type = str(payload.get("agent_type") or "").strip()
+        scenario = str(payload.get("scenario") or payload.get("context_scene") or payload.get("scene") or "").strip()
+
+        for condition in rule.conditions or []:
+            condition_type = condition.get("type")
+            if condition_type not in {"agent_type", "agent", "scenario", "agent_scenario", "scope"}:
+                continue
+
+            raw_values = condition.get("values", condition.get("value", condition.get("match")))
+            if raw_values is None:
+                raw_values = condition.get("description")
+            values = self._ensure_list(raw_values)
+            normalized_values = {str(value).strip().lower() for value in values if str(value).strip()}
+            if not normalized_values or "*" in normalized_values or "all" in normalized_values:
+                continue
+
+            if condition_type in {"agent_type", "agent"}:
+                if not agent_type or agent_type.lower() not in normalized_values:
+                    return False
+                continue
+
+            if condition_type in {"scenario", "agent_scenario"}:
+                if not scenario or scenario.lower() not in normalized_values:
+                    return False
+                continue
+
+            if condition_type == "scope":
+                if agent_type and agent_type.lower() in normalized_values:
+                    continue
+                if scenario and scenario.lower() in normalized_values:
+                    continue
+                return False
+
+        return True
+
+    def _filter_rules_by_runtime_context(
+        self,
+        rules: List[WritingRule],
+        context: Optional[Dict[str, Any]] = None,
+    ) -> List[WritingRule]:
+        return [rule for rule in rules if self._rule_matches_runtime_context(rule, context)]
+
     def build_retrieval_query_context(self, project_id: str, context: Optional[Dict[str, Any]] = None) -> str:
         payload = context or {}
         sections: List[str] = [f"project:{project_id}"]
@@ -897,6 +942,10 @@ class WritingRuleService:
             if text:
                 sections.append(f"{title}: {text}")
 
+        append_section("agent_type", payload.get("agent_type"))
+        append_section("scenario", payload.get("scenario"))
+        append_section("context_scene", payload.get("context_scene"))
+        append_section("keywords", payload.get("keywords"))
         append_section("chapter", payload.get("chapter_num"))
         append_section("total_chapters", payload.get("total_chapters"))
         append_section("discussion_summary", payload.get("discussion_summary"))
@@ -915,6 +964,10 @@ class WritingRuleService:
     def has_meaningful_retrieval_context(self, context: Optional[Dict[str, Any]] = None) -> bool:
         payload = context or {}
         meaningful_keys = [
+            "agent_type",
+            "scenario",
+            "context_scene",
+            "keywords",
             "discussion_summary",
             "environment",
             "intents",

@@ -247,6 +247,11 @@ class SkillService:
 
         return skill
 
+    @staticmethod
+    def _normalize_scenario(scenario: Optional[str]) -> str:
+        scenario_value = (scenario or "default").strip()
+        return scenario_value or "default"
+
     async def _sync_applicable_agent_types_to_assignments(self, skill: Skill):
         """
         将 Skill 的 applicable_agent_types 同步到 skill_assignments 表
@@ -260,10 +265,10 @@ class SkillService:
         try:
             # 获取现有的分配
             existing_rows = await self._db.execute_query(
-                "SELECT agent_type, slot_name FROM skill_assignments WHERE skill_id = :skill_id",
+                "SELECT agent_type, scenario, slot_name FROM skill_assignments WHERE skill_id = :skill_id",
                 {"skill_id": skill.id}
             )
-            existing_agents = {row['agent_type'] for row in existing_rows}
+            existing_agents = {row['agent_type'] for row in existing_rows if self._normalize_scenario(row.get('scenario')) == "default"}
 
             # 计算需要添加和删除的
             new_agents = set(skill.applicable_agent_types or [])
@@ -274,7 +279,7 @@ class SkillService:
             if to_remove:
                 for agent_type in to_remove:
                     await self._db.execute_write(
-                        "DELETE FROM skill_assignments WHERE skill_id = :skill_id AND agent_type = :agent_type",
+                        "DELETE FROM skill_assignments WHERE skill_id = :skill_id AND agent_type = :agent_type AND scenario = 'default'",
                         {"skill_id": skill.id, "agent_type": agent_type}
                     )
                     logger.info(f"移除 Skill {skill.id} 对 Agent {agent_type} 的分配")
@@ -286,15 +291,16 @@ class SkillService:
                     await self._db.execute_write(
                         """
                         INSERT INTO skill_assignments
-                        (id, skill_id, agent_type, slot_name, priority, is_enabled, is_required, variable_overrides, assigned_by)
-                        VALUES (:id, :skill_id, :agent_type, :slot_name, :priority, true, false, '{}', 'system')
-                        ON CONFLICT (skill_id, agent_type, slot_name) DO UPDATE SET
+                        (id, skill_id, agent_type, scenario, slot_name, priority, is_enabled, is_required, variable_overrides, assigned_by)
+                        VALUES (:id, :skill_id, :agent_type, :scenario, :slot_name, :priority, true, false, '{}', 'system')
+                        ON CONFLICT (skill_id, agent_type, scenario, slot_name) DO UPDATE SET
                             priority = :priority, is_enabled = true
                         """,
                         {
                             "id": assignment_id,
                             "skill_id": skill.id,
                             "agent_type": agent_type,
+                            "scenario": "default",
                             "slot_name": skill.category,  # 使用 category 作为默认 slot_name
                             "priority": skill.priority,
                         }
@@ -329,15 +335,16 @@ class SkillService:
                 await self._db.execute_write(
                     """
                     INSERT INTO skill_assignments
-                    (id, skill_id, agent_type, slot_name, priority, is_enabled, is_required, variable_overrides, assigned_by)
-                    VALUES (:id, :skill_id, :agent_type, :slot_name, :priority, true, false, '{}', 'system')
-                    ON CONFLICT (skill_id, agent_type, slot_name) DO UPDATE SET
+                    (id, skill_id, agent_type, scenario, slot_name, priority, is_enabled, is_required, variable_overrides, assigned_by)
+                    VALUES (:id, :skill_id, :agent_type, :scenario, :slot_name, :priority, true, false, '{}', 'system')
+                    ON CONFLICT (skill_id, agent_type, scenario, slot_name) DO UPDATE SET
                         priority = :priority, is_enabled = true
                     """,
                     {
                         "id": assignment_id,
                         "skill_id": skill_id,
                         "agent_type": agent_type,
+                        "scenario": "default",
                         "slot_name": category,
                         "priority": priority,
                     }
@@ -511,11 +518,14 @@ class SkillService:
         if dto.skill_id not in self._skills_cache:
             raise ValueError(f"Skill {dto.skill_id} 不存在")
 
+        normalized_scenario = self._normalize_scenario(dto.scenario)
+
         assignment_id = f"assign_{uuid.uuid4().hex[:12]}"
         assignment = SkillAssignment(
             id=assignment_id,
             skill_id=dto.skill_id,
             agent_type=dto.agent_type,
+            scenario=normalized_scenario,
             slot_name=dto.slot_name or '',
             custom_parameters=dto.custom_parameters,
             variable_overrides=dto.variable_overrides or {},
@@ -533,11 +543,11 @@ class SkillService:
                 await self._db.execute_write(
                     """
                     INSERT INTO skill_assignments
-                    (id, skill_id, agent_type, slot_name, custom_parameters, variable_overrides,
+                    (id, skill_id, agent_type, scenario, slot_name, custom_parameters, variable_overrides,
                      priority, execution_condition, is_enabled, is_required, load_mode, trigger_keywords)
-                    VALUES (:id, :skill_id, :agent_type, :slot_name, :custom_parameters, :variable_overrides,
+                    VALUES (:id, :skill_id, :agent_type, :scenario, :slot_name, :custom_parameters, :variable_overrides,
                      :priority, :execution_condition, :is_enabled, :is_required, :load_mode, :trigger_keywords)
-                    ON CONFLICT (skill_id, agent_type, slot_name) DO UPDATE SET
+                    ON CONFLICT (skill_id, agent_type, scenario, slot_name) DO UPDATE SET
                     custom_parameters = :custom_parameters, variable_overrides = :variable_overrides, priority = :priority,
                     execution_condition = :execution_condition, is_enabled = :is_enabled, is_required = :is_required,
                     load_mode = :load_mode, trigger_keywords = :trigger_keywords
@@ -546,6 +556,7 @@ class SkillService:
                         "id": assignment_id,
                         "skill_id": dto.skill_id,
                         "agent_type": dto.agent_type,
+                        "scenario": normalized_scenario,
                         "slot_name": dto.slot_name or '',
                         "custom_parameters": json.dumps(dto.custom_parameters or {}, ensure_ascii=False),
                         "variable_overrides": json.dumps(dto.variable_overrides or {}, ensure_ascii=False),
@@ -560,10 +571,10 @@ class SkillService:
             except Exception as e:
                 logger.error(f"分配 Skill 到数据库失败: {e}")
 
-        logger.info(f"分配 Skill {dto.skill_id} 给 Agent 类型 {dto.agent_type}")
+        logger.info(f"分配 Skill {dto.skill_id} 给 Agent 类型 {dto.agent_type} 场景 {normalized_scenario}")
         return assignment
 
-    async def get_skills_for_agent_type(self, agent_type: str) -> List[Skill]:
+    async def get_skills_for_agent_type(self, agent_type: str, scenario: Optional[str] = None) -> List[Skill]:
         """
         获取适用于某个 Agent 类型的所有 Skill
 
@@ -576,7 +587,7 @@ class SkillService:
             List[Skill]: 适用的 Skill 列表
         """
         # 使用统一的分配表查询
-        assigned = await self.get_assigned_skills_for_agent(agent_type)
+        assigned = await self.get_assigned_skills_for_agent(agent_type, scenario)
         return [skill for skill, _ in assigned]
 
     async def get_skills_for_agent_type_legacy(self, agent_type: str) -> List[Skill]:
@@ -600,6 +611,7 @@ class SkillService:
     async def get_assigned_skills_for_agent(
         self,
         agent_type: str,
+        scenario: Optional[str] = None,
     ) -> List[tuple[Skill, SkillAssignment]]:
         """
         获取已分配给某个 Agent 类型的 Skill 及其分配配置
@@ -618,20 +630,44 @@ class SkillService:
             return []
 
         try:
-            # 使用 DISTINCT ON 去重，避免同一 skill 被多次分配到不同 slot 导致重复
+            normalized_scenario = self._normalize_scenario(scenario)
             rows = await self._db.execute_query(
                 """
                 SELECT DISTINCT ON (sa.skill_id) sa.*, s.*
                 FROM skill_assignments sa
                 JOIN skills s ON sa.skill_id = s.id
                 WHERE sa.agent_type = :agent_type
+                  AND sa.scenario = :scenario
                   AND sa.is_enabled = true
                   AND s.status = 'active'
                   AND s.is_enabled = true
                 ORDER BY sa.skill_id, sa.priority DESC, s.priority DESC
                 """,
-                {"agent_type": agent_type}
+                {"agent_type": agent_type, "scenario": normalized_scenario}
             )
+
+            if not rows and normalized_scenario != "default":
+                rows = await self._db.execute_query(
+                    """
+                    SELECT DISTINCT ON (sa.skill_id) sa.*, s.*
+                    FROM skill_assignments sa
+                    JOIN skills s ON sa.skill_id = s.id
+                    WHERE sa.agent_type = :agent_type
+                      AND sa.scenario = 'default'
+                      AND sa.is_enabled = true
+                      AND s.status = 'active'
+                      AND s.is_enabled = true
+                    ORDER BY sa.skill_id, sa.priority DESC, s.priority DESC
+                    """,
+                    {"agent_type": agent_type}
+                )
+                if rows:
+                    logger.warning(
+                        "未找到 Agent 场景 Skill 分配，回退 default: agent=%s, scenario=%s, count=%s",
+                        agent_type,
+                        normalized_scenario,
+                        len(rows),
+                    )
 
             results = []
             for row in rows:
@@ -681,6 +717,7 @@ class SkillService:
                     'id': row['id'],
                     'skill_id': row['skill_id'],
                     'agent_type': row['agent_type'],
+                    'scenario': row.get('scenario') or 'default',
                     'slot_name': row.get('slot_name', ''),
                     'custom_parameters': row.get('custom_parameters', '{}'),
                     'variable_overrides': row.get('variable_overrides', '{}'),
@@ -697,14 +734,19 @@ class SkillService:
 
                 results.append((skill, assignment))
 
-            logger.info(f"获取 Agent {agent_type} 的已分配 Skills: {len(results)} 个")
+            logger.info(
+                "获取 Agent %s 的已分配 Skills: %s 个%s",
+                agent_type,
+                len(results),
+                f" (scenario={scenario})" if scenario else "",
+            )
             return results
 
         except Exception as e:
             logger.error(f"获取 Agent 分配的 Skills 失败: {e}")
             return []
 
-    async def get_core_skills_for_agent(self, agent_type: str) -> List[Skill]:
+    async def get_core_skills_for_agent(self, agent_type: str, scenario: Optional[str] = None) -> List[Skill]:
         """
         获取 Agent 的核心层 Skills（始终加载）
 
@@ -714,11 +756,12 @@ class SkillService:
 
         Args:
             agent_type: Agent 类型
+            scenario: Agent 使用场景
 
         Returns:
             List[Skill]: 核心 Skills 列表
         """
-        assigned_skills = await self.get_assigned_skills_for_agent(agent_type)
+        assigned_skills = await self.get_assigned_skills_for_agent(agent_type, scenario)
 
         core_skills = []
         for skill, assignment in assigned_skills:
@@ -737,6 +780,7 @@ class SkillService:
         agent_type: str,
         context_keywords: Optional[List[str]] = None,
         context_scene: Optional[str] = None,
+        scenario: Optional[str] = None,
     ) -> List[Skill]:
         """
         获取 Agent 的按需加载 Skills（根据上下文关键词/场景匹配）
@@ -749,12 +793,12 @@ class SkillService:
             agent_type: Agent 类型
             context_keywords: 上下文关键词列表
             context_scene: 当前场景类型
+            scenario: Agent 使用场景
 
         Returns:
             List[Skill]: 匹配的按需 Skills 列表
         """
-        assigned_skills = await self.get_assigned_skills_for_agent(agent_type)
-
+        assigned_skills = await self.get_assigned_skills_for_agent(agent_type, scenario)
         on_demand_skills = []
         for skill, assignment in assigned_skills:
             # 确定加载模式（分配配置优先）
@@ -818,6 +862,7 @@ class SkillService:
             id=row['id'],
             skill_id=row['skill_id'],
             agent_type=row['agent_type'],
+            scenario=row.get('scenario') or 'default',
             slot_name=row.get('slot_name', ''),
             custom_parameters=json.loads(row.get('custom_parameters', '{}')) if isinstance(row.get('custom_parameters'), str) else row.get('custom_parameters', {}),
             variable_overrides=json.loads(row.get('variable_overrides', '{}')) if isinstance(row.get('variable_overrides'), str) else row.get('variable_overrides', {}),

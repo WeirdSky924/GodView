@@ -22,6 +22,7 @@ class ProcGenAgent(BaseAgent):
     """世界生成 Agent"""
 
     AGENT_TYPE = AgentType.PROC_GEN
+    DEFAULT_SCENARIO = "procedural_generation"
 
     def __init__(
         self,

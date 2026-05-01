@@ -31,6 +31,7 @@ class EventGeneratorAgent(BaseAgent):
     """事件生成 Agent - 独立的世界事件管理器"""
 
     AGENT_TYPE = AgentType.EVENT_GENERATOR
+    DEFAULT_SCENARIO = "event_generation"
 
     def __init__(
         self,

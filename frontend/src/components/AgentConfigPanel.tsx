@@ -31,6 +31,7 @@ interface AgentConfigPanelProps {
 interface AgentConfigRow {
   key: string
   agentType: string
+  scenario: string
   label: string
   template?: AgentTemplate
   config?: AgentConfig
@@ -104,26 +105,32 @@ export default function AgentConfigPanel({
     }
   }
 
+  const getRowKey = (agentType: string, scenario?: string) => `${agentType}:${scenario || 'default'}`
+
   const getTemplateForConfig = (config?: AgentConfig | null) => {
     if (!config) return null
     if (config.template_id) {
       const matchedById = templates.find((template) => template.id === config.template_id)
       if (matchedById) return matchedById
     }
-    return templates.find((template) => template.agent_type === config.agent_type) || null
+    return templates.find(
+      (template) => template.agent_type === config.agent_type && (template.scenario || 'default') === (config.scenario || 'default')
+    ) || templates.find((template) => template.agent_type === config.agent_type) || null
   }
 
   const rows = useMemo<AgentConfigRow[]>(() => {
-    const configMap = new Map(configs.map((config) => [config.agent_type, config]))
+    const configMap = new Map(configs.map((config) => [getRowKey(config.agent_type, config.scenario), config]))
     const visibleTemplates = agentTypeFilter
       ? templates.filter((template) => template.agent_type === agentTypeFilter)
       : templates
 
     const templateRows: AgentConfigRow[] = visibleTemplates.map((template) => {
-      const config = configMap.get(template.agent_type)
+      const scenario = template.scenario || 'default'
+      const config = configMap.get(getRowKey(template.agent_type, scenario))
       return {
-        key: template.agent_type,
+        key: getRowKey(template.agent_type, scenario),
         agentType: template.agent_type,
+        scenario,
         label: AGENT_TYPE_LABELS[template.agent_type] || template.agent_type,
         template,
         config,
@@ -132,12 +139,14 @@ export default function AgentConfigPanel({
       }
     })
 
+    const visibleTemplateKeys = new Set(visibleTemplates.map((template) => getRowKey(template.agent_type, template.scenario)))
     const extraConfigRows: AgentConfigRow[] = configs
-      .filter((config) => !visibleTemplates.some((template) => template.agent_type === config.agent_type))
+      .filter((config) => !visibleTemplateKeys.has(getRowKey(config.agent_type, config.scenario)))
       .filter((config) => !agentTypeFilter || config.agent_type === agentTypeFilter)
       .map((config) => ({
-        key: config.agent_type,
+        key: getRowKey(config.agent_type, config.scenario),
         agentType: config.agent_type,
+        scenario: config.scenario || 'default',
         label: AGENT_TYPE_LABELS[config.agent_type] || config.agent_type,
         template: undefined,
         config,
@@ -159,7 +168,7 @@ export default function AgentConfigPanel({
 
   const handleEdit = async (row: AgentConfigRow) => {
     try {
-      const resolvedConfig = row.config || await getAgentConfig(projectId, row.agentType)
+      const resolvedConfig = row.config || await getAgentConfig(projectId, row.agentType, row.scenario)
       const wasLazyCreated = !row.config
 
       setEditingConfig(resolvedConfig)
@@ -190,7 +199,7 @@ export default function AgentConfigPanel({
   const handleSave = async () => {
     if (!editingConfig) return
     try {
-      await updateAgentConfig(projectId, editingConfig.agent_type, formData)
+      await updateAgentConfig(projectId, editingConfig.agent_type, formData, editingConfig.scenario)
       setShowEditModal(false)
       await loadData()
       onChanged?.()
@@ -205,7 +214,7 @@ export default function AgentConfigPanel({
     setShowPreviewModal(true)
 
     try {
-      const result = await previewAgentConfig(projectId, row.agentType)
+      const result = await previewAgentConfig(projectId, row.agentType, {}, row.scenario)
       setPreviewContent(result.final_prompt)
 
       if (!row.config) {
@@ -218,10 +227,10 @@ export default function AgentConfigPanel({
     }
   }
 
-  const handleReset = async (agentType?: string) => {
+  const handleReset = async (agentType?: string, scenario?: string) => {
     if (!confirm('确定要重置配置为模板默认值吗？')) return
     try {
-      await resetAgentConfigs(projectId, agentType)
+      await resetAgentConfigs(projectId, agentType, scenario)
       await loadData()
       onChanged?.()
     } catch (error) {
@@ -229,12 +238,12 @@ export default function AgentConfigPanel({
     }
   }
 
-  const toggleExpand = (agentType: string) => {
+  const toggleExpand = (rowKey: string) => {
     const newExpanded = new Set(expandedConfigs)
-    if (newExpanded.has(agentType)) {
-      newExpanded.delete(agentType)
+    if (newExpanded.has(rowKey)) {
+      newExpanded.delete(rowKey)
     } else {
-      newExpanded.add(agentType)
+      newExpanded.add(rowKey)
     }
     setExpandedConfigs(newExpanded)
   }
@@ -290,13 +299,13 @@ export default function AgentConfigPanel({
           {rows.map((row) => {
             const config = row.config
             const template = row.template || getTemplateForConfig(config)
-            const isExpanded = expandedConfigs.has(row.agentType)
+            const isExpanded = expandedConfigs.has(row.key)
 
             return (
               <Card key={row.key} className="p-4">
                 <div
                   className="flex items-center justify-between gap-4 cursor-pointer"
-                  onClick={() => toggleExpand(row.agentType)}
+                  onClick={() => toggleExpand(row.key)}
                 >
                   <div className="flex items-center gap-3 min-w-0">
                     {isExpanded ? <ChevronUp className="w-5 h-5 flex-shrink-0" /> : <ChevronDown className="w-5 h-5 flex-shrink-0" />}
@@ -307,6 +316,9 @@ export default function AgentConfigPanel({
                         </span>
                         <span className={`px-2 py-0.5 text-xs rounded ${isDark ? 'bg-gray-700 text-gray-200' : 'bg-gray-200 text-gray-700'}`}>
                           {row.label}
+                        </span>
+                        <span className={`px-2 py-0.5 text-xs rounded ${isDark ? 'bg-gray-700 text-gray-200' : 'bg-gray-200 text-gray-700'}`}>
+                          {row.scenario}
                         </span>
                         <span className={`px-2 py-0.5 text-xs rounded ${row.effectiveActive ? 'bg-green-900 text-green-300' : 'bg-gray-700 text-gray-300'}`}>
                           {row.effectiveActive ? '项目启用' : '项目禁用'}
@@ -337,9 +349,9 @@ export default function AgentConfigPanel({
                     <Button
                       size="sm"
                       variant="secondary"
-                      onClick={() => handleReset(row.agentType)}
+                      onClick={() => handleReset(row.agentType, row.scenario)}
                       disabled={!config}
-                      title={!config ? '该类型还没有项目级配置，无需重置' : '重置该 Agent 的项目配置'}
+                      title={!config ? '该场景还没有项目级配置，无需重置' : '重置该 Agent 场景的项目配置'}
                     >
                       <RefreshCw className="w-4 h-4" />
                     </Button>

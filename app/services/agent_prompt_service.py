@@ -20,6 +20,7 @@ from app.models.agent_template import AgentTemplate, AgentType, PromptSlot, Skil
 from app.models.prompt_template import PromptTemplate
 from app.models.skill import Skill, SkillType, SkillLoadMode
 from app.services.prompt_builder import PromptBuilder
+from app.services.writing_rule_rag import get_writing_rule_rag_service
 from app.services.writing_rule_service import get_writing_rule_service
 
 logger = logging.getLogger(__name__)
@@ -77,6 +78,7 @@ class AgentPromptService:
         self,
         agent_type: str,
         project_id: Optional[str] = None,
+        scenario: Optional[str] = None,
     ) -> Optional[AgentTemplate]:
         """按项目配置解析运行时模板。"""
         try:
@@ -86,17 +88,51 @@ class AgentPromptService:
 
             if project_id:
                 config_service = get_agent_config_service()
-                state = await config_service.resolve_agent_runtime_state(project_id, agent_type)
+                state = await config_service.resolve_agent_runtime_state(project_id, agent_type, scenario)
                 template = state.get("template")
                 if template:
                     return template
 
             template_service = self._agent_template_service or get_agent_template_service()
-            return await template_service.get_template_by_type(AgentTypeEnum(agent_type))
+            return await template_service.get_template_by_type(AgentTypeEnum(agent_type), scenario)
         except Exception as e:
-            logger.debug(f"解析 AgentTemplate 失败: agent={agent_type}, project={project_id}, error={e}")
+            logger.debug(f"解析 AgentTemplate 失败: agent={agent_type}, project={project_id}, scenario={scenario}, error={e}")
 
         return self.get_agent_template(agent_type)
+
+    def _build_skill_scope(
+        self,
+        agent_type: str,
+        scenario: Optional[str] = None,
+        context_scene: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """构建 Skill 加载作用域。"""
+        resolved_scenario = (scenario or context_scene or "default").strip() or "default"
+        return {
+            "agent_type": agent_type,
+            "scenario": resolved_scenario,
+        }
+
+    def _skill_applies_to_scope(
+        self,
+        skill: Skill,
+        agent_type: str,
+        scenario: Optional[str] = None,
+        context_scene: Optional[str] = None,
+    ) -> bool:
+        """校验 Skill 是否适用于当前 Agent + 场景作用域。"""
+        applicable_agent_types = [item for item in (skill.applicable_agent_types or []) if item]
+        if applicable_agent_types and agent_type not in applicable_agent_types:
+            return False
+
+        resolved_scenario = (scenario or context_scene or "").strip()
+        if resolved_scenario and skill.trigger_scenes:
+            normalized_scenario = resolved_scenario.lower()
+            normalized_scenes = {scene.lower() for scene in skill.trigger_scenes if scene}
+            if normalized_scenes and normalized_scenario not in normalized_scenes:
+                return False
+
+        return True
 
     async def _load_skills_for_agent(
         self,
@@ -105,6 +141,7 @@ class AgentPromptService:
         context_query: Optional[str] = None,
         context_keywords: Optional[List[str]] = None,
         context_scene: Optional[str] = None,
+        scenario: Optional[str] = None,
         use_intelligent_retrieval: bool = True,
     ) -> List[tuple[Skill, Dict[str, Any]]]:
         """
@@ -121,22 +158,32 @@ class AgentPromptService:
             slot_skills = await self._load_skills_from_template_slots(
                 agent_type,
                 project_id=project_id,
+                scenario=scenario,
+                context_scene=context_scene,
             )
             if slot_skills:
-                logger.info(f"从 agent_templates.skill_slots 加载 {len(slot_skills)} 个 Skills")
+                logger.info(
+                    "从 agent_templates.skill_slots 加载 %s 个 Skills: agent=%s, scenario=%s",
+                    len(slot_skills),
+                    agent_type,
+                    (scenario or context_scene or "default"),
+                )
                 slot_skills.sort(key=lambda x: -x[0].priority)
                 return slot_skills
 
             from app.services.skill_service import get_skill_service
             service = get_skill_service()
 
-            core_skills = await service.get_core_skills_for_agent(agent_type)
+            core_skills = await service.get_core_skills_for_agent(agent_type, scenario)
             for skill in core_skills:
                 skills_with_params.append((skill, {}))
 
             if use_intelligent_retrieval and context_query:
                 on_demand_skills = await self._intelligent_skill_retrieval(
-                    agent_type, context_query
+                    agent_type,
+                    context_query,
+                    scenario=scenario,
+                    context_scene=context_scene,
                 )
                 skills_with_params.extend(on_demand_skills)
             else:
@@ -144,6 +191,7 @@ class AgentPromptService:
                     agent_type,
                     context_keywords=context_keywords,
                     context_scene=context_scene,
+                    scenario=scenario,
                 )
                 for skill in on_demand_skills:
                     skills_with_params.append((skill, {}))
@@ -174,6 +222,8 @@ class AgentPromptService:
         self,
         agent_type: str,
         context_query: str,
+        scenario: Optional[str] = None,
+        context_scene: Optional[str] = None,
     ) -> List[tuple[Skill, Dict[str, Any]]]:
         """按查询文本做轻量技能检索，避免运行时因缺少实现而退回默认路径。"""
         if not context_query:
@@ -183,7 +233,7 @@ class AgentPromptService:
             from app.services.skill_service import get_skill_service
 
             service = get_skill_service()
-            assigned_skills = await service.get_assigned_skills_for_agent(agent_type)
+            assigned_skills = await service.get_assigned_skills_for_agent(agent_type, scenario)
             if not assigned_skills:
                 return []
 
@@ -197,6 +247,9 @@ class AgentPromptService:
 
             ranked: List[tuple[int, Skill, Dict[str, Any]]] = []
             for skill, assignment in assigned_skills:
+                if not self._skill_applies_to_scope(skill, agent_type, scenario, context_scene):
+                    continue
+
                 if assignment.load_mode == SkillLoadMode.CORE:
                     continue
                 if assignment.load_mode is None and skill.load_mode == SkillLoadMode.CORE:
@@ -229,6 +282,8 @@ class AgentPromptService:
         self,
         agent_type: str,
         project_id: Optional[str] = None,
+        scenario: Optional[str] = None,
+        context_scene: Optional[str] = None,
     ) -> List[tuple[Skill, Dict[str, Any]]]:
         """
         从 agent_templates.skill_slots 加载 Skills
@@ -240,6 +295,7 @@ class AgentPromptService:
             template = await self._resolve_template_for_agent(
                 agent_type,
                 project_id=project_id,
+                scenario=scenario,
             )
             if not template or not template.skill_slots:
                 return []
@@ -262,6 +318,15 @@ class AgentPromptService:
                     continue
 
                 if not skill.is_enabled:
+                    continue
+
+                if not self._skill_applies_to_scope(skill, agent_type, scenario, context_scene):
+                    logger.debug(
+                        "跳过不匹配当前作用域的 Skill: skill=%s, agent=%s, scenario=%s",
+                        skill.id,
+                        agent_type,
+                        (scenario or context_scene or "default"),
+                    )
                     continue
 
                 params = slot.variable_overrides.copy() if slot.variable_overrides else {}
@@ -333,8 +398,16 @@ class AgentPromptService:
             "total_cached_skills": sum(len(s) for s in self._skills_cache.values()),
         }
 
-    def get_prompt_template(self, template_id: str) -> Optional[PromptTemplate]:
-        """获取 Prompt 模板"""
+    async def get_prompt_template(self, template_id: str) -> Optional[PromptTemplate]:
+        """获取 Prompt 模板，优先使用运行时 PromptTemplateService。"""
+        if self._prompt_template_service:
+            try:
+                template = await self._prompt_template_service.get_template(template_id)
+                if template:
+                    return template
+            except Exception as e:
+                logger.debug(f"从 PromptTemplateService 获取模板失败: {template_id}, error={e}")
+
         return self._prompt_cache.get(template_id)
 
     def get_agent_template(self, agent_type: str) -> Optional[AgentTemplate]:
@@ -373,6 +446,7 @@ class AgentPromptService:
         agent_type: str,
         project_id: str,
         variables: Optional[Dict[str, Any]] = None,
+        scenario: Optional[str] = None,
     ) -> str:
         """基于项目级 AgentConfig + AgentTemplate 构建 prompt。"""
         try:
@@ -384,13 +458,13 @@ class AgentPromptService:
             template_service = self._agent_template_service or get_agent_template_service()
             prompt_service = self._prompt_template_service or get_prompt_template_service()
 
-            state = await config_service.resolve_agent_runtime_state(project_id, agent_type)
+            state = await config_service.resolve_agent_runtime_state(project_id, agent_type, scenario)
             template = state.get("template")
             config = state.get("config")
 
             if not template:
                 try:
-                    template = await template_service.get_template_by_type(AgentType(agent_type))
+                    template = await template_service.get_template_by_type(AgentType(agent_type), scenario)
                 except ValueError:
                     logger.debug(f"未知 Agent 类型，无法按项目配置构建 prompt: {agent_type}")
                     return ""
@@ -400,9 +474,10 @@ class AgentPromptService:
 
             if not config:
                 config = AgentConfig(
-                    id=f"runtime_{project_id}_{agent_type}",
+                    id=f"runtime_{project_id}_{agent_type}_{scenario or 'default'}",
                     project_id=project_id,
                     agent_type=agent_type,
+                    scenario=scenario or "default",
                     name=f"{agent_type} 运行时配置",
                     description="runtime fallback config",
                     template_id=template.id,
@@ -426,7 +501,7 @@ class AgentPromptService:
             return await self._prompt_builder.build_prompt(config, template, variables or {})
         except Exception as e:
             logger.warning(
-                f"按项目配置构建 Agent prompt 失败: project={project_id}, agent={agent_type}, error={e}"
+                f"按项目配置构建 Agent prompt 失败: project={project_id}, agent={agent_type}, scenario={scenario}, error={e}"
             )
             return ""
 
@@ -440,10 +515,16 @@ class AgentPromptService:
         context_query: Optional[str] = None,
         context_keywords: Optional[List[str]] = None,
         context_scene: Optional[str] = None,
+        scenario: Optional[str] = None,
         use_intelligent_retrieval: bool = True,
     ) -> str:
         """构建 Agent 的完整 system prompt。"""
-        template = await self._resolve_template_for_agent(agent_type, project_id=project_id)
+        runtime_scenario = scenario or (variables or {}).get("scenario") or context_scene
+        template = await self._resolve_template_for_agent(
+            agent_type,
+            project_id=project_id,
+            scenario=runtime_scenario,
+        )
         if not template:
             logger.warning(f"未找到 Agent 类型 {agent_type} 的模板")
             return ""
@@ -458,6 +539,7 @@ class AgentPromptService:
                 context_query=context_query,
                 context_keywords=context_keywords,
                 context_scene=context_scene,
+                scenario=runtime_scenario,
                 use_intelligent_retrieval=use_intelligent_retrieval,
             )
             if skills_content:
@@ -469,6 +551,7 @@ class AgentPromptService:
                 agent_type=agent_type,
                 project_id=project_id,
                 variables=variables,
+                scenario=runtime_scenario,
             )
 
         if config_prompt:
@@ -476,7 +559,15 @@ class AgentPromptService:
 
             slot_names = {slot.slot_name for slot in template.prompt_slots if slot.is_enabled}
             if "writing_rules" in slot_names:
-                writing_prompt = await self._build_writing_rules_prompt(project_id)
+                writing_context = self._build_writing_rules_context(
+                    variables,
+                    agent_type=agent_type,
+                    scenario=runtime_scenario,
+                    context_scene=context_scene,
+                    context_query=context_query,
+                    context_keywords=context_keywords,
+                )
+                writing_prompt = await self._build_writing_rules_prompt(project_id, writing_context)
                 if writing_prompt:
                     prompt_pieces.append(writing_prompt)
 
@@ -493,7 +584,15 @@ class AgentPromptService:
                 continue
 
             if slot.slot_name == "writing_rules":
-                writing_prompt = await self._build_writing_rules_prompt(project_id)
+                writing_context = self._build_writing_rules_context(
+                    variables,
+                    agent_type=agent_type,
+                    scenario=runtime_scenario,
+                    context_scene=context_scene,
+                    context_query=context_query,
+                    context_keywords=context_keywords,
+                )
+                writing_prompt = await self._build_writing_rules_prompt(project_id, writing_context)
                 if writing_prompt:
                     prompt_pieces.append(writing_prompt)
                 continue
@@ -508,7 +607,7 @@ class AgentPromptService:
             if not prompt_template_id:
                 continue
 
-            prompt_template = self.get_prompt_template(prompt_template_id)
+            prompt_template = await self.get_prompt_template(prompt_template_id)
             if not prompt_template:
                 logger.warning(f"未找到 Prompt 模板: {prompt_template_id}")
                 continue
@@ -525,7 +624,7 @@ class AgentPromptService:
 
         return "\n\n".join(prompt_pieces)
 
-    async def _build_skills_prompt(
+    async def build_skills_prompt_with_trace(
         self,
         agent_type: str,
         project_id: Optional[str] = None,
@@ -533,26 +632,56 @@ class AgentPromptService:
         context_query: Optional[str] = None,
         context_keywords: Optional[List[str]] = None,
         context_scene: Optional[str] = None,
+        scenario: Optional[str] = None,
         use_intelligent_retrieval: bool = True,
-    ) -> str:
-        """
-        构建 Agent 的 Skills prompt（双层加载 + 智能检索）
-
-        核心层 Skills 始终加载，按需层 Skills 通过智能检索加载。
-
-        按优先级加载和渲染 Skills：
-        1. KNOWLEDGE 类型：直接提供知识内容
-        2. PROMPT 类型：渲染模板内容
-        """
+    ) -> Dict[str, Any]:
+        """构建 Skills prompt，并返回与 runtime resolver 一致的 trace。"""
         skills_with_params = await self._load_skills_for_agent(
             agent_type,
             project_id=project_id,
             context_query=context_query,
             context_keywords=context_keywords,
             context_scene=context_scene,
+            scenario=scenario,
             use_intelligent_retrieval=use_intelligent_retrieval,
         )
+        content = await self._render_skills_prompt(skills_with_params, variables, update_usage=False)
+        skill_ids: List[str] = []
+        seen_ids: Set[str] = set()
+        for skill, _ in skills_with_params:
+            if not skill.is_enabled or skill.status.value != 'active':
+                continue
+            if skill.id in seen_ids:
+                continue
+            seen_ids.add(skill.id)
+            skill_ids.append(skill.id)
 
+        template = await self._resolve_template_for_agent(agent_type, project_id=project_id, scenario=scenario)
+        scope = self._build_skill_scope(agent_type, scenario, context_scene)
+        source = "template_skill_slots" if template and template.skill_slots else "skill_assignments_or_retrieval"
+        fallbacks_used: List[str] = []
+        if source == "skill_assignments_or_retrieval" and scenario and scenario != "default":
+            fallbacks_used.append("skill_assignment_default_fallback_possible")
+
+        return {
+            "content": content,
+            "trace": {
+                "skill_ids": skill_ids,
+                "skill_count": len(skill_ids),
+                "source": source,
+                "scope": scope,
+                "fallbacks_used": fallbacks_used,
+                "deprecated_sources_used": [],
+            },
+        }
+
+    async def _render_skills_prompt(
+        self,
+        skills_with_params: List[tuple[Skill, Dict[str, Any]]],
+        variables: Optional[Dict[str, Any]] = None,
+        update_usage: bool = True,
+    ) -> str:
+        """渲染已解析的 Skills 列表。"""
         if not skills_with_params:
             return ""
 
@@ -562,7 +691,8 @@ class AgentPromptService:
         on_demand_prompt_pieces = []
 
         skills_only = [s for s, _ in skills_with_params]
-        await self._update_skill_usage_counts(skills_only)
+        if update_usage:
+            await self._update_skill_usage_counts(skills_only)
 
         for skill, params in skills_with_params:
             if not skill.is_enabled:
@@ -606,6 +736,37 @@ class AgentPromptService:
             pieces.append("【场景技能指导】\n" + "\n\n".join(on_demand_prompt_pieces))
 
         return "\n\n".join(pieces)
+
+    async def _build_skills_prompt(
+        self,
+        agent_type: str,
+        project_id: Optional[str] = None,
+        variables: Optional[Dict[str, Any]] = None,
+        context_query: Optional[str] = None,
+        context_keywords: Optional[List[str]] = None,
+        context_scene: Optional[str] = None,
+        scenario: Optional[str] = None,
+        use_intelligent_retrieval: bool = True,
+    ) -> str:
+        """
+        构建 Agent 的 Skills prompt（双层加载 + 智能检索）
+
+        核心层 Skills 始终加载，按需层 Skills 通过智能检索加载。
+
+        按优先级加载和渲染 Skills：
+        1. KNOWLEDGE 类型：直接提供知识内容
+        2. PROMPT 类型：渲染模板内容
+        """
+        skills_with_params = await self._load_skills_for_agent(
+            agent_type,
+            project_id=project_id,
+            context_query=context_query,
+            context_keywords=context_keywords,
+            context_scene=context_scene,
+            scenario=scenario,
+            use_intelligent_retrieval=use_intelligent_retrieval,
+        )
+        return await self._render_skills_prompt(skills_with_params, variables, update_usage=True)
 
 
     def _render_skill_content(
@@ -654,6 +815,7 @@ class AgentPromptService:
         context_query: Optional[str] = None,
         context_keywords: Optional[List[str]] = None,
         context_scene: Optional[str] = None,
+        scenario: Optional[str] = None,
         use_intelligent_retrieval: bool = True,
     ) -> List[Skill]:
         """获取 Agent 运行时应加载的 Skills 列表。"""
@@ -663,6 +825,7 @@ class AgentPromptService:
             context_query=context_query,
             context_keywords=context_keywords,
             context_scene=context_scene,
+            scenario=scenario,
             use_intelligent_retrieval=use_intelligent_retrieval,
         )
 
@@ -737,36 +900,158 @@ class AgentPromptService:
             logger.warning(f"构建角色层级 prompt 失败: {e}")
             return ""
 
-    async def _build_writing_rules_prompt(self, project_id: Optional[str]) -> str:
+    def _build_writing_rules_context(
+        self,
+        variables: Optional[Dict[str, Any]] = None,
+        agent_type: Optional[str] = None,
+        scenario: Optional[str] = None,
+        context_scene: Optional[str] = None,
+        context_query: Optional[str] = None,
+        context_keywords: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """构建 Writing Rules runtime/preview 共用检索上下文。"""
+        context: Dict[str, Any] = dict(variables or {})
+        if agent_type:
+            context["agent_type"] = agent_type
+        resolved_scenario = scenario or context_scene or context.get("scenario")
+        if resolved_scenario:
+            context["scenario"] = resolved_scenario
+            context.setdefault("scene", resolved_scenario)
+        if context_scene:
+            context["context_scene"] = context_scene
+        if context_query:
+            context["query"] = context_query
+        if context_keywords:
+            context["keywords"] = context_keywords
+        return context
+
+    async def build_writing_rules_prompt(
+        self,
+        project_id: Optional[str],
+        context: Optional[Dict[str, Any]] = None,
+        agent_type: Optional[str] = None,
+        scenario: Optional[str] = None,
+    ) -> str:
+        """构建写作规则 prompt，供 runtime 和 preview 共用。"""
+        rule_context = self._build_writing_rules_context(
+            context,
+            agent_type=agent_type,
+            scenario=scenario,
+        )
+        data = await self._build_writing_rules_prompt_data(project_id, rule_context)
+        return data["content"]
+
+    async def build_writing_rules_prompt_with_trace(
+        self,
+        project_id: Optional[str],
+        context: Optional[Dict[str, Any]] = None,
+        agent_type: Optional[str] = None,
+        scenario: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """构建写作规则 prompt，并返回规则命中 trace。"""
+        rule_context = self._build_writing_rules_context(
+            context,
+            agent_type=agent_type,
+            scenario=scenario,
+        )
+        return await self._build_writing_rules_prompt_data(project_id, rule_context)
+
+    async def _build_writing_rules_prompt(
+        self,
+        project_id: Optional[str],
+        context: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        data = await self._build_writing_rules_prompt_data(project_id, context)
+        return data["content"]
+
+    async def _build_writing_rules_prompt_data(
+        self,
+        project_id: Optional[str],
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """
-        构建写作规则 prompt
+        构建写作规则 prompt。
 
-        Args:
-            project_id: 项目ID
-
-        Returns:
-            str: 写作规则 prompt
+        Runtime 必须和 /agent-templates preview 一样注入实际命中的规则内容，
+        而不是只给出“检索协议”，否则界面配置的 writing-rules 不会真正约束 Agent。
         """
-        if not project_id:
-            return ""
-
+        trace: Dict[str, Any] = {
+            "project_id": project_id,
+            "agent_type": (context or {}).get("agent_type"),
+            "scenario": (context or {}).get("scenario"),
+            "writing_rule_ids": [],
+            "always_rule_ids": [],
+            "retrieved_rules": [],
+            "resolved_scope": None,
+            "query": "",
+            "fallbacks_used": [],
+            "deprecated_sources_used": [],
+        }
         try:
-            writing_rule_service = get_writing_rule_service()
-            scope = await writing_rule_service.resolve_project_rule_scope(project_id)
-            scope_summary = writing_rule_service.describe_project_rule_scope(scope)
-            if not scope_summary.get("is_active"):
-                return ""
             lines = [
                 "## 写作规则检索协议",
                 "- 写作前先按当前章节目标、环境、讨论摘要、角色状态检索相关写作规则。",
                 "- 常驻规则只保留不可违反的高优先级约束；其余规则按需检索注入。",
                 "- 场景、分段焦点或修订目标发生明显变化时，应再次检索。",
-                f"- 当前作用域规则数：{scope_summary.get('resolved_rule_count', 0)}，基线规则集：{'是' if scope_summary.get('used_baseline') else '否'}。",
             ]
-            return "\n".join(lines)
+
+            if not project_id:
+                trace["fallbacks_used"].append("missing_project_id")
+                return {"content": "\n".join(lines), "trace": trace}
+
+            writing_rule_service = get_writing_rule_service()
+            scope = await writing_rule_service.resolve_project_rule_scope(project_id)
+            scope_summary = writing_rule_service.describe_project_rule_scope(scope)
+            trace["resolved_scope"] = scope_summary
+            if not scope_summary.get("is_active"):
+                trace["fallbacks_used"].append("inactive_writing_rule_scope")
+                return {"content": "", "trace": trace}
+
+            lines.append(
+                f"- 当前作用域规则数：{scope_summary.get('resolved_rule_count', 0)}，基线规则集：{'是' if scope_summary.get('used_baseline') else '否'}。"
+            )
+
+            retrieval = await get_writing_rule_rag_service().retrieve_for_project(
+                project_id,
+                context=context or {},
+                limit=4,
+            )
+            retrieved_rules = retrieval.get("retrieved_rules", [])
+            always_rule_ids = retrieval.get("always_rules", [])
+            trace.update({
+                "writing_rule_ids": [rule.get("id") for rule in retrieved_rules if rule.get("id")],
+                "always_rule_ids": always_rule_ids,
+                "retrieved_rules": [
+                    {
+                        "id": rule.get("id"),
+                        "name": rule.get("name"),
+                        "severity": rule.get("severity"),
+                        "reason": rule.get("reason"),
+                        "score": rule.get("score"),
+                    }
+                    for rule in retrieved_rules
+                ],
+                "resolved_scope": retrieval.get("resolved_scope") or scope_summary,
+                "query": retrieval.get("query", ""),
+            })
+            if retrieved_rules:
+                lines.append("\n## 当前命中的写作规则")
+                for rule in retrieved_rules:
+                    lines.append(
+                        f"- [{rule.get('severity')}] {rule.get('name')}: {rule.get('summary')}"
+                    )
+
+            rendered_guidance = retrieval.get("rendered_guidance", "").strip()
+            if rendered_guidance:
+                lines.append("\n## 写作规则约束")
+                lines.append(rendered_guidance)
+
+            return {"content": "\n".join(lines), "trace": trace}
         except Exception as e:
             logger.error(f"构建写作规则 prompt 失败: {e}")
-            return ""
+            trace["fallbacks_used"].append("writing_rules_error")
+            trace["error"] = str(e)
+            return {"content": "", "trace": trace}
 
     def _render_template(self, template: PromptTemplate, variables: Dict[str, Any]) -> str:
         """
@@ -814,6 +1099,7 @@ class AgentPromptService:
         context_query: Optional[str] = None,
         context_keywords: Optional[List[str]] = None,
         context_scene: Optional[str] = None,
+        scenario: Optional[str] = None,
         use_intelligent_retrieval: bool = True,
     ) -> List[Dict[str, Any]]:
         """
@@ -836,6 +1122,7 @@ class AgentPromptService:
             context_query=context_query,
             context_keywords=context_keywords,
             context_scene=context_scene,
+            scenario=scenario,
             use_intelligent_retrieval=use_intelligent_retrieval,
         )
 

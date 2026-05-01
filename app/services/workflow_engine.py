@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from app.agents.base import AgentResponse
+from app.models.agent_template import AgentType
 from app.models.agent_output_contract import (
     AgentOutputContract,
     DEFAULT_AGENT_OUTPUT_CONTRACT_REGISTRY,
@@ -2820,20 +2821,41 @@ class WorkflowEngine:
         self,
         project_id: str,
         agent_type: str,
+        scenario: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """获取项目级 Agent 运行时状态。"""
         try:
             from app.api.app import postgres_db
-            from app.services.agent_template_service import AgentTemplateService
 
             if not postgres_db or not project_id:
                 return None
 
             config_service = get_agent_config_service()
-            return await config_service.resolve_agent_runtime_state(project_id, agent_type)
+            return await config_service.resolve_agent_runtime_state(project_id, agent_type, scenario)
         except Exception as e:
-            logger.warning(f"读取 Agent 运行时状态失败: project={project_id}, agent={agent_type}, error={e}")
+            logger.warning(
+                f"读取 Agent 运行时状态失败: project={project_id}, agent={agent_type}, "
+                f"scenario={scenario or 'default'}, error={e}"
+            )
             return None
+
+    def _resolve_agent_node_scenario(
+        self,
+        node: WorkflowNode,
+        profile: Any,
+    ) -> Optional[str]:
+        """从节点配置或执行 profile 推导 Agent 场景。"""
+        node_config = node.config or {}
+        configured_scenario = node_config.get("scenario") or node_config.get("agent_scenario")
+        if configured_scenario:
+            return str(configured_scenario)
+
+        if profile and isinstance(getattr(profile, "metadata", None), dict):
+            profile_scenario = profile.metadata.get("scenario")
+            if profile_scenario:
+                return str(profile_scenario)
+
+        return None
 
     def _coerce_graph_context_bool(self, value: Any, default: bool = False) -> bool:
         if value is None:
@@ -3113,10 +3135,12 @@ class WorkflowEngine:
         """执行 Agent 节点（支持 runtime 禁用校验、adapter 和实时干预）。"""
         profile = get_workflow_node_profile(node.agent_type)
         resolved_agent_type = profile.agent_type if profile else (node.agent_type or "")
+        resolved_scenario = self._resolve_agent_node_scenario(node, profile)
         adapter = get_workflow_node_adapter(resolved_agent_type)
 
         logger.info(
             f"请求 Agent: type={node.agent_type}, resolved={resolved_agent_type}, "
+            f"scenario={resolved_scenario or 'default'}, "
             f"label={node.label}, node_id={node.id}, project_id={project_id}"
         )
 
@@ -3139,6 +3163,10 @@ class WorkflowEngine:
             for key, value in enhanced_context.items():
                 if key not in context or context[key] is None:
                     context[key] = value
+
+        if resolved_scenario:
+            context.setdefault("scenario", resolved_scenario)
+            context.setdefault("agent_scenario", resolved_scenario)
 
         if resolved_agent_type == "writer":
             canonical_target = (
@@ -3189,16 +3217,18 @@ class WorkflowEngine:
                 "messages": intervention_messages,
             })
 
-        runtime_state = await self._get_agent_runtime_state(project_id, resolved_agent_type)
+        runtime_state = await self._get_agent_runtime_state(project_id, resolved_agent_type, resolved_scenario)
         if runtime_state and runtime_state.get("enabled") is False:
             reason = runtime_state.get("reason", "Agent 已禁用")
             logger.info(
-                f"跳过 Agent 节点: type={resolved_agent_type}, node_id={node.id}, reason={reason}"
+                f"跳过 Agent 节点: type={resolved_agent_type}, scenario={resolved_scenario or 'default'}, "
+                f"node_id={node.id}, reason={reason}"
             )
             skipped_output = {
                 "skipped": True,
                 "reason": reason,
                 "agent_type": resolved_agent_type,
+                "scenario": resolved_scenario or "default",
                 "node_id": node.id,
             }
             return skipped_output, None, None
@@ -5661,6 +5691,7 @@ class WorkflowEngine:
         participant_keys = participant_keys or ["required_characters"]
 
         scene_directions = dict(execution.context.get("scene_directions", {}) or {})
+        execution.context["project_id"] = execution.project_id
         if not scene_directions:
             plotter_agent = await self._get_agent_for_discussion("plotter", execution.project_id)
             if plotter_agent:
@@ -5939,6 +5970,7 @@ class WorkflowEngine:
                     summarizer_agent,
                     scene_directions,
                     performance_messages,
+                    project_id=execution.project_id,
                 )
                 if summary:
                     performance_messages.append(summary)
@@ -7517,6 +7549,8 @@ class WorkflowEngine:
             evaluation_result = execution.context.get("evaluation_result", {})
             plot_outline = execution.context.get("plot_outline", [])
 
+            context["project_id"] = execution.project_id
+
             discussion_messages = []
 
             # ========== 第一步：领头人开启会话 ==========
@@ -7593,7 +7627,7 @@ class WorkflowEngine:
             # ========== 第三步：领头人汇总，请求用户确认 ==========
             if leader_agent and discussion_messages:
                 summary_request = await self._generate_leader_summary_request(
-                    leader_agent, chapter_title, discussion_messages
+                    leader_agent, chapter_title, discussion_messages, context=execution.context
                 )
                 if summary_request:
                     discussion_messages.append(summary_request)
@@ -7779,6 +7813,48 @@ class WorkflowEngine:
             "is_llm_generated": False,
         }
 
+    def _format_workflow_prompt_block(self, title: str, value: Any) -> str:
+        """格式化工作流 prompt 上下文块。"""
+        if value is None or value == "":
+            return ""
+        if isinstance(value, str):
+            text = value
+        else:
+            try:
+                text = json.dumps(value, ensure_ascii=False, indent=2)
+            except Exception:
+                text = str(value)
+        return f"【{title}】\n{text}"
+
+    async def _build_workflow_config_prompt(
+        self,
+        agent_type: AgentType,
+        project_id: Optional[str],
+        scenario: str,
+        variables: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """通过 Agent Template 构建工作流辅助 prompt。"""
+        if not project_id:
+            return ""
+        try:
+            from app.services.agent_prompt_service import get_agent_prompt_service
+
+            service = get_agent_prompt_service()
+            return await service.build_agent_prompt(
+                agent_type=agent_type.value,
+                project_id=project_id,
+                variables=variables or {},
+                scenario=scenario,
+            )
+        except Exception as e:
+            logger.warning(
+                "加载工作流 Agent Template prompt 失败: agent=%s, scenario=%s, error=%s",
+                agent_type.value,
+                scenario,
+                e,
+            )
+            return ""
+
     async def _generate_leader_opening(
         self,
         agent,
@@ -7790,47 +7866,29 @@ class WorkflowEngine:
         participants: List[Dict],
         context: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
-        """
-        领头人开启会话
-
-        领头人（总编剧）负责：
-        1. 宣布讨论开始
-        2. 介绍讨论议题
-        3. 引导讨论方向
-        """
+        """领头人开启会话。"""
         try:
             participant_names = [p["name"] for p in participants if not p.get("is_leader")]
             context = context or {}
             constraint_text = self._format_agent_constraint_context(context)
-            prompt = f"""你是总编剧（讨论领头人），现在正式开启《{chapter_title}》创作讨论会。
-
-【参会人员】
-{', '.join(participant_names)}
-
-【讨论内容】
-章节：{chapter_title}
-已写内容：{written_content if written_content else "暂无"}
-
-【评估结果】
-评分: {evaluation_result.get('score', 'N/A')}/10
-
-【工作流角色/设定约束】
-{constraint_text if constraint_text else '当前未形成额外角色出场约束。'}
-
-【讨论要求】
-- 本次讨论只能围绕绑定章节大纲、已检索设定和已有工作流状态提出建议。
-- 不要把未在大纲、角色库、设定库或已确认资产中出现的人名/组织/概念当成事实。
-- 死亡、未激活、退场或不可用角色不能作为当前场景参与者，只能按约束作为传闻、回忆、势力影响或姓名被提及。
-- 角色来源、历史、身份必须遵守角色设定库条目；如果缺少角色设定，应标记“缺失设定”，不要自行补写。
-
-请输出你的开场发言，宣布讨论开始，说明本次讨论的目标和重点。
-格式要求：
-1. 宣布讨论会开始
-2. 简要介绍本章创作情况
-3. 说明本次讨论需要解决的问题
-4. 邀请各位发言
-
-直接输出内容，不要有格式标记。"""
+            config_prompt = await self._build_workflow_config_prompt(
+                AgentType.MASTER_PLOTTER,
+                context.get("project_id"),
+                "workflow_discussion_opening",
+                {"scenario": "workflow_discussion_opening", "chapter_title": chapter_title},
+            )
+            sections = [
+                self._format_workflow_prompt_block("Master Plotter 配置规则", config_prompt),
+                self._format_workflow_prompt_block("参会人员", ", ".join(participant_names) or "暂无"),
+                self._format_workflow_prompt_block("章节", chapter_title),
+                self._format_workflow_prompt_block("已写内容", written_content or "暂无"),
+                self._format_workflow_prompt_block("当前剧情摘要", plot_summary or "暂无"),
+                self._format_workflow_prompt_block("剧情大纲", plot_outline or "暂无"),
+                self._format_workflow_prompt_block("评估结果", {"score": evaluation_result.get("score", "N/A"), "summary": evaluation_result.get("summary", "")}),
+                self._format_workflow_prompt_block("工作流角色/设定约束", constraint_text or "当前未形成额外角色出场约束。"),
+                "【当前任务】\n请输出开场发言，宣布讨论开始，说明本次讨论目标和重点，并邀请各位发言。直接输出内容，不要 JSON，不要格式标记。",
+            ]
+            prompt = "\n\n".join(section for section in sections if section)
 
             if hasattr(agent, 'model') and agent.model:
                 content = await self._get_model_response_text(agent.model, prompt)
@@ -7842,6 +7900,7 @@ class WorkflowEngine:
                     "is_llm_generated": True,
                     "is_leader_action": True,
                     "action": "open_session",
+                    "config_prompt_source": "agent_template_runtime" if config_prompt else "missing",
                 }
         except Exception as e:
             logger.error(f"领头人开场生成失败: {e}")
@@ -7860,47 +7919,30 @@ class WorkflowEngine:
         agent,
         chapter_title: str,
         discussion_messages: List[Dict],
+        context: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
-        """
-        领头人汇总讨论并请求用户确认
-
-        领头人负责：
-        1. 汇总各位发言的要点
-        2. 提出建议方案
-        3. 请求用户确认
-        """
+        """领头人汇总讨论并请求用户确认。"""
         try:
-            # 提取各 Agent 的发言要点
+            context = context or {}
             messages_summary = []
             for msg in discussion_messages:
                 agent_name = msg.get("agent", "Unknown")
                 content = msg.get("content", "")
                 messages_summary.append(f"【{agent_name}】{content}")
 
-            prompt = f"""你是总编剧（讨论领头人），现在需要汇总讨论结果并请求用户确认。
-
-【讨论记录】
-{chr(10).join(messages_summary)}
-
-请输出你的汇总发言，格式要求：
-1. 总结本次讨论的主要观点
-2. 归纳达成的共识和分歧
-3. 提出后续创作建议
-4. 给出一个可落库的讨论资产提案 JSON，必须放在 ```json 代码块中，顶层字段为 discussion_assets
-5. 最后明确询问用户是否同意
-
-讨论资产提案 JSON 结构如下，没有内容的数组可为空：
-{{
-  "discussion_assets": {{
-    "plot_updates": [{{"title": "剧情加码标题", "summary": "后续剧情要承接的变化", "source": "group_discussion"}}],
-    "hooks": [{{"title": "伏笔标题", "description": "伏笔说明", "status": "planted", "related_locations": []}}],
-    "lore_candidates": [{{"title": "设定标题", "content": "设定内容", "category": "world_rule", "priority": "standard"}}],
-    "region_candidates": [{{"name": "地点名称", "description": "地点说明", "region_type": "location", "terrain_type": "unknown", "landmarks": [], "connections": []}}],
-    "character_candidates": [{{"name": "角色名", "importance_tier": "supporting", "description": "角色定位", "appearance": "外貌", "personality": "性格", "background_story": "背景", "goals": []}}]
-  }}
-}}
-
-只把本次讨论已经明确达成共识、适合后续剧情承接的内容写进 JSON；不要虚构讨论中没有依据的资产。"""
+            config_prompt = await self._build_workflow_config_prompt(
+                AgentType.MASTER_PLOTTER,
+                context.get("project_id"),
+                "workflow_discussion_summary",
+                {"scenario": "workflow_discussion_summary", "chapter_title": chapter_title},
+            )
+            sections = [
+                self._format_workflow_prompt_block("Master Plotter 配置规则", config_prompt),
+                self._format_workflow_prompt_block("讨论记录", "\n".join(messages_summary)),
+                self._format_workflow_prompt_block("工作流角色/设定约束", self._format_agent_constraint_context(context)),
+                "【当前任务】\n请汇总讨论结果、提出后续创作建议、输出 discussion_assets JSON 代码块，并明确询问用户是否同意。",
+            ]
+            prompt = "\n\n".join(section for section in sections if section)
 
             if hasattr(agent, 'model') and agent.model:
                 content = await self._get_model_response_text(agent.model, prompt)
@@ -7912,6 +7954,7 @@ class WorkflowEngine:
                     "is_llm_generated": True,
                     "is_leader_action": True,
                     "action": "request_confirmation",
+                    "config_prompt_source": "agent_template_runtime" if config_prompt else "missing",
                 }
         except Exception as e:
             logger.error(f"领头人汇总生成失败: {e}")
@@ -7971,7 +8014,7 @@ class WorkflowEngine:
         characters: List[str],
         context: Dict,
     ) -> Optional[Dict[str, Any]]:
-        """各 Agent 发表意见"""
+        """各 Agent 发表意见。"""
         AGENT_NAME_MAP = {
             "evaluator": "评估员",
             "hook_manager": "伏笔管理员",
@@ -7981,243 +8024,19 @@ class WorkflowEngine:
             "writer": "作家",
             "character": "角色代表",
         }
-
-        AGENT_OPINION_PROMPTS = {
-            "evaluator": """你是评估员，请从质量控制角度进行**深度专业分析**。
-
-【重要】你需要在讨论中发挥关键作用：
-- 你是质量把关者，不要敷衍说"好的"
-- 要指出具体问题，不要模棱两可
-- 要提出可执行的改进方案
-
-【评估结果】
-评分: {score}/10
-问题: {issues}
-建议: {suggestions}
-
-【你的专业分析职责】
-1. **质量诊断**：深入分析章节的优缺点，不只是表面评价
-2. **问题定位**：具体指出哪里有问题、为什么有问题、问题的影响
-3. **改进方案**：提出具体的、可执行的修改建议
-4. **风险预警**：预测可能出现的问题，提前预警
-5. **标准把控**：确保内容符合长篇网文的质量标准
-
-请从以下维度详细分析：
-
-## 质量诊断
-[深入分析本章的质量水平，优点要具体，缺点要尖锐]
-
-## 问题清单
-[列出发现的所有问题，每个问题说明：位置、性质、严重程度]
-
-## 改进建议
-[针对每个问题提出具体的修改方案，包括修改方向和预期效果]
-
-## 风险预警
-[预测后续可能出现的问题，提出预防措施]
-
-## 后续章节建议
-[从质量角度对后续创作提出专业建议]""",
-
-            "hook_manager": """你是伏笔管理员，请从伏笔和悬念角度进行**深度专业分析**。
-
-【重要】你是伏笔专家，要在讨论中发挥核心作用：
-- 不要简单说"伏笔埋得不错"，要具体分析
-- 追踪每一个伏笔的状态和回收计划
-- 提出新伏笔的创意建议
-
-【已有伏笔】{hooks_count} 个伏笔在追踪中
-
-【你的专业分析职责】
-1. **伏笔审计**：检查本章埋设的伏笔是否自然、合理
-2. **回收规划**：追踪所有待回收伏笔，规划最佳回收时机
-3. **悬念设计**：评估悬念设置是否有效，能否吸引读者
-4. **风险识别**：发现可能遗忘或处理不当的伏笔
-5. **创意贡献**：提出新的伏笔创意
-
-请详细输出：
-
-## 伏笔状态报告
-[列出所有伏笔的状态：新埋设/待回收/已回收，以及具体内容]
-
-## 伏笔质量评估
-[分析每个伏笔的自然度、关联性、预期效果]
-
-## 回收规划建议
-[每个待回收伏笔的最佳回收时机和方式]
-
-## 悬念效果分析
-[评估本章悬念是否足够，能否吸引读者继续阅读]
-
-## 新伏笔建议
-[提出可以埋设的新伏笔，包括内容和预期作用]""",
-
-            "setting": """你是设定管理员，请从世界观一致性角度进行**深度专业分析**。
-
-【重要】你是世界观守护者，要确保设定不被破坏：
-- 不要只说"设定一致"，要具体检查每个细节
-- 发现设定冲突是重要贡献
-- 提出深化世界观的具体方案
-
-【你的专业分析职责】
-1. **设定一致性检查**：逐一核对世界观规则是否被遵守
-2. **设定冲突发现**：识别可能的设定矛盾或漏洞
-3. **设定深化机会**：找出可以展现更多世界观的机会
-4. **设定创新建议**：提出符合世界观的新元素创意
-5. **规则完善建议**：发现规则模糊处，提出补充建议
-
-请详细输出：
-
-## 设定一致性报告
-[逐一检查世界观规则在本章的应用情况]
-
-## 发现的问题
-[列出所有设定冲突、漏洞或不合理之处]
-
-## 设定深化建议
-[哪些地方可以更深入展现世界观，具体如何做]
-
-## 创新元素建议
-[提出可以引入的新设定元素，符合世界逻辑]
-
-## 规则补充建议
-[发现的世界观规则漏洞，提出补充方案]""",
-
-            "world_map_manager": """你是地图管理员，请从场景和空间角度进行**深度专业分析**。
-
-【重要】你是空间设计师，要让场景服务于剧情：
-- 不要只说"场景描写不错"
-- 分析场景与剧情的配合度
-- 提出场景创新的具体方案
-
-【你的专业分析职责】
-1. **场景功能分析**：评估每个场景的功能和效果
-2. **空间逻辑检查**：确保地点转换合理、空间关系清晰
-3. **氛围营造评估**：分析场景氛围是否符合剧情需要
-4. **场景创新建议**：提出新的、有趣的场景创意
-5. **感官描写指导**：建议如何增强场景的感官体验
-
-请详细输出：
-
-## 场景功能报告
-[每个场景的功能、效果、与剧情的配合度分析]
-
-## 空间逻辑检查
-[地点转换是否合理，空间关系是否清晰，有无漏洞]
-
-## 氛围营造评估
-[场景氛围是否到位，如何改进]
-
-## 新场景建议
-[可以引入的新场景，以及它们的作用]
-
-## 感官描写建议
-[如何增强视觉、听觉、嗅觉等感官体验]""",
-
-            "event_generator": """你是事件生成器，请从事件和剧情推进角度进行**深度专业分析**。
-
-【重要】你是剧情推进专家，要确保事件有实质意义：
-- 不要只说"事件安排合理"
-- 分析每个事件的因果和意义
-- 提出更有张力的事件创意
-
-【你的专业分析职责】
-1. **事件效果分析**：评估每个事件的作用和效果
-2. **因果逻辑检查**：确保事件的因果链条严密
-3. **节奏推进评估**：分析事件是否有效推进剧情
-4. **张力设计建议**：提出增加张力和冲突的方法
-5. **新事件创意**：提出更有冲击力的事件创意
-
-请详细输出：
-
-## 事件效果报告
-[每个事件的作用、效果、对剧情的推动分析]
-
-## 因果逻辑分析
-[事件的因果链条是否严密，有无逻辑漏洞]
-
-## 节奏推进评估
-[事件是否有效推进了剧情，节奏是否合适]
-
-## 张力设计建议
-[如何增加事件之间的张力和冲突]
-
-## 新事件创意
-[可以引入的新事件，包括内容、作用、预期效果]""",
-
-            "writer": """你是作家，请从文字创作角度进行**深度专业分析**。
-
-【重要】你是文字专家，要对表达效果负责：
-- 不要只说"写得不错"
-- 分析具体的文字技巧和效果
-- 指出表达问题并提出修改方案
-
-【字数检查】{word_count_info}
-
-【你的专业分析职责】
-1. **文字效果分析**：评估描写、对话、心理活动的表达效果
-2. **风格一致性检查**：确保文风与整体一致
-3. **技巧运用评估**：分析Show don't Tell、感官描写等技巧
-4. **表达问题诊断**：发现具体的表达问题
-5. **修改方案建议**：提出具体的文字修改方案
-
-请详细输出：
-
-## 文字效果报告
-[描写、对话、心理活动的效果分析，好的和不好的都要指出]
-
-## 风格一致性检查
-[文风是否与整体一致，有无突兀之处]
-
-## 技巧运用评估
-[Show don't Tell、感官描写、节奏控制等技巧的运用情况]
-
-## 表达问题诊断
-[发现的具体表达问题，每一条都要有位置和改进建议]
-
-## 修改方案
-[针对发现的问题，提出具体的修改示例]""",
-
-            "character": """你是角色代表，请从角色塑造角度进行**深度专业分析**。
-
-【重要】你是角色专家，要确保角色塑造到位：
-- 不要只说"角色表现得当"
-- 分析每个角色的行为逻辑和成长
-- 指出角色塑造的问题并提出改进
-
-【参与角色】{characters}
-
-【你的专业分析职责】
-1. **角色行为分析**：评估每个角色的行为是否符合人设
-2. **角色成长评估**：分析角色是否有成长或变化
-3. **对话质量检查**：评估对话是否符合角色性格
-4. **角色张力分析**：分析角色之间的张力和化学反应
-5. **改进建议**：提出角色塑造的具体改进方案
-
-请详细输出：
-
-## 角色表现报告
-[每个角色的表现分析，是否符合人设，有无OOC]
-
-## 角色成长分析
-[角色是否有成长或变化，成长弧线是否合理]
-
-## 对话质量评估
-[对话是否符合角色性格，有无突兀之处]
-
-## 角色张力分析
-[角色之间的互动是否有火花，如何增强]
-
-## 改进建议
-[针对发现的问题，提出具体的修改方案]""",
+        AGENT_TYPE_MAP = {
+            "evaluator": AgentType.EVALUATOR,
+            "hook_manager": AgentType.HOOK_MANAGER,
+            "setting": AgentType.SETTING,
+            "writer": AgentType.WRITER,
+            "character": AgentType.CHARACTER,
         }
 
         try:
-            prompt_template = AGENT_OPINION_PROMPTS.get(agent_type, "")
-            if not prompt_template:
+            mapped_agent_type = AGENT_TYPE_MAP.get(agent_type)
+            if not mapped_agent_type:
                 return None
 
-            # 安全地格式化 issues（可能是 dict 列表或 str 列表）
             issues_raw = evaluation_result.get('issues', [])
             if issues_raw:
                 issues_formatted = ', '.join([
@@ -8227,7 +8046,6 @@ class WorkflowEngine:
             else:
                 issues_formatted = '无明显问题'
 
-            # 安全地格式化 characters（可能是 dict 列表或 str 列表）
             if characters:
                 char_names = [
                     str(c) if isinstance(c, str) else c.get('name', '未知角色')
@@ -8237,46 +8055,40 @@ class WorkflowEngine:
             else:
                 characters_formatted = '暂无角色'
 
-            # 格式化提示
-            prompt = prompt_template.format(
-                score=evaluation_result.get('score', 'N/A'),
-                issues=issues_formatted,
-                suggestions=evaluation_result.get('summary', '继续保持') if evaluation_result.get('summary') else '继续保持',
-                hooks_count=len(context.get('existing_hooks', [])),
-                word_count_info=context.get('word_count_check', {}).get('actual', '已统计') if context.get('word_count_check') else '字数已达标',
-                characters=characters_formatted,
+            previous_discussion = []
+            for m in previous_messages:
+                speaker = m.get('agent', '某Agent')
+                content_preview = m.get('content', '')
+                previous_discussion.append(f"【{speaker}】\n{content_preview}")
+
+            config_prompt = await self._build_workflow_config_prompt(
+                mapped_agent_type,
+                context.get("project_id"),
+                "workflow_agent_opinion",
+                {
+                    "scenario": "workflow_agent_opinion",
+                    "chapter_title": chapter_title,
+                    "agent_type": agent_type,
+                },
             )
-
-            context_constraint_text = self._format_agent_constraint_context(context)
-
-            # 添加章节内容（重要：让Agent有具体的分析对象）
-            if context_constraint_text:
-                prompt += f"\n\n{context_constraint_text}\n\n【硬性讨论边界】\n- 讨论建议必须服从上述角色出场硬约束和角色设定库。\n- 不得把死亡、未激活、退场或不可用角色写成当前场景的正面参与者。\n- 不得新增未在大纲、角色库、设定库或已确认资产中出现的人名/组织/概念作为事实。\n- 如果发现上游素材违反角色状态或角色设定，应明确要求跳过或改写。"
-
-            # 添加章节内容（重要：让Agent有具体的分析对象）
-                prompt += f"\n\n【章节内容（用于分析）】\n{written_content}"
-
-            # 添加世界观设定
-            world_info = context.get("world_info", {})
-            if world_info:
-                prompt += f"\n\n【世界观设定】\n世界：{world_info.get('name', '未知')}\n类型：{world_info.get('world_type', '奇幻')}\n基调：{world_info.get('tone', '正剧')}"
-
-            # 添加已有的伏笔信息
-            existing_hooks = context.get('existing_hooks', [])
-            if existing_hooks:
-                hooks_info = [f"- {h.get('title', h.get('id', '未知'))}: {h.get('status', 'pending')}" for h in existing_hooks]
-                prompt += f"\n\n【当前伏笔状态】\n{chr(10).join(hooks_info)}"
-
-            # 添加前文讨论摘要（让后续发言能回应前面的问题）
-            if previous_messages:
-                recent_messages = []
-                for m in previous_messages:
-                    speaker = m.get('agent', '某Agent')
-                    content_preview = m.get('content', '')
-                    recent_messages.append(f"【{speaker}】\n{content_preview}")
-                if recent_messages:
-                    prompt += f"\n\n【之前的讨论要点】\n{chr(10).join(recent_messages)}"
-                prompt += "\n\n请结合以上讨论内容，提出你独特的专业见解。如果前面提到了问题，请给出你的解决方案。"
+            sections = [
+                self._format_workflow_prompt_block("Agent 配置规则", config_prompt),
+                self._format_workflow_prompt_block("当前发言身份", AGENT_NAME_MAP.get(agent_type, agent_type)),
+                self._format_workflow_prompt_block("章节", chapter_title),
+                self._format_workflow_prompt_block("章节内容（用于分析）", written_content or "暂无"),
+                self._format_workflow_prompt_block("评估结果", {
+                    "score": evaluation_result.get('score', 'N/A'),
+                    "issues": issues_formatted,
+                    "summary": evaluation_result.get('summary', ''),
+                }),
+                self._format_workflow_prompt_block("参与角色", characters_formatted),
+                self._format_workflow_prompt_block("世界观设定", context.get("world_info", {})),
+                self._format_workflow_prompt_block("当前伏笔状态", context.get('existing_hooks', [])),
+                self._format_workflow_prompt_block("工作流角色/设定约束", self._format_agent_constraint_context(context)),
+                self._format_workflow_prompt_block("之前的讨论要点", "\n".join(previous_discussion)),
+                "【当前任务】\n请结合当前章节内容、评估结果、工作流约束和前序讨论，从你的专业职责出发给出具体分析、问题、改进建议、风险预警和后续创作建议。",
+            ]
+            prompt = "\n\n".join(section for section in sections if section)
 
             if hasattr(agent, 'model') and agent.model:
                 content = await self._get_model_response_text(agent.model, prompt)
@@ -8286,122 +8098,17 @@ class WorkflowEngine:
                     "type": agent_type,
                     "content": content,
                     "is_llm_generated": True,
+                    "config_prompt_source": "agent_template_runtime" if config_prompt else "missing",
                 }
         except Exception as e:
             logger.error(f"{agent_type} 意见生成失败: {e}")
 
-        # 回退到静态消息
         return {
             "agent": AGENT_NAME_MAP.get(agent_type, agent_type),
             "type": agent_type,
             "content": f"【{AGENT_NAME_MAP.get(agent_type, agent_type)}观点】从我的专业角度，本章表现符合预期，建议继续保持。",
             "is_llm_generated": False,
         }
-
-    async def _generate_discussion_summary(
-        self,
-        agent,
-        chapter_title: str,
-        discussion_messages: List[Dict],
-    ) -> Optional[Dict[str, Any]]:
-        """总结 Agent 总结讨论（不限制字数，尽可能详细）"""
-        try:
-            # 构建讨论摘要
-            discussion_text = "\n\n".join([
-                f"【{m['agent']}】{m['content']}"
-                for m in discussion_messages
-            ])
-
-            prompt = f"""你是总结员，请为本次创作讨论会做一个**有价值的总结**。
-
-【重要】你的总结必须：
-- **提炼关键问题**：从讨论中找出真正需要解决的核心问题
-- **整合建议**：把各位Agent的建议整合成可执行的方案
-- **明确行动项**：列出具体要做什么、谁来做、何时做
-- **不要敷衍**：不要只说"大家意见很好"，要给出明确的结论
-
-【讨论主题】《{chapter_title}》创作讨论
-
-【讨论内容】
-{discussion_text}
-
-请输出结构化的总结：
-
-## 核心问题总结
-[从讨论中提炼出的最关键的3-5个问题]
-
-## 各Agent意见摘要
-[每个Agent的核心观点，包括：
-- 编剧的判断
-- 评估员的问题
-- 伏笔管理员的风险预警
-- 设定管理员的冲突发现
-- 其他Agent的关键意见]
-
-## 改进方案汇总
-[针对每个问题，整合各位的建议，形成具体方案]
-
-## 必须修改项
-[列出必须修改的内容，包括：位置、问题、修改方向]
-
-## 建议优化项
-[列出可以优化的内容，非强制但建议做]
-
-## 后续创作指南
-[对下一章/下一阶段创作的具体指导]
-
-## 需要追踪的事项
-[伏笔回收计划、设定完善计划等需要长期追踪的事项]
-
-直接输出总结内容。"""
-
-            if hasattr(agent, 'model') and agent.model:
-                content = await self._get_model_response_text(agent.model, prompt)
-
-                return {
-                    "agent": "总结员",
-                    "type": "summarizer",
-                    "content": content,
-                    "is_llm_generated": True,
-                    "is_summary": True,
-                }
-        except Exception as e:
-            logger.error(f"讨论总结生成失败: {e}")
-
-        # 回退
-        return {
-            "agent": "总结员",
-            "type": "summarizer",
-            "content": f"【总结】本次讨论共{len(discussion_messages)}位Agent发言，讨论了{chapter_title}的创作表现。各方意见已记录，将作为后续创作的参考。",
-            "is_llm_generated": False,
-            "is_summary": True,
-        }
-
-    async def _broadcast_discussion_message(
-        self,
-        execution_id: str,
-        message: Dict[str, Any],
-        is_leader_action: bool = False,
-        broadcast_to_all: bool = False,
-    ):
-        """
-        广播讨论消息
-
-        Args:
-            execution_id: 执行 ID
-            message: 消息内容
-            is_leader_action: 是否是领头人的操作（开启/结束会话）
-            broadcast_to_all: 是否广播给所有参与者
-        """
-        await self._broadcast_status(execution_id, "discussion_message", {
-            "agent": message.get("agent", "Unknown"),
-            "type": message.get("type", "unknown"),
-            "content": message.get("content", ""),
-            "is_llm_generated": message.get("is_llm_generated", False),
-            "is_leader_action": is_leader_action,
-            "broadcast_to_all": broadcast_to_all,
-            "timestamp": datetime.now().isoformat(),
-        })
 
     def _get_agent_role_description(self, agent_type: str) -> str:
         """获取 Agent 的角色描述"""
@@ -8424,18 +8131,13 @@ class WorkflowEngine:
         plotter_agent,
         context: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
-        """
-        让编剧Agent生成场景设定和表演方向
-
-        注意：不限制字数，尽可能详细地规划场景
-        """
+        """让编剧 Agent 生成场景设定和表演方向。"""
         try:
             world_info = context.get("world_info", {})
             characters = context.get("characters", [])
             chapter_goal = context.get("chapter_goal", "")
             plot_outline = context.get("plot_outline", [])
 
-            # 构建角色列表（包含重要性层级）
             char_info = []
             for c in characters:
                 if isinstance(c, dict):
@@ -8444,87 +8146,36 @@ class WorkflowEngine:
                     ctype = c.get("character_type", "supporting")
                     is_protag = c.get("is_protagonist", False)
                     is_antag = c.get("is_antagonist", False)
-                    char_info.append({
-                        "name": name,
-                        "tier": tier,
-                        "type": ctype,
-                        "is_protagonist": is_protag,
-                        "is_antagonist": is_antag,
-                    })
+                    char_info.append(
+                        f"- {name}（层级{tier}，{ctype}"
+                        f"{'，主角' if is_protag else ''}{'，反派' if is_antag else ''}）"
+                    )
 
-            prompt = f"""作为总编剧，你需要为接下来的角色演绎环节设定场景和表演方向。
-
-【世界观设定】
-名称：{world_info.get('name', '未知世界')}
-类型：{world_info.get('world_type', '奇幻')}
-背景：{world_info.get('background', world_info.get('description', ''))}
-基调：{world_info.get('tone', '正剧')}
-规则：{str(world_info.get('rules', {}))}
-
-【当前章节目标】
-{chapter_goal if chapter_goal else '推进主线剧情'}
-
-【参与角色（含重要性层级）】
-{chr(10).join([f"- {c['name']}（层级{c['tier']}，{c['type']}{'，主角' if c['is_protagonist'] else ''}{'，反派' if c['is_antagonist'] else ''}）" for c in char_info])}
-
-【剧情大纲（最近）】
-{str(plot_outline) if plot_outline else '暂无'}
-
-【重要原则】
-1. 角色信息隔离：不要让角色知道不该知道的信息
-2. 角色定位明确：主角推动剧情、反派制造冲突、配角辅助主线
-3. 详细规划：场景描述要详细，角色分工要明确
-
-请输出 JSON 格式（尽可能详细）：
-{{
-    "scene_type": "interactive 或 parallel",
-    "scene_type_reason": "详细说明为什么选择这种场景类型",
-    "main_scene": "主要场景的详细描述（地点、布置、氛围细节）",
-    "atmosphere": "场景氛围（紧张、温馨、神秘等）",
-    "time_of_day": "时间设定",
-    "weather": "天气（如有必要）",
-    "sensory_details": {{
-        "visual": "视觉细节",
-        "auditory": "听觉细节",
-        "olfactory": "嗅觉细节（如有）"
-    }},
-    "character_roles": {{
-        "角色名": {{
-            "role_in_scene": "该角色在场景中的详细定位",
-            "importance_tier": "角色重要性层级",
-            "emotional_state": "情绪状态（详细描述）",
-            "main_action": "主要行为和目标",
-            "known_info": "该角色在场景中能知道的信息",
-            "hidden_motivation": "隐藏动机（如果有）",
-            "relationships_in_scene": "与场景中其他角色的关系"
-        }}
-    }},
-    "required_characters": ["本场景必须出现的角色名列表"],
-    "need_background_characters": true/false,
-    "background_character_count": 2,
-    "background_character_type": "路人/侍从/村民/商贩等",
-    "background_role": "背景角色的作用描述",
-    "background_interaction": true/false,
-    "plot_focus": "本段表演要推进的核心剧情（详细描述）",
-    "key_dialogue_topics": ["主要对话话题"],
-    "conflict_points": ["场景中的冲突点"],
-    "world_elements_to_use": ["要展示的世界观元素"],
-    "foreshadowing_hints": ["可以埋下的伏笔暗示"],
-    "pacing_note": "节奏控制建议",
-    "visible_events": ["普通角色能看到的事件"],
-    "character_filter": {{
-        "min_tier": 1,
-        "max_tier": 5,
-        "locations": ["场景相关位置"],
-        "tags": ["需要包含的角色标签"]
-    }}
-}}"""
+            config_prompt = await self._build_workflow_config_prompt(
+                AgentType.MASTER_PLOTTER,
+                context.get("project_id"),
+                "workflow_scene_direction",
+                {"scenario": "workflow_scene_direction"},
+            )
+            sections = [
+                self._format_workflow_prompt_block("Master Plotter 配置规则", config_prompt),
+                self._format_workflow_prompt_block("世界观设定", {
+                    "name": world_info.get('name', '未知世界'),
+                    "world_type": world_info.get('world_type', '奇幻'),
+                    "background": world_info.get('background', world_info.get('description', '')),
+                    "tone": world_info.get('tone', '正剧'),
+                    "rules": world_info.get('rules', {}),
+                }),
+                self._format_workflow_prompt_block("当前章节目标", chapter_goal or '推进主线剧情'),
+                self._format_workflow_prompt_block("参与角色（含重要性层级）", "\n".join(char_info) or "暂无"),
+                self._format_workflow_prompt_block("剧情大纲（最近）", plot_outline or '暂无'),
+                self._format_workflow_prompt_block("工作流角色/设定约束", self._format_agent_constraint_context(context)),
+                "【当前任务】\n请生成后续角色演绎所需的场景设定、角色分工和信息边界。只输出符合配置规则的 JSON。",
+            ]
+            prompt = "\n\n".join(section for section in sections if section)
 
             content = await self._get_model_response_text(plotter_agent.model, prompt)
 
-            # 解析 JSON
-            import re
-            import json
             json_match = re.search(r'```json\s*(.*?)\s*```', content, re.DOTALL)
             json_str = json_match.group(1) if json_match else content
 
@@ -8535,6 +8186,7 @@ class WorkflowEngine:
         except Exception as e:
             logger.error(f"生成场景方向失败: {e}")
             return None
+
 
     async def _generate_character_performance(
         self,
@@ -8548,138 +8200,69 @@ class WorkflowEngine:
         total_characters: int,
         distributed_info: Dict[str, Any] = None,
     ) -> Optional[Dict[str, Any]]:
-        """
-        生成单个角色的表演内容
-
-        重要原则：
-        1. 信息隔离：角色只能知道自己应该知道的信息，不能有上帝视角
-        2. 角色定位：角色要根据自己的重要性层级做出符合定位的行为
-        3. 详细生成：不限制字数，尽可能详细地展现角色
-
-        Args:
-            agent: Character Agent 实例
-            char_data: 角色数据（包含名字、性格、背景等）
-            scene_directions: 场景方向（编剧设定）
-            world_info: 世界观信息
-            conversation_history: 对话历史（同场景模式下使用）
-            is_interactive: 是否同场景互动模式
-            turn_number: 当前轮次
-            total_characters: 总角色数
-            distributed_info: 智能分发的信息（可选）
-
-        Returns:
-            Dict: 包含角色名、表演内容等
-        """
+        """生成单个角色的表演内容。"""
         try:
             char_name = char_data.get("name", "未知角色")
             char_role = scene_directions.get("character_roles", {}).get(char_name, {})
-
-            # 构建角色信息
             personality = char_data.get("personality", "")
             background = char_data.get("background", char_data.get("description", ""))
             speech_pattern = char_data.get("speech_pattern", "")
             traits = char_data.get("traits", [])
-
-            # 角色重要性层级
             importance_tier = char_data.get("importance_tier", 3)
             character_type = char_data.get("character_type", "supporting")
             is_protagonist = char_data.get("is_protagonist", False)
             is_antagonist = char_data.get("is_antagonist", False)
-
-            # 根据重要性层级确定角色定位说明
             tier_description = self._get_character_tier_description(
                 importance_tier, character_type, is_protagonist, is_antagonist
             )
+            known_info = self._get_character_known_info(char_data, scene_directions, world_info)
 
-            # 角色已知信息（信息隔离：只给角色应该知道的信息）
-            known_info = self._get_character_known_info(
-                char_data, scene_directions, world_info
-            )
-
-            # 构建对话历史（如果是互动模式）- 只保留该角色能感知到的内容
-            history_context = ""
+            history_lines = []
             if is_interactive and conversation_history:
-                # 过滤对话历史，只保留在同一场合能听到的内容
-                recent_history = conversation_history
-                history_lines = []
-                for h in recent_history:
+                for h in conversation_history:
                     speaker = h.get("agent", "某角色")
                     content = h.get("content", "")
                     history_lines.append(f"{speaker}: {content}")
-                history_context = f"\n【当前场景中你能听到/看到的对话】\n" + "\n".join(history_lines)
 
-            prompt = f"""你现在扮演角色「{char_name}」，请进行真实的角色表演。
-
-═══════════════════════════════════════════════════════
-【核心原则 - 必须遵守】
-═══════════════════════════════════════════════════════
-
-⚠️ 【信息隔离原则】
-你只能使用「{char_name}」这个角色已知的信息！
-- 你不知道其他角色的内心想法
-- 你不知道还没发生的事件
-- 你不知道别人私下说的话
-- 你不知道剧情的全貌
-- 你不能"预知"接下来会发生什么
-- 你的所有反应必须基于角色当下的认知
-
-⚠️ 【角色定位原则】
-{tier_description}
-
-你必须根据自己的定位行动：
-- 如果是主角，你要推动剧情、展现成长、面对挑战
-- 如果是反派，你要制造冲突、阻碍主角、展现威胁
-- 如果是配角，你要辅助主线、丰富世界、不抢戏份
-- 如果是路人，你要反应真实、烘托氛围、不干扰主线
-
-═══════════════════════════════════════════════════════
-【角色档案】
-═══════════════════════════════════════════════════════
-名字：{char_name}
-类型：{character_type}
-重要性层级：{importance_tier}（1=核心，2=重要，3=普通，4=配角，5=路人）
-性格：{personality if personality else '根据剧情需要表现'}
-背景：{background if background else '普通背景'}
-说话风格：{speech_pattern if speech_pattern else '自然随意'}
-特质：{', '.join(traits) if traits else '无特殊特质'}
-
-═══════════════════════════════════════════════════════
-【角色已知信息】（你只知道这些！）
-═══════════════════════════════════════════════════════
-{known_info}
-
-═══════════════════════════════════════════════════════
-【当前场景】
-═══════════════════════════════════════════════════════
-场景类型：{'同场景互动' if is_interactive else '独立场景'}
-主场景：{scene_directions.get('main_scene', '未设定')}
-氛围：{scene_directions.get('atmosphere', '正剧')}
-时间：{scene_directions.get('time_of_day', '未设定')}
-
-【你的角色在场景中的定位】
-{char_role.get('role_in_scene', '参与者')}
-情绪状态：{char_role.get('emotional_state', '平静')}
-主要行为：{char_role.get('main_action', '自然互动')}
-{f'隐藏动机：{char_role.get("secret_motivation")}' if char_role.get('secret_motivation') else ''}
-
-{history_context}
-
-═══════════════════════════════════════════════════════
-【表演要求】
-═══════════════════════════════════════════════════════
-1. 用第一人称表演，完全沉浸在这个角色中
-2. 展现角色的性格、说话风格和思维模式
-3. 严格遵守信息隔离，不要表现出不该知道的信息
-4. 根据你的角色定位行动，做自己该做的事
-5. 如果是同场景互动，回应其他角色的话语
-6. 展现内心活动和情感波动
-7. 表演要有剧情意义，不要无意义的闲聊
-8. 可以埋下符合你角色视角的暗示或伏笔
-
-【字数要求】
-不限字数，尽可能详细地展现角色的行为、对话、心理活动。
-
-直接输出你的表演内容（包含动作描写、对话、内心独白等），不要有任何格式标记或解释。"""
+            config_prompt = await self._build_workflow_config_prompt(
+                AgentType.CHARACTER,
+                char_data.get("project_id") or world_info.get("project_id"),
+                "workflow_character_performance",
+                {
+                    "scenario": "workflow_character_performance",
+                    "character_background": background or "普通背景",
+                    "character_personality": personality or "根据剧情需要表现",
+                    "character_goals": char_data.get("goals", ""),
+                },
+            )
+            sections = [
+                self._format_workflow_prompt_block("Character 配置规则", config_prompt),
+                self._format_workflow_prompt_block("当前扮演角色", char_name),
+                self._format_workflow_prompt_block("角色档案", {
+                    "name": char_name,
+                    "type": character_type,
+                    "importance_tier": importance_tier,
+                    "tier_description": tier_description,
+                    "personality": personality or '根据剧情需要表现',
+                    "background": background or '普通背景',
+                    "speech_pattern": speech_pattern or '自然随意',
+                    "traits": traits,
+                }),
+                self._format_workflow_prompt_block("角色已知信息", known_info),
+                self._format_workflow_prompt_block("当前场景", {
+                    "scene_mode": '同场景互动' if is_interactive else '独立场景',
+                    "main_scene": scene_directions.get('main_scene', '未设定'),
+                    "atmosphere": scene_directions.get('atmosphere', '正剧'),
+                    "time_of_day": scene_directions.get('time_of_day', '未设定'),
+                    "role_in_scene": char_role.get('role_in_scene', '参与者'),
+                    "emotional_state": char_role.get('emotional_state', '平静'),
+                    "main_action": char_role.get('main_action', '自然互动'),
+                    "hidden_motivation": char_role.get('secret_motivation') or char_role.get('hidden_motivation') or '',
+                }),
+                self._format_workflow_prompt_block("当前场景中你能听到/看到的对话", "\n".join(history_lines)),
+                "【当前任务】\n请用第一人称输出角色表演内容，包含动作描写、对话、心理活动或感知。直接输出正文，不要 JSON，不要格式标记或解释。",
+            ]
+            prompt = "\n\n".join(section for section in sections if section)
 
             content = await self._get_model_response_text(agent.model, prompt)
 
@@ -8692,6 +8275,7 @@ class WorkflowEngine:
                 "total_characters": total_characters,
                 "character_tier": importance_tier,
                 "character_type": character_type,
+                "config_prompt_source": "agent_template_runtime" if config_prompt else "missing",
             }
 
         except Exception as e:
@@ -8699,208 +8283,10 @@ class WorkflowEngine:
             return {
                 "agent": char_data.get("name", "未知角色"),
                 "type": "character_performance",
-                "content": f"（角色表演生成失败，跳过）",
+                "content": "（角色表演生成失败，跳过）",
                 "is_llm_generated": False,
             }
 
-    def _match_character_filter(self, character: Dict[str, Any], filter_config: Dict[str, Any]) -> bool:
-        """
-        检查角色是否匹配场景筛选条件
-
-        Args:
-            character: 角色数据
-            filter_config: 筛选条件，如:
-                {
-                    "min_tier": 3,           # 最低重要性层级
-                    "max_tier": 5,           # 最高重要性层级
-                    "character_types": ["supporting", "background"],  # 角色类型
-                    "locations": ["客栈", "街道"],  # 当前位置
-                    "tags": ["商人", "武者"],  # 标签匹配
-                    "must_include": ["李明"], # 必须包含的角色
-                }
-
-        Returns:
-            bool: 是否匹配
-        """
-        # 必须包含的角色
-        if filter_config.get("must_include"):
-            if character.get("name") in filter_config["must_include"]:
-                return True
-
-        # 重要性层级范围
-        min_tier = filter_config.get("min_tier", 1)
-        max_tier = filter_config.get("max_tier", 5)
-        char_tier = character.get("importance_tier", 3)
-        if not (min_tier <= char_tier <= max_tier):
-            return False
-
-        # 角色类型
-        if filter_config.get("character_types"):
-            char_type = character.get("character_type", "supporting")
-            if char_type not in filter_config["character_types"]:
-                return False
-
-        # 位置匹配
-        if filter_config.get("locations"):
-            char_location = character.get("current_location", "")
-            if char_location and char_location not in filter_config["locations"]:
-                return False
-
-        # 标签匹配
-        if filter_config.get("tags"):
-            char_tags = character.get("tags", []) or character.get("traits", [])
-            if not any(tag in char_tags for tag in filter_config["tags"]):
-                return False
-
-        return True
-
-    def _distribute_scene_info_to_character(
-        self,
-        char_data: Dict[str, Any],
-        scene_directions: Dict[str, Any],
-        world_info: Dict[str, Any],
-        previous_node_output: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """
-        将场景信息智能分发给角色
-
-        根据角色的重要性和在场景中的定位，分配合适的信息
-
-        Args:
-            char_data: 角色数据
-            scene_directions: 场景方向
-            world_info: 世界观信息
-            previous_node_output: 上一个节点的输出
-
-        Returns:
-            Dict: 该角色应该知道的信息
-        """
-        char_name = char_data.get("name", "未知角色")
-        importance_tier = char_data.get("importance_tier", 3)
-        char_role = scene_directions.get("character_roles", {}).get(char_name, {})
-
-        distributed_info = {
-            "scene_info": {},
-            "plot_context": {},
-            "character_specific": {},
-        }
-
-        # 1. 场景基础信息（所有在场角色都知道）
-        distributed_info["scene_info"] = {
-            "location": scene_directions.get("main_scene", "未知地点"),
-            "atmosphere": scene_directions.get("atmosphere", "正剧"),
-            "time": scene_directions.get("time_of_day", "白天"),
-        }
-
-        # 2. 剧情上下文（根据重要性分发不同程度）
-        if importance_tier <= 2:
-            # 重要角色知道更多
-            distributed_info["plot_context"] = {
-                "plot_focus": scene_directions.get("plot_focus", ""),
-                "conflict_points": scene_directions.get("conflict_points", []),
-                "key_events": previous_node_output.get("key_events", [])[:3],
-            }
-        else:
-            # 普通角色只知道表面
-            distributed_info["plot_context"] = {
-                "visible_events": scene_directions.get("visible_events", []),
-            }
-
-        # 3. 角色专属信息
-        if char_role:
-            distributed_info["character_specific"] = {
-                "role_in_scene": char_role.get("role_in_scene", "参与者"),
-                "emotional_state": char_role.get("emotional_state", "平静"),
-                "known_info": char_role.get("known_info", ""),
-                "hidden_motivation": char_role.get("hidden_motivation", ""),
-            }
-
-        # 4. 处理上一个节点传递的信息
-        if previous_node_output:
-            # 提取与该角色相关的信息
-            related_dialogues = []
-            for dialogue in previous_node_output.get("dialogues", []):
-                # 如果对话涉及该角色或发生在同一地点
-                if char_name in dialogue.get("content", "") or dialogue.get("is_public", True):
-                    related_dialogues.append(dialogue)
-
-            distributed_info["previous_context"] = {
-                "related_dialogues": related_dialogues,
-                "recent_events": previous_node_output.get("events", []),
-            }
-
-        return distributed_info
-
-    def _generate_background_character_behavior(
-        self,
-        background_char: Dict[str, Any],
-        scene_directions: Dict[str, Any],
-        main_characters: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        """
-        生成背景角色的行为
-
-        背景角色行为应该简短、自然、不干扰主线
-
-        Args:
-            background_char: 背景角色数据
-            scene_directions: 场景方向
-            main_characters: 场景中的主要角色列表
-
-        Returns:
-            Dict: 背景角色的行为描述
-        """
-        char_name = background_char.get("name", "路人")
-        scene_type = scene_directions.get("scene_type", "interactive")
-        atmosphere = scene_directions.get("atmosphere", "正剧")
-
-        # 根据场景氛围生成适合的背景行为
-        behavior_templates = {
-            "正剧": [
-                f"({char_name}在一旁静静观看)",
-                f"({char_name}走过，没有停留)",
-                f"({char_name}低声交谈了几句)",
-            ],
-            "紧张": [
-                f"({char_name}神色紧张地望向这边)",
-                f"({char_name}快步走过)",
-                f"({char_name}低着头匆匆离开)",
-            ],
-            "欢快": [
-                f"({char_name}笑着走过)",
-                f"({char_name}在远处闲聊)",
-                f"({char_name}心情不错的样子)",
-            ],
-            "悲伤": [
-                f"({char_name}默默走过)",
-                f"({char_name}低着头，似乎在沉思)",
-            ],
-        }
-
-        behaviors = behavior_templates.get(atmosphere, behavior_templates["正剧"])
-
-        # 选择一个合适的行为
-        import random
-        selected_behavior = random.choice(behaviors)
-
-        # 如果场景需要互动，可能让背景角色有简单反应
-        if scene_directions.get("background_interaction") and random.random() < 0.3:
-            main_char = random.choice(main_characters) if main_characters else {"name": "某人"}
-            return {
-                "agent": char_name,
-                "type": "background_action",
-                "content": selected_behavior + f"，看了{main_char.get('name', '某人')}一眼",
-                "is_llm_generated": False,
-                "importance": "background",
-            }
-
-        return {
-            "agent": char_name,
-            "type": "background_action",
-            "content": selected_behavior,
-            "is_llm_generated": False,
-            "importance": "background",
-        }
 
     def _get_character_tier_description(
         self,
@@ -9057,61 +8443,36 @@ class WorkflowEngine:
         summarizer_agent,
         scene_directions: Dict[str, Any],
         performance_messages: List[Dict],
+        project_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """
-        生成表演总结（不限制字数，尽可能详细）
-
-        Args:
-            summarizer_agent: 总结 Agent
-            scene_directions: 场景方向
-            performance_messages: 表演消息列表
-
-        Returns:
-            Dict: 总结内容
-        """
+        """生成表演总结。"""
         try:
-            # 提取表演内容（使用更多内容）
             performances = []
             for msg in performance_messages:
                 agent = msg.get("agent", "未知")
                 content = msg.get("content", "")
                 performances.append(f"【{agent}】\n{content}")
 
-            prompt = f"""作为总结员，请对刚才的角色演绎进行详细总结。
-
-【场景设定】
-{scene_directions.get('main_scene', '未设定')}
-氛围：{scene_directions.get('atmosphere', '正剧')}
-剧情焦点：{scene_directions.get('plot_focus', '推进剧情')}
-
-【角色表演内容】
-{chr(10).join(performances)}
-
-请输出 JSON 格式（尽可能详细）：
-{{
-    "summary": "表演内容详细总结",
-    "plot_advancement": "详细分析剧情推进要点",
-    "character_performances": {{
-        "角色名": {{
-            "performance_quality": "表演质量评价",
-            "character_consistency": "角色一致性分析",
-            "highlight_moments": ["亮点时刻"]
-        }}
-    }},
-    "character_highlights": ["各角色亮点时刻汇总"],
-    "world_elements_shown": ["展示的世界观元素及评价"],
-    "foreshadowing_planted": ["埋下的伏笔及其预期效果"],
-    "dialogue_quality": "对话质量评价",
-    "pacing_analysis": "节奏分析",
-    "next_scene_suggestion": "下一场景的详细建议",
-    "improvement_suggestions": ["改进建议"]
-}}"""
+            config_prompt = await self._build_workflow_config_prompt(
+                AgentType.SUMMARIZER,
+                project_id,
+                "workflow_performance_summary",
+                {"scenario": "workflow_performance_summary"},
+            )
+            sections = [
+                self._format_workflow_prompt_block("Summarizer 配置规则", config_prompt),
+                self._format_workflow_prompt_block("场景设定", {
+                    "main_scene": scene_directions.get('main_scene', '未设定'),
+                    "atmosphere": scene_directions.get('atmosphere', '正剧'),
+                    "plot_focus": scene_directions.get('plot_focus', '推进剧情'),
+                }),
+                self._format_workflow_prompt_block("角色表演内容", "\n".join(performances)),
+                "【当前任务】\n请对角色演绎进行详细总结，只输出符合配置规则的 JSON。",
+            ]
+            prompt = "\n\n".join(section for section in sections if section)
 
             content = await self._get_model_response_text(summarizer_agent.model, prompt)
 
-            # 尝试解析 JSON
-            import re
-            import json
             json_match = re.search(r'```json\s*(.*?)\s*```', content, re.DOTALL)
             json_str = json_match.group(1) if json_match else content
 
@@ -9123,6 +8484,7 @@ class WorkflowEngine:
                     "content": result.get("summary", content),
                     "data": result,
                     "is_llm_generated": True,
+                    "config_prompt_source": "agent_template_runtime" if config_prompt else "missing",
                 }
             except json.JSONDecodeError:
                 return {
@@ -9130,6 +8492,7 @@ class WorkflowEngine:
                     "type": "performance_summary",
                     "content": content,
                     "is_llm_generated": True,
+                    "config_prompt_source": "agent_template_runtime" if config_prompt else "missing",
                 }
 
         except Exception as e:
@@ -9140,6 +8503,7 @@ class WorkflowEngine:
                 "content": "角色演绎已完成，各角色展现了精彩的表现。",
                 "is_llm_generated": False,
             }
+
 
     async def _execute_parallel_node(
         self,

@@ -116,8 +116,11 @@ export default function PropertyPanel({ projectId, node, edge, onClose, onUpdate
     }
   }, [projectId])
 
+  const getScenario = (nextConfig: Record<string, any> = config) =>
+    String(nextConfig.scenario || nextConfig.agent_scenario || 'default')
+
   // 加载 Agent 类型的 Skills
-  const loadAgentSkills = async (agentType: string) => {
+  const loadAgentSkills = async (agentType: string, scenario?: string) => {
     if (!agentType) {
       setAgentSkills([])
       return
@@ -125,7 +128,7 @@ export default function PropertyPanel({ projectId, node, edge, onClose, onUpdate
 
     setLoadingSkills(true)
     try {
-      const skills = await getAgentTypeSkills(agentType)
+      const skills = await getAgentTypeSkills(agentType, scenario || getScenario())
       setAgentSkills(skills)
     } catch (error) {
       console.error('Failed to load agent skills:', error)
@@ -145,7 +148,7 @@ export default function PropertyPanel({ projectId, node, edge, onClose, onUpdate
       setOutputs((node as any).outputs || [])
       // 加载 Agent Skills
       if (node.node_type === 'agent' && node.agent_type) {
-        loadAgentSkills(node.agent_type)
+        loadAgentSkills(node.agent_type, getScenario(node.config || {}))
       } else {
         setAgentSkills([])
       }
@@ -158,7 +161,7 @@ export default function PropertyPanel({ projectId, node, edge, onClose, onUpdate
   // 当 agentType 变化时重新加载 Skills
   useEffect(() => {
     if (node?.node_type === 'agent' && agentType) {
-      loadAgentSkills(agentType)
+      loadAgentSkills(agentType, getScenario())
     }
   }, [agentType])
 
@@ -690,7 +693,11 @@ export default function PropertyPanel({ projectId, node, edge, onClose, onUpdate
             </label>
             <select
               value={agentType}
-              onChange={(e) => setAgentType(e.target.value)}
+              onChange={(e) => {
+                const newType = e.target.value
+                setAgentType(newType)
+                loadAgentSkills(newType, getScenario())
+              }}
               className={`
                 w-full px-3 py-2 rounded-lg border text-sm
                 ${isDark
@@ -706,6 +713,40 @@ export default function PropertyPanel({ projectId, node, edge, onClose, onUpdate
                 </option>
               ))}
             </select>
+          </div>
+        )}
+
+        {/* Agent 场景 (仅 Agent 节点) */}
+        {node!.node_type === 'agent' && (
+          <div>
+            <label
+              className={`block text-xs font-medium mb-1 ${
+                isDark ? 'text-gray-400' : 'text-gray-500'
+              }`}
+            >
+              Agent 场景
+            </label>
+            <input
+              type="text"
+              value={getScenario()}
+              onChange={(e) => {
+                const scenario = e.target.value || 'default'
+                const nextConfig = { ...config, scenario }
+                setConfig(nextConfig)
+                loadAgentSkills(agentType, scenario)
+              }}
+              placeholder="default"
+              className={`
+                w-full px-3 py-2 rounded-lg border text-sm
+                ${isDark
+                  ? 'bg-gray-800 border-gray-600 text-white'
+                  : 'bg-white border-gray-300'
+                }
+              `}
+            />
+            <p className={`mt-1 text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+              用于按 agent_type + scenario 加载模板与 Skills
+            </p>
           </div>
         )}
 
@@ -908,7 +949,7 @@ export default function PropertyPanel({ projectId, node, edge, onClose, onUpdate
                 Agent Skills
               </label>
               <button
-                onClick={() => loadAgentSkills(agentType)}
+                onClick={() => loadAgentSkills(agentType, getScenario())}
                 disabled={loadingSkills}
                 className={`flex items-center gap-1 px-2 py-1 text-xs text-purple-500 hover:bg-purple-50 dark:hover:bg-purple-900/30 rounded ${loadingSkills ? 'opacity-50' : ''}`}
               >

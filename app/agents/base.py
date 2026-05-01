@@ -149,6 +149,7 @@ class BaseAgent(ABC):
 
     # 类属性，子类必须覆盖
     AGENT_TYPE: Optional[str] = None
+    DEFAULT_SCENARIO: Optional[str] = None
 
     def __init__(
         self,
@@ -164,6 +165,7 @@ class BaseAgent(ABC):
         self.config = config or {}
         self.project_id = project_id
         self.agent_id = agent_id  # 实例 ID
+        self.scenario = self.config.get("scenario") or self.config.get("agent_scenario") or self.DEFAULT_SCENARIO
         self.message_history: List = []
         self._lock = asyncio.Lock()
         # 流式输出回调（由 workflow_engine 设置）
@@ -430,6 +432,7 @@ class BaseAgent(ABC):
             prompt = await service.build_agent_prompt(
                 agent_type=self.AGENT_TYPE,
                 project_id=self.project_id,
+                scenario=self.scenario,
             )
 
             if prompt:
@@ -972,6 +975,8 @@ class BaseAgent(ABC):
             skills = await prompt_service.get_runtime_agent_skills(
                 self.AGENT_TYPE,
                 project_id=self.project_id,
+                context_scene=self.scenario,
+                scenario=self.scenario,
                 use_intelligent_retrieval=False,
             )
 
@@ -979,7 +984,10 @@ class BaseAgent(ABC):
                 self._skills[skill.id] = skill
 
             self._skills_loaded = True
-            logger.info(f"Agent {self.name} 加载了 {len(self._skills)} 个 Skills")
+            logger.info(
+                f"Agent {self.name} 加载了 {len(self._skills)} 个 Skills "
+                f"(scenario={self.scenario or 'default'})"
+            )
 
         except Exception as e:
             logger.warning(f"Agent {self.name} 加载 Skills 失败: {e}")

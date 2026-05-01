@@ -97,8 +97,8 @@ export interface SkillAssignment {
   id: string
   skill_id: string
   agent_type: string
+  scenario: string
 
-  // 分配配置
   slot_name: string
   custom_parameters?: Record<string, any>
   variable_overrides: Record<string, any>
@@ -204,6 +204,7 @@ export interface UpdateSkillDTO {
 export interface AssignSkillDTO {
   skill_id: string
   agent_type: string
+  scenario?: string
   slot_name?: string
   custom_parameters?: Record<string, any>
   variable_overrides?: Record<string, any>
@@ -333,8 +334,11 @@ export async function getSkillAssignments(skillId: string): Promise<SkillAssignm
 /**
  * 获取 Agent 模板的 Skills
  */
-export async function getAgentTypeSkills(agentType: string): Promise<Skill[]> {
-  return await api.get(`${API_BASE}/agents/${agentType}/skills`)
+export async function getAgentTypeSkills(agentType: string, scenario?: string): Promise<Skill[]> {
+  const params = new URLSearchParams()
+  if (scenario) params.append('scenario', scenario)
+  const query = params.toString()
+  return await api.get(`${API_BASE}/agents/${agentType}/skills${query ? `?${query}` : ''}`)
 }
 
 /**

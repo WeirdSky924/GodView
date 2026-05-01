@@ -25,6 +25,7 @@ class MasterPlotterAgent(BaseAgent):
     """总编剧 Agent"""
 
     AGENT_TYPE = AgentType.MASTER_PLOTTER
+    DEFAULT_SCENARIO = "workflow_plot_planning"
 
     def __init__(
         self,
@@ -72,38 +73,141 @@ class MasterPlotterAgent(BaseAgent):
         }
 
     def _build_default_system_prompt(self) -> str:
-        """构建默认系统提示（向后兼容）"""
-        return """你是总编剧，负责把控主线进度和剧情走向，并指导角色演绎环节。
+        """构建默认系统提示（向后兼容）。"""
+        return (
+            "你是总编剧，负责把控主线进度和剧情走向。"
+            "优先使用 Agent Template 绑定的 md prompt / skills / writing-rules；"
+            "仅在未能加载配置资产时，将此最小提示作为 deprecated fallback。"
+        )
 
-【重要：长篇网文创作原则】
-这是一部长篇小说，你需要确保：
-1. **可持续发展**：剧情要能支撑后续几百章的发展，不要急于推进
-2. **渐进式展开**：设定和秘密要逐步揭示，留有余地给后续剧情
-3. **节奏把控**：避免开头即高潮的感觉，保持读者对后续内容的期待
-4. **伏笔管理**：埋下的伏笔不要急于回收，长线伏笔能增加故事深度
-5. **成长空间**：为主角和配角预留成长空间，不要让他们一开始就无敌
-6. **世界观层次**：世界观要有递进层次，让读者感觉还有更深的内容待探索
+    async def _get_master_plotter_config_prompt(
+        self,
+        scenario: str,
+        variables: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """获取 Master Plotter 指定场景的配置 prompt。"""
+        try:
+            from app.services.agent_prompt_service import get_agent_prompt_service
 
-【你的职责】
-1. 评估当前剧情是否应该推进到下一阶段
-2. 决定是否需要埋设"即将发生的事件"
-3. 如果触发强制推进，提供合理的外部事件
-4. 确保剧情不跑题、不拖沓
-5. 控制节奏，不要让故事感觉急于完结
+            service = get_agent_prompt_service()
+            prompt = await service.build_agent_prompt(
+                agent_type=self.AGENT_TYPE.value,
+                project_id=self.project_id,
+                variables=variables or {},
+                scenario=scenario,
+            )
+            if prompt.strip():
+                return prompt.strip()
+        except Exception as e:
+            logger.warning(
+                "加载 MasterPlotter Agent Template prompt 失败: scenario=%s, error=%s",
+                scenario,
+                e,
+            )
 
-【角色演绎指导职责】
-当需要为角色演绎环节设定场景时，你需要：
-1. **场景选择**：选择能推进剧情的关键场景，避免无意义的日常
-2. **场景类型**：
-   - "interactive"（同场景互动）：适合角色对话、冲突、合作等需要互动的情节
-   - "parallel"（独立场景）：适合角色各自行动、内心独白等独立情节
-3. **角色分工**：为每个参与角色设定明确的定位和情绪状态
-4. **剧情焦点**：明确本段表演要推进的核心剧情
-5. **世界观融入**：确保表演中展现世界观元素
-6. **伏笔暗示**：指示可以埋下的伏笔点
+        if scenario == self.DEFAULT_SCENARIO:
+            await self._ensure_system_prompt_loaded()
+            return (self.system_prompt or "").strip()
+        return ""
 
-输出 JSON 格式：
-{
+    def _build_task_prompt(
+        self,
+        *,
+        config_prompt: str,
+        task_title: str,
+        context_text: str,
+        output_schema: Optional[str] = None,
+        task_notes: Optional[List[str]] = None,
+    ) -> str:
+        parts: List[str] = []
+        if config_prompt:
+            parts.append(
+                "【Master Plotter 配置规则】\n"
+                "以下内容来自 Agent Template 绑定的 md prompt / skills / writing-rules，是本次规划的稳定规则来源。\n"
+                f"{config_prompt}"
+            )
+        parts.append(f"【当前任务】\n{task_title}")
+        parts.append(context_text if context_text.strip() else "【上游上下文】\n（暂无上游上下文）")
+        if task_notes:
+            parts.append("【本次任务补充要求】\n" + "\n".join(f"- {note}" for note in task_notes if note))
+        if output_schema:
+            parts.append(f"【输出 JSON Schema】\n{output_schema}")
+        return "\n\n".join(part for part in parts if part)
+
+    def _get_writing_plan_output_schema(self, target_word_count: Any) -> str:
+        return f"""{{
+  "writing_plan": {{
+    "chapter_focus": "本章核心焦点",
+    "opening": "开篇承接方式",
+    "middle_beats": ["中段剧情节拍"],
+    "ending": "收束方式",
+    "target_word_count": {target_word_count or 0}
+  }},
+  "plot_guidance": {{
+    "must_include": ["必须出现的大纲要点"],
+    "avoid": ["必须避免的偏离/冲突"],
+    "hook_usage": ["可承接或新埋伏笔建议"]
+  }},
+  "scene_integration_plan": {{
+    "use_from_performance": ["可整合的场景演绎素材"],
+    "rewrite_or_skip": ["需改写或跳过的素材"]
+  }},
+  "required_elements_check": {{
+    "outline_elements": [{{"item": "要素", "status": "covered/missing/conflict", "note": "说明"}}],
+    "setting_elements": [{{"item": "设定", "status": "covered/missing/conflict", "note": "说明"}}]
+  }},
+  "supporting_character_plan": {{
+    "needed": true,
+    "reason": "如果主要角色不足以推进剧情，说明需要次要角色辅助的原因；否则说明不需要",
+    "avoid_names": ["不得正面出场或不得借用的角色名"],
+    "use_with_upcoming_outline": "如有后续大纲，说明候选角色如何服务后续章节；没有则写'无后续大纲，仅服务当前绑定大纲与轻量铺垫'"
+  }},
+  "character_candidates": [
+    {{"name": "新次要角色姓名", "importance_tier": "supporting/recurring/catalyst/informant/npc", "description": "剧情功能定位", "appearance": "外貌", "personality": "性格", "background_story": "来源背景，必须符合设定", "goals": ["短期目标"], "reason_for_arrival": "为何此时出现并能推动剧情", "future_plot_usage": "如有后续大纲，说明后续用途"}}
+  ],
+  "outline_adherence_notes": ["大纲遵循提示"],
+  "setting_conflict_warnings": ["设定冲突警告"],
+  "suggested_chapter_outline": null,
+  "suggested_chapter_goals": null
+}}"""
+
+    def _get_plot_planning_output_schema(self) -> str:
+        return """{
+    "overall_summary": "整体剧情概述（详细描述，需体现世界观特色和长篇格局）",
+    "tone": "故事基调（如热血、黑暗、温馨、搞笑等）",
+    "writing_style": "建议的写作风格",
+    "pacing_strategy": "节奏策略（详细说明如何保持长篇的可持续发展）",
+    "chapter_titles": ["第一章标题", "第二章标题", ...],
+    "chapter_goals": [
+        {
+            "goal": "本章主要目标",
+            "key_events": ["关键事件1", "关键事件2"],
+            "character_focus": ["重点关注角色"],
+            "environment": "主要场景环境",
+            "foreshadowing": "本章埋下的伏笔（如有）",
+            "performance_directions": {
+                "scene_type": "interactive 或 parallel",
+                "main_scene": "主要表演场景",
+                "character_emotions": {"角色名": "情绪状态"},
+                "plot_focus": "表演要推进的剧情点"
+            }
+        }
+    ],
+    "main_conflicts": ["主要冲突1", "主要冲突2", ...],
+    "progression_phases": [
+        {"phase": "前期（1-X章）", "focus": "主要内容和目标"},
+        {"phase": "中期（X-Y章）", "focus": "主要内容和目标"},
+        {"phase": "后期（Y-Z章）", "focus": "主要内容和目标"}
+    ],
+    "climax_chapter": 高潮章节编号,
+    "ending_hint": "结局暗示",
+    "world_elements_used": ["本小说将运用的世界观元素"],
+    "long_term_hooks": ["长线伏笔（需要多章节才能回收）"],
+    "discussion_considerations": ["根据讨论记录需要考虑的事项"]
+}"""
+
+    def _get_advance_output_schema(self) -> str:
+        return """{
     "should_advance": true/false,
     "reason": "判断理由",
     "current_progress": 0.0-1.0,
@@ -121,8 +225,7 @@ class MasterPlotterAgent(BaseAgent):
     }
 }"""
 
-    def _extract_discussion_summary(self, discussion: Dict[str, Any]) -> str:
-        """提取单条讨论记录的总结，优先读取统一后的 discussion 结构。"""
+
         if not isinstance(discussion, dict):
             return ""
 
@@ -263,14 +366,31 @@ class MasterPlotterAgent(BaseAgent):
             interaction_turns = input_data.get("interaction_turns", 0)
             max_turns_threshold = input_data.get("max_turns_threshold", 5)
 
-            # 构建用户消息
-            user_message = self._build_user_message(
+            context_text = self._build_user_message(
                 main_plot_progress=main_plot_progress,
                 pending_hooks=pending_hooks,
                 chapter_goal=chapter_goal,
                 recent_events=recent_events,
                 interaction_turns=interaction_turns,
                 max_turns_threshold=max_turns_threshold,
+            )
+            config_prompt = await self._get_master_plotter_config_prompt(
+                "workflow_plot_advance",
+                variables={
+                    **input_data,
+                    "main_plot_progress": main_plot_progress,
+                    "pending_hooks": pending_hooks,
+                    "chapter_goal": chapter_goal,
+                    "recent_events": recent_events,
+                    "interaction_turns": interaction_turns,
+                    "max_turns_threshold": max_turns_threshold,
+                },
+            )
+            user_message = self._build_task_prompt(
+                config_prompt=config_prompt,
+                task_title="评估是否应该推进剧情到下一阶段，是否需要埋设即将发生的事件；如需强制推进，提供合理的外部事件。",
+                context_text=context_text,
+                output_schema=self._get_advance_output_schema(),
             )
 
             # 调用 LLM (structured)
@@ -359,58 +479,21 @@ class MasterPlotterAgent(BaseAgent):
         ]
         context_text = "\n\n".join(block for block in blocks if block)
 
-        prompt = f"""你是章节工作流中的总编剧索引员。你的职责是整理上游状态，给 Writer 提供写作计划、检查清单和冲突提示。
-
-{context_text if context_text else '（暂无上游上下文）'}
-
-【硬性规则】
-1. 绑定章节大纲是事实输入源，不能改写、替换或另起剧情。
-2. 固定最高级设定优先于动态设定；动态设定优先于场景演绎素材。
-3. 场景演绎素材只能作为写作素材，若与绑定大纲或固定设定冲突，必须标记冲突而不是采纳。
-4. 不要输出顶层 chapter_outline 或 chapter_goals；如确实需要修订，只能放入 suggested_chapter_outline / suggested_chapter_goals。
-5. 角色出场硬约束优先级高于场景演绎素材和集体讨论素材：只有 present_character_names 可作为当前场景正面参与者。
-6. mentioned_only_names / forbidden_direct_appearance_names 中的角色只能作为传闻、回忆、姓名、势力或影响被提及，不能安排其直接出场、发言或行动。
-7. 角色来源、历史、身份和背景必须遵守 category=character_setting 的设定；如素材冲突，写入 rewrite_or_skip / avoid，而不是采纳。
-8. 如果已有后续大纲参考，写作计划和新角色候选必须服务后续剧情发展，不能只解决本章即时推进。
-9. 如果没有后续大纲，不要擅自新建完整后续大纲；只按当前绑定大纲推进，并可在 future_setup / hook_usage 中提出轻量后续铺垫建议。
-10. 当 present_character_names 中的主要角色不足以推动本章事件时，可以提出新的 supporting/recurring/catalyst/informant/npc 次要角色候选，但候选必须避开 mentioned_only_names / forbidden_direct_appearance_names，且必须给出可落库的姓名、定位、背景、目标和出场理由。
-
-请输出 JSON：
-{{
-  "writing_plan": {{
-    "chapter_focus": "本章核心焦点",
-    "opening": "开篇承接方式",
-    "middle_beats": ["中段剧情节拍"],
-    "ending": "收束方式",
-    "target_word_count": {target_word_count or 0}
-  }},
-  "plot_guidance": {{
-    "must_include": ["必须出现的大纲要点"],
-    "avoid": ["必须避免的偏离/冲突"],
-    "hook_usage": ["可承接或新埋伏笔建议"]
-  }},
-  "scene_integration_plan": {{
-    "use_from_performance": ["可整合的场景演绎素材"],
-    "rewrite_or_skip": ["需改写或跳过的素材"]
-  }},
-  "required_elements_check": {{
-    "outline_elements": [{{"item": "要素", "status": "covered/missing/conflict", "note": "说明"}}],
-    "setting_elements": [{{"item": "设定", "status": "covered/missing/conflict", "note": "说明"}}]
-  }},
-  "supporting_character_plan": {{
-    "needed": true/false,
-    "reason": "如果主要角色不足以推进剧情，说明需要次要角色辅助的原因；否则说明不需要",
-    "avoid_names": ["不得正面出场或不得借用的角色名"],
-    "use_with_upcoming_outline": "如有后续大纲，说明候选角色如何服务后续章节；没有则写'无后续大纲，仅服务当前绑定大纲与轻量铺垫'"
-  }},
-  "character_candidates": [
-    {{"name": "新次要角色姓名", "importance_tier": "supporting/recurring/catalyst/informant/npc", "description": "剧情功能定位", "appearance": "外貌", "personality": "性格", "background_story": "来源背景，必须符合设定", "goals": ["短期目标"], "reason_for_arrival": "为何此时出现并能推动剧情", "future_plot_usage": "如有后续大纲，说明后续用途"}}
-  ],
-  "outline_adherence_notes": ["大纲遵循提示"],
-  "setting_conflict_warnings": ["设定冲突警告"],
-  "suggested_chapter_outline": null,
-  "suggested_chapter_goals": null
-}}"""
+        config_prompt = await self._get_master_plotter_config_prompt(
+            "workflow_chapter_planning",
+            variables={
+                **input_data,
+                "chapter_outline": chapter_outline,
+                "chapter_goals": chapter_goals,
+                "target_word_count": target_word_count or 0,
+            },
+        )
+        prompt = self._build_task_prompt(
+            config_prompt=config_prompt,
+            task_title="整理上游状态，给 Writer 提供写作计划、检查清单和冲突提示。",
+            context_text=context_text,
+            output_schema=self._get_writing_plan_output_schema(target_word_count),
+        )
 
         try:
             parsed = await self._call_structured(
@@ -572,85 +655,37 @@ class MasterPlotterAgent(BaseAgent):
 请在剧情规划中优先承接这些已确认的剧情加码、伏笔、地点、设定和角色信息；涉及已持久化资产时不要随意改名或改设定。
 """
 
-        prompt = f"""你是一位资深网文编剧，现在需要根据以下信息规划一部小说的整体剧情大纲。
-请确保剧情与世界观设定紧密结合，风格基调一致。
-
-【重要：长篇网文创作原则】
-这是一部长篇小说，你需要确保：
-1. **可持续发展**：剧情要能支撑后续几百章的发展，不要急于推进到高潮
-2. **渐进式展开**：设定和秘密要逐步揭示，让读者保持探索的好奇心
-3. **节奏把控**：前面章节主要是铺垫和建立，高潮要在后期逐步展开
-4. **伏笔管理**：埋下的伏笔不要急于回收，长线伏笔能增加故事深度
-5. **成长空间**：为主角和配角预留成长空间，不要让他们一开始就无敌
-6. **世界观层次**：世界观要有递进层次，让读者感觉还有更深的内容待探索
-
-【角色演绎指导原则】
-在规划章节时，你需要考虑角色演绎环节：
-- 为每章规划关键的角色表演场景
-- 明确角色的情绪状态和互动方式
-- 指定场景类型（同场景互动 vs 独立场景）
-- 确保表演能推进剧情，而非单纯的对话
-
-{world_section}
-
-{characters_section}
-
-【初始剧情设定】
-{initial_plot if initial_plot else '（无初始设定，请根据世界观自行构思）'}
-{hooks_section}
-【当前主线进度】
-{main_plot_progress * 100:.1f}%
-{discussion_section}
-【目标】
-规划 {chapter_count} 个章节的大纲
-
-请输出 JSON 格式：
-{{
-    "overall_summary": "整体剧情概述（详细描述，需体现世界观特色和长篇格局）",
-    "tone": "故事基调（如热血、黑暗、温馨、搞笑等）",
-    "writing_style": "建议的写作风格",
-    "pacing_strategy": "节奏策略（详细说明如何保持长篇的可持续发展）",
-    "chapter_titles": ["第一章标题", "第二章标题", ...],
-    "chapter_goals": [
-        {{
-            "goal": "本章主要目标",
-            "key_events": ["关键事件1", "关键事件2"],
-            "character_focus": ["重点关注角色"],
-            "environment": "主要场景环境",
-            "foreshadowing": "本章埋下的伏笔（如有）",
-            "performance_directions": {{
-                "scene_type": "interactive 或 parallel",
-                "main_scene": "主要表演场景",
-                "character_emotions": {{"角色名": "情绪状态"}},
-                "plot_focus": "表演要推进的剧情点"
-            }}
-        }},
-        ...
-    ],
-    "main_conflicts": ["主要冲突1", "主要冲突2", ...],
-    "progression_phases": [
-        {{"phase": "前期（1-X章）", "focus": "主要内容和目标"}},
-        {{"phase": "中期（X-Y章）", "focus": "主要内容和目标"}},
-        {{"phase": "后期（Y-Z章）", "focus": "主要内容和目标"}}
-    ],
-    "climax_chapter": 高潮章节编号,
-    "ending_hint": "结局暗示",
-    "world_elements_used": ["本小说将运用的世界观元素"],
-    "long_term_hooks": ["长线伏笔（需要多章节才能回收）"],
-    "discussion_considerations": ["根据讨论记录需要考虑的事项"]
-}}
-
-要求：
-1. 章节标题要吸引人，符合网文风格，体现世界观特色
-2. 每章目标要具体，包含冲突和转折，场景要结合世界观设定
-3. 确保有起承转合，但前期不要急于推进到高潮
-4. 伏笔要分为短线（近期回收）和长线（后期回收）两种
-5. 必须与世界观设定保持一致，充分利用世界观的独特元素
-6. 角色行为要符合其设定和世界观规则
-7. 为每章规划角色表演场景，确保表演能推进剧情
-8. 明确角色在表演中的情绪状态和互动方式
-7. 如果有讨论记录，请在规划中体现讨论达成的共识和建议
-8. 确保长篇小说的可持续发展，不要让读者感觉开头就是高潮"""
+        config_prompt = await self._get_master_plotter_config_prompt(
+            self.DEFAULT_SCENARIO,
+            variables={
+                **input_data,
+                "initial_plot": initial_plot,
+                "chapter_count": chapter_count,
+                "characters": characters,
+                "world_info": world_info,
+                "main_plot_progress": main_plot_progress,
+                "existing_hooks": existing_hooks,
+                "last_discussion_summary": last_discussion_summary,
+                "discussion_asset_context": discussion_asset_context,
+            },
+        )
+        context_text = "\n\n".join(
+            part for part in [
+                world_section,
+                characters_section,
+                f"【初始剧情设定】\n{initial_plot if initial_plot else '（无初始设定，请根据世界观自行构思）'}",
+                hooks_section,
+                f"【当前主线进度】\n{main_plot_progress * 100:.1f}%",
+                discussion_section,
+                f"【目标】\n规划 {chapter_count} 个章节的大纲",
+            ] if part and part.strip()
+        )
+        prompt = self._build_task_prompt(
+            config_prompt=config_prompt,
+            task_title="根据初始剧情、世界观、角色、伏笔和已确认讨论资产规划长篇小说整体剧情大纲。",
+            context_text=context_text,
+            output_schema=self._get_plot_planning_output_schema(),
+        )
 
         try:
             parsed = await self._call_structured(
@@ -748,18 +783,28 @@ class MasterPlotterAgent(BaseAgent):
         Returns:
             str: 强制事件描述
         """
-        prompt = f"""基于以下情境，生成一个合理的外部事件来强制推进剧情：
-
-【最近事件】
-{chr(10).join(recent_events) if recent_events else '无'}
-
-【待回收伏笔】
-{chr(10).join([h.get('title', '') for h in pending_hooks]) if pending_hooks else '无'}
-
-要求：
-1. 事件应该是外部的、突然的（如：刺客袭击、天灾、意外来客）
-2. 如果能与现有伏笔关联更好
-3. 简洁描述（50 字以内）"""
+        context_text = "\n\n".join(
+            part for part in [
+                self._format_context_block("最近事件", recent_events),
+                self._format_context_block(
+                    "待回收伏笔",
+                    [h.get("title", "") if isinstance(h, dict) else h for h in pending_hooks],
+                ),
+            ] if part
+        )
+        config_prompt = await self._get_master_plotter_config_prompt(
+            "workflow_forced_event",
+            variables={
+                "recent_events": recent_events,
+                "pending_hooks": pending_hooks,
+            },
+        )
+        prompt = self._build_task_prompt(
+            config_prompt=config_prompt,
+            task_title="基于当前情境生成一个 50 字以内、低侵入、可写的外部事件来强制推进剧情。",
+            context_text=context_text,
+            task_notes=["直接输出事件描述，不要 JSON，不要解释。"],
+        )
 
         try:
             response = await self._call_llm(
@@ -770,12 +815,12 @@ class MasterPlotterAgent(BaseAgent):
             )
             return response.strip()
         except Exception:
-            # 默认 fallback 事件
+            # Deprecated minimal fallback：正常路径应由 function_master_plotter_forced_event.md 控制事件风格。
             fallback_events = [
-                "突然传来一声巨响，地面开始震动",
-                "就在此时，窗外飞进一支冷箭",
-                "远处传来急促的号角声",
-                "天空突然乌云密布，狂风大作",
+                "远处传来异常动静，迫使众人立刻确认情况",
+                "一条紧急消息送达，打断了当前停滞的局面",
+                "周围环境突然发生变化，暴露出新的线索",
+                "一名普通传讯者带来与当前目标相关的警示",
             ]
             import random
             return random.choice(fallback_events)

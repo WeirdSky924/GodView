@@ -22,7 +22,7 @@ import {
 } from '@/api/agentTemplates'
 import { getAgentConfigs } from '@/api/agentConfigs'
 import { getPrompts, PromptTemplate } from '@/api/prompts'
-import { getAgentTypeSkills, type Skill } from '@/api/skills'
+import { getAgentTypeSkills, getSkills, type Skill } from '@/api/skills'
 import { useAgentTypes } from '@/hooks/useAgentTypes'
 import { Plus, Edit2, Trash2, Eye, GripVertical, ChevronDown, ChevronUp, Lock, ToggleLeft, ToggleRight, AlertTriangle, Layers, BookOpen } from 'lucide-react'
 import { useProject } from '@/contexts/ProjectContext'
@@ -50,10 +50,28 @@ export default function AgentTemplates() {
   const [previewResult, setPreviewResult] = useState<{
     rendered_prompts: Array<{ slot_name: string; description: string; content: string }>
     final_prompt: string
+    render_trace?: {
+      agent_type: string
+      scenario?: string | null
+      template_id: string
+      prompt_ids: string[]
+      skill_ids: string[]
+      writing_rule_ids: string[]
+      context_blocks: string[]
+      fallbacks_used: string[]
+      deprecated_sources_used: string[]
+      writing_rules?: {
+        retrieved_rules?: Array<{ id?: string; name?: string; severity?: string; reason?: string; score?: number }>
+        always_rule_ids?: string[]
+        resolved_scope?: Record<string, any> | null
+        query?: string
+      } | null
+    }
   } | null>(null)
 
   // Skills 状态
   const [availableSkills, setAvailableSkills] = useState<Skill[]>([])
+  const [allSkills, setAllSkills] = useState<Skill[]>([])
   const [loadingSkills, setLoadingSkills] = useState(false)
 
   // 表单状态
@@ -62,13 +80,21 @@ export default function AgentTemplates() {
     description: '',
     agent_type: 'character',
     prompt_slots: [],
+    skill_slots: [],
     default_prompt_order: [],
+    default_skill_order: [],
+    default_model: '',
+    default_temperature: 0.7,
     tags: [],
+    scenario: 'default',
+    is_optional: false,
+    is_enabled: true,
   })
 
   useEffect(() => {
     loadTemplates()
     loadPrompts()
+    loadAllSkills()
   }, [selectedType, currentProject?.id])
 
   const loadTemplates = async () => {
@@ -78,12 +104,12 @@ export default function AgentTemplates() {
       const projectConfigs = currentProject?.id
         ? await getAgentConfigs(currentProject.id, undefined, undefined, 200)
         : []
-      const projectConfigMap = new Map(projectConfigs.map((config) => [config.agent_type, config]))
+      const projectConfigMap = new Map(projectConfigs.map((config) => [`${config.agent_type}:${config.scenario || 'default'}`, config]))
 
       // 确保返回的是数组
       if (Array.isArray(data)) {
         const mergedTemplates = data.map((template) => {
-          const projectConfig = currentProject?.id ? projectConfigMap.get(template.agent_type) : undefined
+          const projectConfig = currentProject?.id ? projectConfigMap.get(`${template.agent_type}:${template.scenario || 'default'}`) : undefined
           if (!template.is_optional || !projectConfig) {
             return template
           }
@@ -136,6 +162,41 @@ export default function AgentTemplates() {
     }
   }
 
+  const loadAllSkills = async () => {
+    try {
+      const data = await getSkills(undefined, undefined, undefined, undefined, undefined, undefined, 300)
+      if (Array.isArray(data)) {
+        setAllSkills(data)
+      } else {
+        setAllSkills([])
+      }
+    } catch (error) {
+      console.error('Failed to load all skills:', error)
+      setAllSkills([])
+    }
+  }
+
+  const getPromptById = (promptId?: string | null) => {
+    if (!promptId) return undefined
+    return prompts.find((prompt) => prompt.id === promptId)
+  }
+
+  const getSkillById = (skillId?: string | null) => {
+    if (!skillId) return undefined
+    return allSkills.find((skill) => skill.id === skillId) || availableSkills.find((skill) => skill.id === skillId)
+  }
+
+  const formatSlotBinding = (slot: PromptSlot) => {
+    if (slot.slot_name === 'writing_rules' && !slot.prompt_template_id) {
+      return '动态 Writing Rules'
+    }
+    const prompt = getPromptById(slot.prompt_template_id)
+    return prompt ? `${prompt.name} (${prompt.id})` : slot.prompt_template_id || '未绑定'
+  }
+
+  const enabledPromptSlots = (template: AgentTemplate) => (template.prompt_slots || []).filter((slot) => slot.is_enabled)
+  const enabledSkillSlots = (template: AgentTemplate) => (template.skill_slots || []).filter((slot) => slot.is_enabled)
+
   const handleCreate = async () => {
     setEditingTemplate(null)
     setFormData({
@@ -146,7 +207,12 @@ export default function AgentTemplates() {
       skill_slots: [],
       default_prompt_order: [],
       default_skill_order: [],
+      default_model: '',
+      default_temperature: 0.7,
       tags: [],
+      scenario: 'default',
+      is_optional: false,
+      is_enabled: true,
     })
     setAvailableSkills([])
     setShowEditModal(true)
@@ -162,18 +228,24 @@ export default function AgentTemplates() {
       skill_slots: template.skill_slots || [],
       default_prompt_order: template.default_prompt_order || [],
       default_skill_order: template.default_skill_order || [],
+      default_model: template.default_model || '',
+      default_temperature: template.default_temperature ?? 0.7,
       tags: template.tags || [],
+      scenario: template.scenario || 'default',
+      is_system: template.is_system,
+      is_optional: template.is_optional,
+      is_enabled: template.is_enabled,
     })
     setShowEditModal(true)
 
     // 加载该 Agent 类型可用的 Skills
-    await loadSkillsForAgentType(template.agent_type)
+    await loadSkillsForAgentType(template.agent_type, template.scenario || 'default')
   }
 
-  const loadSkillsForAgentType = async (agentType: AgentType) => {
+  const loadSkillsForAgentType = async (agentType: AgentType, scenario?: string) => {
     setLoadingSkills(true)
     try {
-      const skills = await getAgentTypeSkills(agentType)
+      const skills = await getAgentTypeSkills(agentType, scenario || formData.scenario || 'default')
       setAvailableSkills(skills)
     } catch (error) {
       console.error('Failed to load skills:', error)
@@ -222,10 +294,24 @@ export default function AgentTemplates() {
 
   const handleSave = async () => {
     try {
+      const payload = {
+        ...formData,
+        default_model: formData.default_model?.trim() || null,
+        default_temperature: Number(formData.default_temperature ?? 0.7),
+        default_prompt_order: (formData.prompt_slots || [])
+          .filter((slot) => slot.is_enabled)
+          .map((slot) => slot.slot_name)
+          .filter(Boolean),
+        default_skill_order: (formData.skill_slots || [])
+          .filter((slot) => slot.is_enabled)
+          .map((slot) => slot.slot_name)
+          .filter(Boolean),
+      }
+
       if (editingTemplate) {
-        await updateAgentTemplate(editingTemplate.id, formData as UpdateAgentTemplateDTO)
+        await updateAgentTemplate(editingTemplate.id, payload as UpdateAgentTemplateDTO)
       } else {
-        await createAgentTemplate(formData)
+        await createAgentTemplate(payload)
       }
       setShowEditModal(false)
       await loadTemplates()
@@ -423,58 +509,81 @@ export default function AgentTemplates() {
                         <span className={`px-2 py-1 text-xs rounded ${isDark ? 'bg-gray-700' : 'bg-gray-200'}`}>
                           {AGENT_TYPE_LABELS[template.agent_type]}
                         </span>
+                        <span className={`px-2 py-1 text-xs rounded ${isDark ? 'bg-gray-700 text-gray-300' : 'bg-gray-200 text-gray-600'}`}>
+                          {template.scenario || 'default'}
+                        </span>
                       </div>
                       <p className={`text-sm mb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>{template.description}</p>
 
-                      <div className="flex items-center gap-2 mb-2">
-                        <span className={`text-sm ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>Prompt 插槽：</span>
-                        <div className="flex gap-1 flex-wrap">
-                          {template.prompt_slots
-                            .filter((s) => s.is_enabled)
-                            .slice(0, 5)
-                            .map((slot, idx) => (
-                              <span
-                                key={slot.prompt_template_id || `prompt-${idx}`}
-                                className={`px-2 py-0.5 text-xs rounded ${
-                                  slot.prompt_template_id ? 'bg-green-900 text-green-300' : isDark ? 'bg-gray-700 text-gray-400' : 'bg-gray-200 text-gray-500'
-                                }`}
-                              >
-                                {slot.slot_name}
-                              </span>
-                            ))}
-                          {template.prompt_slots.filter((s) => s.is_enabled).length > 5 && (
-                            <span className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
-                              +{template.prompt_slots.filter((s) => s.is_enabled).length - 5}
+                      <div className="space-y-3 mb-2">
+                        <div>
+                          <div className="flex items-center gap-2 mb-2">
+                            <span className={`text-sm ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>Prompt / Rule 绑定：</span>
+                            <span className={`text-xs ${isDark ? 'text-gray-600' : 'text-gray-400'}`}>
+                              按 default_prompt_order / 插槽顺序加载
                             </span>
-                          )}
-                        </div>
-                      </div>
-
-                      {template.skill_slots && template.skill_slots.length > 0 && (
-                        <div className="flex items-center gap-2">
-                          <span className={`text-sm ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>Skill 插槽：</span>
-                          <div className="flex gap-1 flex-wrap">
-                            {template.skill_slots
-                              .filter((s) => s.is_enabled)
-                              .slice(0, 5)
-                              .map((slot, idx) => (
+                          </div>
+                          <div className="flex gap-2 flex-wrap">
+                            {enabledPromptSlots(template).length ? enabledPromptSlots(template).map((slot, idx) => {
+                              const prompt = getPromptById(slot.prompt_template_id)
+                              const isWritingRules = slot.slot_name === 'writing_rules' && !slot.prompt_template_id
+                              return (
                                 <span
-                                  key={slot.skill_id || `skill-${idx}`}
-                                  className={`px-2 py-0.5 text-xs rounded ${
-                                    slot.skill_id ? 'bg-purple-900 text-purple-300' : isDark ? 'bg-gray-700 text-gray-400' : 'bg-gray-200 text-gray-500'
+                                  key={`${template.id}-prompt-${slot.slot_name}-${idx}`}
+                                  title={formatSlotBinding(slot)}
+                                  className={`px-2 py-1 text-xs rounded border ${
+                                    isWritingRules
+                                      ? 'bg-amber-900/40 text-amber-300 border-amber-700'
+                                      : prompt
+                                        ? 'bg-green-900/40 text-green-300 border-green-700'
+                                        : isDark
+                                          ? 'bg-gray-800 text-gray-400 border-gray-700'
+                                          : 'bg-gray-100 text-gray-500 border-gray-200'
                                   }`}
                                 >
-                                  {slot.slot_name}
+                                  <span className="font-medium">{idx + 1}. {slot.slot_name}</span>
+                                  <span className="opacity-75"> → {isWritingRules ? '动态规则' : prompt?.name || slot.prompt_template_id || '未绑定'}</span>
                                 </span>
-                              ))}
-                            {template.skill_slots.filter((s) => s.is_enabled).length > 5 && (
-                              <span className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
-                                +{template.skill_slots.filter((s) => s.is_enabled).length - 5}
-                              </span>
+                              )
+                            }) : (
+                              <span className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>无启用插槽</span>
                             )}
                           </div>
                         </div>
-                      )}
+
+                        <div>
+                          <div className="flex items-center gap-2 mb-2">
+                            <span className={`text-sm ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>Skill / md 绑定：</span>
+                            <span className={`text-xs ${isDark ? 'text-gray-600' : 'text-gray-400'}`}>
+                              由模板 skill_slots 显式加载
+                            </span>
+                          </div>
+                          <div className="flex gap-2 flex-wrap">
+                            {enabledSkillSlots(template).length ? enabledSkillSlots(template).map((slot, idx) => {
+                              const skill = getSkillById(slot.skill_id)
+                              return (
+                                <span
+                                  key={`${template.id}-skill-${slot.slot_name}-${idx}`}
+                                  title={skill ? `${skill.name} (${skill.id})` : slot.skill_id || '未绑定'}
+                                  className={`px-2 py-1 text-xs rounded border ${
+                                    skill || slot.skill_id
+                                      ? 'bg-purple-900/40 text-purple-300 border-purple-700'
+                                      : isDark
+                                        ? 'bg-gray-800 text-gray-400 border-gray-700'
+                                        : 'bg-gray-100 text-gray-500 border-gray-200'
+                                  }`}
+                                >
+                                  <span className="font-medium">{idx + 1}. {slot.slot_name}</span>
+                                  <span className="opacity-75"> → {skill?.name || slot.skill_id || '未绑定'}</span>
+                                </span>
+                              )
+                            }) : (
+                              <span className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>无启用 Skill</span>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+
                     </div>
 
                     <div className="flex gap-2 items-center">
@@ -546,7 +655,7 @@ export default function AgentTemplates() {
                 onChange={(e) => {
                   const newType = e.target.value as AgentType
                   setFormData({ ...formData, agent_type: newType })
-                  loadSkillsForAgentType(newType)
+                  loadSkillsForAgentType(newType, formData.scenario || 'default')
                 }}
               >
                 {Object.entries(AGENT_TYPE_LABELS).map(([key, label]) => (
@@ -559,6 +668,20 @@ export default function AgentTemplates() {
           </div>
 
           <div>
+            <label className={`block text-sm mb-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>场景</label>
+            <Input
+              value={formData.scenario || 'default'}
+              onChange={(e) => {
+                const scenario = e.target.value || 'default'
+                setFormData({ ...formData, scenario })
+                loadSkillsForAgentType(formData.agent_type, scenario)
+              }}
+              placeholder="如：workflow_chapter_generation"
+            />
+            <p className={`mt-1 text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>同一 Agent 类型可通过不同场景加载不同模板。</p>
+          </div>
+
+          <div>
             <label className={`block text-sm mb-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>描述</label>
             <TextArea
               value={formData.description}
@@ -566,6 +689,68 @@ export default function AgentTemplates() {
               placeholder="模板描述"
               rows={2}
             />
+          </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className={`block text-sm mb-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>默认模型</label>
+              <Input
+                value={formData.default_model || ''}
+                onChange={(e) => setFormData({ ...formData, default_model: e.target.value })}
+                placeholder="留空则使用项目/全局模型配置"
+              />
+            </div>
+            <div>
+              <label className={`block text-sm mb-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>默认温度</label>
+              <Input
+                type="number"
+                min="0"
+                max="2"
+                step="0.1"
+                value={formData.default_temperature ?? 0.7}
+                onChange={(e) => setFormData({ ...formData, default_temperature: Number(e.target.value) })}
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-3 gap-4">
+            <label className={`flex items-center gap-2 text-sm ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
+              <input
+                type="checkbox"
+                checked={!!formData.is_optional}
+                onChange={(e) => setFormData({ ...formData, is_optional: e.target.checked })}
+              />
+              可选 Agent
+            </label>
+            <label className={`flex items-center gap-2 text-sm ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
+              <input
+                type="checkbox"
+                checked={formData.is_enabled ?? true}
+                onChange={(e) => setFormData({ ...formData, is_enabled: e.target.checked })}
+              />
+              启用模板
+            </label>
+            <label className={`flex items-center gap-2 text-sm ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
+              <input
+                type="checkbox"
+                checked={!!formData.is_system}
+                onChange={(e) => setFormData({ ...formData, is_system: e.target.checked })}
+              />
+              系统种子
+            </label>
+          </div>
+
+          <div>
+            <label className={`block text-sm mb-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>标签</label>
+            <Input
+              value={(formData.tags || []).join(', ')}
+              onChange={(e) => setFormData({
+                ...formData,
+                tags: e.target.value.split(',').map((tag) => tag.trim()).filter(Boolean),
+              })}
+              placeholder="例如：director, writer, workflow"
+            />
+            <p className={`mt-1 text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>多个标签用英文逗号分隔。</p>
           </div>
 
           {/* Prompt 插槽 */}
@@ -636,7 +821,7 @@ export default function AgentTemplates() {
                         />
                       </div>
                       <div>
-                        <label className={`block text-xs mb-1 ${isDark ? 'text-gray-500' : 'text-gray-500'}`}>关联 Prompt 模板</label>
+                        <label className={`block text-xs mb-1 ${isDark ? 'text-gray-500' : 'text-gray-500'}`}>关联 Prompt 模板 / 动态规则</label>
                         <select
                           className={`w-full border rounded px-3 py-2 text-sm ${isDark ? 'bg-gray-700 border-gray-600 text-white' : 'bg-white border-gray-300 text-gray-800'}`}
                           value={slot.prompt_template_id || ''}
@@ -644,13 +829,18 @@ export default function AgentTemplates() {
                             handleUpdateSlot(index, 'prompt_template_id', e.target.value || null)
                           }
                         >
-                          <option value="">选择 Prompt 模板</option>
+                          <option value="">{slot.slot_name === 'writing_rules' ? '动态加载 Writing Rules' : '选择 Prompt 模板'}</option>
                           {prompts.map((p) => (
                             <option key={p.id} value={p.id}>
-                              {p.name}
+                              {p.name} · {p.category} · {p.id}
                             </option>
                           ))}
                         </select>
+                        <p className={`mt-1 text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+                          {slot.slot_name === 'writing_rules' && !slot.prompt_template_id
+                            ? '此插槽不绑定单个 md prompt，运行时按项目、Agent 类型和场景动态注入 Writing Rules。'
+                            : `当前绑定：${formatSlotBinding(slot)}`}
+                        </p>
                       </div>
                     </div>
                   </div>
@@ -676,30 +866,37 @@ export default function AgentTemplates() {
             {(formData.skill_slots?.length ?? 0) > 0 && (
               <div className="space-y-2 mb-3">
                 {(formData.skill_slots || []).map((skillSlot, index) => (
-                  <div key={index} className={`p-3 rounded-lg border flex items-center justify-between ${isDark ? 'bg-gray-800 border-gray-700' : 'bg-gray-50 border-gray-200'}`}>
-                    <div className="flex items-center gap-3">
-                      <BookOpen className={`w-4 h-4 ${isDark ? 'text-gray-400' : 'text-gray-500'}`} />
-                      <div>
-                        <span className={`font-medium ${isDark ? 'text-gray-200' : 'text-gray-700'}`}>
-                          {skillSlot.slot_name}
-                        </span>
-                        <span className={`text-xs ml-2 ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
-                          {skillSlot.skill_id}
-                        </span>
+                  <div key={index} className={`p-3 rounded-lg border ${isDark ? 'bg-gray-800 border-gray-700' : 'bg-gray-50 border-gray-200'}`}>
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="flex items-center gap-3 min-w-0">
+                        <BookOpen className={`w-4 h-4 flex-shrink-0 ${isDark ? 'text-gray-400' : 'text-gray-500'}`} />
+                        <div className="min-w-0">
+                          <span className={`font-medium ${isDark ? 'text-gray-200' : 'text-gray-700'}`}>
+                            {skillSlot.slot_name}
+                          </span>
+                          <span className={`text-xs ml-2 ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+                            → {getSkillById(skillSlot.skill_id)?.name || skillSlot.skill_id || '未绑定'}
+                          </span>
+                        </div>
+                        <label className={`flex items-center gap-1 text-sm flex-shrink-0 ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
+                          <input
+                            type="checkbox"
+                            checked={skillSlot.is_enabled}
+                            onChange={(e) => handleUpdateSkillSlot(index, 'is_enabled', e.target.checked)}
+                            className="w-3 h-3"
+                          />
+                          启用
+                        </label>
                       </div>
-                      <label className={`flex items-center gap-1 text-sm ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
-                        <input
-                          type="checkbox"
-                          checked={skillSlot.is_enabled}
-                          onChange={(e) => handleUpdateSkillSlot(index, 'is_enabled', e.target.checked)}
-                          className="w-3 h-3"
-                        />
-                        启用
-                      </label>
+                      <Button size="sm" variant="danger" onClick={() => handleRemoveSkillSlot(index)}>
+                        <Trash2 className="w-3 h-3" />
+                      </Button>
                     </div>
-                    <Button size="sm" variant="danger" onClick={() => handleRemoveSkillSlot(index)}>
-                      <Trash2 className="w-3 h-3" />
-                    </Button>
+                    <div className={`mt-2 text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+                      <span>ID：{skillSlot.skill_id || '未绑定'}</span>
+                      {getSkillById(skillSlot.skill_id)?.category && <span className="ml-3">分类：{getSkillById(skillSlot.skill_id)?.category}</span>}
+                      {getSkillById(skillSlot.skill_id)?.skill_type && <span className="ml-3">类型：{getSkillById(skillSlot.skill_id)?.skill_type}</span>}
+                    </div>
                   </div>
                 ))}
               </div>
@@ -749,11 +946,11 @@ export default function AgentTemplates() {
             )}
           </div>
 
-          {/* 系统模板警告 */}
+          {/* 系统种子模板提示 */}
           {editingTemplate?.is_system && (
-            <div className={`p-3 rounded-lg flex items-center gap-2 ${isDark ? 'bg-yellow-900/30 text-yellow-300' : 'bg-yellow-50 text-yellow-700'}`}>
+            <div className={`p-3 rounded-lg flex items-center gap-2 ${isDark ? 'bg-blue-900/30 text-blue-300' : 'bg-blue-50 text-blue-700'}`}>
               <AlertTriangle className="w-4 h-4 flex-shrink-0" />
-              <span className="text-sm">这是系统内置模板，修改后可能会被系统更新覆盖。建议创建新模板进行自定义。</span>
+              <span className="text-sm">这是系统种子模板。Prompt / Skill / 场景关系会保存到数据库并作为运行时配置生效；系统种子不可删除，但可以在此编辑。</span>
             </div>
           )}
 
@@ -784,6 +981,49 @@ export default function AgentTemplates() {
                 ))}
               </div>
             </div>
+
+            {previewResult.render_trace && (
+              <div>
+                <h4 className={`text-sm mb-2 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>Render Trace</h4>
+                <div className={`p-3 rounded text-sm space-y-2 ${isDark ? 'bg-gray-800 text-gray-300' : 'bg-gray-100 text-gray-700'}`}>
+                  <div>Agent：{previewResult.render_trace.agent_type}</div>
+                  <div>Template：{previewResult.render_trace.template_id}</div>
+                  {previewResult.render_trace.scenario && <div>Scenario：{previewResult.render_trace.scenario}</div>}
+                  <div>Prompt IDs：{previewResult.render_trace.prompt_ids.length ? previewResult.render_trace.prompt_ids.join(', ') : '无'}</div>
+                  <div>Skill IDs：{previewResult.render_trace.skill_ids.length ? previewResult.render_trace.skill_ids.join(', ') : '无'}</div>
+                  <div>Writing Rule IDs：{previewResult.render_trace.writing_rule_ids.length ? previewResult.render_trace.writing_rule_ids.join(', ') : '无'}</div>
+                  {previewResult.render_trace.writing_rules?.always_rule_ids?.length ? (
+                    <div>Always Rules：{previewResult.render_trace.writing_rules.always_rule_ids.join(', ')}</div>
+                  ) : null}
+                  {previewResult.render_trace.writing_rules?.query ? (
+                    <div>Rule Query：{previewResult.render_trace.writing_rules.query}</div>
+                  ) : null}
+                  {previewResult.render_trace.writing_rules?.resolved_scope ? (
+                    <div>Rule Scope：{JSON.stringify(previewResult.render_trace.writing_rules.resolved_scope)}</div>
+                  ) : null}
+                  {previewResult.render_trace.writing_rules?.retrieved_rules?.length ? (
+                    <div>
+                      <div className="mb-1">命中规则：</div>
+                      <ul className="list-disc pl-5 space-y-1">
+                        {previewResult.render_trace.writing_rules.retrieved_rules.map((rule) => (
+                          <li key={rule.id || rule.name}>
+                            <span className="font-medium">{rule.name || rule.id}</span>
+                            <span className="opacity-75"> [{rule.severity || 'unknown'} / {rule.reason || 'unknown'}]</span>
+                            {typeof rule.score === 'number' && <span className="opacity-60"> score={rule.score.toFixed(3)}</span>}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  ) : null}
+                  {previewResult.render_trace.fallbacks_used.length ? (
+                    <div>Fallbacks：{previewResult.render_trace.fallbacks_used.join(', ')}</div>
+                  ) : null}
+                  {previewResult.render_trace.deprecated_sources_used.length ? (
+                    <div>Deprecated：{previewResult.render_trace.deprecated_sources_used.join(', ')}</div>
+                  ) : null}
+                </div>
+              </div>
+            )}
 
             <div>
               <h4 className={`text-sm mb-2 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>最终拼接结果</h4>

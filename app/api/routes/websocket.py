@@ -116,7 +116,11 @@ async def create_agent_provider(director: DirectorSystem):
     # 获取数据库连接（用于记忆加载）
     from app.api.app import postgres_db
 
-    async def _resolve_runtime_state(agent_type_value: str, project_id: str) -> Optional[Dict[str, Any]]:
+    async def _resolve_runtime_state(
+        agent_type_value: str,
+        project_id: str,
+        scenario: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         if not postgres_db or not project_id:
             return None
 
@@ -124,15 +128,20 @@ async def create_agent_provider(director: DirectorSystem):
             from app.services.agent_config_service import get_agent_config_service
 
             config_service = get_agent_config_service()
-            return await config_service.resolve_agent_runtime_state(project_id, agent_type_value)
+            return await config_service.resolve_agent_runtime_state(project_id, agent_type_value, scenario)
         except Exception as e:
             logger.warning(
-                f"读取 Agent 运行时状态失败: project={project_id}, agent={agent_type_value}, error={e}"
+                f"读取 Agent 运行时状态失败: project={project_id}, agent={agent_type_value}, "
+                f"scenario={scenario or 'default'}, error={e}"
             )
             return None
 
-    async def _is_agent_disabled(agent_type_value: str, project_id: str) -> tuple[bool, Optional[str]]:
-        runtime_state = await _resolve_runtime_state(agent_type_value, project_id)
+    async def _is_agent_disabled(
+        agent_type_value: str,
+        project_id: str,
+        scenario: Optional[str] = None,
+    ) -> tuple[bool, Optional[str]]:
+        runtime_state = await _resolve_runtime_state(agent_type_value, project_id, scenario)
         if runtime_state and runtime_state.get("enabled") is False:
             return True, runtime_state.get("reason", "Agent 已禁用")
         return False, None
@@ -258,6 +267,10 @@ async def create_agent_provider(director: DirectorSystem):
         profile = get_workflow_node_profile(agent_type)
         agent_type_lower = normalized_agent_type.lower().replace(" ", "_").replace("-", "_")
 
+        scenario = None
+        if profile and isinstance(getattr(profile, "metadata", None), dict):
+            scenario = profile.metadata.get("scenario")
+
         agent_type_enum: Optional[AgentType] = None
         try:
             agent_type_enum = AgentType(normalized_agent_type)
@@ -265,10 +278,11 @@ async def create_agent_provider(director: DirectorSystem):
             agent_type_enum = None
 
         if agent_type_enum is not None:
-            disabled, reason = await _is_agent_disabled(agent_type_enum.value, project_id)
+            disabled, reason = await _is_agent_disabled(agent_type_enum.value, project_id, scenario)
             if disabled:
                 logger.info(
-                    f"Agent 在当前项目已禁用，provider 返回 None: type={agent_type_enum.value}, project_id={project_id}, reason={reason}"
+                    f"Agent 在当前项目已禁用，provider 返回 None: type={agent_type_enum.value}, "
+                    f"scenario={scenario or 'default'}, project_id={project_id}, reason={reason}"
                 )
                 return None
 

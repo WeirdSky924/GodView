@@ -265,6 +265,7 @@ class SkillRetrievalService:
         agent_type: str,
         top_k: int = 5,
         min_similarity: float = 0.3,
+        scenario: Optional[str] = None,
     ) -> RetrievalResult:
         """
         两阶段 Skill 检索
@@ -274,12 +275,13 @@ class SkillRetrievalService:
             agent_type: Agent 类型（用于过滤已分配的 Skills）
             top_k: 返回候选数量
             min_similarity: 最小相似度阈值
+            scenario: Agent 使用场景
 
         Returns:
             RetrievalResult: 检索结果
         """
         # 1. 获取 Agent 可用的 Skills（仅已分配到插槽的）
-        available_skills = await self._get_available_skills(agent_type)
+        available_skills = await self._get_available_skills(agent_type, scenario)
 
         if not available_skills:
             logger.warning(f"Agent {agent_type} 没有可用的 Skills")
@@ -344,13 +346,13 @@ class SkillRetrievalService:
 
         return RetrievalResult([], [], final_skills)
 
-    async def _get_available_skills(self, agent_type: str) -> List[Skill]:
+    async def _get_available_skills(self, agent_type: str, scenario: Optional[str] = None) -> List[Skill]:
         """获取 Agent 可用的 Skills（仅插槽绑定的）"""
         if not self.skill_service:
             return []
 
         try:
-            assigned = await self.skill_service.get_assigned_skills_for_agent(agent_type)
+            assigned = await self.skill_service.get_assigned_skills_for_agent(agent_type, scenario)
             return [skill for skill, _ in assigned]
         except Exception as e:
             logger.error(f"获取 Agent Skills 失败: {e}")

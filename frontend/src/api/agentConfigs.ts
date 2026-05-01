@@ -33,6 +33,7 @@ export interface AgentConfig {
   id: string
   project_id: string
   agent_type: string
+  scenario: string
   name: string
   description: string
   template_id?: string
@@ -50,7 +51,7 @@ export interface AgentConfig {
 
 export interface UpdateAgentConfigDTO {
   name?: string
-  description?: string
+  scenario?: string
   template_id?: string
   is_custom?: boolean
   slot_overrides?: SlotOverride[]
@@ -64,10 +65,12 @@ export interface PreviewConfigResult {
   config_id: string
   project_id: string
   agent_type: string
+  scenario: string
   template?: {
     id: string
     name: string
     agent_type: string
+    scenario?: string
   }
   is_custom: boolean
   llm_config: ModelConfig
@@ -86,10 +89,12 @@ export async function getAgentConfigs(
   agentType?: string,
   isActive?: boolean,
   limit: number = 50,
-  offset: number = 0
+  offset: number = 0,
+  scenario?: string
 ): Promise<AgentConfig[]> {
   const params = new URLSearchParams()
   if (agentType) params.append('agent_type', agentType)
+  if (scenario) params.append('scenario', scenario)
   if (isActive !== undefined) params.append('is_active', String(isActive))
   params.append('limit', String(limit))
   params.append('offset', String(offset))
@@ -101,8 +106,15 @@ export async function getAgentConfigs(
 /**
  * 获取项目特定 Agent 类型的配置
  */
-export async function getAgentConfig(projectId: string, agentType: string): Promise<AgentConfig> {
-  return await api.get(`${API_BASE}/projects/${projectId}/agents/${agentType}`)
+export async function getAgentConfig(
+  projectId: string,
+  agentType: string,
+  scenario?: string
+): Promise<AgentConfig> {
+  const params = new URLSearchParams()
+  if (scenario) params.append('scenario', scenario)
+  const query = params.toString()
+  return await api.get(`${API_BASE}/projects/${projectId}/agents/${agentType}${query ? `?${query}` : ''}`)
 }
 
 /**
@@ -111,9 +123,13 @@ export async function getAgentConfig(projectId: string, agentType: string): Prom
 export async function updateAgentConfig(
   projectId: string,
   agentType: string,
-  dto: UpdateAgentConfigDTO
+  dto: UpdateAgentConfigDTO,
+  scenario?: string
 ): Promise<{ success: boolean; message: string; config: AgentConfig }> {
-  return await api.put(`${API_BASE}/projects/${projectId}/agents/${agentType}`, dto)
+  const params = new URLSearchParams()
+  if (scenario) params.append('scenario', scenario)
+  const query = params.toString()
+  return await api.put(`${API_BASE}/projects/${projectId}/agents/${agentType}${query ? `?${query}` : ''}`, dto)
 }
 
 /**
@@ -122,9 +138,13 @@ export async function updateAgentConfig(
 export async function previewAgentConfig(
   projectId: string,
   agentType: string,
-  variables: Record<string, any> = {}
+  variables: Record<string, any> = {},
+  scenario?: string
 ): Promise<PreviewConfigResult> {
-  return await api.post(`${API_BASE}/projects/${projectId}/agents/${agentType}/preview`, variables)
+  const params = new URLSearchParams()
+  if (scenario) params.append('scenario', scenario)
+  const query = params.toString()
+  return await api.post(`${API_BASE}/projects/${projectId}/agents/${agentType}/preview${query ? `?${query}` : ''}`, variables)
 }
 
 /**
@@ -132,19 +152,22 @@ export async function previewAgentConfig(
  */
 export async function resetAgentConfigs(
   projectId: string,
-  agentType?: string
+  agentType?: string,
+  scenario?: string
 ): Promise<{
   success: boolean
   message: string
   results: Array<{
     config_id: string
     agent_type: string
+    scenario?: string
     success: boolean
     message: string
   }>
 }> {
   const params = new URLSearchParams()
   if (agentType) params.append('agent_type', agentType)
+  if (scenario) params.append('scenario', scenario)
 
   return await api.post(`${API_BASE}/projects/${projectId}/agents/reset?${params.toString()}`)
 }

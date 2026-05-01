@@ -16,22 +16,10 @@ from app.models.agent_template import (
     AgentTemplateUpdate,
 )
 from app.models.prompt_template import PromptRenderRequest
+from app.services.agent_prompt_service import get_agent_prompt_service
 from app.services.agent_config_service import get_agent_config_service
-from app.services.writing_rule_rag import get_writing_rule_rag_service
 
 logger = logging.getLogger(__name__)
-
-# 写作规则服务实例
-_writing_rules_service = None
-
-
-def get_writing_rules_service():
-    """获取写作规则服务实例"""
-    global _writing_rules_service
-    if _writing_rules_service is None:
-        from app.services.writing_rule_service import get_writing_rule_service as get_service
-        _writing_rules_service = get_service()
-    return _writing_rules_service
 
 router = APIRouter()
 
@@ -75,6 +63,7 @@ def set_prompt_service(service):
 @router.get("/agent-templates", response_model=List[Dict[str, Any]])
 async def list_agent_templates(
     agent_type: Optional[str] = Query(default=None, description="按 Agent 类型过滤"),
+    scenario: Optional[str] = Query(default=None, description="按 Agent 使用场景过滤"),
     is_system: Optional[bool] = Query(default=None, description="是否系统内置"),
     tags: Optional[List[str]] = Query(default=None, description="按标签过滤"),
     limit: int = Query(default=50, le=500, description="返回数量限制"),
@@ -106,6 +95,7 @@ async def list_agent_templates(
     try:
         templates = await service.list_templates(
             agent_type=agent_type_enum,
+            scenario=scenario,
             is_system=is_system,
             tags=tags,
             limit=limit,
@@ -179,8 +169,6 @@ async def update_agent_template(template_id: str, request: AgentTemplateUpdate):
     template, error = await service.update_template(template_id, request)
     if error == 'not_found':
         raise HTTPException(status_code=404, detail="Agent 模板不存在")
-    if error == 'is_system':
-        raise HTTPException(status_code=403, detail="系统内置模板不可修改")
 
     return {
         "success": True,
@@ -240,30 +228,80 @@ async def preview_agent_template(
 
     logger.info(f"预览 Agent 模板: {template_id}, skill_slots 数量: {len(template.skill_slots)}")
 
-    # 构建 available_skills 内容
-    skills_content = await _build_available_skills_content(template)
-    logger.info(f"available_skills 内容长度: {len(skills_content)} 字符")
+    agent_type_value = template.agent_type.value if hasattr(template.agent_type, "value") else str(template.agent_type)
+    preview_variables = dict(variables or {})
+    preview_variables.setdefault("scenario", template.scenario)
+
+    agent_prompt_service = get_agent_prompt_service()
+    skills_data = await agent_prompt_service.build_skills_prompt_with_trace(
+        agent_type_value,
+        project_id=project_id,
+        variables=preview_variables,
+        context_scene=template.scenario,
+        scenario=template.scenario,
+        use_intelligent_retrieval=False,
+    )
+    skills_content = skills_data.get("content", "")
+    skills_trace = skills_data.get("trace", {})
+    logger.info(f"resolved skills prompt 内容长度: {len(skills_content)} 字符")
 
     # 构建渲染结果
     rendered_prompts = []
-    prompt_order = template.default_prompt_order
-
+    if skills_content:
+        rendered_prompts.append({
+            "slot_name": "skills",
+            "description": "Skills（按 Agent Template / Skill Assignments 解析）",
+            "content": skills_content,
+        })
+    render_trace: Dict[str, Any] = {
+        "agent_type": agent_type_value,
+        "scenario": template.scenario,
+        "template_id": template.id,
+        "prompt_ids": [],
+        "skill_ids": skills_trace.get("skill_ids", []),
+        "skills": skills_trace,
+        "writing_rule_ids": [],
+        "context_blocks": [],
+        "fallbacks_used": list(skills_trace.get("fallbacks_used", [])),
+        "deprecated_sources_used": list(skills_trace.get("deprecated_sources_used", [])),
+        "writing_rules": None,
+    }
+    prompt_order = template.default_prompt_order or []
+    prompt_slots_by_name = {slot.slot_name: slot for slot in template.prompt_slots}
+    ordered_slots = []
+    used_slot_names = set()
     for slot_name in prompt_order:
-        # 查找插槽
-        slot = None
-        for s in template.prompt_slots:
-            if s.slot_name == slot_name:
-                slot = s
-                break
+        slot = prompt_slots_by_name.get(slot_name)
+        if slot and slot.is_enabled:
+            ordered_slots.append((slot_name, slot))
+            used_slot_names.add(slot_name)
 
-        if not slot or not slot.is_enabled:
-            continue
+    remaining_slots = [
+        (slot.slot_name, slot)
+        for slot in template.prompt_slots
+        if slot.is_enabled and slot.slot_name not in used_slot_names
+    ]
+    remaining_slots.sort(key=lambda item: -item[1].priority)
+    ordered_slots.extend(remaining_slots)
 
+    for slot_name, slot in ordered_slots:
         prompt_content = ""
 
-        # 特殊处理：writing_rules 插槽（动态加载）
+        # 特殊处理：writing_rules 插槽（动态加载）。复用 runtime 的 AgentPromptService，
+        # 避免 /agent-templates preview 与实际运行时规则注入逻辑分叉。
         if slot_name == "writing_rules" and not slot.prompt_template_id:
-            prompt_content = await _build_writing_rules_prompt(project_id, variables or {})
+            writing_rules_data = await agent_prompt_service.build_writing_rules_prompt_with_trace(
+                project_id,
+                preview_variables,
+                agent_type=agent_type_value,
+                scenario=template.scenario,
+            )
+            prompt_content = writing_rules_data.get("content", "")
+            writing_rules_trace = writing_rules_data.get("trace", {})
+            render_trace["writing_rules"] = writing_rules_trace
+            render_trace["writing_rule_ids"] = writing_rules_trace.get("writing_rule_ids", [])
+            render_trace["fallbacks_used"].extend(writing_rules_trace.get("fallbacks_used", []))
+            render_trace["deprecated_sources_used"].extend(writing_rules_trace.get("deprecated_sources_used", []))
             # 替换 available_skills 占位符
             prompt_content = _inject_skills(prompt_content, skills_content)
             rendered_prompts.append({
@@ -279,8 +317,8 @@ async def preview_agent_template(
             if prompt_template:
                 # 渲染变量
                 merged_vars = slot.variable_overrides.copy()
-                if variables:
-                    merged_vars.update(variables)
+                if preview_variables:
+                    merged_vars.update(preview_variables)
                 request = PromptRenderRequest(
                     template_id=slot.prompt_template_id,
                     variables=merged_vars,
@@ -288,9 +326,12 @@ async def preview_agent_template(
                 try:
                     result = await prompt_service.render_template(request)
                     prompt_content = result.rendered_content
+                    render_trace["prompt_ids"].append(slot.prompt_template_id)
                 except Exception as e:
                     logger.warning(f"Failed to render prompt {slot.prompt_template_id}: {e}")
                     prompt_content = prompt_template.content
+                    render_trace["prompt_ids"].append(slot.prompt_template_id)
+                    render_trace["fallbacks_used"].append(f"prompt_template_raw:{slot.prompt_template_id}")
 
         # 替换 available_skills 占位符
         prompt_content = _inject_skills(prompt_content, skills_content)
@@ -307,6 +348,7 @@ async def preview_agent_template(
         "project_id": project_id,
         "rendered_prompts": rendered_prompts,
         "final_prompt": "\n\n".join([p["content"] for p in rendered_prompts if p["content"]]),
+        "render_trace": render_trace,
     }
 
 
@@ -411,66 +453,13 @@ async def _build_available_skills_content(template: AgentTemplate) -> str:
     return ""
 
 
-async def _build_writing_rules_prompt(project_id: Optional[str], context: Optional[Dict[str, Any]] = None) -> str:
-    """
-    构建写作规则提示词
-
-    Args:
-        project_id: 项目 ID
-        context: 预览上下文
-
-    Returns:
-        str: 写作规则提示词
-    """
-    try:
-        lines = [
-            "## 写作规则检索协议",
-            "- 写作前先按当前章节目标、环境、讨论摘要、角色状态检索相关写作规则。",
-            "- 常驻规则只保留不可违反的高优先级约束；其余规则按需检索注入。",
-            "- 场景、分段焦点或修订目标发生明显变化时，应再次检索。",
-        ]
-
-        if not project_id:
-            return "\n".join(lines)
-
-        service = get_writing_rules_service()
-        scope = await service.resolve_project_rule_scope(project_id)
-        scope_summary = service.describe_project_rule_scope(scope)
-        if not scope_summary.get("is_active"):
-            return ""
-
-        lines.append(
-            f"- 当前作用域规则数：{scope_summary.get('resolved_rule_count', 0)}，基线规则集：{'是' if scope_summary.get('used_baseline') else '否'}。"
-        )
-
-        retrieval = await get_writing_rule_rag_service().retrieve_for_project(
-            project_id,
-            context=context or {},
-            limit=4,
-        )
-        retrieved_rules = retrieval.get("retrieved_rules", [])
-        if retrieved_rules:
-            lines.append("\n## 当前预览命中的规则")
-            for rule in retrieved_rules:
-                lines.append(
-                    f"- [{rule.get('severity')}] {rule.get('name')}: {rule.get('summary')}"
-                )
-
-        rendered_guidance = retrieval.get("rendered_guidance", "").strip()
-        if rendered_guidance:
-            lines.append("\n## 最终注入片段")
-            lines.append(rendered_guidance)
-
-        return "\n".join(lines)
-    except Exception as e:
-        logger.warning(f"Failed to build writing rules prompt: {e}")
-        return ""
-
-
 @router.get("/agent-templates/by-type/{agent_type}", response_model=Dict[str, Any])
-async def get_agent_template_by_type(agent_type: str):
+async def get_agent_template_by_type(
+    agent_type: str,
+    scenario: Optional[str] = Query(default=None, description="Agent 使用场景"),
+):
     """
-    按类型获取 Agent 模板（返回第一个匹配的系统模板）
+    按类型获取 Agent 模板（返回匹配 agent_type + scenario 的可用模板，数据库配置优先）
 
     Args:
         agent_type: Agent 类型
@@ -485,7 +474,7 @@ async def get_agent_template_by_type(agent_type: str):
     except ValueError:
         raise HTTPException(status_code=400, detail=f"无效的 Agent 类型: {agent_type}")
 
-    template = await service.get_template_by_type(agent_type_enum)
+    template = await service.get_template_by_type(agent_type_enum, scenario)
     if not template:
         raise HTTPException(
             status_code=404,
@@ -521,12 +510,17 @@ async def toggle_agent_template(
 
     if project_id:
         config_service = get_agent_config_service()
-        config = await config_service.get_config_by_project_agent(project_id, template.agent_type.value)
+        config = await config_service.get_config_by_project_agent(
+            project_id,
+            template.agent_type.value,
+            template.scenario,
+        )
         if not config:
             config = await config_service.get_or_create_config(
                 project_id=project_id,
                 agent_type=template.agent_type.value,
                 template_id=template.id,
+                scenario=template.scenario,
             )
 
         from app.models.agent_config import AgentConfigUpdate

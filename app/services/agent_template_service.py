@@ -81,6 +81,7 @@ class AgentTemplateService:
             name=row['name'],
             description=row.get('description', ''),
             agent_type=AgentType(row['agent_type']),
+            scenario=row.get('scenario') or 'default',
             tags=tags,
             prompt_slots=[PromptSlot(**slot) for slot in prompt_slots],
             default_prompt_order=default_prompt_order,
@@ -96,6 +97,10 @@ class AgentTemplateService:
             updated_at=row.get('updated_at', datetime.now()),
         )
 
+    def _copy_template(self, template: AgentTemplate) -> AgentTemplate:
+        """复制模板，避免合并运行时 assignment 时污染缓存对象。"""
+        return template.model_copy(deep=True)
+
     async def _merge_skill_assignments(self, template: AgentTemplate) -> AgentTemplate:
         """
         将 skill_assignments 表中的分配关系合并到模板的 skill_slots 中
@@ -109,7 +114,9 @@ class AgentTemplateService:
             AgentTemplate: 合并后的模板
         """
         if not self._db:
-            return template
+            return self._copy_template(template)
+
+        merged_template = self._copy_template(template)
 
         try:
             # 从 skill_assignments 表加载该 agent_type 的所有分配
@@ -121,16 +128,45 @@ class AgentTemplateService:
                 FROM skill_assignments sa
                 JOIN skills s ON sa.skill_id = s.id
                 WHERE sa.agent_type = :agent_type
+                  AND sa.scenario = :scenario
                   AND sa.is_enabled = true
                   AND s.is_enabled = true
                   AND s.status = 'active'
                 ORDER BY sa.priority DESC
                 """,
-                {"agent_type": template.agent_type.value}
+                {
+                    "agent_type": merged_template.agent_type.value,
+                    "scenario": self._normalize_scenario(merged_template.scenario),
+                }
             )
 
+            if not rows and self._normalize_scenario(merged_template.scenario) != "default":
+                rows = await self._db.execute_query(
+                    """
+                    SELECT sa.skill_id, sa.slot_name, sa.priority, sa.is_enabled,
+                           sa.is_required, sa.variable_overrides, sa.execution_condition,
+                           s.name as skill_name, s.description as skill_description
+                    FROM skill_assignments sa
+                    JOIN skills s ON sa.skill_id = s.id
+                    WHERE sa.agent_type = :agent_type
+                      AND sa.scenario = 'default'
+                      AND sa.is_enabled = true
+                      AND s.is_enabled = true
+                      AND s.status = 'active'
+                    ORDER BY sa.priority DESC
+                    """,
+                    {"agent_type": merged_template.agent_type.value}
+                )
+                if rows:
+                    logger.warning(
+                        "未找到 AgentTemplate 场景 Skill 分配，回退 default: agent_type=%s, scenario=%s, count=%s",
+                        merged_template.agent_type.value,
+                        self._normalize_scenario(merged_template.scenario),
+                        len(rows),
+                    )
+
             # 获取现有的 skill_slots 中的 skill_id 集合
-            existing_skill_ids = {slot.skill_id for slot in template.skill_slots if slot.skill_id}
+            existing_skill_ids = {slot.skill_id for slot in merged_template.skill_slots if slot.skill_id}
 
             # 添加新的 skill_slots（不覆盖已存在的）
             for row in rows:
@@ -145,19 +181,18 @@ class AgentTemplateService:
                         variable_overrides=row.get('variable_overrides', {}) or {},
                         execution_condition=row.get('execution_condition'),
                     )
-                    template.skill_slots.append(new_slot)
+                    merged_template.skill_slots.append(new_slot)
                     existing_skill_ids.add(row['skill_id'])
 
             # 按 priority 降序排列
-            template.skill_slots.sort(key=lambda x: -x.priority)
+            merged_template.skill_slots.sort(key=lambda x: -x.priority)
 
-            logger.debug(f"模板 {template.id} 合并了 {len(rows)} 个 skill_assignments，现有 {len(template.skill_slots)} 个插槽")
+            logger.debug(f"模板 {merged_template.id} 合并了 {len(rows)} 个 skill_assignments，现有 {len(merged_template.skill_slots)} 个插槽")
 
         except Exception as e:
             logger.warning(f"合并 skill_assignments 失败: {e}")
 
-        return template
-
+        return merged_template
     def _template_to_db_dict(self, template: AgentTemplate) -> Dict[str, Any]:
         """将 AgentTemplate 对象转换为数据库字典"""
         return {
@@ -165,6 +200,7 @@ class AgentTemplateService:
             'name': template.name,
             'description': template.description,
             'agent_type': template.agent_type.value,
+            'scenario': template.scenario,
             'tags': json.dumps(template.tags),
             'prompt_slots': json.dumps([slot.dict() for slot in template.prompt_slots]),
             'default_prompt_order': json.dumps(template.default_prompt_order),
@@ -179,10 +215,64 @@ class AgentTemplateService:
             'updated_at': datetime.now(),
         }
 
+    @staticmethod
+    def _normalize_scenario(scenario: Optional[str]) -> str:
+        """规范化 Agent 场景名称。"""
+        scenario_value = (scenario or "default").strip()
+        return scenario_value or "default"
+
     def invalidate_cache(self):
         """使缓存失效"""
         self._cache_valid = False
         self._templates.clear()
+
+    def _sync_missing_slots_from_seed(self, existing: AgentTemplate, seed: AgentTemplate) -> bool:
+        """从系统种子模板补齐缺失插槽，不覆盖已有绑定。"""
+        changed = False
+
+        if self._normalize_scenario(existing.scenario) == "default" and self._normalize_scenario(seed.scenario) != "default":
+            existing.scenario = seed.scenario
+            changed = True
+
+        merged_tags = list(dict.fromkeys([*existing.tags, *seed.tags]))
+        if merged_tags != existing.tags:
+            existing.tags = merged_tags
+            changed = True
+
+        existing_prompt_slots = {slot.slot_name for slot in existing.prompt_slots}
+        for slot in seed.prompt_slots:
+            if slot.slot_name not in existing_prompt_slots:
+                existing.prompt_slots.append(slot.model_copy(deep=True))
+                existing_prompt_slots.add(slot.slot_name)
+                changed = True
+
+        seed_prompt_names = [slot.slot_name for slot in seed.prompt_slots]
+        extra_prompt_order = [name for name in existing.default_prompt_order if name not in seed_prompt_names]
+        new_prompt_order = [name for name in seed.default_prompt_order if name in existing_prompt_slots]
+        new_prompt_order.extend(name for name in extra_prompt_order if name in existing_prompt_slots)
+        if new_prompt_order and new_prompt_order != existing.default_prompt_order:
+            existing.default_prompt_order = new_prompt_order
+            changed = True
+
+        existing_skill_slots = {slot.slot_name for slot in existing.skill_slots}
+        for slot in seed.skill_slots:
+            if slot.slot_name not in existing_skill_slots:
+                existing.skill_slots.append(slot.model_copy(deep=True))
+                existing_skill_slots.add(slot.slot_name)
+                changed = True
+
+        seed_skill_names = [slot.slot_name for slot in seed.skill_slots]
+        extra_skill_order = [name for name in existing.default_skill_order if name not in seed_skill_names]
+        new_skill_order = [name for name in seed.default_skill_order if name in existing_skill_slots]
+        new_skill_order.extend(name for name in extra_skill_order if name in existing_skill_slots)
+        if new_skill_order and new_skill_order != existing.default_skill_order:
+            existing.default_skill_order = new_skill_order
+            changed = True
+
+        if changed:
+            existing.updated_at = datetime.now()
+
+        return changed
 
     # ==================== CRUD 操作 ====================
 
@@ -197,12 +287,16 @@ class AgentTemplateService:
             name=dto.name,
             description=dto.description,
             agent_type=dto.agent_type,
+            scenario=dto.scenario,
             tags=dto.tags or [],
             prompt_slots=dto.prompt_slots or [],
             default_prompt_order=dto.default_prompt_order or [],
             skill_slots=dto.skill_slots or [],
-            default_skill_order=dto.default_skill_order or [],
+            default_model=dto.default_model,
+            default_temperature=dto.default_temperature,
             is_system=dto.is_system or False,
+            is_optional=dto.is_optional or False,
+            is_enabled=dto.is_enabled,
         )
 
         # 保存到数据库
@@ -231,18 +325,60 @@ class AgentTemplateService:
             template = await self._merge_skill_assignments(template)
         return template
 
-    async def get_template_by_type(self, agent_type: AgentType) -> Optional[AgentTemplate]:
-        """按类型获取 Agent 模板（返回第一个匹配的系统模板）"""
+    async def get_template_by_type(
+        self,
+        agent_type: AgentType,
+        scenario: Optional[str] = None,
+    ) -> Optional[AgentTemplate]:
+        """按 Agent 类型和场景获取 active 模板，数据库配置优先，系统种子仅作兜底。"""
         await self._ensure_cache()
-        for template in self._templates.values():
-            if template.agent_type == agent_type and template.is_system:
+        normalized_scenario = self._normalize_scenario(scenario)
+        templates = [
+            template
+            for template in self._templates.values()
+            if template.agent_type == agent_type and template.is_enabled
+        ]
+
+        def sort_key(template: AgentTemplate):
+            return (
+                template.is_system,
+                -template.updated_at.timestamp(),
+                -template.created_at.timestamp(),
+            )
+
+        for template in sorted(templates, key=sort_key):
+            if self._normalize_scenario(template.scenario) == normalized_scenario:
                 return await self._merge_skill_assignments(template)
+
+        if normalized_scenario != "default":
+            for template in sorted(templates, key=sort_key):
+                if self._normalize_scenario(template.scenario) == "default":
+                    logger.warning(
+                        "未找到 AgentTemplate 场景模板，回退 default: agent_type=%s, scenario=%s, template=%s",
+                        agent_type.value,
+                        normalized_scenario,
+                        template.id,
+                    )
+                    return await self._merge_skill_assignments(template)
+
+        if templates:
+            fallback = sorted(templates, key=sort_key)[0]
+            if normalized_scenario != "default":
+                logger.warning(
+                    "未找到 AgentTemplate 场景模板，回退首个可用模板: agent_type=%s, scenario=%s, template=%s",
+                    agent_type.value,
+                    normalized_scenario,
+                    fallback.id,
+                )
+            return await self._merge_skill_assignments(fallback)
+
         return None
 
     async def list_templates(
         self,
         agent_type: Optional[AgentType] = None,
         is_system: Optional[bool] = None,
+        scenario: Optional[str] = None,
         tags: Optional[List[str]] = None,
         limit: int = 50,
         offset: int = 0,
@@ -256,26 +392,31 @@ class AgentTemplateService:
         if agent_type:
             templates = [t for t in templates if t.agent_type == agent_type]
 
+        # 按场景过滤
+        if scenario:
+            normalized_scenario = self._normalize_scenario(scenario)
+            templates = [t for t in templates if self._normalize_scenario(t.scenario) == normalized_scenario]
+
         # 按系统内置过滤
         if is_system is not None:
             templates = [t for t in templates if t.is_system == is_system]
 
         # 按标签过滤（任一匹配）
         if tags:
-            templates = [t for t in templates if any(tag in t.tags for tag in tags)]
+            tag_set = set(tags)
+            templates = [t for t in templates if tag_set.intersection(t.tags)]
 
-        # 排序：系统模板优先，然后按创建时间倒序
-        templates.sort(key=lambda x: (-x.is_system, -x.created_at.timestamp()))
+        # 排序：系统模板优先，然后按场景和创建时间倒序
+        templates.sort(key=lambda x: (-x.is_system, x.scenario, -x.created_at.timestamp()))
 
         # 分页
-        start = offset
-        end = start + limit
+        start = max(offset, 0)
+        end = start + limit if limit and limit > 0 else None
         result = templates[start:end]
 
         # 合并 skill_assignments
         if merge_skill_assignments and self._db:
-            for template in result:
-                await self._merge_skill_assignments(template)
+            result = [await self._merge_skill_assignments(template) for template in result]
 
         return result
 
@@ -286,18 +427,13 @@ class AgentTemplateService:
         更新 Agent 模板
 
         Returns:
-            tuple: (模板, 错误类型) 错误类型为 'not_found' 或 'is_system' 或 None
+            tuple: (模板, 错误类型) 错误类型为 'not_found' 或 None
         """
         await self._ensure_cache()
 
         template = self._templates.get(template_id)
         if not template:
             return None, 'not_found'
-
-        # 系统内置模板不可更新
-        if template.is_system:
-            logger.warning(f"尝试更新系统内置模板 {template_id}，操作被拒绝")
-            return None, 'is_system'
 
         # 更新字段
         update_data = dto.dict(exclude_unset=True)
@@ -551,12 +687,18 @@ class AgentTemplateService:
 
         added_count = 0
         skipped_count = 0
+        updated_count = 0
 
         for template in templates:
             if template.id in self._templates:
-                # 数据库中已存在，跳过硬编码版本
-                skipped_count += 1
-                logger.debug(f"数据库中已存在 Agent模板 {template.id}，跳过硬编码版本")
+                existing_template = self._templates[template.id]
+                if existing_template.is_system and self._sync_missing_slots_from_seed(existing_template, template):
+                    await self._save_template_to_db(existing_template)
+                    updated_count += 1
+                    logger.info(f"同步系统 Agent模板增量更新: {template.id}")
+                else:
+                    skipped_count += 1
+                    logger.debug(f"数据库中已存在 Agent模板 {template.id}，跳过硬编码版本")
                 continue
 
             # 数据库中不存在，添加硬编码版本
@@ -584,4 +726,4 @@ class AgentTemplateService:
             added_count += 1
             logger.info(f"初始化系统内置 AgentTemplate: {template.id}")
 
-        logger.info(f"Agent模板初始化完成: 从数据库加载 {len(self._templates) - added_count} 个，新增 {added_count} 个，跳过 {skipped_count} 个")
+        logger.info(f"Agent模板初始化完成: 从数据库加载 {len(self._templates) - added_count} 个，新增 {added_count} 个，更新 {updated_count} 个，跳过 {skipped_count} 个")

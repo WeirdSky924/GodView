@@ -47,15 +47,21 @@ class PromptBuilder:
         slot_order = config.custom_prompt_order or template.default_prompt_order
         enabled_slots = await self._get_enabled_slots(template, config)
 
-        # 过滤并排序插槽
+        # 前端维护的 order 是 Agent-md 绑定关系的一部分，必须优先生效。
+        # 未出现在 order 中的启用插槽再按 priority 追加，避免遗漏。
         ordered_slots = []
+        used_slot_names = set()
         for slot_name in slot_order:
             if slot_name in enabled_slots:
-                slot = enabled_slots[slot_name]
-                ordered_slots.append((slot_name, slot))
+                ordered_slots.append((slot_name, enabled_slots[slot_name]))
+                used_slot_names.add(slot_name)
 
-        # 按优先级排序
-        ordered_slots = self._sort_by_priority(ordered_slots)
+        remaining_slots = [
+            (slot_name, slot)
+            for slot_name, slot in enabled_slots.items()
+            if slot_name not in used_slot_names
+        ]
+        ordered_slots.extend(self._sort_by_priority(remaining_slots))
 
         # 构建 prompt 片段
         prompt_pieces = []

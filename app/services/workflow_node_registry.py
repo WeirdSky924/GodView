@@ -16,12 +16,14 @@ _PROFILES: dict[str, WorkflowNodeExecutionProfile] = {
     "plot_outline": WorkflowNodeExecutionProfile(
         agent_type="plot_outline",
         kind="service_adapter",
+        metadata={"scenario": "generate_chapter_outline"},
     ),
     "master_plotter": WorkflowNodeExecutionProfile(
         agent_type="master_plotter",
         kind="direct_agent",
         aliases=("plotter",),
         metadata={
+            "scenario": "workflow_plot_planning",
             "graph_context": {
                 "enabled": True,
                 "mode": "summary",
@@ -33,15 +35,18 @@ _PROFILES: dict[str, WorkflowNodeExecutionProfile] = {
     "summarizer": WorkflowNodeExecutionProfile(
         agent_type="summarizer",
         kind="direct_agent",
+        metadata={"scenario": "workflow_summary"},
     ),
     "hook_manager": WorkflowNodeExecutionProfile(
         agent_type="hook_manager",
         kind="direct_agent",
+        metadata={"scenario": "workflow_hook_management"},
     ),
     "writer": WorkflowNodeExecutionProfile(
         agent_type="writer",
         kind="direct_agent",
         metadata={
+            "scenario": "workflow_chapter_generation",
             "graph_context": {
                 "enabled": True,
                 "mode": "summary",
@@ -53,27 +58,33 @@ _PROFILES: dict[str, WorkflowNodeExecutionProfile] = {
     "evaluator": WorkflowNodeExecutionProfile(
         agent_type="evaluator",
         kind="direct_agent",
+        metadata={"scenario": "chapter_quality_review"},
     ),
     "setting": WorkflowNodeExecutionProfile(
         agent_type="setting",
         kind="service_adapter",
+        metadata={"scenario": "workflow_context"},
     ),
     "event_generator": WorkflowNodeExecutionProfile(
         agent_type="event_generator",
         kind="direct_agent",
+        metadata={"scenario": "event_generation"},
     ),
     "world_map_manager": WorkflowNodeExecutionProfile(
         agent_type="world_map_manager",
         kind="direct_agent",
+        metadata={"scenario": "world_map_management"},
     ),
     "proc_gen": WorkflowNodeExecutionProfile(
         agent_type="proc_gen",
         kind="direct_agent",
         aliases=("procgen",),
+        metadata={"scenario": "procedural_generation"},
     ),
     "dungeon_generator": WorkflowNodeExecutionProfile(
         agent_type="dungeon_generator",
         kind="direct_agent",
+        metadata={"scenario": "dungeon_generation"},
     ),
 }
 

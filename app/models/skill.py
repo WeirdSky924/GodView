@@ -267,6 +267,7 @@ class SkillAssignment(BaseModel):
     id: str = Field(..., description="分配 ID")
     skill_id: str = Field(..., description="Skill ID")
     agent_type: str = Field(..., description="Agent 类型")
+    scenario: str = Field(default="default", description="Agent 使用场景")
 
     # 分配配置
     slot_name: str = Field(default="", description="插槽名称")
@@ -420,6 +421,7 @@ class AssignSkillDTO(BaseModel):
     """分配 Skill 到 Agent 模板 DTO"""
     skill_id: str
     agent_type: str
+    scenario: str = "default"
     slot_name: str = ""
     custom_parameters: Optional[Dict[str, Any]] = None
     variable_overrides: Dict[str, Any] = {}

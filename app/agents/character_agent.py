@@ -22,6 +22,7 @@ class CharacterAgent(BaseAgent):
     """角色 Agent"""
 
     AGENT_TYPE = AgentType.CHARACTER
+    DEFAULT_SCENARIO = "roleplay"
 
     def __init__(
         self,
@@ -33,8 +34,9 @@ class CharacterAgent(BaseAgent):
         agent_id: Optional[str] = None,
     ):
         self.character = character
+        self._manual_prompt_provided = bool(prompt_template)
 
-        # 如果没有提供 prompt_template，使用旧的构建方式（向后兼容）
+        # 如果没有提供 prompt_template 且没有 project_id，使用最小 fallback（向后兼容）
         if not prompt_template and not project_id:
             system_prompt = self._build_system_prompt()
         else:
@@ -80,49 +82,78 @@ class CharacterAgent(BaseAgent):
         }
 
     def _build_system_prompt(self) -> str:
-        """构建角色系统提示"""
-        char = self.character
+        """构建角色系统提示（deprecated fallback）。"""
+        return (
+            f"你是{self.character.name}，一个虚构故事中的角色。"
+            "优先使用 Agent Template 绑定的 md prompt / skills / writing-rules；"
+            "仅在未能加载配置资产时，将此最小提示作为 deprecated fallback。"
+        )
 
-        # 处理 personality_traits - 可能是 PersonalityTrait 对象列表或字典列表
-        traits_list = []
-        for t in (char.personality_traits or []):
-            if hasattr(t, 'name') and hasattr(t, 'value'):
-                traits_list.append(f"{t.name}({t.value})")
-            elif isinstance(t, dict):
-                traits_list.append(f"{t.get('name', '未知')}({t.get('value', 0)})")
-            else:
-                traits_list.append(str(t))
-        traits_desc = ", ".join(traits_list)
+    def _build_character_profile_block(self) -> str:
+        """构建动态角色档案上下文。"""
+        variables = self._get_default_variables()
+        return "\n".join(
+            [
+                "【当前角色档案】",
+                f"- 名称：{variables['character_name']}",
+                f"- 描述：{variables['character_description']}",
+                f"- 性格特质：{variables['personality_traits']}",
+                f"- 背景故事：{variables['background_story']}",
+                f"- 说话风格：{variables['speech_pattern']}",
+                f"- 常用词汇：{variables['lexicon']}",
+                f"- 禁止使用：{variables['forbidden_words']}",
+                f"- 当前位置：{variables['current_location']}",
+                f"- 地图区域 ID：{variables['current_region_id']}",
+                f"- 来到此地原因：{variables['current_location_reason']}",
+                f"- 当前目标：{variables['goals']}",
+                f"- 当前物品：{variables['inventory']}",
+            ]
+        )
 
-        prompt = f"""你是{char.name}，一个虚构故事中的角色。请完全沉浸在这个角色中。
+    async def _ensure_system_prompt_loaded(self):
+        """按 Character 动态变量加载 Agent Template prompt。"""
+        if self._system_prompt_loaded or not self._pending_system_prompt_load:
+            return
 
-【角色设定】
-- 名称：{char.name}
-- 描述：{char.description or '无'}
-- 性格特质：{traits_desc}
-- 背景故事：{char.background_story or '无'}
-- 说话风格：{char.speech_pattern or '无特殊限制'}
+        if not self.project_id or not self.AGENT_TYPE:
+            self._system_prompt_loaded = True
+            self._pending_system_prompt_load = False
+            return
 
-【语言规范】
-- 常用词汇：{', '.join(char.lexicon) if char.lexicon else '无限制'}
-- 禁止使用：{', '.join(char.forbidden_words) if char.forbidden_words else '无禁止'}
+        try:
+            from app.services.agent_prompt_service import get_agent_prompt_service
 
-【当前状态】
-- 位置：{char.current_location or '未知'}
-- 地图区域 ID：{char.current_region_id or '未知'}
-- 来到此地原因：{char.current_location_reason or '未记录'}
-- 目标：{', '.join(char.goals) if char.goals else '无特定目标'}
-- 物品：{', '.join(char.inventory) if char.inventory else '无'}
+            variables = self._get_default_variables()
+            variables.update({"scenario": self.scenario})
+            service = get_agent_prompt_service()
+            prompt = await service.build_agent_prompt(
+                agent_type=self.AGENT_TYPE.value,
+                project_id=self.project_id,
+                variables=variables,
+                scenario=self.scenario,
+                context_query=f"{self.character.name} 角色扮演 决策 信息隔离",
+            )
+            if prompt.strip():
+                self.system_prompt = prompt.strip()
+                logger.debug(
+                    "CharacterAgent 从模板加载 prompt 成功: character=%s, project=%s, scenario=%s",
+                    self.character.name,
+                    self.project_id,
+                    self.scenario,
+                )
+        except Exception as e:
+            logger.warning(
+                "CharacterAgent 加载模板 prompt 失败: character=%s, project=%s, scenario=%s, error=%s",
+                self.character.name,
+                self.project_id,
+                self.scenario,
+                e,
+            )
 
-请根据情境做出符合角色设定的决策。输出 JSON 格式：
-{{
-    "dialogue": "你的台词",
-    "action": "你的动作",
-    "inner_thought": "内心独白",
-    "emotion": "当前情绪"
-}}"""
-
-        return prompt
+        if not self.system_prompt:
+            self.system_prompt = self._build_system_prompt()
+        self._system_prompt_loaded = True
+        self._pending_system_prompt_load = False
 
     async def execute(self, input_data: Dict[str, Any]) -> AgentResponse:
         """
@@ -150,6 +181,11 @@ class CharacterAgent(BaseAgent):
                 present_characters=present_characters,
                 recent_events=recent_events,
                 dialogue_history=dialogue_history,
+                round_number=input_data.get("round_number"),
+                total_rounds=input_data.get("total_rounds"),
+                round_focus=input_data.get("round_focus"),
+                is_supplement=bool(input_data.get("is_supplement", False)),
+                target_word_count=input_data.get("target_word_count"),
             )
 
             parsed = await self._call_structured(
@@ -178,37 +214,41 @@ class CharacterAgent(BaseAgent):
         present_characters: List[str],
         recent_events: List[str],
         dialogue_history: List[Dict[str, str]],
+        round_number: Optional[int] = None,
+        total_rounds: Optional[int] = None,
+        round_focus: Optional[str] = None,
+        is_supplement: bool = False,
+        target_word_count: Optional[int] = None,
     ) -> str:
-        """构建用户消息"""
-        message_parts = []
+        """构建用户消息。"""
+        message_parts = [self._build_character_profile_block()]
 
-        # 当前情境
         if context:
             message_parts.append(f"【当前情境】\n{context}")
 
-        # 在场人物
         if present_characters:
             message_parts.append(f"【在场人物】\n{', '.join(present_characters)}")
 
-        # 最近事件
         if recent_events:
             message_parts.append(f"【最近发生的事】\n{chr(10).join(recent_events)}")
 
-        # 对话历史
         if dialogue_history:
             dialogue_text = "\n".join(
-                [f"{d.get('speaker', 'Unknown')}: {d.get('content', '')}" for d in dialogue_history[-5:]]  # 最近 5 轮
+                [f"{d.get('speaker') or d.get('agent', 'Unknown')}: {d.get('content', '')}" for d in dialogue_history[-5:]]
             )
             message_parts.append(f"【对话历史】\n{dialogue_text}")
 
-        # 行动请求
-        message_parts.append(
-            "\n请决定你接下来的行动：\n"
-            "1. 你会说什么（如果有）\n"
-            "2. 你会做什么动作\n"
-            "3. 你的内心独白\n"
-            "4. 你的当前情绪"
-        )
+        task_lines = ["根据当前角色档案和可见情境，生成下一步角色决策。"]
+        if round_number and total_rounds:
+            task_lines.append(f"当前是第 {round_number}/{total_rounds} 轮互动。")
+        if round_focus:
+            task_lines.append(f"本轮剧情焦点：{round_focus}")
+        if is_supplement:
+            task_lines.append("这是补充表演，只补足当前场景素材，不扩写成完整章节正文。")
+        if target_word_count:
+            task_lines.append(f"目标长度参考：约 {target_word_count} 字。")
+        task_lines.append("只使用当前角色可知信息，输出必须符合 CharacterDecisionSchema。")
+        message_parts.append("【当前任务】\n" + "\n".join(f"- {line}" for line in task_lines))
 
         return "\n\n".join(message_parts)
 
@@ -224,4 +264,9 @@ class CharacterAgent(BaseAgent):
                 setattr(self.character, key, value)
 
         # 更新系统提示
-        self.system_prompt = self._build_system_prompt()
+        if self.project_id and not self._manual_prompt_provided:
+            self.system_prompt = ""
+            self._system_prompt_loaded = False
+            self._pending_system_prompt_load = True
+        else:
+            self.system_prompt = self._build_system_prompt()

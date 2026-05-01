@@ -41,6 +41,7 @@ class WriterAgent(BaseAgent):
     """内容执行官 Agent"""
 
     AGENT_TYPE = AgentType.WRITER
+    DEFAULT_SCENARIO = "workflow_chapter_generation"
     WRITER_OUTPUT_CONTRACT = DEFAULT_AGENT_OUTPUT_CONTRACT_REGISTRY.get("writer.workflow_output")
 
     def _as_list(self, value: Any) -> List[Any]:
@@ -129,8 +130,33 @@ class WriterAgent(BaseAgent):
             "task_description": "将剧情意图润色成长篇网文文本",
         }
 
+    def _load_md_prompt_content(self, prompt_id: str) -> str:
+        try:
+            from app.services.md_file_service import get_md_file_service
+            md_service = get_md_file_service()
+            prompt = md_service.get_prompt(prompt_id)
+            if prompt:
+                content = prompt.get("content") or prompt.get("raw_content") or ""
+                if content:
+                    return content.strip()
+        except Exception as e:
+            logger.warning(f"加载 {prompt_id} prompt 失败: {e}")
+
+        return ""
+
+    def _build_md_writer_fallback_prompt(self) -> str:
+        """从 md prompt 资产构建 Writer 备用 prompt。"""
+        prompt_ids = ["role_writer", "function_writing"]
+        parts = [content for prompt_id in prompt_ids if (content := self._load_md_prompt_content(prompt_id))]
+        return "\n\n".join(parts).strip()
+
     def _build_default_system_prompt(self) -> str:
-        """构建默认系统提示（向后兼容）"""
+        """构建默认系统提示（优先使用 prompts/**/*.md 资产）。"""
+        md_prompt = self._build_md_writer_fallback_prompt()
+        if md_prompt:
+            return md_prompt
+
+        logger.warning("writer md prompt 资产不可用，使用 deprecated 硬编码默认系统提示")
         return """你是内容执行官，负责将剧情意图润色成有网文质感的连贯文本。
 
 【重要：长篇网文创作原则】
@@ -457,6 +483,8 @@ class WriterAgent(BaseAgent):
                 "is_retry": is_retry,
                 "retry_count": retry_count,
                 "use_segmented": use_segmented,
+                "config_prompt_source": getattr(self, "_writer_config_prompt_source", None),
+                "config_prompt_length": len(getattr(self, "_writer_config_prompt", "") or ""),
             }
             result["metadata"] = {**metadata, **result.get("metadata", {})}
             chapter_content = result.get("chapter_content") or result.get("content", "")
@@ -474,6 +502,60 @@ class WriterAgent(BaseAgent):
         except Exception as e:
             logger.error(f"WriterAgent 执行失败：{e}", exc_info=True)
             return AgentResponse(success=False, error=str(e))
+
+    async def _get_writer_config_prompt(self, variables: Optional[Dict[str, Any]] = None) -> str:
+        """获取 Writer Agent Template 渲染后的配置 prompt。"""
+        if getattr(self, "_writer_config_prompt", None):
+            return self._writer_config_prompt
+
+        await self._ensure_system_prompt_loaded()
+        prompt = (self.system_prompt or "").strip()
+        if prompt:
+            self._writer_config_prompt = prompt
+            self._writer_config_prompt_source = "agent_template_runtime"
+            return prompt
+
+        fallback = self._build_md_writer_fallback_prompt()
+        if fallback:
+            self._writer_config_prompt = fallback
+            self._writer_config_prompt_source = "md_prompt_fallback"
+            return fallback
+
+        self._writer_config_prompt = ""
+        self._writer_config_prompt_source = "missing"
+        return ""
+
+    def _format_task_context_block(self, title: str, value: Any) -> str:
+        block = self._format_workflow_context_block(title, value)
+        return block if block else ""
+
+    def _format_writer_task_prompt(
+        self,
+        task_title: str,
+        sections: List[Tuple[str, Any]],
+        output_schema: str,
+        task_notes: Optional[List[str]] = None,
+        config_prompt: str = "",
+    ) -> str:
+        parts: List[str] = []
+        if config_prompt:
+            parts.append(
+                "【Writer 配置规则】\n"
+                "以下内容来自 Agent Template 绑定的 md prompt / skills / writing-rules，是本次写作的稳定规则来源。\n"
+                f"{config_prompt}"
+            )
+
+        parts.append(f"【当前任务】\n{task_title}")
+        for title, value in sections:
+            block = self._format_task_context_block(title, value)
+            if block:
+                parts.append(block)
+
+        if task_notes:
+            parts.append("【本次任务补充要求】\n" + "\n".join(f"- {note}" for note in task_notes if note))
+
+        parts.append(f"【输出 JSON Schema】\n{output_schema}")
+        return "\n\n".join(part for part in parts if part)
 
     async def _execute_single(
         self,
@@ -515,11 +597,24 @@ class WriterAgent(BaseAgent):
             limit=6,
         )
 
+        writer_config_prompt = await self._get_writer_config_prompt({
+            **input_data,
+            "target_word_count": word_count,
+            "min_word_count": min_word_count,
+        })
         workflow_binding_block = self._build_workflow_binding_block(input_data)
 
         # 构建用户消息
         if auto_write_mode and writing_prompt:
             user_message = writing_prompt
+            if writer_config_prompt:
+                user_message = (
+                    "【Writer 配置规则】\n"
+                    "以下内容来自 Agent Template 绑定的 md prompt / skills / writing-rules，是本次写作的稳定规则来源。\n"
+                    f"{writer_config_prompt}\n\n"
+                    "【当前写作任务】\n"
+                    f"{user_message}"
+                )
             if workflow_binding_block:
                 user_message = f"{user_message}\n\n{workflow_binding_block}"
             if writing_rules_guidance:
@@ -537,9 +632,10 @@ class WriterAgent(BaseAgent):
                 chapter_num=chapter_num,
                 total_chapters=total_chapters,
                 world_info=world_info,
+                workflow_context=input_data,
                 writing_rules_guidance=writing_rules_guidance,
                 discussion_asset_digest=discussion_asset_digest,
-                workflow_context=input_data,
+                config_prompt=writer_config_prompt,
             )
 
         # 调用 LLM (structured)
@@ -595,6 +691,7 @@ class WriterAgent(BaseAgent):
                 total_chapters=total_chapters,
                 writing_rules_guidance=writing_rules_guidance,
                 workflow_binding_block=workflow_binding_block,
+                config_prompt=writer_config_prompt,
             )
 
             # 调用 LLM 续写 (structured)
@@ -661,6 +758,11 @@ class WriterAgent(BaseAgent):
         world_info = self._as_dict(input_data.get("world_info"))
 
         workflow_binding_block = self._build_workflow_binding_block(input_data)
+        writer_config_prompt = await self._get_writer_config_prompt({
+            **input_data,
+            "target_word_count": word_count,
+            "min_word_count": min_word_count,
+        })
 
         chapter_rule_context = self._build_writing_rule_context(
             chapter_num=chapter_num,
@@ -696,6 +798,7 @@ class WriterAgent(BaseAgent):
             world_info=world_info,
             discussion_asset_digest=discussion_asset_digest,
             workflow_binding_block=workflow_binding_block,
+            config_prompt=writer_config_prompt,
         )
 
         # ========== 第二阶段：逐段生成 ==========
@@ -742,6 +845,7 @@ class WriterAgent(BaseAgent):
                 writing_rules_guidance=segment_writing_rules_guidance,
                 discussion_asset_digest=discussion_asset_digest,
                 workflow_binding_block=workflow_binding_block,
+                config_prompt=writer_config_prompt,
             )
 
             # 生成该段 (structured)
@@ -801,6 +905,7 @@ class WriterAgent(BaseAgent):
                 total_chapters=total_chapters,
                 writing_rules_guidance=chapter_writing_rules_guidance,
                 workflow_binding_block=workflow_binding_block,
+                config_prompt=writer_config_prompt,
             )
 
             try:
@@ -854,8 +959,8 @@ class WriterAgent(BaseAgent):
         chapter_num: int,
         total_chapters: int,
         world_info: Optional[Dict[str, Any]] = None,
-        discussion_asset_digest: str = "",
         workflow_binding_block: str = "",
+        config_prompt: str = "",
     ) -> Dict[str, Any]:
         """
         规划分段结构
@@ -863,60 +968,41 @@ class WriterAgent(BaseAgent):
         Returns:
             Dict: 包含 segments 列表，每段有 focus 和 key_elements
         """
-        prompt = f"""你是小说结构规划师，请为以下章节内容规划分段结构。
-
-【章节信息】
-- 第 {chapter_num} 章，全书共 {total_chapters} 章
-- 目标字数: {word_count} 字
-- 分段数: {segment_count} 段
-
-【环境设定】
-{environment if environment else "无特定环境"}
-
-【需要表达的意图】
-{chr(10).join(intents) if intents else "自由发挥"}
-
-【角色状态】
-{chr(10).join([f"- {k}: {v}" for k, v in character_moods.items()]) if character_moods else "无特定状态"}
-"""
-        if workflow_binding_block:
-            prompt += f"""
-
-{workflow_binding_block}
-"""
-
-        if discussion_asset_digest:
-            prompt += f"""
-
-【已确认讨论资产】
-{discussion_asset_digest}
-请在分段结构中显式承接这些已确认的剧情、伏笔、地点、设定或角色信息，不要与其冲突。
-"""
-        prompt += f"""
-
-【规划要求】
-1. 每段应该有明确的叙事焦点，并优先覆盖绑定章节大纲中的必达节点
-2. 必须把章节大纲、章节目标、修订要求中的关键剧情点分配到具体段落，不允许用通用桥段替代
-3. 段落之间要自然过渡
-4. 保持剧情连贯性
-5. 合理分配信息密度
-6. 每一段都必须回答“因为什么发生、角色做了什么、外部世界因此有什么变化”；不能连续规划纯对话/纯心理活动段落
-7. 开章可以克制，但必须有实际事件推进：遭遇、发现、抉择、误会、追索、任务、危机、线索或环境变化至少出现一种
-8. 不得规划未授权角色、组织、能力、地点或专有概念；如素材冲突，以绑定大纲、固定设定和角色硬约束为准
-
-请输出 JSON 格式：
-{{
+        prompt = self._format_writer_task_prompt(
+            task_title="为当前章节规划分段结构。",
+            sections=[
+                ("章节信息", {
+                    "chapter_num": chapter_num,
+                    "total_chapters": total_chapters,
+                    "target_word_count": word_count,
+                    "segment_count": segment_count,
+                }),
+                ("环境设定", environment or "无特定环境"),
+                ("需要表达的意图", intents or "自由发挥"),
+                ("角色状态", character_moods or "无特定状态"),
+                ("工作流绑定上下文", workflow_binding_block),
+                ("已确认讨论资产", discussion_asset_digest),
+                ("世界观参考", world_info),
+            ],
+            task_notes=[
+                "把绑定章节大纲、章节目标、修订要求中的关键剧情点分配到具体段落，不能用通用桥段替代。",
+                "每段必须有明确叙事焦点、关键元素和因果推进。",
+                "不得规划未授权角色、组织、能力、地点或专有概念。",
+            ],
+            output_schema='''{
     "segments": [
-        {{
-            "focus": "该段的叙事焦点（如：开篇铺垫、冲突展开、对话互动、情节推进、高潮渲染、结尾收束等）",
+        {
+            "focus": "该段的叙事焦点",
             "key_elements": ["该段需要包含的关键元素"],
             "tone": "该段的情感基调",
             "suggested_word_count": 建议字数
-        }}
+        }
     ],
     "overall_structure": "整体结构说明",
     "pacing_note": "节奏把控建议"
-}}"""
+}''',
+            config_prompt=config_prompt,
+        )
 
         try:
             parsed = await self._call_structured(
@@ -959,67 +1045,46 @@ class WriterAgent(BaseAgent):
         writing_rules_guidance: str = "",
         discussion_asset_digest: str = "",
         workflow_binding_block: str = "",
+        config_prompt: str = "",
     ) -> str:
         """构建分段生成提示"""
-        parts = []
-
         min_words = min_words or max(1, int(target_words * 0.85))
         max_words = max_words or max(target_words, int(target_words * 1.25))
-
-        parts.append(f"""【分段写作任务】
-- 当前是第 {segment_num}/{total_segments} 段
-- 本段焦点: {segment_info.get('focus', '自由发挥')}
-- 目标字数: 约 {target_words} 字
-- 字数范围: {min_words}-{max_words} 字，禁止明显低于或高于该范围
-- 情感基调: {segment_info.get('tone', '平稳')}""")
-
         key_elements = self._as_list(segment_info.get('key_elements', []))
-        if key_elements:
-            parts.append(f"\n【本段关键元素】\n{chr(10).join(['- ' + str(e) for e in key_elements])}")
 
-        if workflow_binding_block:
-            parts.append(f"\n{workflow_binding_block}")
-
-        if writing_rules_guidance:
-            parts.append(f"\n{writing_rules_guidance}")
-
-        if world_info:
-            parts.append(f"\n【世界观参考】\n名称：{world_info.get('name', '未知')}\n类型：{world_info.get('world_type', '奇幻')}")
-
-        if discussion_asset_digest:
-            parts.append(
-                f"\n【已确认讨论资产】\n{discussion_asset_digest}\n"
-                "本段需要承接这些已确认的剧情资产；如涉及新增角色、地点、设定或伏笔，按已确认信息写作，不要随意改名或改设定。"
-            )
-
-        if previous_content:
-            parts.append(f"\n【前一段落结尾】\n{previous_content}")
-
-        if previous_style and segment_num == 1:
-            parts.append(f"\n【前文风格样本】\n{previous_style}\n请保持与上述风格一致。")
-
-        parts.append(f"""
-【写作要求】
-1. 本段字数必须控制在 {min_words}-{max_words} 字范围内，接近目标 {target_words} 字即可，不要为了铺陈而超写
-2. 与前文自然衔接
-3. 突出本段的叙事焦点，并覆盖本段关键元素
-4. 严格遵守工作流绑定上下文，不得新增未授权角色、组织、能力、地点或专有概念
-5. 场景演绎素材只可作为参考，不得覆盖章节大纲或逐字照抄
-6. 本段必须有可见的故事推进：角色行动、发现线索、遭遇阻力、做出选择、环境变化或局势变化至少出现一种
-7. 对话必须服务于行动和因果推进；禁止整段只写已有角色互相解释、寒暄、分析或情绪演绎
-8. 写清楚前因后果：读者应能理解“为什么现在发生、为什么角色这样做、这一段结束后局势有什么变化”
-9. “金手指”只能作为作者/策划视角标签，不得出现在主角正文认知或台词中；角色只能用其自身世界观可理解的名称描述异常能力或物件
-10. 保持网文的节奏感和可读性
-
-输出 JSON 格式：
-{{
+        return self._format_writer_task_prompt(
+            task_title="按分段计划写作当前段落。",
+            sections=[
+                ("分段写作任务", {
+                    "segment_num": segment_num,
+                    "total_segments": total_segments,
+                    "focus": segment_info.get("focus", "自由发挥"),
+                    "target_words": target_words,
+                    "min_words": min_words,
+                    "max_words": max_words,
+                    "tone": segment_info.get("tone", "平稳"),
+                }),
+                ("本段关键元素", key_elements),
+                ("工作流绑定上下文", workflow_binding_block),
+                ("当前相关写作规则", writing_rules_guidance),
+                ("世界观参考", world_info),
+                ("已确认讨论资产", discussion_asset_digest),
+                ("前一段落结尾", previous_content),
+                ("前文风格样本", previous_style if segment_num == 1 else ""),
+            ],
+            task_notes=[
+                f"本段字数控制在 {min_words}-{max_words} 字范围内，接近目标 {target_words} 字。",
+                "与前文自然衔接，突出本段叙事焦点并覆盖关键元素。",
+                "严格遵守工作流绑定上下文；具体分段、续写、补写规则以 Writer 配置规则中的 md 资产为准。",
+            ],
+            output_schema='''{
     "content": "本段正文内容",
     "word_count": 字数,
     "key_points_covered": ["已覆盖的关键元素"],
     "transition_to_next": "与下一段的衔接思路"
-}}""")
-
-        return "\n".join(parts)
+}''',
+            config_prompt=config_prompt,
+        )
 
     def _build_supplement_prompt(
         self,
@@ -1029,35 +1094,28 @@ class WriterAgent(BaseAgent):
         total_chapters: int,
         writing_rules_guidance: str = "",
         workflow_binding_block: str = "",
+        config_prompt: str = "",
     ) -> str:
         """构建补充内容提示"""
-        guidance_block = f"\n【当前相关写作规则】\n{writing_rules_guidance}\n" if writing_rules_guidance else ""
-        binding_block = f"\n{workflow_binding_block}\n" if workflow_binding_block else ""
-        return f"""请为以下章节内容进行补充，增加约 {shortage} 字。
-
-【已有内容】
-{existing_content}{binding_block}{guidance_block}
-【长篇创作意识】
-- 当前是第 {chapter_num} 章，全书共 {total_chapters} 章
-- 保持剧情可持续发展，不要急于推进到高潮
-
-【补充方向】
-请优先补足绑定章节大纲中尚未覆盖的必达节点，或扩写已有合法场景中的因果链与行动后果；不得新增未授权角色、组织、能力、地点或专有概念。
-补充内容必须优先选择能增强故事推进的方向，避免只增加聊天和心理活动：
-1. 补足事件前因或直接诱因
-2. 写出角色采取的具体行动
-3. 增加外部阻力、线索发现或局势变化
-4. 写清角色选择造成的后果
-5. 埋下伏笔或悬念
-
-注意：“金手指”是作者视角术语，正文角色不得这样称呼或理解相关能力/物件。
-
-输出 JSON 格式：
-{{
+        return self._format_writer_task_prompt(
+            task_title=f"为已有章节内容补写约 {shortage} 字，补足字数或未覆盖的大纲节点。",
+            sections=[
+                ("章节信息", {"chapter_num": chapter_num, "total_chapters": total_chapters, "shortage": shortage}),
+                ("已有内容", existing_content),
+                ("工作流绑定上下文", workflow_binding_block),
+                ("当前相关写作规则", writing_rules_guidance),
+            ],
+            task_notes=[
+                "补写只能扩展已有合法场景中的前因、行动、阻力、线索或后果，不能开启新剧情线。",
+                "不得新增未授权角色、组织、能力、地点或专有概念。",
+            ],
+            output_schema='''{
     "content": "补充的内容",
     "word_count": 字数,
     "supplement_direction": "选择的补充方向"
-}}"""
+}''',
+            config_prompt=config_prompt,
+        )
 
     def _build_continue_prompt(
         self,
@@ -1069,37 +1127,31 @@ class WriterAgent(BaseAgent):
         total_chapters: int,
         writing_rules_guidance: str = "",
         workflow_binding_block: str = "",
+        config_prompt: str = "",
     ) -> str:
         """构建续写提示"""
-        guidance_block = f"\n【当前相关写作规则】\n{writing_rules_guidance}\n" if writing_rules_guidance else ""
-        binding_block = f"\n{workflow_binding_block}\n" if workflow_binding_block else ""
-        return f"""请继续写作，补充约 {shortage} 字的内容。
-
-【已有内容】
-{existing_content}{binding_block}{guidance_block}
-【长篇创作意识】
-- 当前是第 {chapter_num} 章，全书共 {total_chapters} 章
-- 请保持剧情可持续发展的节奏
-- 不要急于推进到高潮或结局
-- 续写内容要与上文自然衔接
-
-【续写方向】
-请优先补足绑定章节大纲中尚未覆盖的必达节点，或沿着已有合法内容自然续写出新的行动、线索、阻力或局势变化；不得新增未授权角色、组织、能力、地点或专有概念。
-请选择以下方向之一进行续写：
-1. 补足事件前因或读者理解当前冲突所需的信息
-2. 推进角色的具体行动和选择
-3. 引入或深化外部阻力、线索发现、环境变化
-4. 写出上一段行动造成的后果
-5. 为后续情节埋下伏笔
-
-注意：“金手指”是作者视角术语，正文角色不得这样称呼或理解相关能力/物件。
-
-输出 JSON 格式：
-{{
+        return self._format_writer_task_prompt(
+            task_title=f"在已有内容后自然续写约 {shortage} 字，补足字数或未覆盖的大纲节点。",
+            sections=[
+                ("章节信息", {"chapter_num": chapter_num, "total_chapters": total_chapters, "shortage": shortage}),
+                ("已有内容", existing_content),
+                ("需要表达的意图", intents),
+                ("角色状态", character_moods),
+                ("工作流绑定上下文", workflow_binding_block),
+                ("当前相关写作规则", writing_rules_guidance),
+            ],
+            task_notes=[
+                "续写必须与上文自然衔接，只用于补足字数或补足未覆盖的大纲节点。",
+                "优先写前因、角色行动、外部阻力、线索发现、环境变化或上一段行动后果。",
+                "不得开启新剧情线，不得新增未授权角色、组织、能力、地点或专有概念。",
+            ],
+            output_schema='''{
     "content": "续写的内容",
     "word_count": 续写字数,
     "continue_direction": "选择的续写方向说明"
-}}"""
+}''',
+            config_prompt=config_prompt,
+        )
 
     def _count_words(self, text: str) -> int:
         """
@@ -1223,19 +1275,7 @@ class WriterAgent(BaseAgent):
         if parts:
             parts.append(
                 "【工作流状态使用要求】\n"
-                "- 绑定章节大纲、固定设定和动态设定是事实输入源，必须承接，不能改写为另一套剧情。\n"
-                "- 当章节大纲明确要求某个能力觉醒、融合、警告、线索或场景在本章发生时，必须执行；不得以长篇渐进展开为理由延后或替换。\n"
-                "- 如果提供了后续大纲参考，本章新增人物、伏笔和转折必须兼顾后续章节可持续发展，避免堵死后续大纲；但不得提前剧透或替代后续章节应发生的事件。\n"
-                "- 如果没有后续大纲参考，不要自行新建完整后续大纲；按当前绑定章节大纲写作，只做轻量伏笔/悬念铺垫。\n"
-                "- 场景演绎素材和讨论素材只作为参考材料/写作索引，不是必须逐字照抄的正文脚本；如与绑定大纲或固定设定冲突，以绑定大纲和固定设定为准。\n"
-                "- 角色出场硬约束只限制谁能正面出场、说话或行动；它不是把章节写成室内聊天或静态群像的理由。\n"
-                "- 只有 present_character_names 和已确认/已创建的次要角色可以正面出场、说话或行动。\n"
-                "- mentioned_only_names / forbidden_direct_appearance_names 中的角色只能作为传闻、回忆、姓名、势力或影响被提及；不得写成当前场景的活人参与者、发言者或行动者。\n"
-                "- 如果总编剧已提供次要角色辅助计划，可使用其中已确认或已创建的 supporting/recurring/catalyst/informant/npc 角色推动剧情；不要临场发明未落库的新命名角色。\n"
-                "- 如果讨论资产、场景演绎素材或写作计划引入未授权角色，必须跳过或改写，不得作为事实承接。\n"
-                "- 角色来源、历史、身份和背景必须遵守 category=character_setting 的设定库条目；缺失时不要自行补写。\n"
-                "- 不要引入项目设定中不存在的通用修真/玄幻规则、组织、角色或专有概念。\n"
-                "- “金手指”是作者视角/元叙事术语；正文中主角不能把自己的异常能力、系统、物品或机缘称为“金手指”，也不能理解这个词的作者语境。请改写成角色视角能理解的称呼，如异常感应、残页、印记、回响、梦境、旧物、未知能力等。"
+                "以上内容是本次章节写作的动态事实输入源，必须按 Writer 配置规则中的工作流上下文绑定规则使用。"
             )
 
         return "\n\n".join(parts)
@@ -1253,21 +1293,27 @@ class WriterAgent(BaseAgent):
         chapter_num: int = 1,
         total_chapters: int = 10,
         world_info: Optional[Dict[str, Any]] = None,
+        workflow_context: Optional[Dict[str, Any]] = None,
         writing_rules_guidance: str = "",
         discussion_asset_digest: str = "",
-        workflow_context: Optional[Dict[str, Any]] = None,
+        config_prompt: str = "",
     ) -> str:
         """构建用户消息"""
         message_parts = []
 
-        # 长篇创作意识（放在最前面）
-        message_parts.append(f"""【长篇网文创作意识】
-- 当前是第 {chapter_num} 章，全书计划共 {total_chapters} 章
-- 这是长篇小说，不是短篇故事
-- 剧情要可持续发展，不要让读者感觉开头就是高潮、马上要大结局
-- 为后续剧情留有余地和伏笔空间
-- 角色要有成长空间，不要一开始就无敌
-- 世界观要有多层次，让读者感觉还有更深的内容待探索""")
+        if config_prompt:
+            message_parts.append(
+                "【Writer 配置规则】\n"
+                "以下内容来自 Agent Template 绑定的 md prompt / skills / writing-rules，是本次写作的稳定规则来源。\n"
+                f"{config_prompt}"
+            )
+
+        message_parts.append(
+            f"【章节信息】\n"
+            f"- 当前章节：第 {chapter_num} 章\n"
+            f"- 总章节数：{total_chapters}\n"
+            "- 请按 Writer 配置规则、绑定大纲和当前动态上下文完成本章写作。"
+        )
 
         # 字数要求（放在最前面强调）
         message_parts.append(
@@ -1280,26 +1326,9 @@ class WriterAgent(BaseAgent):
         if writing_rules_guidance:
             message_parts.append(writing_rules_guidance)
 
-        # 世界观设定（重要！所有写作都要符合世界观）
         if world_info:
-            world_section = f"""【世界观设定】
-名称：{world_info.get('name', '未知世界')}
-类型：{world_info.get('world_type', '奇幻')}
-基调：{world_info.get('tone', '正剧')}
-背景：{world_info.get('background', world_info.get('description', ''))}"""
-            rules = world_info.get('rules', {})
-            if rules:
-                if isinstance(rules, dict):
-                    rules_text = '\n'.join([f'- {k}: {v}' for k, v in rules.items()])
-                else:
-                    rules_text = str(rules)
-                world_section += f"\n\n【世界规则】\n{rules_text}"
-            themes = world_info.get('themes', [])
-            if themes:
-                world_section += f"\n\n【核心主题】\n{', '.join(str(theme) for theme in themes)}"
-            message_parts.append(world_section)
+            message_parts.append(self._format_workflow_context_block("世界观设定", world_info))
 
-        workflow_context = workflow_context or {}
         workflow_binding_block = self._build_workflow_binding_block(workflow_context)
         if workflow_binding_block:
             message_parts.append(workflow_binding_block)
@@ -1353,16 +1382,7 @@ class WriterAgent(BaseAgent):
 
         message_parts.append(
             "\n请将以上要素融合，生成一段有小说质感的连贯文本。"
-            "注意：\n"
-            "- 多用动作和神态描写，少用直接告知\n"
-            "- 对话要符合角色性格，但对话必须推动行动、线索、冲突或决策，不能代替剧情本身\n"
-            "- 每章都要有实际故事开展：至少写出一个明确事件、一个外部阻力或变化、一次角色选择，以及这一切带来的后果\n"
-            "- 写清楚前因后果，让读者理解事件为何发生、角色为何行动、章节结束时局势发生了什么变化\n"
-            "- 长篇开章可以保留谜团，但不能省略读者理解当前事件所需的基本因果链\n"
-            "- 伏笔要自然嵌入，不突兀\n"
-            "- 正文角色不得使用或理解‘金手指’这个作者视角术语；如输入里有金手指，请改写为角色可感知的异常能力、物件、印记、回响、梦境或未知机缘\n"
-            "- 必须控制在字数范围内，接近目标字数即可，禁止明显超写\n"
-            "- 保持长篇网文的节奏感，不要急于推进到高潮"
+            "本次任务只保留当前章节生成所需的动态输入；稳定写作规则以 Writer 配置规则中的 md prompt、skills 和 writing-rules 为准。"
         )
 
         return "\n\n".join(message_parts)

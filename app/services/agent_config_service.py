@@ -88,6 +88,7 @@ class AgentConfigService:
             id=row["id"],
             project_id=str(row["project_id"]),
             agent_type=row["agent_type"],
+            scenario=row.get("scenario") or "default",
             name=row.get("name", f"{row['agent_type']} 配置"),
             description=row.get("description", ""),
             template_id=row.get("template_id"),
@@ -109,6 +110,7 @@ class AgentConfigService:
             "id": config.id,
             "project_id": config.project_id,
             "agent_type": config.agent_type,
+            "scenario": config.scenario,
             "name": config.name,
             "description": config.description,
             "template_id": config.template_id,
@@ -148,10 +150,16 @@ class AgentConfigService:
         )
         self._configs[config.id] = config
 
+    @staticmethod
+    def _normalize_scenario(scenario: Optional[str]) -> str:
+        scenario_value = (scenario or "default").strip()
+        return scenario_value or "default"
+
     async def _resolve_template_for_agent(
         self,
         project_id: str,
         agent_type: str,
+        scenario: Optional[str] = None,
         config: Optional[AgentConfig] = None,
     ) -> Optional[AgentTemplate]:
         """解析运行时实际使用的模板"""
@@ -160,7 +168,13 @@ class AgentConfigService:
 
         await self._ensure_cache()
         normalized_agent_type = self._normalize_agent_type(agent_type)
-        config = config or await self.get_config_by_project_agent(project_id, normalized_agent_type)
+        normalized_scenario = self._normalize_scenario(scenario)
+        config = config or await self.get_config_by_project_agent(
+            project_id,
+            normalized_agent_type,
+            normalized_scenario,
+            allow_default_fallback=False,
+        )
 
         if config and config.template_id:
             template = await self._agent_template_service.get_template(config.template_id)
@@ -168,7 +182,10 @@ class AgentConfigService:
                 return template
 
         try:
-            return await self._agent_template_service.get_template_by_type(AgentType(normalized_agent_type))
+            return await self._agent_template_service.get_template_by_type(
+                AgentType(normalized_agent_type),
+                normalized_scenario,
+            )
         except ValueError:
             logger.debug(f"未知 AgentType，无法按类型解析模板: {normalized_agent_type}")
             return None
@@ -180,11 +197,18 @@ class AgentConfigService:
         project_id: str,
         agent_type: str,
         template_id: Optional[str] = None,
+        scenario: Optional[str] = None,
     ) -> AgentConfig:
         """获取或创建项目的 Agent 配置"""
         await self._ensure_cache()
+        normalized_scenario = self._normalize_scenario(scenario)
 
-        existing = await self.get_config_by_project_agent(project_id, agent_type)
+        existing = await self.get_config_by_project_agent(
+            project_id,
+            agent_type,
+            normalized_scenario,
+            allow_default_fallback=False,
+        )
         if existing:
             return existing
 
@@ -195,7 +219,7 @@ class AgentConfigService:
                 template = await self._agent_template_service.get_template(resolved_template_id)
             if not template:
                 try:
-                    template = await self._agent_template_service.get_template_by_type(AgentType(agent_type))
+                    template = await self._agent_template_service.get_template_by_type(AgentType(agent_type), normalized_scenario)
                     if template and not resolved_template_id:
                         resolved_template_id = template.id
                 except ValueError:
@@ -215,6 +239,7 @@ class AgentConfigService:
             id=config_id,
             project_id=project_id,
             agent_type=agent_type,
+            scenario=normalized_scenario,
             name=config_name,
             description=f"项目 {project_id} 的 {agent_type} Agent 配置",
             template_id=resolved_template_id,
@@ -223,7 +248,7 @@ class AgentConfigService:
         )
 
         await self._save_config(config)
-        logger.info(f"创建 AgentConfig: {config_id} for project {project_id}, agent {agent_type}")
+        logger.info(f"创建 AgentConfig: {config_id} for project {project_id}, agent {agent_type}, scenario {normalized_scenario}")
         return config
 
     async def get_config(self, config_id: str) -> Optional[AgentConfig]:
@@ -232,20 +257,42 @@ class AgentConfigService:
         return self._configs.get(config_id)
 
     async def get_config_by_project_agent(
-        self, project_id: str, agent_type: str
+        self,
+        project_id: str,
+        agent_type: str,
+        scenario: Optional[str] = None,
+        allow_default_fallback: bool = True,
     ) -> Optional[AgentConfig]:
-        """获取项目特定 Agent 类型的配置"""
+        """获取项目特定 Agent 类型和场景的配置"""
         await self._ensure_cache()
         normalized_agent_type = self._normalize_agent_type(agent_type)
-        for config in self._configs.values():
-            if config.project_id == project_id and config.agent_type == normalized_agent_type:
+        normalized_scenario = self._normalize_scenario(scenario)
+        configs = [
+            config
+            for config in self._configs.values()
+            if config.project_id == project_id and config.agent_type == normalized_agent_type
+        ]
+        for config in configs:
+            if self._normalize_scenario(config.scenario) == normalized_scenario:
                 return config
+        if allow_default_fallback and normalized_scenario != "default":
+            for config in configs:
+                if self._normalize_scenario(config.scenario) == "default":
+                    logger.warning(
+                        "未找到项目 Agent 场景配置，回退 default: project=%s, agent_type=%s, scenario=%s, config=%s",
+                        project_id,
+                        normalized_agent_type,
+                        normalized_scenario,
+                        config.id,
+                    )
+                    return config
         return None
 
     async def get_all_configs(
         self,
         project_id: str,
         agent_type: Optional[str] = None,
+        scenario: Optional[str] = None,
         is_active: Optional[bool] = None,
         limit: int = 50,
         offset: int = 0,
@@ -255,7 +302,12 @@ class AgentConfigService:
         configs = [c for c in self._configs.values() if c.project_id == project_id]
 
         if agent_type:
-            configs = [c for c in configs if c.agent_type == agent_type]
+            normalized_agent_type = self._normalize_agent_type(agent_type)
+            configs = [c for c in configs if c.agent_type == normalized_agent_type]
+
+        if scenario:
+            normalized_scenario = self._normalize_scenario(scenario)
+            configs = [c for c in configs if self._normalize_scenario(c.scenario) == normalized_scenario]
 
         if is_active is not None:
             configs = [c for c in configs if c.is_active == is_active]
@@ -326,16 +378,29 @@ class AgentConfigService:
         self,
         project_id: str,
         agent_type: str,
+        scenario: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """解析 Agent 在当前项目下的运行时状态"""
+        """解析 Agent 在当前项目和场景下的运行时状态"""
         normalized_agent_type = self._normalize_agent_type(agent_type)
-        config = await self.get_config_by_project_agent(project_id, normalized_agent_type)
-        template = await self._resolve_template_for_agent(project_id, normalized_agent_type, config=config)
+        normalized_scenario = self._normalize_scenario(scenario)
+        config = await self.get_config_by_project_agent(
+            project_id,
+            normalized_agent_type,
+            normalized_scenario,
+            allow_default_fallback=False,
+        )
+        template = await self._resolve_template_for_agent(
+            project_id,
+            normalized_agent_type,
+            scenario=normalized_scenario,
+            config=config,
+        )
 
         if config and config.is_active is False:
             return {
                 "enabled": False,
                 "reason": "项目级 Agent 配置已禁用",
+                "scenario": normalized_scenario,
                 "config": config,
                 "template": template,
             }
@@ -344,6 +409,7 @@ class AgentConfigService:
             return {
                 "enabled": False,
                 "reason": "全局模板已禁用该可选 Agent",
+                "scenario": normalized_scenario,
                 "config": config,
                 "template": template,
             }
@@ -351,13 +417,19 @@ class AgentConfigService:
         return {
             "enabled": True,
             "reason": "enabled",
+            "scenario": normalized_scenario,
             "config": config,
             "template": template,
         }
 
-    async def is_agent_enabled(self, project_id: str, agent_type: str) -> Tuple[bool, str]:
-        """检查 Agent 是否在当前项目启用"""
-        state = await self.resolve_agent_runtime_state(project_id, agent_type)
+    async def is_agent_enabled(
+        self,
+        project_id: str,
+        agent_type: str,
+        scenario: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        """检查 Agent 是否在当前项目和场景启用"""
+        state = await self.resolve_agent_runtime_state(project_id, agent_type, scenario)
         return state["enabled"], state["reason"]
 
     # ==================== Prompt 构建和预览 ====================
@@ -379,6 +451,7 @@ class AgentConfigService:
             agent_type=config.agent_type,
             project_id=config.project_id,
             variables=variables,
+            scenario=config.scenario,
         )
 
     async def preview_prompt(
@@ -398,6 +471,7 @@ class AgentConfigService:
             template = await self._resolve_template_for_agent(
                 config.project_id,
                 config.agent_type,
+                scenario=config.scenario,
                 config=config,
             )
             if template:
@@ -405,12 +479,14 @@ class AgentConfigService:
                     "id": template.id,
                     "name": template.name,
                     "agent_type": template.agent_type,
+                    "scenario": template.scenario,
                 }
 
         return {
             "config_id": config_id,
             "project_id": config.project_id,
             "agent_type": config.agent_type,
+            "scenario": config.scenario,
             "template": template_info,
             "is_custom": config.is_custom,
             "llm_config": config.llm_config.model_dump(mode="json"),

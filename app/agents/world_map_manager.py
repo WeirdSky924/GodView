@@ -31,6 +31,7 @@ class WorldMapManagerAgent(BaseAgent):
     """地图管理 Agent - 独立的世界地图管理者"""
 
     AGENT_TYPE = AgentType.WORLD_MAP_MANAGER
+    DEFAULT_SCENARIO = "world_map_management"
 
     def __init__(
         self,

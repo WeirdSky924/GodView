@@ -19,6 +19,7 @@ export type AgentType =
   | 'evaluator'
   | 'proc_gen'
   | 'scene_coordinator'
+  | 'plot_outline'
   | 'event_generator'
   | 'dungeon_generator'
   | 'world_map_manager'
@@ -49,10 +50,13 @@ export interface AgentTemplate {
   name: string
   description: string
   agent_type: AgentType
+  scenario: string
   prompt_slots: PromptSlot[]
   skill_slots: SkillSlot[]
   default_prompt_order: string[]
   default_skill_order: string[]
+  default_model?: string | null
+  default_temperature: number
   tags: string[]
   is_system: boolean
   is_optional: boolean
@@ -66,22 +70,64 @@ export interface CreateAgentTemplateDTO {
   name: string
   description: string
   agent_type: AgentType
+  scenario?: string
   prompt_slots?: PromptSlot[]
   skill_slots?: SkillSlot[]
   default_prompt_order?: string[]
   default_skill_order?: string[]
+  default_model?: string | null
+  default_temperature?: number
   tags?: string[]
+  is_system?: boolean
+  is_optional?: boolean
+  is_enabled?: boolean
 }
 
 export interface UpdateAgentTemplateDTO {
   name?: string
   description?: string
+  agent_type?: AgentType
+  scenario?: string
   prompt_slots?: PromptSlot[]
   skill_slots?: SkillSlot[]
   default_prompt_order?: string[]
   default_skill_order?: string[]
+  default_model?: string | null
+  default_temperature?: number
   tags?: string[]
+  is_system?: boolean
+  is_optional?: boolean
+  is_enabled?: boolean
   version?: string
+}
+
+export interface PreviewRenderTrace {
+  agent_type: AgentType | string
+  scenario?: string | null
+  template_id: string
+  prompt_ids: string[]
+  skill_ids: string[]
+  writing_rule_ids: string[]
+  context_blocks: string[]
+  fallbacks_used: string[]
+  deprecated_sources_used: string[]
+  writing_rules?: {
+    project_id?: string | null
+    writing_rule_ids?: string[]
+    always_rule_ids?: string[]
+    retrieved_rules?: Array<{
+      id?: string
+      name?: string
+      severity?: string
+      reason?: string
+      score?: number
+    }>
+    resolved_scope?: Record<string, any> | null
+    query?: string
+    fallbacks_used?: string[]
+    deprecated_sources_used?: string[]
+    error?: string
+  } | null
 }
 
 export interface PreviewResult {
@@ -94,6 +140,7 @@ export interface PreviewResult {
     content: string
   }>
   final_prompt: string
+  render_trace?: PreviewRenderTrace
 }
 
 // ==================== API 函数 ====================
@@ -106,10 +153,12 @@ export async function getAgentTemplates(
   isSystem?: boolean,
   tags?: string[],
   limit: number = 50,
-  offset: number = 0
+  offset: number = 0,
+  scenario?: string
 ): Promise<AgentTemplate[]> {
   const params = new URLSearchParams()
   if (agentType) params.append('agent_type', agentType)
+  if (scenario) params.append('scenario', scenario)
   if (isSystem !== undefined) params.append('is_system', String(isSystem))
   tags?.forEach((tag) => params.append('tags', tag))
   params.append('limit', String(limit))
@@ -167,8 +216,11 @@ export async function previewAgentTemplate(
 /**
  * 按类型获取 Agent 模板
  */
-export async function getAgentTemplateByType(agentType: AgentType): Promise<AgentTemplate> {
-  return await api.get(`${API_BASE}/by-type/${agentType}`)
+export async function getAgentTemplateByType(agentType: AgentType, scenario?: string): Promise<AgentTemplate> {
+  const params = new URLSearchParams()
+  if (scenario) params.append('scenario', scenario)
+  const query = params.toString()
+  return await api.get(`${API_BASE}/by-type/${agentType}${query ? `?${query}` : ''}`)
 }
 
 /**

@@ -155,6 +155,7 @@ class SceneCoordinatorAgent(BaseAgent):
     """场景协调者 Agent - 统筹多角色演绎"""
 
     AGENT_TYPE = "scene_coordinator"
+    DEFAULT_SCENARIO = "scene_coordination"
 
     def __init__(
         self,
@@ -166,7 +167,7 @@ class SceneCoordinatorAgent(BaseAgent):
         super().__init__(
             name="SceneCoordinatorAgent",
             model=model,
-            system_prompt=self._build_system_prompt(),
+            system_prompt=None if project_id else self._build_system_prompt(),
             config=config,
             project_id=project_id,
         )
@@ -188,26 +189,36 @@ class SceneCoordinatorAgent(BaseAgent):
         }
 
     def _build_system_prompt(self) -> str:
-        return """你是场景协调者，负责统筹多角色演绎场景。
+        return (
+            "你是场景协调者，负责统筹多角色演绎场景。"
+            "优先使用 Agent Template 绑定的 md prompt / skills / writing-rules；"
+            "仅在未能加载配置资产时，将此最小提示作为 deprecated fallback。"
+        )
 
-【核心职责】
-1. 信息分配：根据角色定位，智能分发场景信息
-2. 顺序协调：决定角色发言顺序，避免混乱
-3. 内容整合：汇总所有角色表演，形成连贯场景
-4. 质量把控：确保表演符合角色设定和场景氛围
-
-【工作流程】
-1. 接收场景方向和上一节点输出
-2. 分析参与角色及其定位
-3. 为每个角色准备专属信息
-4. 按顺序调用各角色Agent表演
-5. 整合表演内容，输出最终结果
-
-【重要原则】
-- 信息隔离：每个角色只知道自己该知道的
-- 角色独立：尊重每个角色的自主性
-- 场景连贯：确保场景流畅自然
-- 剧情推进：表演要推进故事发展"""
+    def _build_supplement_context(
+        self,
+        *,
+        base_context: str,
+        current_content: str,
+        shortage: int,
+        character_name: str,
+        plot_intents: Optional[List[str]] = None,
+    ) -> str:
+        """构建场景补充上下文，稳定规则由 Character Agent 模板提供。"""
+        parts = [base_context]
+        supplement_lines = [
+            f"当前场景素材字数不足，需要补充约 {shortage} 字。",
+            "补充内容必须延续已有场景，只作为 Writer 的参考素材，不扩写成完整章节正文。",
+            "只能让当前角色基于可见信息行动；不得让仅提及、不可用或禁止正面出场角色发言、行动或进入现场。",
+        ]
+        if character_name:
+            supplement_lines.append(f"当前补充角色：{character_name}")
+        if plot_intents:
+            supplement_lines.append("剧情意图参考：" + "；".join(str(item) for item in plot_intents if item))
+        parts.append("【补充任务边界】\n" + "\n".join(f"- {line}" for line in supplement_lines))
+        if current_content:
+            parts.append(f"【已有内容摘要】\n{current_content[-500:]}")
+        return "\n\n".join(part for part in parts if part)
 
     def get_or_create_character_agent(
         self,
@@ -236,6 +247,7 @@ class SceneCoordinatorAgent(BaseAgent):
             agent = CharacterAgent(
                 character=character,
                 model=model or self.model,
+                config={"scenario": "roleplay"},
                 project_id=self.project_id,
             )
 
@@ -296,7 +308,13 @@ class SceneCoordinatorAgent(BaseAgent):
             AgentResponse: 协调结果
         """
         try:
+            await self._ensure_system_prompt_loaded()
+
             scene_directions = input_data.get("scene_directions", {})
+            if not isinstance(scene_directions, dict):
+                scene_directions = {}
+            scene_directions.setdefault("scenario", self.scenario)
+            scene_directions.setdefault("config_prompt_source", "agent_template_runtime" if self.system_prompt else "deprecated_fallback")
             characters_data = input_data.get("characters", [])
             performers = scene_directions.get("performers") or characters_data
             mentioned_characters = scene_directions.get("mentioned_characters") or []
@@ -816,26 +834,16 @@ class SceneCoordinatorAgent(BaseAgent):
             char_agent = self.get_or_create_character_agent(char_data)
 
             char_input = {
-                "context": self._build_character_context_with_history(
-                    char_data, distribution_plan.get(char_name, {}),
-                    scene_directions, world_info, 1, 1
-                ) + f"""
-
-【场景补充边界】
-当前场景内容字数不足，需要补充约 {shortage} 字。
-
-【已有内容摘要】
-{current_content[-500:]}
-
-【你的角色】{char_data.get('name', '未知')}
-
-请根据场景氛围和剧情发展，进行一段补充表演。
-可以是：
-- 深入的内心独白
-- 与其他允许正面出场角色的互动
-- 对环境的反应
-- 推进剧情的行动
-""",
+                "context": self._build_supplement_context(
+                    base_context=self._build_character_context_with_history(
+                        char_data, distribution_plan.get(char_name, {}),
+                        scene_directions, world_info, 1, 1
+                    ),
+                    current_content=current_content,
+                    shortage=shortage,
+                    character_name=char_data.get('name', '未知'),
+                    plot_intents=plot_intents,
+                ),
                 "present_characters": [c.get("name") for c in main_chars],
                 "dialogue_history": self._conversation_history[-5:],
                 "is_supplement": True,

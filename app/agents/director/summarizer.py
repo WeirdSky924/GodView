@@ -25,6 +25,7 @@ class SummarizerAgent(BaseAgent):
     """剧情总结员 Agent"""
 
     AGENT_TYPE = AgentType.SUMMARIZER
+    DEFAULT_SCENARIO = "workflow_summary"
 
     def __init__(
         self,

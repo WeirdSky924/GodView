@@ -27,6 +27,7 @@ class SettingAgent(BaseAgent):
     """
 
     AGENT_TYPE = "setting"
+    DEFAULT_SCENARIO = "workflow_context"
     AGENT_PROMPT = """你是一个专业的长篇网络小说设定管理者（Setting Agent）。
 
 【核心职责】

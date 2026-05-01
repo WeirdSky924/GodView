@@ -2657,6 +2657,24 @@ class PostgresDatabase:
                     except Exception as e:
                         logger.warning(f"更新项目表结构时出错: {str(e)[:100]}")
 
+            agent_config_schema_updates = [
+                "ALTER TABLE agent_templates ADD COLUMN IF NOT EXISTS scenario TEXT DEFAULT 'default'",
+                "ALTER TABLE skill_assignments ADD COLUMN IF NOT EXISTS scenario TEXT DEFAULT 'default'",
+                "ALTER TABLE skill_assignments ADD COLUMN IF NOT EXISTS slot_name TEXT DEFAULT ''",
+                "ALTER TABLE skill_assignments ADD COLUMN IF NOT EXISTS is_required BOOLEAN DEFAULT FALSE",
+                "ALTER TABLE skill_assignments ADD COLUMN IF NOT EXISTS variable_overrides JSONB DEFAULT '{}'",
+                "ALTER TABLE skill_assignments ADD COLUMN IF NOT EXISTS execution_condition TEXT",
+                "ALTER TABLE skill_assignments ADD COLUMN IF NOT EXISTS assigned_by TEXT DEFAULT 'user'",
+                "ALTER TABLE skill_assignments ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP",
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_skill_assignments_skill_agent_scenario_slot ON skill_assignments(skill_id, agent_type, scenario, slot_name)",
+            ]
+            if 'agent_templates' in existing_tables or 'skill_assignments' in existing_tables:
+                for statement in agent_config_schema_updates:
+                    try:
+                        await session.execute(text(statement))
+                    except Exception as e:
+                        logger.warning(f"更新 Agent 配置表结构时出错: {str(e)[:100]}")
+
             world_schema_updates = [
                 "ALTER TABLE worlds ADD COLUMN IF NOT EXISTS content_styles JSONB DEFAULT '[]'",
                 "ALTER TABLE worlds ADD COLUMN IF NOT EXISTS protagonist_types JSONB DEFAULT '[]'",

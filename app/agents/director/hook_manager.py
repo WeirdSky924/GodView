@@ -31,6 +31,7 @@ class HookManagerAgent(BaseAgent):
     """伏笔管理员 Agent"""
 
     AGENT_TYPE = AgentType.HOOK_MANAGER
+    DEFAULT_SCENARIO = "workflow_hook_management"
 
     def __init__(
         self,

@@ -108,6 +108,7 @@ export default function Skills() {
   // 视图模式
   const [viewMode, setViewMode] = useState<ViewMode>('all')
   const [selectedAgentType, setSelectedAgentType] = useState<string>('')
+  const [selectedScenario, setSelectedScenario] = useState<string>('default')
   const [agentSkills, setAgentSkills] = useState<Skill[]>([])
 
   // 表单状态
@@ -164,10 +165,10 @@ export default function Skills() {
     }
   }, [filterType, filterStatus, filterCategory, searchQuery])
 
-  const loadAgentSkills = async (agentType: string) => {
+  const loadAgentSkills = async (agentType: string, scenario: string = selectedScenario) => {
     setLoading(true)
     try {
-      const skills = await getAgentTypeSkills(agentType)
+      const skills = await getAgentTypeSkills(agentType, scenario || 'default')
       setAgentSkills(skills)
     } catch (error) {
       console.error('Failed to load agent skills:', error)
@@ -183,7 +184,7 @@ export default function Skills() {
     } else if (selectedAgentType) {
       loadAgentSkills(selectedAgentType)
     }
-  }, [viewMode, selectedAgentType, loadSkills])
+  }, [viewMode, selectedAgentType, selectedScenario, loadSkills])
 
   const openCreateModal = () => {
     setEditingSkill(null)
@@ -413,7 +414,7 @@ export default function Skills() {
 
         {/* Agent 类型选择 */}
         {viewMode === 'by_agent' && (
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-4 flex-wrap">
             <span className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>选择 Agent 类型：</span>
             <select
               value={selectedAgentType}
@@ -425,6 +426,13 @@ export default function Skills() {
                 <option key={agent.value} value={agent.value}>{agent.label}</option>
               ))}
             </select>
+            <span className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>场景：</span>
+            <Input
+              value={selectedScenario}
+              onChange={(e) => setSelectedScenario(e.target.value || 'default')}
+              className="max-w-xs"
+              placeholder="default"
+            />
           </div>
         )}
       </div>

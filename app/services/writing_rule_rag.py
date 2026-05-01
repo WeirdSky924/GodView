@@ -133,7 +133,14 @@ class WritingRuleRAGService:
                 "rendered_guidance": "",
             }
 
-        rules: List[WritingRule] = scope.get("rules", [])
+        rules: List[WritingRule] = service._filter_rules_by_runtime_context(
+            scope.get("rules", []),
+            context,
+        )
+        scope_summary = {
+            **scope_summary,
+            "runtime_rule_count": len(rules),
+        }
         query = service.build_retrieval_query_context(project_id, context)
         semantic_query = self._semantic_query_text(query)
 
@@ -195,8 +202,6 @@ class WritingRuleRAGService:
                 continue
             seen.add(rule.id)
             deduped.append(rule)
-            if len(deduped) >= limit:
-                break
 
         always_ids = {rule.id for rule in always_rules}
         fallback_ids = {rule.id for rule in fallback_rules}

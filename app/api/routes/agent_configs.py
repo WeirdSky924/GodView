@@ -25,6 +25,7 @@ router = APIRouter()
 async def list_agent_configs(
     project_id: str,
     agent_type: Optional[str] = Query(default=None, description="按 Agent 类型过滤"),
+    scenario: Optional[str] = Query(default=None, description="按 Agent 使用场景过滤"),
     is_active: Optional[bool] = Query(default=None, description="按激活状态过滤"),
     limit: int = Query(default=50, le=500, description="返回数量限制"),
     offset: int = Query(default=0, ge=0, description="偏移量"),
@@ -48,6 +49,7 @@ async def list_agent_configs(
         configs = await service.get_all_configs(
             project_id=project_id,
             agent_type=agent_type,
+            scenario=scenario,
             is_active=is_active,
             limit=limit,
             offset=offset,
@@ -85,13 +87,14 @@ async def create_agent_config(
             project_id=request.project_id,
             agent_type=request.agent_type,
             template_id=request.template_id,
+            scenario=request.scenario,
         )
 
         # 更新其他字段
-        update_data = request.dict(exclude={"project_id", "agent_type", "template_id"})
-        for field, value in update_data.items():
-            if value is not None:
-                setattr(config, field, value)
+        update_data = request.dict(exclude={"project_id", "agent_type", "template_id", "scenario"})
+        updated_config = await service.update_config(config.id, AgentConfigUpdate(**update_data))
+        if updated_config:
+            config = updated_config
 
         return {
             "success": True,
@@ -107,6 +110,7 @@ async def create_agent_config(
 async def get_agent_config(
     project_id: str,
     agent_type: str,
+    scenario: Optional[str] = Query(default=None, description="Agent 使用场景"),
 ):
     """
     获取项目特定 Agent 类型的配置
@@ -121,12 +125,13 @@ async def get_agent_config(
     service = get_agent_config_service()
 
     try:
-        config = await service.get_config_by_project_agent(project_id, agent_type)
+        config = await service.get_config_by_project_agent(project_id, agent_type, scenario)
         if not config:
             # 如果不存在，创建默认配置
             config = await service.get_or_create_config(
                 project_id=project_id,
                 agent_type=agent_type,
+                scenario=scenario,
             )
 
         return config.dict()
@@ -140,6 +145,7 @@ async def update_agent_config(
     project_id: str,
     agent_type: str,
     request: AgentConfigUpdate,
+    scenario: Optional[str] = Query(default=None, description="Agent 使用场景"),
 ):
     """
     更新项目特定 Agent 类型的配置
@@ -155,12 +161,13 @@ async def update_agent_config(
     service = get_agent_config_service()
 
     # 先获取配置
-    config = await service.get_config_by_project_agent(project_id, agent_type)
+    config = await service.get_config_by_project_agent(project_id, agent_type, scenario)
     if not config:
         # 如果不存在，创建默认配置
         config = await service.get_or_create_config(
             project_id=project_id,
             agent_type=agent_type,
+            scenario=scenario,
         )
 
     try:
@@ -183,6 +190,7 @@ async def update_agent_config(
 async def preview_agent_config(
     project_id: str,
     agent_type: str,
+    scenario: Optional[str] = Query(default=None, description="Agent 使用场景"),
     variables: Optional[Dict[str, Any]] = None,
 ):
     """
@@ -199,12 +207,13 @@ async def preview_agent_config(
     service = get_agent_config_service()
 
     # 获取配置
-    config = await service.get_config_by_project_agent(project_id, agent_type)
+    config = await service.get_config_by_project_agent(project_id, agent_type, scenario)
     if not config:
         # 如果不存在，创建默认配置
         config = await service.get_or_create_config(
             project_id=project_id,
             agent_type=agent_type,
+            scenario=scenario,
         )
 
     try:
@@ -219,6 +228,7 @@ async def preview_agent_config(
 async def reset_agent_configs(
     project_id: str,
     agent_type: Optional[str] = Query(default=None, description="要重置的 Agent 类型，为空则重置所有"),
+    scenario: Optional[str] = Query(default=None, description="要重置的 Agent 使用场景，为空则重置所有场景"),
 ):
     """
     重置为模板默认
@@ -234,7 +244,11 @@ async def reset_agent_configs(
 
     try:
         # 获取要重置的配置
-        configs = await service.get_all_configs(project_id=project_id, agent_type=agent_type)
+        configs = await service.get_all_configs(
+            project_id=project_id,
+            agent_type=agent_type,
+            scenario=scenario,
+        )
 
         if not configs:
             raise HTTPException(status_code=404, detail="未找到符合条件的配置")
@@ -247,6 +261,7 @@ async def reset_agent_configs(
                     reset_results.append({
                         "config_id": config.id,
                         "agent_type": config.agent_type,
+                        "scenario": config.scenario,
                         "success": True,
                         "message": f"配置 {config.id} 重置成功",
                     })
@@ -254,6 +269,7 @@ async def reset_agent_configs(
                     reset_results.append({
                         "config_id": config.id,
                         "agent_type": config.agent_type,
+                        "scenario": config.scenario,
                         "success": False,
                         "message": f"配置 {config.id} 重置失败（可能没有关联模板）",
                     })
@@ -261,6 +277,7 @@ async def reset_agent_configs(
                 reset_results.append({
                     "config_id": config.id,
                     "agent_type": config.agent_type,
+                    "scenario": config.scenario,
                     "success": False,
                     "message": str(e),
                 })

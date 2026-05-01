@@ -26,6 +26,7 @@ class EvaluatorAgent(BaseAgent):
     """评估 Agent"""
 
     AGENT_TYPE = AgentType.EVALUATOR
+    DEFAULT_SCENARIO = "chapter_quality_review"
 
     def __init__(
         self,
@@ -47,6 +48,91 @@ class EvaluatorAgent(BaseAgent):
         return {
             "agent_role": "评估员",
             "task_description": "章节判定与读者模拟",
+        }
+
+    def _load_md_prompt_content(self, prompt_id: str) -> str:
+        try:
+            from app.services.md_file_service import get_md_file_service
+
+            md_service = get_md_file_service()
+            prompt = md_service.get_prompt(prompt_id)
+            if prompt:
+                content = prompt.get("content") or prompt.get("raw_content") or ""
+                if content:
+                    return content.strip()
+        except Exception as e:
+            logger.warning(f"加载 {prompt_id} prompt 失败: {e}")
+
+        return ""
+
+    def _build_md_evaluator_fallback_prompt(self) -> str:
+        """从 md prompt 资产构建 Evaluator 备用 prompt。"""
+        prompt_ids = [
+            "role_evaluator",
+            "function_evaluation",
+            "function_evaluator_chapter_quality_gate",
+            "function_evaluator_reader_simulation",
+            "function_evaluator_ooc_review",
+        ]
+        parts = [content for prompt_id in prompt_ids if (content := self._load_md_prompt_content(prompt_id))]
+        return "\n\n".join(parts).strip()
+
+    async def _get_evaluator_config_prompt(self, variables: Optional[Dict[str, Any]] = None) -> str:
+        """获取 Evaluator Agent Template 渲染后的配置 prompt。"""
+        if getattr(self, "_evaluator_config_prompt", None):
+            return self._evaluator_config_prompt
+
+        await self._ensure_system_prompt_loaded()
+        prompt = (self.system_prompt or "").strip()
+        if prompt:
+            self._evaluator_config_prompt = prompt
+            self._evaluator_config_prompt_source = "agent_template_runtime"
+            return prompt
+
+        fallback = self._build_md_evaluator_fallback_prompt()
+        if fallback:
+            self._evaluator_config_prompt = fallback
+            self._evaluator_config_prompt_source = "md_prompt_fallback"
+            return fallback
+
+        self._evaluator_config_prompt = ""
+        self._evaluator_config_prompt_source = "missing"
+        return ""
+
+    def _format_evaluator_task_prompt(
+        self,
+        task_title: str,
+        sections: List[tuple[str, Any]],
+        output_schema: str,
+        task_notes: Optional[List[str]] = None,
+        config_prompt: str = "",
+    ) -> str:
+        parts: List[str] = []
+        if config_prompt:
+            parts.append(
+                "【Evaluator 配置规则】\n"
+                "以下内容来自 Agent Template 绑定的 md prompt / skills / writing-rules，是本次评估的稳定规则来源。\n"
+                f"{config_prompt}"
+            )
+
+        parts.append(f"【当前任务】\n{task_title}")
+        for title, value in sections:
+            block = self._format_context_block(title, value)
+            if block:
+                parts.append(block)
+
+        if task_notes:
+            parts.append("【本次任务补充要求】\n" + "\n".join(f"- {note}" for note in task_notes if note))
+
+        parts.append(f"【输出 JSON Schema】\n{output_schema}")
+        return "\n\n".join(part for part in parts if part)
+
+    def _get_evaluator_config_metadata(self) -> Dict[str, Any]:
+        config_prompt = getattr(self, "_evaluator_config_prompt", "") or ""
+        return {
+            "config_prompt_source": getattr(self, "_evaluator_config_prompt_source", None),
+            "config_prompt_length": len(config_prompt),
+            "scenario": self.scenario,
         }
 
     def _format_context_block(self, title: str, value: Any, max_chars: Optional[int] = None) -> str:
@@ -196,33 +282,30 @@ class EvaluatorAgent(BaseAgent):
         workflow_context = "\n\n".join(block for block in context_blocks if block)
         direct_character_issues = self._direct_character_constraint_issues(input_data)
 
-        prompt = f"""你是章节质量评估员。请评估当前章节是否可以收尾，并判断是否通过质量门禁。
+        evaluator_config_prompt = await self._get_evaluator_config_prompt({
+            "task_type": "chapter_end",
+            "chapter_num": chapter_num,
+            "total_chapters": total_chapters,
+            "target_word_count": target_word_count,
+        })
 
-{workflow_context if workflow_context else '（未提供工作流上下文；只能根据正文保守评估）'}
-
-【硬性评估规则】
-- 必须以绑定章节大纲、固定设定、动态设定和项目/世界规则为依据，不得套用未提供的通用修真/玄幻规则。
-- 如果正文偏离绑定章节大纲、违反固定设定、缺少上游要求的角色/场景/伏笔，quality_passed 必须为 false。
-- 如果角色出场硬约束中的 mentioned_only_names / forbidden_direct_appearance_names 被写成当前场景的活人参与者、发言者或行动者，quality_passed 必须为 false。
-- 如果正文违反 category=character_setting 的角色来源、历史、身份或背景设定，quality_passed 必须为 false。
-- 如果提供了后续大纲参考，需要评估本章新增角色、伏笔、转折是否为后续剧情留出合理接口；若正文堵死后续大纲或提前替代后续章节事件，quality_passed 必须为 false。
-- 如果没有后续大纲参考，不应要求正文凭空服务不存在的后续大纲；只评估它是否按当前绑定大纲推进并留下合理的轻量可持续空间。
-- 如果正文出现首次正面出场的新命名次要角色，需要确认其来自已确认次要角色计划/character_candidates 或已落库角色；否则应要求先创建角色信息或改写为无名背景人物。
-- 集体讨论或场景演绎素材若引入未授权角色或违反角色状态，不能作为通过依据，必须指出并要求改写。
-- 字数需达到目标字数的 80%，且通常不超过目标字数的 125%；目标字数为 {target_word_count or '未提供'}。
-- 如果缺少必要上下文，应在 upstream_context_usage_check 中说明，不能凭空补设定。
-
-【当前章节数据】
-- 章节号：第 {chapter_num} 章 / 共 {total_chapters} 章
-- 已发生事件数量：{len(events)}
-- 事件列表：{events}
-- 埋设的伏笔：{hooks_planted}
-- 当前字数：{word_count}
-- 确定性角色约束预检问题：{direct_character_issues if direct_character_issues else '无'}
-- 章节内容：{chapter_content if chapter_content else '无'}
-
-请输出 JSON 格式：
-{{
+        prompt = self._format_evaluator_task_prompt(
+            "评估当前章节是否可以收尾，并判断是否通过质量门禁。",
+            [
+                ("工作流上下文", workflow_context if workflow_context else "（未提供工作流上下文；只能根据正文保守评估）"),
+                ("当前章节数据", {
+                    "chapter_num": chapter_num,
+                    "total_chapters": total_chapters,
+                    "events_count": len(events),
+                    "events": events,
+                    "hooks_planted": hooks_planted,
+                    "word_count": word_count,
+                    "target_word_count": target_word_count or None,
+                    "deterministic_character_constraint_issues": direct_character_issues,
+                    "chapter_content": chapter_content or "无",
+                }),
+            ],
+            output_schema=f"""{{
   "should_end": true/false,
   "quality_passed": true/false,
   "score": 0.0,
@@ -242,7 +325,13 @@ class EvaluatorAgent(BaseAgent):
   "long_term_check": {{"has_room_for_future": true/false, "note": "是否为后续剧情留有余地"}},
   "world_consistency_check": {{"is_consistent": true/false, "issues": ["世界观一致性问题"]}},
   "scores": {{"info_gain": 0.0, "suspense": 0.0, "pacing": 0.0, "completeness": 0.0, "world_consistency": 0.0}}
-}}"""
+}}""",
+            task_notes=[
+                "必须以 Agent Template / md prompt / writing-rules 中的门禁为准。",
+                "确定性角色约束预检问题必须作为阻断问题写入 character_participation_check。",
+            ],
+            config_prompt=evaluator_config_prompt,
+        )
 
         try:
             parsed = await self._call_structured(
@@ -289,6 +378,7 @@ class EvaluatorAgent(BaseAgent):
             return AgentResponse.strict(
                 structured_data=parsed_data,
                 schema_name="evaluator.chapter_end",
+                metadata=self._get_evaluator_config_metadata(),
             )
         except StructuredOutputError as e:
             logger.error(f"章节结束评估 structured 失败：{e}")
@@ -310,45 +400,29 @@ class EvaluatorAgent(BaseAgent):
         if not chapter_content:
             return AgentResponse(success=False, error="章节内容为空")
 
-        # 构建世界观部分
-        world_section = ""
-        if world_info:
-            world_section = f"""
-【世界观设定】
-世界：{world_info.get('name', '未知世界')}
-类型：{world_info.get('world_type', '奇幻')}
-基调：{world_info.get('tone', '正剧')}
-"""
+        evaluator_config_prompt = await self._get_evaluator_config_prompt({
+            "task_type": "reader_simulate",
+            "chapter_num": chapter_num,
+            "total_chapters": total_chapters,
+        })
 
-        prompt = f"""你是一名首次阅读的挑剔读者，正在阅读一部长篇网文。
-请对刚生成的章节进行评分。
-{world_section}
-【重要：长篇网文读者视角】
-- 当前是第 {chapter_num} 章，全书共 {total_chapters} 章
-- 作为读者，你希望看到可持续发展的剧情，而不是急于完结
-- 前期章节主要是建立世界观和角色，不需要太多高潮
-- 你希望看到伏笔和悬念，让你期待后续内容
-- 如果感觉"开头就是高潮，马上要大结局"，你会感到失望
-
-【章节信息】
-标题：{chapter_title}
-
-【章节内容】
-{chapter_content}
-
-【评分维度】（1-10 分）
-1. 开篇吸引力 - 开头是否抓人
-2. 节奏把控 - 快慢是否适中（不要过于急促）
-3. 悬念设置 - 是否有吸引人的悬念或伏笔
-4. 角色魅力 - 角色是否讨喜/有趣
-5. 情感共鸣 - 是否能引发情感波动
-6. 阅读流畅度 - 文字是否流畅
-7. 长篇期待感 - 是否让你想继续看后续内容
-8. 世界观沉浸 - 世界观是否有吸引力
-
-请输出 JSON 格式：
-{{
-    "scores": {{
+        prompt = self._format_evaluator_task_prompt(
+            "以首次阅读的挑剔长篇网文读者视角，对刚生成的章节进行评分。",
+            [
+                ("世界观设定", {
+                    "name": world_info.get("name", "未知世界") if isinstance(world_info, dict) else "未知世界",
+                    "world_type": world_info.get("world_type", "奇幻") if isinstance(world_info, dict) else "奇幻",
+                    "tone": world_info.get("tone", "正剧") if isinstance(world_info, dict) else "正剧",
+                } if world_info else None),
+                ("章节信息", {
+                    "chapter_title": chapter_title,
+                    "chapter_num": chapter_num,
+                    "total_chapters": total_chapters,
+                }),
+                ("章节内容", chapter_content),
+            ],
+            output_schema="""{
+    "scores": {
         "opening": 0,
         "pacing": 0,
         "suspense": 0,
@@ -357,19 +431,21 @@ class EvaluatorAgent(BaseAgent):
         "flow": 0,
         "long_term_appeal": 0,
         "world_immersion": 0
-    }},
+    },
     "overall": 0,
     "comments": "具体评价（尽可能详细）",
-    "detailed_analysis": {{
+    "detailed_analysis": {
         "opening_analysis": "开篇详细分析",
         "pacing_analysis": "节奏详细分析",
         "character_analysis": "角色表现详细分析",
         "world_building_analysis": "世界观呈现详细分析"
-    }},
+    },
     "suggestions": ["改进建议列表（详细）"],
     "long_term_feedback": "作为读者，对后续内容的期待或担忧（详细描述）",
     "world_feedback": "对世界观呈现的评价和期待（详细描述）"
-}}"""
+}""",
+            config_prompt=evaluator_config_prompt,
+        )
 
         try:
             parsed = await self._call_structured(
@@ -394,6 +470,7 @@ class EvaluatorAgent(BaseAgent):
             return AgentResponse.strict(
                 structured_data=result,
                 schema_name="evaluator.reader_simulate",
+                metadata=self._get_evaluator_config_metadata(),
             )
         except StructuredOutputError as e:
             logger.error(f"读者模拟评分 structured 失败：{e}")
@@ -423,36 +500,25 @@ class EvaluatorAgent(BaseAgent):
         Returns:
             AgentResponse: 审查结果
         """
-        forbidden_check = ""
-        if forbidden_words:
-            forbidden_check = f"- 禁用语：{', '.join(forbidden_words)}"
-
-        samples_text = "\n".join([f"- {s}" for s in voice_samples])
-
-        prompt = f"""你是角色一致性审查员。请检查生成的台词是否符合角色设定。
-
-【角色信息】
-- 姓名：{character_name}
-- 性格特质：{', '.join(character_traits)}
-{forbidden_check}
-- 典型台词样本：
-{samples_text}
-
-【待审查台词】
-"{dialogue}"
-
-【审查标准】
-1. 是否使用了禁用语
-2. 是否符合角色语言风格
-3. 与典型台词样本的语义相似度
-
-请输出 JSON 格式：
-{{
+        prompt = self._format_evaluator_task_prompt(
+            "检查生成的台词是否符合角色设定、禁用语和典型台词样本。",
+            [
+                ("角色信息", {
+                    "name": character_name,
+                    "traits": character_traits,
+                    "forbidden_words": forbidden_words or [],
+                    "voice_samples": voice_samples,
+                }),
+                ("待审查台词", dialogue),
+            ],
+            output_schema="""{
     "is_ooc": true/false,
     "confidence": 0.0-1.0,
     "issues": ["问题列表"],
     "suggestion": "修改建议（如有）"
-}}"""
+}""",
+            config_prompt=await self._get_evaluator_config_prompt({"task_type": "ooc_review"}),
+        )
 
         try:
             parsed = await self._call_structured(
@@ -464,6 +530,7 @@ class EvaluatorAgent(BaseAgent):
             return AgentResponse.strict(
                 structured_data=parsed.model_dump(),
                 schema_name="evaluator.ooc",
+                metadata=self._get_evaluator_config_metadata(),
             )
         except StructuredOutputError as e:
             logger.error(f"OOC 审查 structured 失败：{e}")

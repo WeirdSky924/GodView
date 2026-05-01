@@ -41,6 +41,7 @@ class SkillRetrievalRequest(BaseModel):
     top_k: int = Field(default=5, ge=1, le=20, description="返回候选数量")
     min_similarity: float = Field(default=0.3, ge=0.0, le=1.0, description="最小相似度阈值")
     use_llm_decision: bool = Field(default=True, description="是否使用 LLM 决策")
+    scenario: Optional[str] = Field(default=None, description="Agent 使用场景")
 
 
 class SkillDecisionResult(BaseModel):
@@ -229,7 +230,7 @@ async def assign_skill(dto: AssignSkillDTO):
     service = get_skill_service()
 
     try:
-        assignment = await service.assign_skill_to_agent(dto)
+        assignment = await service.assign_skill(dto)
         return assignment
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -341,18 +342,22 @@ async def get_skills_stats():
 # ==================== Agent 类型 Skills ====================
 
 @router.get("/agents/{agent_type}/skills", response_model=List[Skill])
-async def get_agent_type_skills(agent_type: str):
+async def get_agent_type_skills(
+    agent_type: str,
+    scenario: Optional[str] = Query(default=None, description="Agent 使用场景"),
+):
     """
     获取 Agent 模板的所有可用 Skills
 
     Args:
         agent_type: Agent 类型
+        scenario: Agent 使用场景
 
     Returns:
         List: Agent 可用的 Skill 列表
     """
     service = get_skill_service()
-    return await service.get_skills_for_agent_type(agent_type)
+    return await service.get_skills_for_agent_type(agent_type, scenario)
 
 
 # ==================== 类别和类型 ====================
@@ -434,6 +439,7 @@ async def retrieve_skills_intelligently(request: SkillRetrievalRequest):
             agent_type=request.agent_type,
             top_k=request.top_k,
             min_similarity=request.min_similarity,
+            scenario=request.scenario,
         )
 
         # 构建响应
@@ -487,6 +493,7 @@ async def retrieve_skills_for_agent(
     query: str = Query(..., description="场景描述/用户指令"),
     top_k: int = Query(default=5, ge=1, le=20),
     min_similarity: float = Query(default=0.3, ge=0.0, le=1.0),
+    scenario: Optional[str] = Query(default=None, description="Agent 使用场景"),
 ):
     """
     为指定 Agent 智能检索 Skills
@@ -507,6 +514,7 @@ async def retrieve_skills_for_agent(
         agent_type=agent_type,
         top_k=top_k,
         min_similarity=min_similarity,
+        scenario=scenario,
     )
     return await retrieve_skills_intelligently(request)
 
@@ -515,7 +523,7 @@ async def retrieve_skills_for_agent(
 async def build_agent_prompt_with_skills(
     agent_type: str,
     query: str = Body(..., embed=True, description="场景描述"),
-    project_id: Optional[str] = Body(default=None, embed=True),
+    scenario: Optional[str] = Body(default=None, embed=True),
     use_intelligent_retrieval: bool = Body(default=True, embed=True),
 ):
     """
@@ -540,6 +548,7 @@ async def build_agent_prompt_with_skills(
             agent_type=agent_type,
             project_id=project_id,
             context_query=query,
+            scenario=scenario,
             use_intelligent_retrieval=use_intelligent_retrieval,
         )
 
@@ -548,6 +557,7 @@ async def build_agent_prompt_with_skills(
             agent_type=agent_type,
             project_id=project_id,
             context_query=query,
+            scenario=scenario,
             use_intelligent_retrieval=use_intelligent_retrieval,
         )
 
@@ -591,6 +601,7 @@ class OrchestrateRequest(BaseModel):
     agent_type: str = Field(..., description="Agent 类型")
     initial_params: Optional[Dict[str, Any]] = Field(default=None, description="初始参数")
     max_iterations: int = Field(default=10, ge=1, le=50, description="最大迭代次数")
+    scenario: Optional[str] = Field(default=None, description="Agent 使用场景")
 
 
 class OrchestrateResponse(BaseModel):
@@ -632,6 +643,7 @@ async def orchestrate_skills(request: OrchestrateRequest):
             goal=request.goal,
             initial_params=request.initial_params,
             max_iterations=request.max_iterations,
+            scenario=request.scenario,
         )
 
         # 构建响应
@@ -679,6 +691,7 @@ async def execute_chapter_writing_workflow(
     target_words: int = Body(default=3000, ge=500, le=50000, description="目标字数"),
     chapter_outline: Optional[str] = Body(default=None, description="章节大纲（可选）"),
     agent_type: str = Body(default="writer", description="Agent 类型"),
+    scenario: Optional[str] = Body(default="workflow_chapter_generation", description="Agent 使用场景"),
 ):
     """
     执行章节写作工作流
@@ -731,6 +744,7 @@ async def execute_chapter_writing_workflow(
             goal=goal,
             initial_params=initial_params,
             max_iterations=20,  # 章节写作可能需要更多迭代
+            scenario=scenario,
         )
 
         # 获取最终内容

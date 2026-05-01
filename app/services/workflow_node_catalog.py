@@ -16,6 +16,7 @@ SYSTEM_AGENT_NODE_CATALOG: List[Dict[str, Any]] = [
     {
         "type": NodeType.AGENT.value,
         "agent_type": AgentType.SETTING.value,
+        "scenario": "workflow_context",
         "label": "设定 Agent",
         "description": "按当前节点输入检索并传输相关已有设定",
         "category": "agent",
@@ -26,6 +27,7 @@ SYSTEM_AGENT_NODE_CATALOG: List[Dict[str, Any]] = [
     {
         "type": NodeType.AGENT.value,
         "agent_type": AgentType.WRITER.value,
+        "scenario": "workflow_chapter_generation",
         "label": "作家 Agent",
         "description": "生成小说内容",
         "category": "agent",
@@ -36,6 +38,7 @@ SYSTEM_AGENT_NODE_CATALOG: List[Dict[str, Any]] = [
     {
         "type": NodeType.AGENT.value,
         "agent_type": AgentType.MASTER_PLOTTER.value,
+        "scenario": "workflow_plot_planning",
         "label": "总编剧 Agent",
         "description": "规划整体剧情结构",
         "category": "agent",
@@ -56,6 +59,7 @@ SYSTEM_AGENT_NODE_CATALOG: List[Dict[str, Any]] = [
     {
         "type": NodeType.AGENT.value,
         "agent_type": AgentType.SUMMARIZER.value,
+        "scenario": "workflow_summary",
         "label": "摘要 Agent",
         "description": "生成内容摘要",
         "category": "agent",
@@ -66,6 +70,7 @@ SYSTEM_AGENT_NODE_CATALOG: List[Dict[str, Any]] = [
     {
         "type": NodeType.AGENT.value,
         "agent_type": AgentType.EVALUATOR.value,
+        "scenario": "chapter_quality_review",
         "label": "评估 Agent",
         "description": "评估内容质量",
         "category": "agent",
@@ -76,6 +81,7 @@ SYSTEM_AGENT_NODE_CATALOG: List[Dict[str, Any]] = [
     {
         "type": NodeType.AGENT.value,
         "agent_type": AgentType.HOOK_MANAGER.value,
+        "scenario": "workflow_hook_management",
         "label": "伏笔 Agent",
         "description": "管理伏笔和悬念",
         "category": "agent",
@@ -86,6 +92,7 @@ SYSTEM_AGENT_NODE_CATALOG: List[Dict[str, Any]] = [
     {
         "type": NodeType.AGENT.value,
         "agent_type": AgentType.EVENT_GENERATOR.value,
+        "scenario": "event_generation",
         "label": "事件 Agent",
         "description": "生成随机事件",
         "category": "agent",
@@ -96,6 +103,7 @@ SYSTEM_AGENT_NODE_CATALOG: List[Dict[str, Any]] = [
     {
         "type": NodeType.AGENT.value,
         "agent_type": AgentType.WORLD_MAP_MANAGER.value,
+        "scenario": "world_map_management",
         "label": "地图 Agent",
         "description": "管理世界地图和地点",
         "category": "agent",
@@ -106,6 +114,7 @@ SYSTEM_AGENT_NODE_CATALOG: List[Dict[str, Any]] = [
     {
         "type": NodeType.AGENT.value,
         "agent_type": AgentType.PROC_GEN.value,
+        "scenario": "procedural_generation",
         "label": "过程生成 Agent",
         "description": "过程化生成内容",
         "category": "agent",
@@ -116,6 +125,7 @@ SYSTEM_AGENT_NODE_CATALOG: List[Dict[str, Any]] = [
     {
         "type": NodeType.AGENT.value,
         "agent_type": AgentType.DUNGEON_GENERATOR.value,
+        "scenario": "dungeon_generation",
         "label": "副本生成 Agent",
         "description": "生成副本和关卡",
         "category": "agent",
@@ -126,6 +136,7 @@ SYSTEM_AGENT_NODE_CATALOG: List[Dict[str, Any]] = [
     {
         "type": NodeType.AGENT.value,
         "agent_type": AgentType.PLOT_OUTLINE.value,
+        "scenario": "generate_chapter_outline",
         "label": "章节大纲 Agent",
         "description": "优先输出已准备的章节大纲，缺失时兜底生成",
         "category": "agent",
@@ -227,7 +238,11 @@ async def resolve_disabled_agent_types(project_id: Optional[str], db: Any) -> se
                 agent_type = node.get("agent_type")
                 if not agent_type:
                     continue
-                runtime_state = await config_service.resolve_agent_runtime_state(project_id, agent_type)
+                runtime_state = await config_service.resolve_agent_runtime_state(
+                    project_id,
+                    agent_type,
+                    node.get("scenario"),
+                )
                 if runtime_state.get("enabled") is False:
                     disabled_agent_types.add(agent_type)
         else:

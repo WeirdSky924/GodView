@@ -192,6 +192,7 @@ class PlotOutlineService:
                 agent_type="plot_outline",
                 project_id=project_id,
                 include_skills=True,
+                scenario="generate_chapter_outline",
             )
         except Exception as e:
             logger.warning(f"加载 plot_outline prompt 模板失败: {e}，使用默认 prompt")
@@ -245,18 +246,31 @@ class PlotOutlineService:
         if cached is not None:
             return cached
 
+        content = self._load_md_prompt_content("plot_outline_output")
+        if content:
+            return self._cache_entry(self._output_format_cache, cache_key, content)
+
+        return self._cache_entry(self._output_format_cache, cache_key, self._get_simple_output_format())
+
+    def _load_md_prompt_content(self, prompt_id: str) -> str:
         try:
             from app.services.md_file_service import get_md_file_service
             md_service = get_md_file_service()
-            prompt = md_service.get_prompt("plot_outline_output")
+            prompt = md_service.get_prompt(prompt_id)
             if prompt:
                 content = prompt.get("content") or prompt.get("raw_content") or ""
                 if content:
-                    return self._cache_entry(self._output_format_cache, cache_key, content.strip())
+                    return content.strip()
         except Exception as e:
-            logger.warning(f"加载 plot_outline_output prompt 失败: {e}")
+            logger.warning(f"加载 {prompt_id} prompt 失败: {e}")
 
-        return self._cache_entry(self._output_format_cache, cache_key, self._get_simple_output_format())
+        return ""
+
+    def _build_md_plot_outline_fallback_prompt(self) -> str:
+        """从 md prompt 资产构建 plot_outline 备用 prompt。"""
+        prompt_ids = ["role_plot_outline", "function_plot_outline", "plot_outline_output"]
+        parts = [content for prompt_id in prompt_ids if (content := self._load_md_prompt_content(prompt_id))]
+        return "\n\n".join(parts).strip()
 
     def _build_combined_context(self, context_str: str, user_context: str) -> str:
         if not context_str:
@@ -1301,6 +1315,7 @@ class PlotOutlineService:
                 agent_type="plot_outline",
                 project_id=project_id,
                 include_skills=True,
+                scenario="generate_chapter_outline",
             )
         except Exception as e:
             logger.warning(f"加载 plot_outline prompt 模板失败: {e}")
@@ -2037,7 +2052,12 @@ class PlotOutlineService:
 规则：必须输出完整 JSON，不要省略字段。"""
 
     def _build_fallback_prompt(self) -> str:
-        """构建备用 prompt（当数据库模板加载失败时使用）"""
+        """构建备用 prompt（优先使用 prompts/**/*.md 资产）。"""
+        md_prompt = self._build_md_plot_outline_fallback_prompt()
+        if md_prompt:
+            return md_prompt
+
+        logger.warning("plot_outline md prompt 资产不可用，使用 deprecated 硬编码备用 prompt")
         return """你是专业的章节大纲规划助手（Plot Outline Agent）。
 
 你的职责是帮助用户规划章节结构和场景设计，设计情绪曲线和节奏控制，管理章节目标、伏笔埋设和回收。
