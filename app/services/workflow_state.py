@@ -52,6 +52,12 @@ RUNTIME_STATE_KEYS = {
     "scene_integration_plan",
     "performance_result",
     "evaluation_feedback",
+    "resource_requirements",
+    "role_delta_resource_requirements",
+    "pending_resource_requirements",
+    "workflow_resource_requirements",
+    "latest_resource_requirements",
+    "latest_role_delta_resource_requirements",
 }
 
 ASSET_STATE_KEYS = {
@@ -66,6 +72,7 @@ ASSET_STATE_KEYS = {
     "event_persistence_state",
     "location_persistence_state",
     "asset_persistence_state",
+    "resource_requirement_persistence_state",
     "persisted_asset_refs",
 }
 

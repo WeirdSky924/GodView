@@ -61,6 +61,16 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 
+class ChapterReadinessBlockedError(ValueError):
+    """章节存在未解决 blocking 资源需求，禁止启动生成工作流。"""
+
+    def __init__(self, payload: Dict[str, Any]):
+        self.payload = payload
+        chapter_num = payload.get("chapter_num")
+        blocking_count = len(payload.get("blocking_requirements") or [])
+        super().__init__(f"第 {chapter_num or '未知'} 章资源未就绪，存在 {blocking_count} 个 blocking 需求")
+
+
 class WorkflowEngine:
     """工作流执行引擎"""
 
@@ -939,6 +949,8 @@ class WorkflowEngine:
         if db:
             if context.get("chapter_outline"):
                 explicit_outline = self._ensure_context_dict(context.get("chapter_outline"))
+                if explicit_outline.get("id") and not context.get("chapter_outline_id"):
+                    context["chapter_outline_id"] = str(explicit_outline.get("id"))
                 context.setdefault("chapter_title", explicit_outline.get("title", f"第{context.get('chapter_num')}章"))
                 context.setdefault("chapter_summary", explicit_outline.get("summary", ""))
                 outline_target_word_count = explicit_outline.get("target_word_count")
@@ -958,6 +970,8 @@ class WorkflowEngine:
                     )
                     if outline:
                         context["chapter_outline"] = outline
+                        if outline.get("id") and not context.get("chapter_outline_id"):
+                            context["chapter_outline_id"] = str(outline.get("id"))
                         context["chapter_title"] = outline.get("title", f"第{context.get('chapter_num')}章")
                         context["chapter_summary"] = outline.get("summary", "")
                         outline_target_word_count = outline.get("target_word_count")
@@ -971,6 +985,22 @@ class WorkflowEngine:
                         logger.warning(f"未找到第 {context.get('chapter_num')} 章大纲，将由大纲Agent生成")
                 except Exception as e:
                     logger.warning(f"加载章节大纲失败: {e}")
+
+        try:
+            readiness_context = await self._check_chapter_resource_readiness(project_id, context, db)
+        except ChapterReadinessBlockedError as exc:
+            if operation and db:
+                operation_service = OperationLifecycleService(db=db, redis=redis_service)
+                await operation_service.fail(
+                    operation,
+                    str(exc),
+                    {"blocked": True, **exc.payload},
+                )
+            raise
+        if readiness_context:
+            context["chapter_resource_readiness"] = readiness_context.get("readiness")
+            if readiness_context.get("advisory_requirements"):
+                context["chapter_resource_readiness_warnings"] = readiness_context["advisory_requirements"]
 
         trace_service = get_trace_service(db)
         trace_id = str(operation.get("trace_id")) if operation and operation.get("trace_id") else str(uuid.uuid4())
@@ -1762,6 +1792,17 @@ class WorkflowEngine:
             "asset_state",
             "state_transitions",
             "context_propagation_trace",
+            "role_performance_context",
+            "public_performances",
+            "private_performances",
+            "relationship_deltas",
+            "state_deltas",
+            "continuity_notes",
+            "performance_warnings",
+            "role_performance_gate",
+            "role_performance_gate_passed",
+            "role_performance_gate_blockers",
+            "role_performance_gate_warnings",
         ]
         snapshot = {
             key: source_context.get(key)
@@ -2093,6 +2134,137 @@ class WorkflowEngine:
             "output_schema_name": schema_name,
             "output_schema_version": schema_version,
         }
+
+    def _normalize_workflow_resource_requirements(
+        self,
+        output: Any,
+        execution: WorkflowExecution,
+        node: WorkflowNode,
+    ) -> Dict[str, Any]:
+        """归一化节点输出中的资源需求建议，仅写入工作流运行期上下文。"""
+        if not isinstance(output, dict):
+            return {}
+
+        raw_requirements: List[tuple[str, Any]] = []
+        for key in ("resource_requirements", "role_delta_resource_requirements"):
+            for item in self._ensure_context_list(output.get(key)):
+                raw_requirements.append((key, item))
+
+        if not raw_requirements:
+            return {}
+
+        existing = self._ensure_context_list(execution.context.get("pending_resource_requirements"))
+        normalized: List[Dict[str, Any]] = [item for item in existing if isinstance(item, dict)]
+        seen: set[tuple[str, str, str, str]] = set()
+        for item in normalized:
+            seen.add((
+                str(item.get("requirement_type") or "").strip(),
+                str(item.get("resource_name") or "").strip(),
+                str(item.get("reason") or "").strip(),
+                str(item.get("source_node_id") or "").strip(),
+            ))
+
+        latest_all: List[Dict[str, Any]] = []
+        latest_role_delta: List[Dict[str, Any]] = []
+        valid_severities = {"blocking", "advisory", "optional"}
+
+        for source_key, requirement in raw_requirements:
+            if not isinstance(requirement, dict):
+                continue
+
+            requirement_type = str(requirement.get("requirement_type") or "").strip()
+            resource_name = str(requirement.get("resource_name") or requirement.get("name") or "").strip()
+            reason = str(requirement.get("reason") or requirement.get("description") or "").strip()
+            if not requirement_type or not resource_name:
+                continue
+
+            severity = str(requirement.get("severity") or "advisory").strip().lower()
+            if severity not in valid_severities:
+                severity = "advisory"
+
+            normalized_item = dict(requirement)
+            normalized_item.update({
+                "requirement_type": requirement_type,
+                "resource_name": resource_name,
+                "severity": severity,
+                "status": str(requirement.get("status") or "pending").strip() or "pending",
+                "reason": reason,
+                "source_agent": requirement.get("source_agent") or node.agent_type or node.node_type.value,
+                "source_field": source_key,
+                "source_node_id": node.id,
+                "source_node_label": node.label,
+                "source_execution_id": execution.id,
+                "project_id": execution.project_id,
+            })
+            if execution.context.get("chapter_num") is not None:
+                normalized_item.setdefault("chapter_num", execution.context.get("chapter_num"))
+            if execution.context.get("chapter_outline_id") is not None:
+                normalized_item.setdefault("chapter_outline_id", execution.context.get("chapter_outline_id"))
+            normalized_item.setdefault("suggested_payload", {})
+
+            fingerprint = (requirement_type, resource_name, reason, node.id)
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            normalized.append(normalized_item)
+            latest_all.append(normalized_item)
+            if source_key == "role_delta_resource_requirements":
+                latest_role_delta.append(normalized_item)
+
+        if not latest_all:
+            return {}
+
+        updates: Dict[str, Any] = {
+            "pending_resource_requirements": normalized,
+            "workflow_resource_requirements": normalized,
+            "latest_resource_requirements": latest_all,
+        }
+        if latest_role_delta:
+            updates["latest_role_delta_resource_requirements"] = latest_role_delta
+        return updates
+
+    async def _persist_workflow_resource_requirements(
+        self,
+        requirements: List[Dict[str, Any]],
+        execution: WorkflowExecution,
+        db,
+    ) -> Dict[str, Any]:
+        """把运行期资源需求落库，并刷新章节 readiness；不修改大纲或资源本体。"""
+        if not db or not requirements or not hasattr(db, "save_outline_resource_requirements"):
+            return {}
+
+        saved_ids = await db.save_outline_resource_requirements(requirements)
+        readiness_by_chapter: Dict[str, Any] = {}
+        if hasattr(db, "update_chapter_resource_readiness"):
+            seen_chapters: set[tuple[Optional[str], Optional[int]]] = set()
+            for requirement in requirements:
+                outline_id = requirement.get("outline_id") or requirement.get("chapter_outline_id")
+                chapter_num = self._parse_chapter_number(requirement.get("chapter_num") or requirement.get("chapter_number"))
+                if chapter_num is None:
+                    continue
+                key = (str(outline_id) if outline_id else None, chapter_num)
+                if key in seen_chapters:
+                    continue
+                seen_chapters.add(key)
+                readiness = await db.update_chapter_resource_readiness(
+                    execution.project_id,
+                    outline_id=str(outline_id) if outline_id else None,
+                    chapter_num=chapter_num,
+                )
+                if readiness:
+                    readiness_by_chapter[f"{outline_id or 'none'}:{chapter_num}"] = readiness
+
+        persistence_state = {
+            "saved_requirement_ids": saved_ids,
+            "saved_count": len(saved_ids),
+            "readiness_by_chapter": readiness_by_chapter,
+            "source": "workflow_resource_requirements",
+        }
+        get_workflow_state(execution).set_asset_state(
+            {"resource_requirement_persistence_state": persistence_state},
+            source="workflow_resource_requirement_persistence",
+        )
+        return persistence_state
 
     async def _process_node_outputs(
         self,
@@ -2577,11 +2749,27 @@ class WorkflowEngine:
             if actual_node_type == NodeType.CONDITION and isinstance(safe_output, dict) and "quality_passed" in safe_output:
                 execution.context["evaluation_passed"] = safe_output["quality_passed"]
 
+            resource_requirement_updates = self._normalize_workflow_resource_requirements(
+                safe_output,
+                execution,
+                node,
+            )
+            if resource_requirement_updates and db:
+                persisted_state = await self._persist_workflow_resource_requirements(
+                    resource_requirement_updates.get("latest_resource_requirements", []),
+                    execution,
+                    db,
+                )
+                if persisted_state:
+                    resource_requirement_updates["resource_requirement_persistence_state"] = persisted_state
+
             # ========== 根据节点 outputs 配置处理输出 ==========
             if node.outputs:
                 # 使用配置处理输出
                 processed_output = await self._process_node_outputs(node, safe_output, execution, db)
                 processed_output = self._make_json_safe(processed_output)
+                if resource_requirement_updates:
+                    processed_output.update(self._make_json_safe(resource_requirement_updates))
                 state_update = get_workflow_state(execution).merge_runtime_state(
                     processed_output,
                     source=f"node_outputs:{node.id}",
@@ -2590,8 +2778,11 @@ class WorkflowEngine:
                 logger.info(f"节点 '{node.label}' 根据 outputs 配置处理了 {len(node.outputs)} 个输出")
             elif isinstance(safe_output, dict):
                 # 向后兼容：输出写入运行期状态，保护 canonical/retrieved 状态不被普通节点覆盖
+                runtime_output = dict(safe_output)
+                if resource_requirement_updates:
+                    runtime_output.update(self._make_json_safe(resource_requirement_updates))
                 state_update = get_workflow_state(execution).merge_runtime_state(
-                    safe_output,
+                    runtime_output,
                     source=f"node_output:{node.id}",
                 )
                 context_updates = list(state_update.get("allowed_updates", {}).keys())
@@ -3538,6 +3729,24 @@ class WorkflowEngine:
                     "chapter_title",
                     "scene_directions",
                     "performance_result",
+                    "role_performance_context",
+                    "public_performances",
+                    "private_performances",
+                    "relationship_deltas",
+                    "state_deltas",
+                    "continuity_notes",
+                    "performance_warnings",
+                    "role_performance_gate",
+                    "role_performance_gate_passed",
+                    "role_performance_gate_blockers",
+                    "role_performance_gate_warnings",
+                    "resource_requirements",
+                    "role_delta_resource_requirements",
+                    "pending_resource_requirements",
+                    "workflow_resource_requirements",
+                    "latest_resource_requirements",
+                    "latest_role_delta_resource_requirements",
+                    "resource_requirement_persistence_state",
                     "writing_plan",
                     "plot_guidance",
                     "scene_integration_plan",
@@ -3552,6 +3761,9 @@ class WorkflowEngine:
                 ]:
                     if execution.context.get(workflow_key) is not None and workflow_key not in context:
                         context[workflow_key] = execution.context.get(workflow_key)
+
+                if agent_type in {"writer", "master_plotter", "plotter", "evaluator", "summarizer"}:
+                    self._attach_role_performance_context(context, execution.context)
 
                 if agent_type in {"writer", "master_plotter", "plotter", "evaluator"}:
                     self._inject_character_constraints(context)
@@ -3574,6 +3786,7 @@ class WorkflowEngine:
 
             # ===== Summarizer Agent：需要章节历史、事件 =====
             if agent_type == "summarizer":
+                self._attach_role_performance_context(context, execution.context)
                 if "all_chapters" not in context:
                     chapters = await db.get_chapters_by_project(project_id) if hasattr(db, 'get_chapters_by_project') else []
                     if chapters:
@@ -3639,13 +3852,31 @@ class WorkflowEngine:
                     "writing_plan",
                     "plot_guidance",
                     "scene_integration_plan",
+                    "resource_requirements",
+                    "role_delta_resource_requirements",
+                    "pending_resource_requirements",
+                    "workflow_resource_requirements",
+                    "latest_resource_requirements",
+                    "latest_role_delta_resource_requirements",
+                    "resource_requirement_persistence_state",
                     "fixed_lore_entries",
                     "dynamic_lore_entries",
                     "selected_lore_entries",
                     "upcoming_outline_context",
                     "upcoming_outline_policy",
+                    "performance_result",
+                    "role_performance_context",
+                    "public_performances",
+                    "private_performances",
+                    "relationship_deltas",
+                    "state_deltas",
+                    "continuity_notes",
+                    "performance_warnings",
+                    "role_performance_gate",
+                    "role_performance_gate_passed",
+                    "role_performance_gate_blockers",
+                    "role_performance_gate_warnings",
                     "participation_trace",
-                    "participation_warnings",
                     "map_persistence_state",
                     "asset_persistence_state",
                     "saved_region_ids",
@@ -3657,6 +3888,8 @@ class WorkflowEngine:
                 ]:
                     if execution.context.get(workflow_key) is not None and workflow_key not in context:
                         context[workflow_key] = execution.context.get(workflow_key)
+
+                self._attach_role_performance_context(context, execution.context)
 
                 target_word_count = (
                     context.get("target_word_count")
@@ -3713,6 +3946,20 @@ class WorkflowEngine:
                         context["existing_hooks"] = hooks
                         execution.context["existing_hooks"] = hooks
                         logger.info(f"加载 {len(hooks)} 个伏笔到编剧上下文（plotter）")
+
+                self._attach_role_performance_context(context, execution.context)
+
+                for workflow_key in [
+                    "resource_requirements",
+                    "role_delta_resource_requirements",
+                    "pending_resource_requirements",
+                    "workflow_resource_requirements",
+                    "latest_resource_requirements",
+                    "latest_role_delta_resource_requirements",
+                    "resource_requirement_persistence_state",
+                ]:
+                    if execution.context.get(workflow_key) is not None and workflow_key not in context:
+                        context[workflow_key] = execution.context.get(workflow_key)
 
                 # 讨论历史：从执行上下文获取之前的讨论记录
                 discussion_history = self._ensure_context_list(execution.context.get("discussion_history", []))
@@ -3904,7 +4151,9 @@ class WorkflowEngine:
                     dialogue = data.get("dialogue", data.get("content", ""))
                     emotion = data.get("emotion", data.get("mood", ""))
                     action = data.get("action", "")
-                    inner_thought = data.get("inner_thought", "")
+
+                    public_content = data.get("public_content") or " ".join(part for part in [f"（{action}）" if action else "", dialogue] if part)
+                    private_thought = data.get("private_thought") or data.get("inner_thought", "")
 
                     aggregated_outputs.append({
                         "character": character_name,
@@ -3913,19 +4162,40 @@ class WorkflowEngine:
                         **data,
                     })
 
-                    if dialogue:
+                    if public_content:
                         aggregated_dialogues.append({
                             "character": character_name,
                             "dialogue": dialogue,
+                            "content": public_content,
+                            "public_content": public_content,
                             "emotion": emotion,
                             "action": action,
-                            "inner_thought": inner_thought,
                         })
-                        full_content_parts.append(f"【{character_name}】{dialogue}")
+                        full_content_parts.append(f"【{character_name}】{public_content}")
                         execution.context.setdefault("character_dialogues", []).append({
                             "character": character_name,
-                            "dialogue": dialogue,
+                            "dialogue": public_content,
                         })
+
+                    if private_thought or data.get("intent") or data.get("withheld_information"):
+                        execution.context.setdefault("private_performances", []).append({
+                            "agent": character_name,
+                            "private_thought": private_thought,
+                            "intent": data.get("intent", ""),
+                            "withheld_information": data.get("withheld_information", []),
+                            "misinterpretations": data.get("misinterpretations", []),
+                        })
+
+                    for delta in data.get("relationship_delta", []) or []:
+                        if isinstance(delta, dict):
+                            execution.context.setdefault("relationship_deltas", []).append({"source_character": character_name, **delta})
+                    for delta in data.get("state_delta", []) or []:
+                        if isinstance(delta, dict):
+                            execution.context.setdefault("state_deltas", []).append({"source_character": character_name, **delta})
+                    for note in data.get("continuity_notes", []) or []:
+                        execution.context.setdefault("continuity_notes", []).append({"source_character": character_name, "note": note})
+                    for warning in data.get("warnings", []) or []:
+                        execution.context.setdefault("performance_warnings", []).append({"source_character": character_name, "warning": warning})
 
                     if emotion:
                         aggregated_moods[character_name] = emotion
@@ -3977,6 +4247,22 @@ class WorkflowEngine:
                     except Exception as e:
                         logger.warning(f"保存多 Agent 子实例记忆失败: {sub_agent_name}, error={e}")
 
+            role_context_source = {
+                "private_performances": execution.context.get("private_performances", []),
+                "relationship_deltas": execution.context.get("relationship_deltas", []),
+                "state_deltas": execution.context.get("state_deltas", []),
+                "continuity_notes": execution.context.get("continuity_notes", []),
+                "performance_warnings": execution.context.get("performance_warnings", []),
+                "full_content": "\n".join(full_content_parts),
+            }
+            role_gate = self._build_role_performance_gate(role_context_source, execution.context)
+            role_context_source.update({
+                "role_performance_gate": role_gate,
+                "role_performance_gate_passed": role_gate.get("passed", False),
+                "role_performance_gate_blockers": role_gate.get("blockers", []),
+                "role_performance_gate_warnings": role_gate.get("warnings", []),
+            })
+            role_context = self._extract_role_performance_context(role_context_source)
             result_payload = {
                 "outputs": aggregated_outputs,
                 "dialogues": aggregated_dialogues,
@@ -3984,7 +4270,10 @@ class WorkflowEngine:
                 "full_content": "\n".join(full_content_parts),
                 "success_count": len([item for item in aggregated_outputs if item.get("success")]),
                 "error_count": len(errors),
+                **role_context,
             }
+            if role_context:
+                result_payload["role_performance_context"] = role_context
             if errors:
                 result_payload["errors"] = errors
             return result_payload, None, None
@@ -5839,15 +6128,254 @@ class WorkflowEngine:
             "previous_node_output": previous_node_output,
         }
 
+    def _extract_role_performance_context(
+        self,
+        performance_result: Any,
+    ) -> Dict[str, Any]:
+        """提取场景演绎的公开/私有分层上下文，供后续节点消费。"""
+        result = self._ensure_context_dict(performance_result)
+        if not result:
+            return {}
+
+        extracted: Dict[str, Any] = {}
+        for key in (
+            "public_performances",
+            "private_performances",
+            "relationship_deltas",
+            "state_deltas",
+            "continuity_notes",
+            "performance_warnings",
+            "role_performance_gate",
+            "role_performance_gate_passed",
+            "role_performance_gate_blockers",
+            "role_performance_gate_warnings",
+        ):
+            value = result.get(key)
+            if value:
+                extracted[key] = value
+
+        if result.get("full_content"):
+            extracted["last_performance_content"] = result.get("full_content")
+        if result.get("summary"):
+            extracted["last_performance_summary"] = result.get("summary")
+        if result.get("scene_directions"):
+            extracted["last_scene_directions"] = result.get("scene_directions")
+
+        return extracted
+
+    def _build_role_performance_gate(
+        self,
+        performance_result: Dict[str, Any],
+        source_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """确定性检查角色演绎素材的公开/私有边界和出场约束。"""
+        source_context = source_context or {}
+        constraints_context = dict(source_context)
+        if performance_result.get("scene_directions"):
+            constraints_context["scene_directions"] = performance_result.get("scene_directions")
+        constraints = self._build_character_constraint_state(constraints_context)
+
+        public_performances = self._ensure_context_list(performance_result.get("public_performances"))
+        if not public_performances:
+            public_performances = self._ensure_context_list(performance_result.get("performances"))
+        private_performances = self._ensure_context_list(performance_result.get("private_performances"))
+        relationship_deltas = self._ensure_context_list(performance_result.get("relationship_deltas"))
+        state_deltas = self._ensure_context_list(performance_result.get("state_deltas"))
+        performance_warnings = self._ensure_context_list(performance_result.get("performance_warnings"))
+
+        blockers: List[str] = []
+        warnings: List[str] = []
+        checks = {
+            "private_leakage": [],
+            "forbidden_participation": [],
+            "performance_warnings": [],
+            "delta_schema": [],
+        }
+
+        public_text = "\n".join(
+            str(item.get("public_content") or item.get("content") or item.get("dialogue") or "")
+            for item in public_performances
+            if isinstance(item, dict)
+        )
+        public_text += "\n" + str(performance_result.get("full_content") or "")
+
+        private_fragments: List[Dict[str, str]] = []
+        for item in private_performances:
+            if not isinstance(item, dict):
+                continue
+            agent = str(item.get("agent") or item.get("source_character") or "未知角色")
+            for key in ("private_thought", "intent"):
+                value = str(item.get(key) or "").strip()
+                if len(value) >= 8:
+                    private_fragments.append({"agent": agent, "field": key, "value": value})
+            for private_key in ("withheld_information", "misinterpretations"):
+                for value in self._ensure_context_list(item.get(private_key)):
+                    text = str(value).strip()
+                    if len(text) >= 6:
+                        private_fragments.append({"agent": agent, "field": private_key, "value": text})
+
+        for fragment in private_fragments:
+            value = fragment["value"]
+            if value and value in public_text:
+                issue = f"私有演绎内容泄露到公开表演：{fragment['agent']}.{fragment['field']}"
+                blockers.append(issue)
+                checks["private_leakage"].append(issue)
+
+        for item in public_performances:
+            if not isinstance(item, dict):
+                continue
+            agent = str(item.get("agent") or item.get("character") or "未知角色")
+            for key in ("private_thought", "inner_thought", "intent", "withheld_information", "misinterpretations"):
+                raw_value = item.get(key)
+                values = self._ensure_context_list(raw_value) if isinstance(raw_value, (list, tuple)) else [raw_value]
+                for value in values:
+                    text = str(value or "").strip()
+                    if len(text) >= 6:
+                        issue = f"公开表演携带私有字段：{agent}.{key}"
+                        blockers.append(issue)
+                        checks["private_leakage"].append(issue)
+
+        forbidden_names = set(constraints.get("forbidden_direct_appearance_names") or [])
+        mentioned_names = set(constraints.get("mentioned_only_names") or [])
+        present_names = set(constraints.get("present_character_names") or [])
+        blocked_names = (forbidden_names | mentioned_names) - present_names
+        direct_markers = [
+            "说", "问", "答", "喊", "低声", "开口", "回应", "走", "站", "看", "伸手", "转身", "出现", "参与", "进入",
+            "dialogue", "said", "asked", "replied",
+        ]
+
+        for item in public_performances:
+            if not isinstance(item, dict):
+                continue
+            agent = str(item.get("agent") or item.get("character") or "")
+            content = str(item.get("public_content") or item.get("content") or item.get("dialogue") or "")
+            if agent and agent in blocked_names:
+                issue = f"不可正面出场角色 {agent} 被作为公开表演者输出"
+                blockers.append(issue)
+                checks["forbidden_participation"].append(issue)
+            for name in sorted(blocked_names, key=len, reverse=True):
+                if not name or name not in content:
+                    continue
+                idx = content.find(name)
+                snippet = content[max(0, idx - 20): idx + len(name) + 35]
+                if any(marker in snippet for marker in direct_markers):
+                    issue = f"不可正面出场角色 {name} 疑似被写成公开行动/发言者：{snippet}"
+                    blockers.append(issue)
+                    checks["forbidden_participation"].append(issue)
+                    break
+
+        for warning_item in performance_warnings:
+            warning_text = ""
+            if isinstance(warning_item, dict):
+                warning_text = str(warning_item.get("warning") or warning_item.get("message") or warning_item)
+            else:
+                warning_text = str(warning_item)
+            if not warning_text:
+                continue
+            checks["performance_warnings"].append(warning_text)
+            if any(keyword in warning_text for keyword in ("OOC", "信息越界", "出场越界", "缺资源", "未授权", "forbidden", "unavailable")):
+                blockers.append(f"角色演绎 warning 需阻断：{warning_text}")
+            else:
+                warnings.append(f"角色演绎 warning：{warning_text}")
+
+        valid_relationship_dimensions = {"trust", "fear", "suspicion", "debt", "affection", "hostility", "respect"}
+        for delta in relationship_deltas:
+            if not isinstance(delta, dict):
+                issue = f"relationship_delta 不是对象：{delta}"
+                warnings.append(issue)
+                checks["delta_schema"].append(issue)
+                continue
+            if not delta.get("target_character"):
+                issue = f"relationship_delta 缺少 target_character：{delta}"
+                warnings.append(issue)
+                checks["delta_schema"].append(issue)
+            dimension = str(delta.get("dimension") or "")
+            if dimension and dimension not in valid_relationship_dimensions:
+                issue = f"relationship_delta dimension 非标准值：{dimension}"
+                warnings.append(issue)
+                checks["delta_schema"].append(issue)
+
+        for delta in state_deltas:
+            if not isinstance(delta, dict):
+                issue = f"state_delta 不是对象：{delta}"
+                warnings.append(issue)
+                checks["delta_schema"].append(issue)
+                continue
+            if not delta.get("field") or not delta.get("change"):
+                issue = f"state_delta 缺少 field/change：{delta}"
+                warnings.append(issue)
+                checks["delta_schema"].append(issue)
+
+        unique_blockers = list(dict.fromkeys(blockers))
+        unique_warnings = list(dict.fromkeys(warnings))
+        return {
+            "passed": not unique_blockers,
+            "blockers": unique_blockers,
+            "warnings": unique_warnings,
+            "checks": checks,
+        }
+
+    def _attach_role_performance_context(
+        self,
+        context: Dict[str, Any],
+        source_context: Dict[str, Any],
+    ) -> None:
+        """把角色演绎分层上下文注入当前节点输入。"""
+        performance_result = source_context.get("performance_result")
+        role_context = self._extract_role_performance_context(performance_result)
+
+        for key in (
+            "public_performances",
+            "private_performances",
+            "relationship_deltas",
+            "state_deltas",
+            "continuity_notes",
+            "performance_warnings",
+            "role_performance_gate",
+            "role_performance_gate_passed",
+            "role_performance_gate_blockers",
+            "role_performance_gate_warnings",
+            "last_performance_content",
+            "last_performance_summary",
+            "last_scene_directions",
+        ):
+            if key not in role_context and source_context.get(key):
+                role_context[key] = source_context.get(key)
+
+        if role_context:
+            context.setdefault("role_performance_context", role_context)
+            for key, value in role_context.items():
+                context.setdefault(key, value)
+
+    def _sync_role_performance_context(
+        self,
+        execution: "WorkflowExecution",
+        performance_result: Dict[str, Any],
+    ) -> None:
+        """把 SceneCoordinator 的分层输出同步到 execution.context。"""
+        role_gate = self._build_role_performance_gate(performance_result, execution.context)
+        performance_result["role_performance_gate"] = role_gate
+        performance_result["role_performance_gate_passed"] = role_gate.get("passed", False)
+        performance_result["role_performance_gate_blockers"] = role_gate.get("blockers", [])
+        performance_result["role_performance_gate_warnings"] = role_gate.get("warnings", [])
+
+        role_context = self._extract_role_performance_context(performance_result)
+        if not role_context:
+            return
+
+        execution.context["role_performance_context"] = role_context
+        for key, value in role_context.items():
+            execution.context[key] = value
+
     def _sync_scene_character_context(
         self,
         execution: "WorkflowExecution",
         performance_result: Dict[str, Any],
     ) -> None:
-        """将多角色场景结果同步到通用角色上下文。"""
+        """将多角色场景的公开结果同步到通用角色上下文。"""
         for perf in performance_result.get("performances", []):
             character_name = perf.get("agent") or perf.get("character")
-            content = perf.get("content") or perf.get("dialogue")
+            content = perf.get("public_content") or perf.get("content") or perf.get("dialogue")
             emotion = perf.get("emotion") or perf.get("mood")
 
             if character_name and content:
@@ -5964,18 +6492,6 @@ class WorkflowEngine:
                 await self._broadcast_discussion_message(execution.id, msg)
                 await asyncio.sleep(0.2)
 
-            summarizer_agent = await self._get_agent_for_discussion("summarizer", execution.project_id)
-            if summarizer_agent and performance_messages:
-                summary = await self._generate_performance_summary(
-                    summarizer_agent,
-                    scene_directions,
-                    performance_messages,
-                    project_id=execution.project_id,
-                )
-                if summary:
-                    performance_messages.append(summary)
-                    await self._broadcast_discussion_message(execution.id, summary)
-
             performance_result.update({
                 "status": "completed",
                 "scene_directions": scene_directions,
@@ -5996,6 +6512,21 @@ class WorkflowEngine:
                 "participation_warnings": scene_directions.get("participation_warnings", []),
                 "timestamp": datetime.now().isoformat(),
             })
+
+            self._sync_role_performance_context(execution, performance_result)
+
+            summarizer_agent = await self._get_agent_for_discussion("summarizer", execution.project_id)
+            if summarizer_agent and performance_messages:
+                summary = await self._generate_performance_summary(
+                    summarizer_agent,
+                    scene_directions,
+                    performance_messages,
+                    project_id=execution.project_id,
+                    role_performance_gate=performance_result.get("role_performance_gate", {}),
+                )
+                if summary:
+                    performance_messages.append(summary)
+                    await self._broadcast_discussion_message(execution.id, summary)
 
             performance_summary = self._extract_discussion_summary_text(performance_result)
             performance_result.setdefault("summary", performance_summary)
@@ -6029,6 +6560,17 @@ class WorkflowEngine:
                 "characters": [c.get("name", "未知") for c in characters_data],
                 "messages": performance_messages,
                 "full_content": performance_result.get("full_content", ""),
+                "public_performances": performance_result.get("public_performances", []),
+                "private_performances": performance_result.get("private_performances", []),
+                "relationship_deltas": performance_result.get("relationship_deltas", []),
+                "state_deltas": performance_result.get("state_deltas", []),
+                "continuity_notes": performance_result.get("continuity_notes", []),
+                "performance_warnings": performance_result.get("performance_warnings", []),
+                "role_performance_gate": performance_result.get("role_performance_gate", {}),
+                "role_performance_gate_passed": performance_result.get("role_performance_gate_passed", False),
+                "role_performance_gate_blockers": performance_result.get("role_performance_gate_blockers", []),
+                "role_performance_gate_warnings": performance_result.get("role_performance_gate_warnings", []),
+                "role_performance_context": execution.context.get("role_performance_context", {}),
                 "iteration_count": actual_iterations,
                 "performance_word_count": actual_word_count,
                 "performance_target_word_count": target_word_count,
@@ -6077,6 +6619,77 @@ class WorkflowEngine:
         if isinstance(value, tuple):
             return list(value)
         return [value]
+
+    async def _check_chapter_resource_readiness(
+        self,
+        project_id: str,
+        context: Dict[str, Any],
+        db,
+    ) -> Dict[str, Any]:
+        """启动章节工作流前检查未解决 blocking 资源需求。"""
+        if not db or not hasattr(db, "get_outline_resource_requirements"):
+            return {}
+
+        chapter_num = self._parse_chapter_number(context.get("chapter_num") or context.get("chapter_number"))
+        chapter_outline = self._ensure_context_dict(context.get("chapter_outline"))
+        outline_id = context.get("chapter_outline_id") or context.get("outline_id") or chapter_outline.get("id")
+        outline_id = str(outline_id) if outline_id else None
+        if chapter_num is None and not outline_id:
+            return {}
+
+        if chapter_num is not None:
+            raw_requirements = await db.get_outline_resource_requirements(
+                project_id=project_id,
+                chapter_num=chapter_num,
+            )
+        else:
+            raw_requirements = await db.get_outline_resource_requirements(
+                project_id=project_id,
+                outline_id=outline_id,
+            )
+
+        requirements: List[Dict[str, Any]] = []
+        for item in raw_requirements or []:
+            if not isinstance(item, dict):
+                continue
+            item_outline_id = item.get("outline_id")
+            if outline_id and item_outline_id and str(item_outline_id) != outline_id:
+                continue
+            requirements.append(item)
+
+        unresolved_statuses = {"pending", "in_progress"}
+        blocking_requirements = [
+            item for item in requirements
+            if str(item.get("severity") or "").lower() == "blocking"
+            and str(item.get("status") or "pending").lower() in unresolved_statuses
+        ]
+        advisory_requirements = [
+            item for item in requirements
+            if str(item.get("severity") or "").lower() == "advisory"
+            and str(item.get("status") or "pending").lower() in unresolved_statuses
+        ]
+
+        readiness = None
+        if chapter_num is not None and hasattr(db, "update_chapter_resource_readiness"):
+            readiness = await db.update_chapter_resource_readiness(
+                project_id=project_id,
+                outline_id=outline_id,
+                chapter_num=chapter_num,
+            )
+
+        readiness_context = {
+            "readiness_status": "blocked" if blocking_requirements else (
+                "ready_with_warnings" if advisory_requirements else "ready"
+            ),
+            "chapter_num": chapter_num,
+            "chapter_outline_id": outline_id,
+            "readiness": readiness,
+            "blocking_requirements": blocking_requirements,
+            "advisory_requirements": advisory_requirements,
+        }
+        if blocking_requirements:
+            raise ChapterReadinessBlockedError(readiness_context)
+        return readiness_context
 
     def _ensure_context_dict(self, value: Any) -> Dict[str, Any]:
         """将运行期上下文字段归一化为 dict，避免对字符串/列表调用 .get。"""
@@ -8444,20 +9057,72 @@ class WorkflowEngine:
         scene_directions: Dict[str, Any],
         performance_messages: List[Dict],
         project_id: Optional[str] = None,
+        role_performance_gate: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """生成表演总结。"""
         try:
             performances = []
             for msg in performance_messages:
                 agent = msg.get("agent", "未知")
-                content = msg.get("content", "")
+                content = msg.get("public_content") or msg.get("content", "")
                 performances.append(f"【{agent}】\n{content}")
 
+            summary_variables = {
+                "scenario": "workflow_performance_summary",
+                "public_performances": [
+                    {
+                        "agent": msg.get("agent"),
+                        "content": msg.get("public_content") or msg.get("content", ""),
+                        "dialogue": msg.get("dialogue", ""),
+                        "action": msg.get("action", ""),
+                        "emotion": msg.get("emotion", ""),
+                    }
+                    for msg in performance_messages
+                    if msg.get("public_content") or msg.get("content")
+                ],
+                "private_performances": [
+                    {
+                        "agent": msg.get("agent"),
+                        "private_thought": msg.get("private_thought", ""),
+                        "intent": msg.get("intent", ""),
+                        "withheld_information": msg.get("withheld_information", []),
+                        "misinterpretations": msg.get("misinterpretations", []),
+                    }
+                    for msg in performance_messages
+                    if msg.get("private_thought") or msg.get("intent") or msg.get("withheld_information")
+                ],
+                "relationship_deltas": [
+                    {"source_character": msg.get("agent"), **delta}
+                    for msg in performance_messages
+                    for delta in (msg.get("relationship_delta", []) or [])
+                    if isinstance(delta, dict)
+                ],
+                "state_deltas": [
+                    {"source_character": msg.get("agent"), **delta}
+                    for msg in performance_messages
+                    for delta in (msg.get("state_delta", []) or [])
+                    if isinstance(delta, dict)
+                ],
+                "continuity_notes": [
+                    {"source_character": msg.get("agent"), "note": note}
+                    for msg in performance_messages
+                    for note in (msg.get("continuity_notes", []) or [])
+                ],
+                "performance_warnings": [
+                    {"source_character": msg.get("agent"), "warning": warning}
+                    for msg in performance_messages
+                    for warning in (msg.get("warnings", []) or [])
+                ],
+                "role_performance_gate": role_performance_gate or {},
+                "role_performance_gate_passed": (role_performance_gate or {}).get("passed", True),
+                "role_performance_gate_blockers": (role_performance_gate or {}).get("blockers", []),
+                "role_performance_gate_warnings": (role_performance_gate or {}).get("warnings", []),
+            }
             config_prompt = await self._build_workflow_config_prompt(
                 AgentType.SUMMARIZER,
                 project_id,
                 "workflow_performance_summary",
-                {"scenario": "workflow_performance_summary"},
+                summary_variables,
             )
             sections = [
                 self._format_workflow_prompt_block("Summarizer 配置规则", config_prompt),
@@ -8466,7 +9131,18 @@ class WorkflowEngine:
                     "atmosphere": scene_directions.get('atmosphere', '正剧'),
                     "plot_focus": scene_directions.get('plot_focus', '推进剧情'),
                 }),
-                self._format_workflow_prompt_block("角色表演内容", "\n".join(performances)),
+                self._format_workflow_prompt_block("公开角色表演内容", "\n".join(performances)),
+                self._format_workflow_prompt_block("私有表演与连续性素材", {
+                    "private_performances": summary_variables["private_performances"],
+                    "relationship_deltas": summary_variables["relationship_deltas"],
+                    "state_deltas": summary_variables["state_deltas"],
+                    "continuity_notes": summary_variables["continuity_notes"],
+                    "performance_warnings": summary_variables["performance_warnings"],
+                    "role_performance_gate": summary_variables["role_performance_gate"],
+                    "role_performance_gate_passed": summary_variables["role_performance_gate_passed"],
+                    "role_performance_gate_blockers": summary_variables["role_performance_gate_blockers"],
+                    "role_performance_gate_warnings": summary_variables["role_performance_gate_warnings"],
+                }),
                 "【当前任务】\n请对角色演绎进行详细总结，只输出符合配置规则的 JSON。",
             ]
             prompt = "\n\n".join(section for section in sections if section)

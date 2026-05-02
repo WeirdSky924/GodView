@@ -29,7 +29,7 @@ class Settings(BaseSettings):
 
     # 应用基本信息
     app_name: str = "Godview"
-    app_version: str = "1.3.2"
+    app_version: str = "1.3.13"
     debug: bool = False
     log_level: str = "INFO"
 

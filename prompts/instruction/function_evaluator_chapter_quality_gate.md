@@ -27,8 +27,9 @@ is_system: true
 1. 已绑定/已审批章节大纲、章节目标、修订要求。
 2. 固定最高级设定、动态设定、世界/项目规则。
 3. 角色出场硬约束、角色参与轨迹、角色状态与角色资源。
-4. 总编剧写作计划、场景方向、地图/伏笔/设定持久化状态。
-5. 后续大纲参考与后续大纲策略。
+4. 场景演绎的公开内容、私有表演素材、关系/状态变化提案和连续性记录。
+5. 总编剧写作计划、场景方向、地图/伏笔/设定持久化状态。
+6. 后续大纲参考与后续大纲策略。
 
 如果上游上下文缺失，应在 `upstream_context_usage_check` 中说明；不得凭空补设定、补世界规则或套用未提供的通用修真/玄幻规则。
 
@@ -41,6 +42,10 @@ is_system: true
 - `mentioned_only_names`、`forbidden_direct_appearance_names`、不可用角色被写成当前场景的活人参与者、发言者或行动者。
 - 首次正面出场的新命名关键角色/组织/地点/能力/道具不来自已审批大纲、已落库资源、已解决需求或明确角色计划。
 - 集体讨论、场景演绎、读者模拟等辅助材料引入未授权角色或违反角色状态，并被正文采纳。
+- 正文把 `private_performances`、`private_thought`、`intent`、`withheld_information` 或 `misinterpretations` 写成其他角色已经知道的公开事实。
+- 正文忽略 `relationship_deltas`、`state_deltas` 或 `continuity_notes` 中明确提示的关系张力、伤势、承诺、误解、线索，导致角色关系或状态连续性断裂。
+- 正文采纳了 `performance_warnings` 中已标记的 OOC、信息越界、出场越界或缺资源素材。
+- 上游 `role_performance_gate_passed=false`，且正文采纳了 `role_performance_gate_blockers` 指向的公开/私有泄露、不可出场角色正面行动、OOC、信息越界或 malformed delta 素材。
 - 本章堵死后续大纲、提前替代后续章节事件，或把局部冲突升级为终局矛盾。
 - 最终反派、高阶势力核心、世界底层真相、终局解法提前正面登场或揭示。
 - 关键危机由未定义、未铺垫、未落库、未批准的设定/能力/道具/组织/神秘高人突然解决。
@@ -55,4 +60,4 @@ is_system: true
 
 ## 输出要求
 
-必须输出调用方要求的 JSON。所有未通过的子检查都要在 `issues` 或对应 check 的 `issues` 中体现，不能只给总分。确定性角色预检问题必须作为阻断问题写入 `character_participation_check`。
+必须输出调用方要求的 JSON。所有未通过的子检查都要在 `issues` 或对应 check 的 `issues` 中体现，不能只给总分。确定性角色预检问题必须作为阻断问题写入 `character_participation_check`；`role_performance_gate_blockers` 必须写入角色表演/上下文使用相关检查。

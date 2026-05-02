@@ -151,6 +151,78 @@ export interface ChatResponse {
   saved_outlines?: ChapterOutline[]  // 多章大纲保存
 }
 
+export type ResourceRequirementSeverity = 'blocking' | 'advisory' | 'optional'
+export type ResourceRequirementStatus = 'pending' | 'in_progress' | 'resolved' | 'ignored' | 'superseded'
+
+export interface OutlineResourceRequirement {
+  id: string
+  project_id: string
+  outline_id?: string | null
+  outline_version_id?: string | null
+  chapter_id?: string | null
+  chapter_num?: number | null
+  requirement_type: string
+  resource_name: string
+  severity: ResourceRequirementSeverity
+  status: ResourceRequirementStatus
+  reason?: string
+  suggested_payload?: Record<string, any>
+  matched_resource_id?: string | null
+  matched_resource_type?: string | null
+  source_excerpt?: string
+  source_agent?: string
+  source_node_id?: string
+  source_execution_id?: string
+  metadata?: Record<string, any>
+  created_at?: string
+  updated_at?: string
+  resolved_at?: string | null
+}
+
+export interface ChapterResourceReadiness {
+  id?: string
+  project_id: string
+  outline_id?: string | null
+  chapter_num: number
+  blocking_total: number
+  blocking_resolved: number
+  advisory_total: number
+  advisory_resolved: number
+  readiness_status: 'not_audited' | 'blocked' | 'ready_with_warnings' | 'ready' | 'stale'
+  last_audited_at?: string | null
+  updated_at?: string
+}
+
+export interface ResourceSupplementDraft {
+  requirement_id: string
+  requirement_type?: string
+  resource_type: string
+  resource_name?: string
+  severity?: ResourceRequirementSeverity
+  chapter_num?: number | null
+  reason?: string
+  draft_payload: Record<string, any>
+  side_effect?: 'draft_only'
+}
+
+export interface ConfirmResourceSupplementResult {
+  created: Array<{
+    resource_type: string
+    resource_id: string
+    resource: Record<string, any>
+    requirement?: OutlineResourceRequirement
+    readiness?: ChapterResourceReadiness | null
+  }>
+  failed: Array<{
+    requirement_id: string
+    resource_type: string
+    error: string
+  }>
+  readiness_by_chapter: Record<string, ChapterResourceReadiness | null>
+  success: boolean
+  message: string
+}
+
 // ==================== API 函数 ====================
 
 /**
@@ -293,4 +365,85 @@ export async function savePendingOutlines(
   return await api.post(`${API_BASE}/save-outlines?project_id=${projectId}`, {
     outlines,
   })
+}
+
+/**
+ * 生成资源补全草案（只返回草案，不直接创建资源）
+ */
+export async function generateResourceSupplementDrafts(data: {
+  project_id: string
+  requirement_ids?: string[]
+  outline_id?: string
+  chapter_num?: number
+  include_advisory?: boolean
+}): Promise<{ drafts: ResourceSupplementDraft[]; total: number; side_effect: 'draft_only'; message: string }> {
+  return await api.post(`${API_BASE}/resource-requirements/supplement-drafts`, data)
+}
+
+/**
+ * 确认资源补全草案并创建资源
+ */
+export async function confirmResourceSupplementDrafts(data: {
+  project_id: string
+  drafts: Array<{
+    requirement_id: string
+    resource_type: string
+    draft_payload: Record<string, any>
+  }>
+}): Promise<ConfirmResourceSupplementResult> {
+  return await api.post(`${API_BASE}/resource-requirements/confirm-supplements`, data)
+}
+
+/**
+ * 查询大纲资源需求
+ */
+export async function getOutlineResourceRequirements(
+  projectId: string,
+  filters?: {
+    outline_id?: string
+    chapter_num?: number
+    status?: ResourceRequirementStatus
+    severity?: ResourceRequirementSeverity
+    requirement_type?: string
+  }
+): Promise<{ requirements: OutlineResourceRequirement[]; total: number }> {
+  const params = new URLSearchParams({ project_id: projectId })
+  if (filters?.outline_id) params.set('outline_id', filters.outline_id)
+  if (filters?.chapter_num !== undefined) params.set('chapter_num', String(filters.chapter_num))
+  if (filters?.status) params.set('status', filters.status)
+  if (filters?.severity) params.set('severity', filters.severity)
+  if (filters?.requirement_type) params.set('requirement_type', filters.requirement_type)
+  return await api.get(`${API_BASE}/resource-requirements?${params.toString()}`)
+}
+
+/**
+ * 查询章节资源 readiness
+ */
+export async function getChapterResourceReadiness(
+  projectId: string,
+  filters?: {
+    outline_id?: string
+    chapter_num?: number
+    refresh?: boolean
+  }
+): Promise<{ readiness: ChapterResourceReadiness[]; total: number }> {
+  const params = new URLSearchParams({ project_id: projectId })
+  if (filters?.outline_id) params.set('outline_id', filters.outline_id)
+  if (filters?.chapter_num !== undefined) params.set('chapter_num', String(filters.chapter_num))
+  if (filters?.refresh) params.set('refresh', 'true')
+  return await api.get(`${API_BASE}/resource-readiness?${params.toString()}`)
+}
+
+/**
+ * 更新大纲资源需求状态
+ */
+export async function updateOutlineResourceRequirementStatus(
+  requirementId: string,
+  data: {
+    status: ResourceRequirementStatus
+    matched_resource_id?: string
+    matched_resource_type?: string
+  }
+): Promise<{ requirement: OutlineResourceRequirement; readiness?: ChapterResourceReadiness | null }> {
+  return await api.patch(`${API_BASE}/resource-requirements/${requirementId}`, data)
 }

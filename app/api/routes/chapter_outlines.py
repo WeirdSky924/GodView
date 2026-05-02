@@ -3,6 +3,7 @@
 GodView v9: PlotOutlineAgent 专用接口
 """
 
+import json
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -121,7 +122,403 @@ class SavePendingOutlinesResponse(BaseModel):
     message: str
 
 
+class UpdateResourceRequirementStatusRequest(BaseModel):
+    """更新资源需求状态请求"""
+    status: str = Field(..., description="pending/in_progress/resolved/ignored/superseded")
+    matched_resource_id: Optional[str] = Field(None, description="绑定的资源 ID")
+    matched_resource_type: Optional[str] = Field(None, description="绑定的资源类型")
+
+
+class GenerateResourceSupplementDraftsRequest(BaseModel):
+    """生成资源补全草案请求"""
+    project_id: str = Field(..., description="项目ID")
+    requirement_ids: Optional[List[str]] = Field(None, description="指定资源需求 ID；为空则按过滤条件生成")
+    outline_id: Optional[str] = Field(None, description="大纲 ID")
+    chapter_num: Optional[int] = Field(None, description="章节号")
+    include_advisory: bool = Field(False, description="是否包含 advisory 需求")
+
+
+class ConfirmResourceSupplementDraft(BaseModel):
+    """确认创建的资源补全草案"""
+    requirement_id: str
+    resource_type: str
+    draft_payload: Dict[str, Any]
+
+
+class ConfirmResourceSupplementDraftsRequest(BaseModel):
+    """确认资源补全草案请求"""
+    project_id: str = Field(..., description="项目ID")
+    drafts: List[ConfirmResourceSupplementDraft]
+
+
 # ==================== API 端点 ====================
+
+
+def _build_resource_supplement_draft(requirement: Dict[str, Any]) -> Dict[str, Any]:
+    """把资源需求转换成可审查的补全草案；不直接创建资源。"""
+    requirement_type = str(requirement.get("requirement_type") or "lore").strip().lower()
+    resource_name = str(requirement.get("resource_name") or "未命名资源").strip()
+    reason = str(requirement.get("reason") or requirement.get("source_excerpt") or "").strip()
+    suggested_payload = requirement.get("suggested_payload") if isinstance(requirement.get("suggested_payload"), dict) else {}
+    base_payload = {
+        "name": resource_name,
+        "title": resource_name,
+        "project_id": str(requirement.get("project_id")),
+        "description": reason or f"由第 {requirement.get('chapter_num') or '未知'} 章大纲资源需求生成的补全草案。",
+        "source_requirement_id": str(requirement.get("id")),
+        "source_chapter_num": requirement.get("chapter_num"),
+        "source_outline_id": requirement.get("outline_id"),
+        "usage_guidance": reason,
+        **suggested_payload,
+    }
+
+    if requirement_type in {"character", "role", "人物", "角色"}:
+        resource_type = "character"
+        payload = {
+            **base_payload,
+            "role": suggested_payload.get("role") or "supporting",
+            "status": suggested_payload.get("status") or "active",
+            "background": suggested_payload.get("background") or reason,
+            "personality": suggested_payload.get("personality") or "待用户确认",
+            "importance_tier": suggested_payload.get("importance_tier") or "supporting",
+        }
+    elif requirement_type in {"location", "place", "地点", "场景地点"}:
+        resource_type = "location"
+        payload = {
+            **base_payload,
+            "location_type": suggested_payload.get("location_type") or "story_location",
+            "summary": suggested_payload.get("summary") or reason,
+            "visibility": suggested_payload.get("visibility") or "draft",
+        }
+    elif requirement_type in {"faction", "organization", "势力", "组织"}:
+        resource_type = "faction"
+        payload = {
+            **base_payload,
+            "faction_type": suggested_payload.get("faction_type") or "organization",
+            "tier": suggested_payload.get("tier") or "local",
+            "public_knowledge": suggested_payload.get("public_knowledge") or reason,
+            "current_visibility": suggested_payload.get("current_visibility") or "mentioned_only",
+        }
+    elif requirement_type in {"item", "ability", "道具", "能力"}:
+        resource_type = requirement_type if requirement_type in {"item", "ability"} else "item"
+        payload = {
+            **base_payload,
+            "category": suggested_payload.get("category") or resource_type,
+            "constraints": suggested_payload.get("constraints") or "不得越级解决关键危机，需由用户确认使用边界。",
+        }
+    else:
+        resource_type = "lore"
+        payload = {
+            **base_payload,
+            "category": suggested_payload.get("category") or requirement_type or "general",
+            "content": suggested_payload.get("content") or reason or f"补全资源：{resource_name}",
+            "priority": suggested_payload.get("priority") or "medium",
+        }
+
+    return {
+        "requirement_id": str(requirement.get("id")),
+        "requirement_type": requirement_type,
+        "resource_type": resource_type,
+        "resource_name": resource_name,
+        "severity": requirement.get("severity"),
+        "chapter_num": requirement.get("chapter_num"),
+        "reason": reason,
+        "draft_payload": payload,
+        "side_effect": "draft_only",
+    }
+
+
+
+def _normalize_character_importance_tier(value: Any) -> str:
+    tier = str(value or "supporting").strip().lower()
+    if tier in {"protagonist", "main", "主角"}:
+        return "protagonist"
+    if tier in {"main_support", "supporting", "配角"}:
+        return "main_support"
+    if tier in {"supporting", "minor", "npc", "临时角色"}:
+        return "supporting"
+    if tier in {"background", "mentioned_only", "背景"}:
+        return "background"
+    return "supporting"
+
+
+def _normalize_lore_category(value: Any) -> str:
+    category = str(value or "custom").strip().lower()
+    aliases = {
+        "faction": "organization",
+        "organization": "organization",
+        "location": "location",
+        "place": "location",
+        "item": "item",
+        "ability": "magic_system",
+        "lore": "custom",
+        "general": "custom",
+    }
+    return aliases.get(category, category or "custom")
+
+
+def _normalize_lore_priority(value: Any) -> str:
+    priority = str(value or "standard").strip().lower()
+    if priority in {"critical", "high", "core"}:
+        return "core"
+    if priority in {"medium", "standard", "normal"}:
+        return "standard"
+    if priority in {"low", "reference"}:
+        return "reference"
+    return "standard"
+
+
+async def _create_confirmed_resource(postgres_db, project_id: str, draft: ConfirmResourceSupplementDraft) -> Dict[str, Any]:
+    """根据用户确认的草案创建最小资源；仅支持 lore / character。"""
+    import uuid
+    from app.models.character import Character
+    from app.models.lore import LoreEntry
+
+    payload = dict(draft.draft_payload or {})
+    payload["project_id"] = project_id
+    resource_type = str(draft.resource_type or "").strip().lower()
+
+    if resource_type == "character":
+        payload.setdefault("name", payload.get("title") or "未命名角色")
+        payload.setdefault("description", payload.get("description") or payload.get("usage_guidance") or "由大纲资源需求补全创建。")
+        payload["importance_tier"] = _normalize_character_importance_tier(payload.get("importance_tier"))
+        character = Character(**payload)
+        character_data = character.model_dump(mode="json")
+        resource_id = await postgres_db.save_character(character_data)
+        return {"resource_type": "character", "resource_id": resource_id, "resource": character_data}
+
+    if resource_type == "lore":
+        payload.setdefault("title", payload.get("name") or "未命名设定")
+        payload.setdefault("content", payload.get("content") or payload.get("description") or "由大纲资源需求补全创建。")
+        payload["category"] = _normalize_lore_category(payload.get("category"))
+        payload["priority"] = _normalize_lore_priority(payload.get("priority"))
+        lore = LoreEntry(**payload)
+        lore_id = str(uuid.uuid4())
+        params = lore.model_dump(mode="json")
+        params["id"] = lore_id
+        await postgres_db.execute_write(
+            """
+            INSERT INTO lore_entries (
+                id, project_id, title, category, priority, content, summary,
+                keywords, tags, constraints, related_characters, related_locations, related_items,
+                forbidden_actions, source, created_at, updated_at
+            ) VALUES (
+                CAST(:id AS UUID), CAST(:project_id AS UUID), :title, :category, :priority, :content, :summary,
+                :keywords, :tags, :constraints, :related_characters, :related_locations, :related_items,
+                :forbidden_actions, :source, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
+            """,
+            {
+                **params,
+                "keywords": json.dumps(params.get("keywords") or [], ensure_ascii=False),
+                "tags": json.dumps(params.get("tags") or [], ensure_ascii=False),
+                "constraints": json.dumps(params.get("constraints") or [], ensure_ascii=False),
+                "related_characters": json.dumps(params.get("related_characters") or [], ensure_ascii=False),
+                "related_locations": json.dumps(params.get("related_locations") or [], ensure_ascii=False),
+                "related_items": json.dumps(params.get("related_items") or [], ensure_ascii=False),
+                "forbidden_actions": json.dumps(params.get("forbidden_actions") or [], ensure_ascii=False),
+                "summary": params.get("summary") or "",
+                "source": params.get("source") or "resource_requirement_supplement",
+            },
+        )
+        return {"resource_type": "lore", "resource_id": lore_id, "resource": params}
+
+    raise ValueError(f"暂不支持确认创建资源类型: {draft.resource_type}")
+
+
+@router.post("/resource-requirements/supplement-drafts", response_model=Dict[str, Any])
+async def generate_resource_supplement_drafts(request: GenerateResourceSupplementDraftsRequest):
+    """按资源需求生成一键补全草案；只返回草案，不落库创建资源。"""
+    from app.api.app import postgres_db
+
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+
+    severities = ["blocking"] if not request.include_advisory else ["blocking", "advisory"]
+    requirements: List[Dict[str, Any]] = []
+    if request.requirement_ids:
+        for requirement_id in request.requirement_ids:
+            rows = await postgres_db.execute_query(
+                """
+                SELECT * FROM outline_resource_requirements
+                WHERE id = CAST(:id AS UUID)
+                  AND project_id = CAST(:project_id AS UUID)
+                """,
+                {"id": requirement_id, "project_id": request.project_id},
+            )
+            requirements.extend(rows)
+    else:
+        for severity in severities:
+            requirements.extend(await postgres_db.get_outline_resource_requirements(
+                project_id=request.project_id,
+                outline_id=request.outline_id,
+                chapter_num=request.chapter_num,
+                status="pending",
+                severity=severity,
+            ))
+            requirements.extend(await postgres_db.get_outline_resource_requirements(
+                project_id=request.project_id,
+                outline_id=request.outline_id,
+                chapter_num=request.chapter_num,
+                status="in_progress",
+                severity=severity,
+            ))
+
+    seen: set[str] = set()
+    drafts: List[Dict[str, Any]] = []
+    for requirement in requirements:
+        requirement_id = str(requirement.get("id"))
+        if not requirement_id or requirement_id in seen:
+            continue
+        seen.add(requirement_id)
+        if str(requirement.get("status") or "pending") not in {"pending", "in_progress"}:
+            continue
+        drafts.append(_build_resource_supplement_draft(requirement))
+
+    return {
+        "drafts": drafts,
+        "total": len(drafts),
+        "side_effect": "draft_only",
+        "message": "已生成资源补全草案，需用户确认后再创建资源并标记需求已解决",
+    }
+
+
+@router.post("/resource-requirements/confirm-supplements", response_model=Dict[str, Any])
+async def confirm_resource_supplements(request: ConfirmResourceSupplementDraftsRequest):
+    """确认资源补全草案，创建最小资源并解决对应 requirement。"""
+    from app.api.app import postgres_db
+
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+
+    created: List[Dict[str, Any]] = []
+    failed: List[Dict[str, Any]] = []
+    readiness_by_chapter: Dict[str, Any] = {}
+
+    for draft in request.drafts:
+        try:
+            created_resource = await _create_confirmed_resource(postgres_db, request.project_id, draft)
+            updated_requirement = await postgres_db.update_outline_resource_requirement_status(
+                requirement_id=draft.requirement_id,
+                status="resolved",
+                matched_resource_id=created_resource["resource_id"],
+                matched_resource_type=created_resource["resource_type"],
+            )
+            readiness = None
+            if updated_requirement and updated_requirement.get("chapter_num") is not None:
+                readiness = await postgres_db.update_chapter_resource_readiness(
+                    project_id=str(updated_requirement.get("project_id")),
+                    outline_id=str(updated_requirement.get("outline_id")) if updated_requirement.get("outline_id") else None,
+                    chapter_num=int(updated_requirement.get("chapter_num")),
+                )
+                readiness_by_chapter[f"{updated_requirement.get('outline_id') or 'none'}:{updated_requirement.get('chapter_num')}"] = readiness
+            created.append({
+                **created_resource,
+                "requirement": updated_requirement,
+                "readiness": readiness,
+            })
+        except Exception as exc:
+            failed.append({
+                "requirement_id": draft.requirement_id,
+                "resource_type": draft.resource_type,
+                "error": str(exc),
+            })
+
+    return {
+        "created": created,
+        "failed": failed,
+        "readiness_by_chapter": readiness_by_chapter,
+        "success": len(failed) == 0,
+        "message": f"已创建 {len(created)} 个资源，失败 {len(failed)} 个",
+    }
+
+
+@router.get("/resource-requirements", response_model=Dict[str, Any])
+async def list_resource_requirements(
+    project_id: str = Query(..., description="项目ID"),
+    outline_id: Optional[str] = Query(None, description="大纲 ID"),
+    chapter_num: Optional[int] = Query(None, description="章节号"),
+    status: Optional[str] = Query(None, description="需求状态"),
+    severity: Optional[str] = Query(None, description="blocking/advisory/optional"),
+    requirement_type: Optional[str] = Query(None, description="资源类型"),
+):
+    """查询大纲资源需求。"""
+    from app.api.app import postgres_db
+
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+
+    requirements = await postgres_db.get_outline_resource_requirements(
+        project_id=project_id,
+        outline_id=outline_id,
+        chapter_num=chapter_num,
+        status=status,
+        severity=severity,
+        requirement_type=requirement_type,
+    )
+    return {"requirements": requirements, "total": len(requirements)}
+
+
+@router.get("/resource-readiness", response_model=Dict[str, Any])
+async def list_resource_readiness(
+    project_id: str = Query(..., description="项目ID"),
+    outline_id: Optional[str] = Query(None, description="大纲 ID"),
+    chapter_num: Optional[int] = Query(None, description="章节号"),
+    refresh: bool = Query(False, description="是否先刷新指定章节 readiness"),
+):
+    """查询章节资源 readiness 汇总。"""
+    from app.api.app import postgres_db
+
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+
+    if refresh and chapter_num is not None:
+        await postgres_db.update_chapter_resource_readiness(
+            project_id=project_id,
+            outline_id=outline_id,
+            chapter_num=chapter_num,
+        )
+    readiness = await postgres_db.get_chapter_resource_readiness(
+        project_id=project_id,
+        outline_id=outline_id,
+        chapter_num=chapter_num,
+    )
+    return {"readiness": readiness, "total": len(readiness)}
+
+
+@router.patch("/resource-requirements/{requirement_id}", response_model=Dict[str, Any])
+async def update_resource_requirement_status(
+    requirement_id: str,
+    request: UpdateResourceRequirementStatusRequest,
+):
+    """更新大纲资源需求状态。"""
+    from app.api.app import postgres_db
+
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+
+    try:
+        updated = await postgres_db.update_outline_resource_requirement_status(
+            requirement_id=requirement_id,
+            status=request.status,
+            matched_resource_id=request.matched_resource_id,
+            matched_resource_type=request.matched_resource_type,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not updated:
+        raise HTTPException(status_code=404, detail="资源需求不存在")
+
+    if updated.get("chapter_num") is not None:
+        readiness = await postgres_db.update_chapter_resource_readiness(
+            project_id=str(updated.get("project_id")),
+            outline_id=str(updated.get("outline_id")) if updated.get("outline_id") else None,
+            chapter_num=int(updated.get("chapter_num")),
+        )
+    else:
+        readiness = None
+    return {"requirement": updated, "readiness": readiness}
+
 
 @router.get("", response_model=OutlineListResponse)
 async def list_outlines(project_id: str):

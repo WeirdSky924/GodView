@@ -14,6 +14,7 @@ from app.agents.director.master_plotter import MasterPlotterAgent
 from app.agents.director.summarizer import SummarizerAgent
 from app.agents.director.writer import WriterAgent
 from app.agents.procgen import ProcGenAgent
+from app.services.workflow_engine import ChapterReadinessBlockedError
 # Removed circular import: qdrant_db will be imported lazily
 # from app.api.app import qdrant_db
 from app.models.character import Character, CharacterStatus
@@ -1795,6 +1796,12 @@ class DirectorSystem:
                                     "content": chapter_result.get("content", ""),
                                 })
 
+                except ChapterReadinessBlockedError as e:
+                    logger.warning("章节资源未就绪，跳过工作流执行: %s", e.payload)
+                    if callback:
+                        callback("chapter_blocked", e.payload)
+                    results.setdefault("blocked_chapters", []).append(e.payload)
+                    continue
                 except Exception as e:
                     logger.error(f"工作流执行失败: {e}")
                     if callback:
@@ -1824,6 +1831,7 @@ class DirectorSystem:
         if callback:
             callback("completed", {
                 "total_chapters": len(results["chapters"]),
+                "blocked_chapters": len(results.get("blocked_chapters", [])),
                 "total_words": results["total_words"],
                 "hooks_planted": len(results["hooks_planted"]),
                 "hooks_resolved": len(results["hooks_resolved"]),
@@ -1832,6 +1840,7 @@ class DirectorSystem:
         return {
             "success": True,
             "chapters": results["chapters"],
+            "blocked_chapters": results.get("blocked_chapters", []),
             "total_words": results["total_words"],
         }
 

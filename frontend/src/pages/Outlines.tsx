@@ -15,10 +15,19 @@ import {
   approveOutline,
   chatWithAgent,
   deleteOutline,
+  getOutlineResourceRequirements,
+  getChapterResourceReadiness,
+  generateResourceSupplementDrafts,
+  confirmResourceSupplementDrafts,
+  updateOutlineResourceRequirementStatus,
   type ChapterOutline,
   type SceneOutline,
   type EmotionPoint,
   type OutlineStatus,
+  type OutlineResourceRequirement,
+  type ChapterResourceReadiness,
+  type ResourceSupplementDraft,
+  type ResourceRequirementStatus,
 } from '@/api/outlines'
 import {
   BookOpen, Plus, Edit2, Check, MessageSquare, Send, RefreshCw,
@@ -80,8 +89,15 @@ export default function Outlines() {
   const [sendingMessage, setSendingMessage] = useState(false)
 
   // 编辑状态
-  const [editingScene, setEditingScene] = useState<SceneOutline | null>(null)
   const [showSceneEditor, setShowSceneEditor] = useState(false)
+
+  // 资源就绪状态
+  const [resourceRequirements, setResourceRequirements] = useState<OutlineResourceRequirement[]>([])
+  const [resourceReadiness, setResourceReadiness] = useState<ChapterResourceReadiness | null>(null)
+  const [resourceDrafts, setResourceDrafts] = useState<ResourceSupplementDraft[]>([])
+  const [loadingResources, setLoadingResources] = useState(false)
+  const [generatingDrafts, setGeneratingDrafts] = useState(false)
+  const [confirmingDrafts, setConfirmingDrafts] = useState(false)
 
   const mergeOutlines = (current: ChapterOutline[], incoming: ChapterOutline[]) => {
     const outlineMap = new Map(current.map(outline => [outline.chapter_number, outline]))
@@ -134,18 +150,113 @@ export default function Outlines() {
     }
   }
 
+  const loadResourceStatus = async (chapterNumber: number, outlineId?: string, refresh = false) => {
+    if (!currentProject?.id) return
+    setLoadingResources(true)
+    try {
+      const [requirementsResult, readinessResult] = await Promise.all([
+        getOutlineResourceRequirements(currentProject.id, {
+          chapter_num: chapterNumber,
+          outline_id: outlineId,
+        }),
+        getChapterResourceReadiness(currentProject.id, {
+          chapter_num: chapterNumber,
+          outline_id: outlineId,
+          refresh,
+        }),
+      ])
+      setResourceRequirements(requirementsResult.requirements)
+      setResourceReadiness(readinessResult.readiness[0] ?? null)
+    } catch (error) {
+      console.error('Failed to load resource readiness:', error)
+      setResourceRequirements([])
+      setResourceReadiness(null)
+    } finally {
+      setLoadingResources(false)
+    }
+  }
+
   const selectChapter = async (chapterNumber: number) => {
     if (!currentProject?.id) return
     setSelectedChapter(chapterNumber)
+    setResourceDrafts([])
     setLoading(true)
     try {
       const outline = await getOutline(currentProject.id, chapterNumber)
       setCurrentOutline(outline)
+      await loadResourceStatus(chapterNumber, outline.id)
     } catch (error) {
       console.error('Failed to load outline:', error)
       setCurrentOutline(null)
+      await loadResourceStatus(chapterNumber)
     } finally {
       setLoading(false)
+    }
+  }
+
+  const refreshResourceStatus = async (refresh = true) => {
+    if (!selectedChapter) return
+    await loadResourceStatus(selectedChapter, currentOutline?.id, refresh)
+  }
+
+  const handleGenerateResourceDrafts = async (includeAdvisory = false) => {
+    if (!currentProject?.id || !selectedChapter) return
+    setGeneratingDrafts(true)
+    try {
+      const result = await generateResourceSupplementDrafts({
+        project_id: currentProject.id,
+        outline_id: currentOutline?.id,
+        chapter_num: selectedChapter,
+        include_advisory: includeAdvisory,
+      })
+      setResourceDrafts(result.drafts)
+      if (result.drafts.length === 0) {
+        alert('当前没有可生成补全草案的未解决资源需求')
+      }
+    } catch (error) {
+      console.error('Failed to generate resource drafts:', error)
+      alert('生成资源补全草案失败')
+    } finally {
+      setGeneratingDrafts(false)
+    }
+  }
+
+  const handleConfirmResourceDrafts = async () => {
+    if (!currentProject?.id || resourceDrafts.length === 0) return
+    const creatableDrafts = resourceDrafts.filter(draft => ['character', 'lore'].includes(draft.resource_type))
+    if (creatableDrafts.length === 0) {
+      alert('当前草案暂不包含可直接创建的角色或设定资源')
+      return
+    }
+    setConfirmingDrafts(true)
+    try {
+      const result = await confirmResourceSupplementDrafts({
+        project_id: currentProject.id,
+        drafts: creatableDrafts.map(draft => ({
+          requirement_id: draft.requirement_id,
+          resource_type: draft.resource_type,
+          draft_payload: draft.draft_payload,
+        })),
+      })
+      const failedMessage = result.failed.length > 0 ? `，${result.failed.length} 个失败` : ''
+      alert(`已创建 ${result.created.length} 个资源${failedMessage}`)
+      setResourceDrafts([])
+      await refreshResourceStatus(true)
+    } catch (error) {
+      console.error('Failed to confirm resource drafts:', error)
+      alert('确认创建资源失败')
+    } finally {
+      setConfirmingDrafts(false)
+    }
+  }
+
+  const handleUpdateRequirementStatus = async (requirementId: string, status: ResourceRequirementStatus) => {
+    try {
+      await updateOutlineResourceRequirementStatus(requirementId, { status })
+      await refreshResourceStatus(true)
+    } catch (error) {
+      console.error('Failed to update resource requirement:', error)
+      alert('更新资源需求状态失败')
     }
   }
 
@@ -187,6 +298,9 @@ export default function Outlines() {
   const handleStartFirstChapterChat = () => {
     // 设置为第一章
     setSelectedChapter(1)
+    setResourceRequirements([])
+    setResourceReadiness(null)
+    setResourceDrafts([])
     // 打开聊天面板
     setShowChat(true)
     // 设置初始消息
@@ -220,10 +334,12 @@ export default function Outlines() {
         const firstSaved = savedOutlines[0]
         setCurrentOutline(firstSaved)
         setSelectedChapter(firstSaved.chapter_number)
+        await loadResourceStatus(firstSaved.chapter_number, firstSaved.id)
       } else if (response.saved_outline) {
         setCurrentOutline(response.saved_outline)
         setSelectedChapter(response.saved_outline.chapter_number)
         upsertOutline(response.saved_outline)
+        await loadResourceStatus(response.saved_outline.chapter_number, response.saved_outline.id)
       } else if (response.outline_updates) {
         setCurrentOutline(prev => prev ? { ...prev, ...response.outline_updates } : prev)
       }
@@ -247,6 +363,154 @@ export default function Outlines() {
 
   const handleQuickCommand = (command: string) => {
     setChatInput(command)
+  }
+
+  const readinessConfig = (status?: ChapterResourceReadiness['readiness_status']) => {
+    switch (status) {
+      case 'blocked':
+        return { label: '资源阻塞', color: 'bg-red-100 text-red-700' }
+      case 'ready_with_warnings':
+        return { label: '可启动但有警告', color: 'bg-yellow-100 text-yellow-700' }
+      case 'ready':
+        return { label: '资源就绪', color: 'bg-green-100 text-green-700' }
+      case 'stale':
+        return { label: '需重新审计', color: 'bg-orange-100 text-orange-700' }
+      case 'not_audited':
+      default:
+        return { label: '未审计', color: 'bg-gray-100 text-gray-700' }
+    }
+  }
+
+  const requirementLabel = (requirement: OutlineResourceRequirement) => {
+    const severityLabel = requirement.severity === 'blocking' ? '阻塞' : requirement.severity === 'advisory' ? '建议' : '可选'
+    return `${severityLabel} · ${requirement.requirement_type}`
+  }
+
+  const renderResourceReadinessPanel = () => {
+    const config = readinessConfig(resourceReadiness?.readiness_status)
+    const unresolvedRequirements = resourceRequirements.filter(req => !['resolved', 'ignored', 'superseded'].includes(req.status))
+    const supportedDrafts = resourceDrafts.filter(draft => ['character', 'lore'].includes(draft.resource_type))
+
+    return (
+      <Card className="p-4 mb-6">
+        <div className="flex items-center justify-between mb-3">
+          <div>
+            <h3 className={`text-sm font-medium ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
+              资源就绪检查
+            </h3>
+            <p className={`text-xs mt-1 ${isDark ? 'text-gray-500' : 'text-gray-500'}`}>
+              生成补全草案不会直接创建资源，确认后才会写入角色/设定并更新需求状态。
+            </p>
+          </div>
+          <span className={`px-3 py-1 text-xs rounded-full ${config.color}`}>{config.label}</span>
+        </div>
+
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-4">
+          <div className={`p-3 rounded ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
+            <p className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-500'}`}>Blocking</p>
+            <p className={`text-sm font-medium ${isDark ? 'text-gray-200' : 'text-gray-700'}`}>
+              {resourceReadiness ? `${resourceReadiness.blocking_resolved}/${resourceReadiness.blocking_total}` : '0/0'}
+            </p>
+          </div>
+          <div className={`p-3 rounded ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
+            <p className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-500'}`}>Advisory</p>
+            <p className={`text-sm font-medium ${isDark ? 'text-gray-200' : 'text-gray-700'}`}>
+              {resourceReadiness ? `${resourceReadiness.advisory_resolved}/${resourceReadiness.advisory_total}` : '0/0'}
+            </p>
+          </div>
+          <div className={`p-3 rounded ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
+            <p className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-500'}`}>未解决需求</p>
+            <p className={`text-sm font-medium ${isDark ? 'text-gray-200' : 'text-gray-700'}`}>{unresolvedRequirements.length}</p>
+          </div>
+          <div className={`p-3 rounded ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
+            <p className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-500'}`}>草案</p>
+            <p className={`text-sm font-medium ${isDark ? 'text-gray-200' : 'text-gray-700'}`}>{resourceDrafts.length}</p>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap gap-2 mb-4">
+          <Button size="sm" variant="secondary" onClick={() => refreshResourceStatus(true)} disabled={loadingResources}>
+            {loadingResources ? <Loader2 className="w-4 h-4 mr-1 animate-spin" /> : <RefreshCw className="w-4 h-4 mr-1" />}
+            刷新资源状态
+          </Button>
+          <Button size="sm" onClick={() => handleGenerateResourceDrafts(false)} disabled={generatingDrafts || unresolvedRequirements.length === 0}>
+            {generatingDrafts ? <Loader2 className="w-4 h-4 mr-1 animate-spin" /> : <Sparkles className="w-4 h-4 mr-1" />}
+            生成 blocking 草案
+          </Button>
+          <Button size="sm" variant="secondary" onClick={() => handleGenerateResourceDrafts(true)} disabled={generatingDrafts || unresolvedRequirements.length === 0}>
+            包含 advisory
+          </Button>
+          {resourceDrafts.length > 0 && (
+            <Button size="sm" onClick={handleConfirmResourceDrafts} disabled={confirmingDrafts || supportedDrafts.length === 0}>
+              {confirmingDrafts ? <Loader2 className="w-4 h-4 mr-1 animate-spin" /> : <Check className="w-4 h-4 mr-1" />}
+              确认创建可支持草案 ({supportedDrafts.length})
+            </Button>
+          )}
+        </div>
+
+        {resourceRequirements.length === 0 ? (
+          <p className={`text-sm ${isDark ? 'text-gray-500' : 'text-gray-500'}`}>暂无资源需求记录。</p>
+        ) : (
+          <div className="space-y-2 mb-4">
+            {resourceRequirements.map(requirement => (
+              <div key={requirement.id} className={`p-3 rounded border ${isDark ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-gray-50'}`}>
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="flex flex-wrap items-center gap-2 mb-1">
+                      <span className={`text-xs px-2 py-0.5 rounded ${requirement.severity === 'blocking' ? 'bg-red-100 text-red-700' : requirement.severity === 'advisory' ? 'bg-yellow-100 text-yellow-700' : 'bg-gray-100 text-gray-700'}`}>
+                        {requirementLabel(requirement)}
+                      </span>
+                      <span className={`text-xs px-2 py-0.5 rounded ${isDark ? 'bg-gray-700 text-gray-300' : 'bg-gray-200 text-gray-600'}`}>
+                        {requirement.status}
+                      </span>
+                    </div>
+                    <p className={`text-sm font-medium ${isDark ? 'text-gray-200' : 'text-gray-800'}`}>{requirement.resource_name}</p>
+                    {requirement.reason && (
+                      <p className={`text-xs mt-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>{requirement.reason}</p>
+                    )}
+                  </div>
+                  <div className="flex flex-wrap gap-1 justify-end">
+                    {requirement.status !== 'resolved' && (
+                      <Button size="sm" variant="secondary" onClick={() => handleUpdateRequirementStatus(requirement.id, 'in_progress')}>处理中</Button>
+                    )}
+                    {requirement.status !== 'resolved' && (
+                      <Button size="sm" variant="secondary" onClick={() => handleUpdateRequirementStatus(requirement.id, 'ignored')}>忽略</Button>
+                    )}
+                    {requirement.status !== 'resolved' && (
+                      <Button size="sm" onClick={() => handleUpdateRequirementStatus(requirement.id, 'resolved')}>标记解决</Button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {resourceDrafts.length > 0 && (
+          <div className="space-y-2">
+            <h4 className={`text-xs font-medium ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>待确认补全草案</h4>
+            {resourceDrafts.map(draft => (
+              <div key={draft.requirement_id} className={`p-3 rounded border ${isDark ? 'border-blue-900 bg-blue-950/30' : 'border-blue-100 bg-blue-50'}`}>
+                <div className="flex items-center justify-between mb-1">
+                  <p className={`text-sm font-medium ${isDark ? 'text-blue-200' : 'text-blue-900'}`}>
+                    {draft.resource_name || draft.draft_payload?.name || '未命名资源'}
+                  </p>
+                  <span className={`text-xs px-2 py-0.5 rounded ${isDark ? 'bg-blue-900 text-blue-200' : 'bg-blue-100 text-blue-700'}`}>
+                    {draft.resource_type}
+                  </span>
+                </div>
+                {draft.reason && <p className={`text-xs ${isDark ? 'text-blue-300' : 'text-blue-700'}`}>{draft.reason}</p>}
+                {!['character', 'lore'].includes(draft.resource_type) && (
+                  <p className={`text-xs mt-1 ${isDark ? 'text-yellow-300' : 'text-yellow-700'}`}>
+                    当前仅支持直接确认创建 character / lore，此草案需后续资源界面处理。
+                  </p>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+    )
   }
 
   // 情绪曲线可视化
@@ -319,6 +583,9 @@ export default function Outlines() {
                 const newChapter = outlines.length > 0 ? Math.max(...outlines.map(o => o.chapter_number)) + 1 : 1
                 setSelectedChapter(newChapter)
                 setCurrentOutline(null)
+                setResourceRequirements([])
+                setResourceReadiness(null)
+                setResourceDrafts([])
               }}>
                 <Plus className="w-4 h-4" />
               </Button>
@@ -411,6 +678,8 @@ export default function Outlines() {
                     {currentOutline.summary}
                   </p>
                 </div>
+
+                {renderResourceReadinessPanel()}
 
                 {/* 章节目标 */}
                 {currentOutline.chapter_goals.length > 0 && (

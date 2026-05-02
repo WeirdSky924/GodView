@@ -65,6 +65,87 @@ class MasterPlotterAgent(BaseAgent):
             return str(value)
         return fallback
 
+    def _role_delta_context(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        """整理角色演绎产生的关系/状态/连续性提案，供剧情规划消费。"""
+        role_context = self._as_dict(input_data.get("role_performance_context"))
+        performance_result = self._as_dict(input_data.get("performance_result"))
+
+        def pick(key: str, default: Any) -> Any:
+            if input_data.get(key) is not None:
+                return input_data.get(key)
+            if role_context.get(key) is not None:
+                return role_context.get(key)
+            if performance_result.get(key) is not None:
+                return performance_result.get(key)
+            return default
+
+        return {
+            "relationship_deltas": self._as_list(pick("relationship_deltas", [])),
+            "state_deltas": self._as_list(pick("state_deltas", [])),
+            "continuity_notes": self._as_list(pick("continuity_notes", [])),
+            "performance_warnings": self._as_list(pick("performance_warnings", [])),
+            "role_performance_gate": self._as_dict(pick("role_performance_gate", {})),
+            "role_performance_gate_passed": pick("role_performance_gate_passed", True),
+            "role_performance_gate_blockers": self._as_list(pick("role_performance_gate_blockers", [])),
+            "role_performance_gate_warnings": self._as_list(pick("role_performance_gate_warnings", [])),
+        }
+
+    def _role_delta_resource_requirements(self, role_delta_context: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """把关系/状态变化暴露出的后续缺口转成资源需求建议，不直接持久化。"""
+        requirements: List[Dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+
+        def add(requirement_type: str, resource_name: str, severity: str, reason: str, source: str) -> None:
+            name = str(resource_name or "").strip()
+            if not name:
+                return
+            key = (requirement_type, name, reason)
+            if key in seen:
+                return
+            seen.add(key)
+            requirements.append({
+                "requirement_type": requirement_type,
+                "resource_name": name,
+                "severity": severity,
+                "status": "pending",
+                "reason": reason,
+                "source_agent": source,
+                "suggested_payload": {},
+            })
+
+        for delta in self._as_list(role_delta_context.get("relationship_deltas")):
+            if not isinstance(delta, dict):
+                continue
+            source = str(delta.get("source_character") or "").strip()
+            target = str(delta.get("target_character") or "").strip()
+            dimension = str(delta.get("dimension") or "relationship").strip()
+            reason = str(delta.get("reason") or "关系变化需要后续承接").strip()
+            if target:
+                add("relationship", target, "advisory", f"{source} -> {target} 的 {dimension} 变化：{reason}", "role_performance_delta")
+
+        for delta in self._as_list(role_delta_context.get("state_deltas")):
+            if not isinstance(delta, dict):
+                continue
+            source = str(delta.get("source_character") or "").strip()
+            field = str(delta.get("field") or "state").strip()
+            change = str(delta.get("change") or "").strip()
+            persistence = str(delta.get("persistence") or "scene_only").strip()
+            if persistence in {"chapter", "long_term"} or delta.get("requires_confirmation"):
+                add("character_state", source, "advisory", f"{field} 状态变化需确认/承接：{change}", "role_performance_delta")
+
+        for note in self._as_list(role_delta_context.get("continuity_notes")):
+            if isinstance(note, dict):
+                source = str(note.get("source_character") or "").strip()
+                text = str(note.get("note") or note.get("content") or "").strip()
+            else:
+                source = ""
+                text = str(note or "").strip()
+            if text:
+                add("continuity", source or "chapter_continuity", "advisory", text, "role_performance_continuity")
+
+        return requirements
+
+
     def _get_default_variables(self) -> Dict[str, Any]:
         """获取默认变量（MasterPlotter 特定）"""
         return {
@@ -461,6 +542,8 @@ class MasterPlotterAgent(BaseAgent):
         upcoming_outline_context = self._as_list(input_data.get("upcoming_outline_context", []))
         upcoming_outline_policy = input_data.get("upcoming_outline_policy")
         character_constraints = input_data.get("character_constraints")
+        role_delta_context = self._role_delta_context(input_data)
+        role_delta_resource_requirements = self._role_delta_resource_requirements(role_delta_context)
 
         blocks = [
             self._format_context_block("绑定章节大纲（事实源，不可改写）", chapter_outline),
@@ -473,6 +556,8 @@ class MasterPlotterAgent(BaseAgent):
             self._format_context_block("角色出场硬约束", character_constraints),
             self._format_context_block("场景方向", scene_directions),
             self._format_context_block("场景演绎素材", performance_result),
+            self._format_context_block("关系/状态/连续性变化提案", role_delta_context),
+            self._format_context_block("由关系/状态变化触发的资源需求建议", role_delta_resource_requirements),
             self._format_context_block("前文概要", previous_chapters, max_chars=2500),
             self._format_context_block("现有伏笔", existing_hooks, max_chars=2500),
             self._format_context_block("角色状态", characters, max_chars=2500),
@@ -485,6 +570,8 @@ class MasterPlotterAgent(BaseAgent):
                 **input_data,
                 "chapter_outline": chapter_outline,
                 "chapter_goals": chapter_goals,
+                "role_delta_context": role_delta_context,
+                "role_delta_resource_requirements": role_delta_resource_requirements,
                 "target_word_count": target_word_count or 0,
             },
         )
@@ -505,6 +592,11 @@ class MasterPlotterAgent(BaseAgent):
             result = parsed.model_dump()
             result.pop("chapter_outline", None)
             result.pop("chapter_goals", None)
+            if role_delta_resource_requirements:
+                result["role_delta_resource_requirements"] = role_delta_resource_requirements
+                result.setdefault("resource_requirements", [])
+                if isinstance(result["resource_requirements"], list):
+                    result["resource_requirements"].extend(role_delta_resource_requirements)
             return AgentResponse(success=True, data=result)
         except StructuredOutputError as e:
             logger.error(f"章节写作计划 structured 失败: {e}")
@@ -529,7 +621,8 @@ class MasterPlotterAgent(BaseAgent):
                     "scene_integration_plan": {"use_from_performance": [], "rewrite_or_skip": []},
                     "required_elements_check": {},
                     "outline_adherence_notes": ["写作计划生成失败，使用绑定大纲作为保底事实源"],
-                    "setting_conflict_warnings": [],
+                    "role_delta_resource_requirements": role_delta_resource_requirements,
+                    "resource_requirements": role_delta_resource_requirements,
                 },
             )
 

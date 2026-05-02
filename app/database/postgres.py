@@ -221,6 +221,7 @@ class PostgresDatabase:
                 'cached_pending_lores', 'cached_pending_characters', 'cached_pending_hooks',
                 'cached_context_sections', 'payload', 'setting_agent_history', 'extracted_seed', 'confirmed_seed',
                 'root_input_summary', 'metadata', 'attributes', 'content',
+                'suggested_payload',
             ]
 
             for row in rows:
@@ -1836,6 +1837,290 @@ class PostgresDatabase:
             return default
         return [value]
 
+    async def save_outline_resource_requirement(self, requirement_data: Dict[str, Any]) -> str:
+        """保存大纲资源需求；用于 workflow 产生的 pending requirement。"""
+        params = requirement_data.copy()
+        requirement_id = str(params.get("id") or uuid_module.uuid4())
+        project_id = _validate_uuid(params.get("project_id"))
+        if not project_id:
+            raise ValueError("资源需求缺少有效 project_id")
+
+        chapter_id = _validate_uuid(params.get("chapter_id"))
+        matched_resource_id = params.get("matched_resource_id")
+        if matched_resource_id is not None:
+            matched_resource_id = str(matched_resource_id)
+
+        requirement_type = str(params.get("requirement_type") or "lore").strip() or "lore"
+        resource_name = str(params.get("resource_name") or params.get("name") or "").strip()
+        if not resource_name:
+            raise ValueError("资源需求缺少 resource_name")
+
+        severity = str(params.get("severity") or "advisory").strip().lower()
+        if severity not in {"blocking", "advisory", "optional"}:
+            severity = "advisory"
+        status = str(params.get("status") or "pending").strip().lower() or "pending"
+        if status not in {"pending", "in_progress", "resolved", "ignored", "superseded"}:
+            status = "pending"
+
+        suggested_payload = params.get("suggested_payload") if isinstance(params.get("suggested_payload"), dict) else {}
+        metadata = params.get("metadata") if isinstance(params.get("metadata"), dict) else {}
+        metadata = {
+            **metadata,
+            "source_requirement": requirement_data,
+            "source_node_label": params.get("source_node_label"),
+            "source_field": params.get("source_field"),
+        }
+        record = {
+            "id": requirement_id,
+            "project_id": project_id,
+            "outline_id": params.get("outline_id") or params.get("chapter_outline_id"),
+            "outline_version_id": params.get("outline_version_id"),
+            "chapter_id": chapter_id,
+            "chapter_num": params.get("chapter_num") or params.get("chapter_number"),
+            "requirement_type": requirement_type,
+            "resource_name": resource_name,
+            "severity": severity,
+            "status": status,
+            "reason": params.get("reason") or "",
+            "suggested_payload": json.dumps(suggested_payload, default=str),
+            "matched_resource_id": matched_resource_id,
+            "matched_resource_type": params.get("matched_resource_type"),
+            "source_excerpt": params.get("source_excerpt") or params.get("reason") or "",
+            "source_agent": params.get("source_agent"),
+            "source_node_id": params.get("source_node_id") or params.get("node_id"),
+            "source_execution_id": params.get("source_execution_id") or params.get("workflow_execution_id"),
+            "metadata": json.dumps(metadata, default=str),
+            "updated_at": params.get("updated_at") or datetime.now(),
+            "resolved_at": params.get("resolved_at"),
+        }
+        fingerprint = "|".join([
+            project_id,
+            str(record["outline_id"] or ""),
+            str(record["chapter_num"] or ""),
+            requirement_type,
+            resource_name,
+            str(record["reason"] or ""),
+            str(record["source_node_id"] or ""),
+        ])
+        record["fingerprint"] = fingerprint
+        chapter_id_sql = "CAST(:chapter_id AS UUID)" if record.get("chapter_id") else "NULL"
+
+        query = """
+        INSERT INTO outline_resource_requirements (
+            id, project_id, outline_id, outline_version_id, chapter_id, chapter_num,
+            requirement_type, resource_name, severity, status, reason, suggested_payload,
+            matched_resource_id, matched_resource_type, source_excerpt, source_agent,
+            source_node_id, source_execution_id, fingerprint, metadata, updated_at, resolved_at
+        ) VALUES (
+            CAST(:id AS UUID), CAST(:project_id AS UUID), :outline_id, :outline_version_id, """ + chapter_id_sql + """, :chapter_num,
+            :requirement_type, :resource_name, :severity, :status, :reason, CAST(:suggested_payload AS jsonb),
+            :matched_resource_id, :matched_resource_type, :source_excerpt, :source_agent,
+            :source_node_id, :source_execution_id, :fingerprint, CAST(:metadata AS jsonb), :updated_at, :resolved_at
+        )
+        ON CONFLICT (project_id, fingerprint) WHERE fingerprint IS NOT NULL DO UPDATE SET
+            outline_id = EXCLUDED.outline_id,
+            outline_version_id = EXCLUDED.outline_version_id,
+            chapter_id = EXCLUDED.chapter_id,
+            chapter_num = EXCLUDED.chapter_num,
+            requirement_type = EXCLUDED.requirement_type,
+            resource_name = EXCLUDED.resource_name,
+            severity = EXCLUDED.severity,
+            status = CASE
+                WHEN outline_resource_requirements.status IN ('resolved', 'ignored') THEN outline_resource_requirements.status
+                ELSE EXCLUDED.status
+            END,
+            reason = EXCLUDED.reason,
+            suggested_payload = EXCLUDED.suggested_payload,
+            matched_resource_id = EXCLUDED.matched_resource_id,
+            matched_resource_type = EXCLUDED.matched_resource_type,
+            source_excerpt = EXCLUDED.source_excerpt,
+            source_agent = EXCLUDED.source_agent,
+            source_node_id = EXCLUDED.source_node_id,
+            source_execution_id = EXCLUDED.source_execution_id,
+            metadata = EXCLUDED.metadata,
+            updated_at = EXCLUDED.updated_at,
+            resolved_at = COALESCE(outline_resource_requirements.resolved_at, EXCLUDED.resolved_at)
+        """
+        await self.execute_write(query, record)
+        return requirement_id
+
+    async def save_outline_resource_requirements(self, requirements: List[Dict[str, Any]]) -> List[str]:
+        """批量保存大纲资源需求。"""
+        saved_ids: List[str] = []
+        for requirement in requirements:
+            if not isinstance(requirement, dict):
+                continue
+            saved_ids.append(await self.save_outline_resource_requirement(requirement))
+        return saved_ids
+
+    async def get_outline_resource_requirements(
+        self,
+        project_id: str,
+        outline_id: Optional[str] = None,
+        chapter_num: Optional[int] = None,
+        status: Optional[str] = None,
+        severity: Optional[str] = None,
+        requirement_type: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """查询大纲资源需求。"""
+        conditions = ["project_id = CAST(:project_id AS UUID)"]
+        params: Dict[str, Any] = {"project_id": project_id}
+        if outline_id:
+            conditions.append("outline_id = :outline_id")
+            params["outline_id"] = outline_id
+        if chapter_num is not None:
+            conditions.append("chapter_num = :chapter_num")
+            params["chapter_num"] = chapter_num
+        if status:
+            conditions.append("status = :status")
+            params["status"] = status
+        if severity:
+            conditions.append("severity = :severity")
+            params["severity"] = severity
+        if requirement_type:
+            conditions.append("requirement_type = :requirement_type")
+            params["requirement_type"] = requirement_type
+        query = f"""
+        SELECT * FROM outline_resource_requirements
+        WHERE {' AND '.join(conditions)}
+        ORDER BY
+            chapter_num NULLS LAST,
+            CASE severity WHEN 'blocking' THEN 1 WHEN 'advisory' THEN 2 ELSE 3 END,
+            created_at ASC
+        """
+        return await self.execute_query(query, params)
+
+    async def update_outline_resource_requirement_status(
+        self,
+        requirement_id: str,
+        status: str,
+        matched_resource_id: Optional[str] = None,
+        matched_resource_type: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """更新大纲资源需求处理状态。"""
+        normalized_status = str(status or "").strip().lower()
+        if normalized_status not in {"pending", "in_progress", "resolved", "ignored", "superseded"}:
+            raise ValueError(f"无效的资源需求状态: {status}")
+        params = {
+            "id": requirement_id,
+            "status": normalized_status,
+            "matched_resource_id": str(matched_resource_id) if matched_resource_id else None,
+            "matched_resource_type": matched_resource_type,
+            "updated_at": datetime.now(),
+            "resolved_at": datetime.now() if normalized_status in {"resolved", "ignored", "superseded"} else None,
+        }
+        resolved_at_sql = "CURRENT_TIMESTAMP" if normalized_status in {"resolved", "ignored", "superseded"} else "NULL"
+        query = f"""
+        UPDATE outline_resource_requirements
+        SET status = :status,
+            matched_resource_id = COALESCE(CAST(:matched_resource_id AS TEXT), matched_resource_id),
+            matched_resource_type = COALESCE(CAST(:matched_resource_type AS TEXT), matched_resource_type),
+            updated_at = :updated_at,
+            resolved_at = CASE
+                WHEN :status IN ('pending', 'in_progress') THEN NULL
+                ELSE {resolved_at_sql}
+            END
+        WHERE id = CAST(:id AS UUID)
+        RETURNING *
+        """
+        rows = await self.execute_query(query, params)
+        return rows[0] if rows else None
+
+    async def get_chapter_resource_readiness(
+        self,
+        project_id: str,
+        outline_id: Optional[str] = None,
+        chapter_num: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """查询章节资源 readiness 汇总。"""
+        conditions = ["project_id = CAST(:project_id AS UUID)"]
+        params: Dict[str, Any] = {"project_id": project_id}
+        if outline_id:
+            conditions.append("outline_id = :outline_id")
+            params["outline_id"] = outline_id
+        if chapter_num is not None:
+            conditions.append("chapter_num = :chapter_num")
+            params["chapter_num"] = chapter_num
+        query = f"""
+        SELECT * FROM chapter_resource_readiness
+        WHERE {' AND '.join(conditions)}
+        ORDER BY chapter_num ASC
+        """
+        return await self.execute_query(query, params)
+
+    async def update_chapter_resource_readiness(
+        self,
+        project_id: str,
+        outline_id: Optional[str],
+        chapter_num: Optional[int],
+    ) -> Optional[Dict[str, Any]]:
+        """根据未完成资源需求刷新章节 readiness 汇总。"""
+        if chapter_num is None:
+            return None
+        params = {
+            "project_id": project_id,
+            "outline_id": outline_id,
+            "chapter_num": chapter_num,
+            "updated_at": datetime.now(),
+        }
+        outline_filter = "outline_id = :outline_id" if outline_id else "outline_id IS NULL"
+        query = f"""
+        WITH stats AS (
+            SELECT
+                COUNT(*) FILTER (WHERE severity = 'blocking' AND status NOT IN ('ignored', 'superseded')) AS blocking_total,
+                COUNT(*) FILTER (WHERE severity = 'blocking' AND status = 'resolved') AS blocking_resolved,
+                COUNT(*) FILTER (WHERE severity = 'advisory' AND status NOT IN ('ignored', 'superseded')) AS advisory_total,
+                COUNT(*) FILTER (WHERE severity = 'advisory' AND status = 'resolved') AS advisory_resolved
+            FROM outline_resource_requirements
+            WHERE project_id = CAST(:project_id AS UUID)
+              AND chapter_num = :chapter_num
+              AND {outline_filter}
+        ), upsert AS (
+            UPDATE chapter_resource_readiness
+            SET blocking_total = stats.blocking_total,
+                blocking_resolved = stats.blocking_resolved,
+                advisory_total = stats.advisory_total,
+                advisory_resolved = stats.advisory_resolved,
+                readiness_status = CASE
+                    WHEN stats.blocking_total > stats.blocking_resolved THEN 'blocked'
+                    WHEN stats.advisory_total > stats.advisory_resolved THEN 'ready_with_warnings'
+                    WHEN stats.blocking_total = 0 AND stats.advisory_total = 0 THEN 'not_audited'
+                    ELSE 'ready'
+                END,
+                last_audited_at = :updated_at,
+                updated_at = :updated_at
+            FROM stats
+            WHERE chapter_resource_readiness.project_id = CAST(:project_id AS UUID)
+              AND chapter_resource_readiness.chapter_num = :chapter_num
+              AND ((CAST(:outline_id AS TEXT) IS NULL AND chapter_resource_readiness.outline_id IS NULL) OR chapter_resource_readiness.outline_id = CAST(:outline_id AS TEXT))
+            RETURNING chapter_resource_readiness.*
+        ), inserted AS (
+            INSERT INTO chapter_resource_readiness (
+                project_id, outline_id, chapter_num, blocking_total, blocking_resolved,
+                advisory_total, advisory_resolved, readiness_status, last_audited_at, updated_at
+            )
+            SELECT
+                CAST(:project_id AS UUID), CAST(:outline_id AS TEXT), :chapter_num,
+                blocking_total, blocking_resolved, advisory_total, advisory_resolved,
+                CASE
+                    WHEN blocking_total > blocking_resolved THEN 'blocked'
+                    WHEN advisory_total > advisory_resolved THEN 'ready_with_warnings'
+                    WHEN blocking_total = 0 AND advisory_total = 0 THEN 'not_audited'
+                    ELSE 'ready'
+                END,
+                :updated_at,
+                :updated_at
+            FROM stats
+            WHERE NOT EXISTS (SELECT 1 FROM upsert)
+            RETURNING *
+        )
+        SELECT * FROM upsert
+        UNION ALL
+        SELECT * FROM inserted
+        """
+        rows = await self.execute_query(query, params)
+        return rows[0] if rows else None
+
     async def save_event(self, event_data: Dict[str, Any]) -> str:
         """保存工作流/事件 Agent 生成的领域剧情事件。"""
         params = event_data.copy()
@@ -2355,6 +2640,64 @@ class PostgresDatabase:
                         await session.execute(text(statement))
                     except Exception as e:
                         logger.warning(f"创建领域剧情事件表结构时出错: {str(e)[:100]}")
+
+            resource_requirement_schema_sql = """
+            CREATE TABLE IF NOT EXISTS outline_resource_requirements (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                outline_id TEXT,
+                outline_version_id TEXT,
+                chapter_id UUID REFERENCES chapters(id) ON DELETE SET NULL,
+                chapter_num INTEGER,
+                requirement_type TEXT NOT NULL,
+                resource_name TEXT NOT NULL,
+                severity TEXT NOT NULL DEFAULT 'advisory',
+                status TEXT NOT NULL DEFAULT 'pending',
+                reason TEXT NOT NULL DEFAULT '',
+                suggested_payload JSONB NOT NULL DEFAULT '{}',
+                matched_resource_id TEXT,
+                matched_resource_type TEXT,
+                source_excerpt TEXT,
+                source_agent TEXT,
+                source_node_id TEXT,
+                source_execution_id TEXT,
+                fingerprint TEXT,
+                metadata JSONB NOT NULL DEFAULT '{}',
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                resolved_at TIMESTAMP WITH TIME ZONE
+            );
+            CREATE INDEX IF NOT EXISTS idx_outline_resource_requirements_project ON outline_resource_requirements(project_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_outline_resource_requirements_outline ON outline_resource_requirements(project_id, outline_id, chapter_num);
+            CREATE INDEX IF NOT EXISTS idx_outline_resource_requirements_status ON outline_resource_requirements(project_id, status, severity);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_outline_resource_requirements_fingerprint ON outline_resource_requirements(project_id, fingerprint) WHERE fingerprint IS NOT NULL;
+
+            CREATE TABLE IF NOT EXISTS chapter_resource_readiness (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                outline_id TEXT,
+                outline_version_id TEXT,
+                chapter_id UUID REFERENCES chapters(id) ON DELETE SET NULL,
+                chapter_num INTEGER NOT NULL,
+                blocking_total INTEGER NOT NULL DEFAULT 0,
+                blocking_resolved INTEGER NOT NULL DEFAULT 0,
+                advisory_total INTEGER NOT NULL DEFAULT 0,
+                advisory_resolved INTEGER NOT NULL DEFAULT 0,
+                readiness_status TEXT NOT NULL DEFAULT 'not_audited',
+                last_audited_at TIMESTAMP WITH TIME ZONE,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_chapter_resource_readiness_project ON chapter_resource_readiness(project_id, chapter_num);
+            CREATE INDEX IF NOT EXISTS idx_chapter_resource_readiness_status ON chapter_resource_readiness(project_id, readiness_status);
+            CREATE INDEX IF NOT EXISTS idx_chapter_resource_readiness_outline ON chapter_resource_readiness(project_id, outline_id, chapter_num);
+            """
+            for statement in resource_requirement_schema_sql.split(';'):
+                if statement.strip():
+                    try:
+                        await session.execute(text(statement))
+                    except Exception as e:
+                        logger.warning(f"创建大纲资源需求表结构时出错: {str(e)[:100]}")
 
             operation_schema_sql = """
             CREATE TABLE IF NOT EXISTS operation_requests (

@@ -106,6 +106,12 @@ Writer 在章节工作流中必须把输入上下文视为已绑定事实源，�
 - 如果场景演绎素材与章节大纲、固定设定或角色约束冲突，以大纲和设定为准。
 - 已确认讨论资产可以作为本章事实使用；未确认讨论资产只能作为灵感参考。
 - 讨论资产、场景演绎素材或写作计划若引入未授权角色、未落库设定或违反角色状态，必须跳过或改写。
+- `public_performances` / `public_content` 是场内其他角色可见、可听的内容，可作为正文公开行动和台词素材。
+- `private_performances`、`private_thought`、`intent`、`withheld_information`、`misinterpretations` 只能作为 Writer 理解潜台词、动机和误会的参考；不能让其他角色无依据地知道。
+- `relationship_deltas`、`state_deltas`、`continuity_notes` 是关系、状态和后续连续性提案；正文可表现其外显结果，但不能把待确认变化直接写成已持久化角色档案。
+- 如果 `role_performance_gate_passed=false`，必须优先查看 `role_performance_gate_blockers`，跳过或改写被阻断的演绎素材，不得把公开/私有泄露、不可出场角色正面行动、OOC 或信息越界素材写入正文。
+- `role_performance_gate_warnings` 是可修正风险提示；可参考素材氛围，但必须规避对应风险。
+- 如果 `performance_warnings` 指出 OOC、信息越界、出场越界或资源缺口，必须优先规避或改写相关素材。
 
 ## 角色出场硬约束
 

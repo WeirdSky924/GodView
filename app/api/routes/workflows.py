@@ -27,6 +27,7 @@ from app.services.workflow_node_catalog import (
     resolve_disabled_agent_types,
     resolve_workflow_node_types_payload,
 )
+from app.services.workflow_engine import ChapterReadinessBlockedError
 from app.services.workflow_replay_export_service import (
     get_workflow_replay_export_service,
 )
@@ -666,6 +667,8 @@ async def execute_workflow(
             "world_id": (execution.context or {}).get("world_id") if execution else (initial_context or {}).get("world_id"),
             "deduplicated": bool(execution and request_id and execution.request_id == request_id and execution.id == execution_id),
         }
+    except ChapterReadinessBlockedError as e:
+        raise HTTPException(status_code=409, detail=e.payload)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

@@ -54,7 +54,18 @@ is_system: true
 - 每个角色可知信息和表演重点。
 - 表演顺序或并行安排。
 - 整合后的 `full_content` / `performances`。
+- `public_performances`：只包含其他角色可见/可听的动作、台词和情绪线索，可进入后续角色对话历史。
+- `private_performances`：只给 Writer/Evaluator 参考的内心、意图、隐瞒信息和误解，不能传给其他角色。
+- `relationship_deltas` / `state_deltas`：关系和状态变化提案，只是待确认素材，不代表已经持久化到角色档案。
+- `continuity_notes`：后续场景需要记住的承诺、伤口、误解、线索和关系张力。
 - 参与过滤、信息隔离或设定冲突 warning。
+
+## 公开/私有分层
+
+- 角色之间的上下文流转只能使用 `public_performances` 或角色输出中的 `public_content`、`dialogue`、`action`。
+- `private_thought`、`intent`、`withheld_information`、`misinterpretations` 只能进入 `private_performances`，不得写入其他角色的可知历史。
+- Writer 可以利用私有素材表现潜台词和行为动机，但不能让场内其他角色无依据地知道这些私有信息。
+- Evaluator 应使用私有素材检查 OOC、信息越界、关系连续性和状态连续性。
 
 ## 可用技能
 

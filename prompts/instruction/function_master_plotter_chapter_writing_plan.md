@@ -33,9 +33,12 @@ is_system: true
 5. 角色出场硬约束优先级高于场景演绎素材和集体讨论素材：只有 `present_character_names` 可作为当前场景正面参与者。
 6. `mentioned_only_names` / `forbidden_direct_appearance_names` 中的角色只能作为传闻、回忆、姓名、势力或影响被提及，不能安排其直接出场、发言或行动。
 7. 角色来源、历史、身份和背景必须遵守 `category=character_setting` 的设定；如素材冲突，写入 `rewrite_or_skip` / `avoid`，而不是采纳。
-8. 如果已有后续大纲参考，写作计划和新角色候选必须服务后续剧情发展，不能只解决本章即时推进。
-9. 如果没有后续大纲，不要擅自新建完整后续大纲；只按当前绑定大纲推进，并可在 `future_setup` / `hook_usage` 中提出轻量后续铺垫建议。
-10. 当 `present_character_names` 中的主要角色不足以推动本章事件时，可以提出新的 supporting / recurring / catalyst / informant / npc 次要角色候选；候选必须避开 `mentioned_only_names` / `forbidden_direct_appearance_names`，且必须给出可落库的姓名、定位、背景、目标和出场理由。
+8. `relationship_deltas`、`state_deltas`、`continuity_notes` 是待确认的关系/状态/连续性提案；可以用于后续冲突、伏笔和状态承接规划，但不能写成已持久化角色档案或已公开事实。
+9. 如果 `role_performance_gate_passed=false`，必须优先把 `role_performance_gate_blockers` 指向的素材放入 `rewrite_or_skip` / `avoid`，不得交给 Writer 直接采纳。
+10. 如果关系/状态变化暴露出角色关系、角色状态、势力、地点、道具、设定或危机解决资源缺口，只能输出 `resource_requirements` / `role_delta_resource_requirements`，不能把缺失资源当作已落库事实。
+11. 如果已有后续大纲参考，写作计划和新角色候选必须服务后续剧情发展，不能只解决本章即时推进。
+12. 如果没有后续大纲，不要擅自新建完整后续大纲；只按当前绑定大纲推进，并可在 `future_setup` / `hook_usage` 中提出轻量后续铺垫建议。
+13. 当 `present_character_names` 中的主要角色不足以推动本章事件时，可以提出新的 supporting / recurring / catalyst / informant / npc 次要角色候选；候选必须避开 `mentioned_only_names` / `forbidden_direct_appearance_names`，且必须给出可落库的姓名、定位、背景、目标和出场理由。
 
 ## 长篇与资源边界
 
@@ -90,6 +93,18 @@ is_system: true
       "future_plot_usage": "如有后续大纲，说明后续用途"
     }
   ],
+  "role_delta_resource_requirements": [
+    {
+      "requirement_type": "relationship/character_state/continuity/lore/location/item/faction/ability/crisis_resolution",
+      "resource_name": "需求对象",
+      "severity": "blocking/advisory/optional",
+      "status": "pending",
+      "reason": "由关系/状态/连续性变化触发的资源缺口原因",
+      "source_agent": "role_performance_delta/role_performance_continuity",
+      "suggested_payload": {}
+    }
+  ],
+  "resource_requirements": [],
   "outline_adherence_notes": ["大纲遵循提示"],
   "setting_conflict_warnings": ["设定冲突警告"],
   "suggested_chapter_outline": null,

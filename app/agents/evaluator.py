@@ -224,6 +224,116 @@ class EvaluatorAgent(BaseAgent):
 
         return issues
 
+    def _context_list(self, value: Any) -> List[Any]:
+        """将上游上下文字段归一化为列表。"""
+        if value in (None, ""):
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        return [value]
+
+    def _context_dict(self, value: Any) -> Dict[str, Any]:
+        """将上游上下文字段归一化为字典。"""
+        return value if isinstance(value, dict) else {}
+
+    def _role_performance_value(self, input_data: Dict[str, Any], key: str, default: Any = None) -> Any:
+        """从顶层、role_performance_context 或 performance_result 中读取角色演绎上下文。"""
+        if input_data.get(key) is not None:
+            return input_data.get(key)
+        role_context = self._context_dict(input_data.get("role_performance_context"))
+        if role_context.get(key) is not None:
+            return role_context.get(key)
+        performance_result = self._context_dict(input_data.get("performance_result"))
+        if performance_result.get(key) is not None:
+            return performance_result.get(key)
+        return default
+
+    def _private_performance_fragments(self, input_data: Dict[str, Any]) -> List[Dict[str, str]]:
+        """提取 Writer/Evaluator-only 的私有演绎片段，用于检测是否被正文公开采纳。"""
+        private_performances = self._context_list(self._role_performance_value(input_data, "private_performances", []))
+        public_performances = self._context_list(self._role_performance_value(input_data, "public_performances", []))
+        fragments: List[Dict[str, str]] = []
+
+        for item in [*private_performances, *public_performances]:
+            if not isinstance(item, dict):
+                continue
+            agent = str(item.get("agent") or item.get("source_character") or item.get("character") or "未知角色")
+            for key in ("private_thought", "inner_thought", "intent"):
+                text = str(item.get(key) or "").strip()
+                if len(text) >= 8:
+                    fragments.append({"agent": agent, "field": key, "value": text})
+            for key in ("withheld_information", "misinterpretations"):
+                for value in self._context_list(item.get(key)):
+                    text = str(value or "").strip()
+                    if len(text) >= 6:
+                        fragments.append({"agent": agent, "field": key, "value": text})
+        return fragments
+
+    def _role_performance_gate_issues(self, input_data: Dict[str, Any]) -> Dict[str, List[str]]:
+        """对正文做角色演绎 gate 确定性预检：只在正文采纳问题素材时阻断。"""
+        content = str(input_data.get("chapter_content") or "")
+        gate = self._context_dict(self._role_performance_value(input_data, "role_performance_gate", {}))
+        gate_passed = self._role_performance_value(input_data, "role_performance_gate_passed", gate.get("passed", True))
+        blockers = self._context_list(gate.get("blockers") or self._role_performance_value(input_data, "role_performance_gate_blockers", []))
+        gate_warnings = self._context_list(gate.get("warnings") or self._role_performance_value(input_data, "role_performance_gate_warnings", []))
+
+        issues: List[str] = []
+        warnings: List[str] = []
+        if gate_passed is False and blockers:
+            warnings.append("上游 role_performance_gate 未通过；Evaluator 必须确认正文没有采纳 blocker 指向素材。")
+
+        for fragment in self._private_performance_fragments(input_data):
+            value = fragment["value"]
+            if content and value in content:
+                issues.append(f"正文采纳了角色私有演绎素材：{fragment['agent']}.{fragment['field']}")
+
+        direct_markers = [
+            "说", "问", "答", "喊", "低声", "开口", "回应", "走", "站", "看", "伸手", "转身", "出现", "参与", "进入",
+            "dialogue", "said", "asked", "replied",
+        ]
+        blocked_names: set[str] = set()
+        for blocker in blockers:
+            text = str(blocker)
+            if "不可正面出场角色 " not in text:
+                continue
+            tail = text.split("不可正面出场角色 ", 1)[1].strip()
+            name = tail.split()[0].strip("：:，,。.") if tail else ""
+            if name:
+                blocked_names.add(name)
+
+        for name in sorted(blocked_names, key=len, reverse=True):
+            if not content or not name or name not in content:
+                continue
+            snippets: List[str] = []
+            start = 0
+            while True:
+                idx = content.find(name, start)
+                if idx == -1:
+                    break
+                snippets.append(content[max(0, idx - 20): idx + len(name) + 35])
+                start = idx + len(name)
+                if len(snippets) >= 3:
+                    break
+            if any(any(marker in snippet for marker in direct_markers) for snippet in snippets):
+                issues.append(f"正文采纳了 role_performance_gate 阻断的不可出场角色行动/发言：{name}：{' / '.join(snippets[:2])}")
+
+        for blocker in blockers:
+            text = str(blocker)
+            if text and not any(text in item for item in warnings):
+                warnings.append(f"role_performance_gate blocker 待核查：{text}")
+        for warning in gate_warnings:
+            text = str(warning)
+            if text:
+                warnings.append(f"role_performance_gate warning：{text}")
+
+        return {
+            "issues": list(dict.fromkeys(issues)),
+            "warnings": list(dict.fromkeys(warnings)),
+            "blockers": [str(item) for item in blockers if str(item)],
+        }
+
     async def execute(self, input_data: Dict[str, Any]) -> AgentResponse:
         """
         执行评估任务
@@ -271,6 +381,20 @@ class EvaluatorAgent(BaseAgent):
             self._format_context_block("世界/项目规则", input_data.get("world_info")),
             self._format_context_block("角色出场硬约束", input_data.get("character_constraints")),
             self._format_context_block("角色参与轨迹", input_data.get("participation_trace")),
+            self._format_context_block("角色演绎 Gate", {
+                "role_performance_gate": self._role_performance_value(input_data, "role_performance_gate", {}),
+                "role_performance_gate_passed": self._role_performance_value(input_data, "role_performance_gate_passed", True),
+                "role_performance_gate_blockers": self._role_performance_value(input_data, "role_performance_gate_blockers", []),
+                "role_performance_gate_warnings": self._role_performance_value(input_data, "role_performance_gate_warnings", []),
+            }),
+            self._format_context_block("角色演绎连续性素材", {
+                "public_performances": self._role_performance_value(input_data, "public_performances", []),
+                "private_performances": self._role_performance_value(input_data, "private_performances", []),
+                "relationship_deltas": self._role_performance_value(input_data, "relationship_deltas", []),
+                "state_deltas": self._role_performance_value(input_data, "state_deltas", []),
+                "continuity_notes": self._role_performance_value(input_data, "continuity_notes", []),
+                "performance_warnings": self._role_performance_value(input_data, "performance_warnings", []),
+            }),
             self._format_context_block("地图/资产持久化状态", {
                 "map_persistence_state": input_data.get("map_persistence_state"),
                 "asset_persistence_state": input_data.get("asset_persistence_state"),
@@ -281,6 +405,7 @@ class EvaluatorAgent(BaseAgent):
         ]
         workflow_context = "\n\n".join(block for block in context_blocks if block)
         direct_character_issues = self._direct_character_constraint_issues(input_data)
+        role_gate_check = self._role_performance_gate_issues(input_data)
 
         evaluator_config_prompt = await self._get_evaluator_config_prompt({
             "task_type": "chapter_end",
@@ -302,6 +427,8 @@ class EvaluatorAgent(BaseAgent):
                     "word_count": word_count,
                     "target_word_count": target_word_count or None,
                     "deterministic_character_constraint_issues": direct_character_issues,
+                    "deterministic_role_performance_gate_issues": role_gate_check["issues"],
+                    "deterministic_role_performance_gate_warnings": role_gate_check["warnings"],
                     "chapter_content": chapter_content or "无",
                 }),
             ],
@@ -329,6 +456,7 @@ class EvaluatorAgent(BaseAgent):
             task_notes=[
                 "必须以 Agent Template / md prompt / writing-rules 中的门禁为准。",
                 "确定性角色约束预检问题必须作为阻断问题写入 character_participation_check。",
+                "确定性 role_performance_gate 问题必须写入 character_participation_check 或 upstream_context_usage_check；若正文采纳 blocker 指向素材，quality_passed=false。",
             ],
             config_prompt=evaluator_config_prompt,
         )
@@ -373,6 +501,36 @@ class EvaluatorAgent(BaseAgent):
                     if not isinstance(existing, list):
                         existing = [existing]
                     character_check["issues"] = [*existing, *direct_character_issues]
+            deterministic_role_issues = role_gate_check["issues"]
+            deterministic_role_warnings = role_gate_check["warnings"]
+            if deterministic_role_issues:
+                parsed_data.setdefault("issues", [])
+                parsed_data["issues"].extend(issue for issue in deterministic_role_issues if issue not in parsed_data["issues"])
+                parsed_data["quality_passed"] = False
+                parsed_data["should_end"] = False
+                parsed_data["approved"] = False
+                parsed_data["pass"] = False
+                character_check = parsed_data.setdefault("character_participation_check", {})
+                if isinstance(character_check, dict):
+                    character_check["passed"] = False
+                    existing = character_check.get("issues") or []
+                    if not isinstance(existing, list):
+                        existing = [existing]
+                    character_check["issues"] = [*existing, *deterministic_role_issues]
+            if deterministic_role_warnings:
+                upstream_check = parsed_data.setdefault("upstream_context_usage_check", {})
+                if isinstance(upstream_check, dict):
+                    existing = upstream_check.get("issues") or []
+                    if not isinstance(existing, list):
+                        existing = [existing]
+                    upstream_check["issues"] = [*existing, *deterministic_role_warnings]
+            parsed_data.setdefault("role_performance_gate_check", {})
+            parsed_data["role_performance_gate_check"] = {
+                "passed": not deterministic_role_issues,
+                "issues": deterministic_role_issues,
+                "warnings": deterministic_role_warnings,
+                "blockers": role_gate_check["blockers"],
+            }
             if "quality_passed" not in parsed_data:
                 parsed_data["quality_passed"] = bool(parsed_data.get("should_end")) and not parsed_data.get("issues")
             return AgentResponse.strict(

@@ -556,6 +556,65 @@ class SceneCoordinatorAgent(BaseAgent):
 
         return relevant
 
+    def _build_performance_message(
+        self,
+        *,
+        char_name: str,
+        result_data: Dict[str, Any],
+        char_data: Dict[str, Any],
+        message_type: str = "character_performance",
+        round_value: Any = None,
+    ) -> Dict[str, Any]:
+        """从 CharacterAgent 输出构建公开/私有分层表演消息。"""
+        dialogue = result_data.get("dialogue", "")
+        action = result_data.get("action", "")
+        content_parts = []
+        if action:
+            content_parts.append(f"（{action}）")
+        if dialogue:
+            content_parts.append(dialogue)
+        public_content = result_data.get("public_content") or " ".join(content_parts)
+        private_thought = result_data.get("private_thought") or result_data.get("inner_thought", "")
+
+        message = {
+            "agent": char_name,
+            "type": message_type,
+            "content": public_content,
+            "public_content": public_content,
+            "dialogue": dialogue,
+            "action": action,
+            "private_thought": private_thought,
+            "inner_thought": private_thought,
+            "emotion": result_data.get("emotion", ""),
+            "intent": result_data.get("intent", ""),
+            "perceived_facts": result_data.get("perceived_facts", []),
+            "misinterpretations": result_data.get("misinterpretations", []),
+            "withheld_information": result_data.get("withheld_information", []),
+            "relationship_delta": result_data.get("relationship_delta", []),
+            "state_delta": result_data.get("state_delta", []),
+            "continuity_notes": result_data.get("continuity_notes", []),
+            "warnings": result_data.get("warnings", []),
+            "importance_tier": _get_importance_tier(char_data, 3),
+        }
+        if round_value is not None:
+            message["round"] = round_value
+        return message
+
+    def _public_history_messages(self, limit: int) -> List[Dict[str, Any]]:
+        """只把公开内容传给后续角色，避免泄露私有思考和隐藏意图。"""
+        public_messages = []
+        for msg in self._conversation_history[-limit:]:
+            public_messages.append({
+                "agent": msg.get("agent"),
+                "speaker": msg.get("agent"),
+                "content": msg.get("public_content") or msg.get("content", ""),
+                "action": msg.get("action", ""),
+                "dialogue": msg.get("dialogue", ""),
+                "emotion": msg.get("emotion", ""),
+                "round": msg.get("round"),
+            })
+        return public_messages
+
     async def _run_interactive_scene(
         self,
         characters_data: List[Dict[str, Any]],
@@ -589,28 +648,25 @@ class SceneCoordinatorAgent(BaseAgent):
                 ),
                 "present_characters": [c.get("name") for c in main_chars],
                 "recent_events": distribution_plan.get(char_name, {}).get("previous_context", {}).get("recent_events", []),
-                "dialogue_history": self._conversation_history[-5:],
+                "dialogue_history": self._public_history_messages(5),
             }
 
             # 执行角色表演
             result = await char_agent.execute(char_input)
 
             if result.success:
-                message = {
-                    "agent": char_name,
-                    "type": "character_performance",
-                    "content": result.data.get("dialogue", ""),
-                    "action": result.data.get("action", ""),
-                    "inner_thought": result.data.get("inner_thought", ""),
-                    "emotion": result.data.get("emotion", ""),
-                    "importance_tier": _get_importance_tier(char_data, 3),
-                }
+                message = self._build_performance_message(
+                    char_name=char_name,
+                    result_data=result.data,
+                    char_data=char_data,
+                    message_type="character_performance",
+                )
                 results.append(message)
                 self._conversation_history.append(message)
 
                 # 广播（如果设置了流式回调）
                 if self._stream_callback:
-                    await self._stream_callback(f"[{char_name}] {result.data.get('dialogue', '')}")
+                    await self._stream_callback(f"[{char_name}] {message.get('public_content', '')}")
 
         # 插入背景角色行为
         for bg_char in background_chars:
@@ -681,7 +737,7 @@ class SceneCoordinatorAgent(BaseAgent):
                     ),
                     "present_characters": [c.get("name") for c in main_chars],
                     "recent_events": distribution_plan.get(char_name, {}).get("previous_context", {}).get("recent_events", []),
-                    "dialogue_history": self._conversation_history[-10:],  # 最近10条对话
+                    "dialogue_history": self._public_history_messages(10),  # 最近10条公开对话
                     "round_number": round_num + 1,
                     "total_rounds": iteration_count,
                     "round_focus": round_focus,
@@ -692,31 +748,17 @@ class SceneCoordinatorAgent(BaseAgent):
                 result = await char_agent.execute(char_input)
 
                 if result.success:
-                    dialogue = result.data.get("dialogue", "")
-                    action = result.data.get("action", "")
-
-                    # 构建完整的内容
-                    content_parts = []
-                    if action:
-                        content_parts.append(f"（{action}）")
-                    if dialogue:
-                        content_parts.append(dialogue)
-
-                    message = {
-                        "agent": char_name,
-                        "type": "character_performance",
-                        "content": " ".join(content_parts),
-                        "dialogue": dialogue,
-                        "action": action,
-                        "inner_thought": result.data.get("inner_thought", ""),
-                        "emotion": result.data.get("emotion", ""),
-                        "importance_tier": _get_importance_tier(char_data, 3),
-                        "round": round_num + 1,
-                    }
+                    message = self._build_performance_message(
+                        char_name=char_name,
+                        result_data=result.data,
+                        char_data=char_data,
+                        message_type="character_performance",
+                        round_value=round_num + 1,
+                    )
                     results.append(message)
                     self._conversation_history.append(message)
 
-                    logger.debug(f"  [{char_name}] 第{round_num + 1}轮: {dialogue[:50]}...")
+                    logger.debug(f"  [{char_name}] 第{round_num + 1}轮: {message.get('public_content', '')[:50]}...")
 
             # 每轮结束后插入背景角色行为
             if background_chars and round_num < iteration_count - 1:
@@ -781,10 +823,11 @@ class SceneCoordinatorAgent(BaseAgent):
         if plot_context.get("visible_events"):
             parts.append(f"【你能看到的事】\n{chr(10).join(plot_context.get('visible_events', []))}")
 
-        # 之前的对话历史（如果有）
-        if self._conversation_history:
+        # 之前的公开对话历史（如果有）
+        public_history = self._public_history_messages(8)
+        if public_history:
             history_lines = []
-            for msg in self._conversation_history[-8:]:
+            for msg in public_history:
                 agent = msg.get("agent", "某人")
                 content = msg.get("content", "")
                 if content:
@@ -845,7 +888,7 @@ class SceneCoordinatorAgent(BaseAgent):
                     plot_intents=plot_intents,
                 ),
                 "present_characters": [c.get("name") for c in main_chars],
-                "dialogue_history": self._conversation_history[-5:],
+                "dialogue_history": self._public_history_messages(5),
                 "is_supplement": True,
                 "target_word_count": shortage // 2,
             }
@@ -853,14 +896,13 @@ class SceneCoordinatorAgent(BaseAgent):
             result = await char_agent.execute(char_input)
 
             if result.success:
-                message = {
-                    "agent": char_name,
-                    "type": "supplement_performance",
-                    "content": result.data.get("dialogue", ""),
-                    "action": result.data.get("action", ""),
-                    "importance_tier": _get_importance_tier(char_data, 3),
-                    "round": "supplement",
-                }
+                message = self._build_performance_message(
+                    char_name=char_name,
+                    result_data=result.data,
+                    char_data=char_data,
+                    message_type="supplement_performance",
+                    round_value="supplement",
+                )
                 results.append(message)
                 self._conversation_history.append(message)
 
@@ -903,15 +945,15 @@ class SceneCoordinatorAgent(BaseAgent):
 
         messages = []
         for i, result in enumerate(results):
-            char_name = characters_data[i].get("name")
+            char_data = characters_data[i]
+            char_name = char_data.get("name")
             if isinstance(result, AgentResponse) and result.success:
-                messages.append({
-                    "agent": char_name,
-                    "type": "character_performance",
-                    "content": result.data.get("dialogue", ""),
-                    "action": result.data.get("action", ""),
-                    "importance_tier": _get_importance_tier(characters_data[i], 3),
-                })
+                messages.append(self._build_performance_message(
+                    char_name=char_name,
+                    result_data=result.data,
+                    char_data=char_data,
+                    message_type="character_performance",
+                ))
 
         return messages
 
@@ -1004,29 +1046,86 @@ class SceneCoordinatorAgent(BaseAgent):
         performance_results: List[Dict[str, Any]],
         scene_directions: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """整合表演内容"""
+        """整合表演内容，并保留公开/私有分层与关系/状态变化提案。"""
         # 分离主要角色和背景角色内容
         main_performances = [p for p in performance_results if _get_importance_tier(p, 3) <= 3]
         background_actions = [p for p in performance_results if _get_importance_tier(p, 3) > 3]
 
-        # 构建完整场景内容
+        # 构建完整公开场景内容
         full_content_lines = []
         for perf in performance_results:
-            if perf.get("content"):
+            public_content = perf.get("public_content") or perf.get("content", "")
+            if public_content:
                 if _get_importance_tier(perf, 3) <= 3:
-                    full_content_lines.append(f"【{perf.get('agent')}】{perf.get('content')}")
+                    full_content_lines.append(f"【{perf.get('agent')}】{public_content}")
                 else:
-                    full_content_lines.append(perf.get("content"))
+                    full_content_lines.append(public_content)
+
+        private_performances = []
+        relationship_deltas = []
+        state_deltas = []
+        continuity_notes = []
+        performance_warnings = []
+
+        for perf in performance_results:
+            agent = perf.get("agent", "")
+            private_thought = perf.get("private_thought") or perf.get("inner_thought")
+            if private_thought or perf.get("intent") or perf.get("withheld_information"):
+                private_performances.append({
+                    "agent": agent,
+                    "private_thought": private_thought or "",
+                    "intent": perf.get("intent", ""),
+                    "withheld_information": perf.get("withheld_information", []),
+                    "misinterpretations": perf.get("misinterpretations", []),
+                    "round": perf.get("round"),
+                })
+
+            for delta in perf.get("relationship_delta", []) or []:
+                if isinstance(delta, dict):
+                    relationship_deltas.append({"source_character": agent, **delta})
+                else:
+                    relationship_deltas.append({"source_character": agent, "change": delta})
+
+            for delta in perf.get("state_delta", []) or []:
+                if isinstance(delta, dict):
+                    state_deltas.append({"source_character": agent, **delta})
+                else:
+                    state_deltas.append({"source_character": agent, "change": delta})
+
+            for note in perf.get("continuity_notes", []) or []:
+                continuity_notes.append({"source_character": agent, "note": note})
+
+            for warning in perf.get("warnings", []) or []:
+                performance_warnings.append({"source_character": agent, "warning": warning})
 
         return {
             "mode": scene_directions.get("scene_type", "interactive"),
             "scene": scene_directions.get("main_scene", ""),
             "characters": list(set(p.get("agent") for p in performance_results)),
             "performances": performance_results,
+            "public_performances": [
+                {
+                    "agent": p.get("agent"),
+                    "type": p.get("type"),
+                    "content": p.get("public_content") or p.get("content", ""),
+                    "dialogue": p.get("dialogue", ""),
+                    "action": p.get("action", ""),
+                    "emotion": p.get("emotion", ""),
+                    "round": p.get("round"),
+                    "importance_tier": _get_importance_tier(p, 3),
+                }
+                for p in performance_results
+                if p.get("public_content") or p.get("content")
+            ],
+            "private_performances": private_performances,
+            "relationship_deltas": relationship_deltas,
+            "state_deltas": state_deltas,
+            "continuity_notes": continuity_notes,
+            "performance_warnings": performance_warnings,
             "full_content": "\n".join(full_content_lines),
-            "main_dialogues": [p for p in main_performances if p.get("content")],
+            "main_dialogues": [p for p in main_performances if p.get("public_content") or p.get("content")],
             "background_actions": background_actions,
-            "total_lines": len([p for p in performance_results if p.get("content")]),
+            "total_lines": len([p for p in performance_results if p.get("public_content") or p.get("content")]),
         }
 
     def clear_character_agents(self):
