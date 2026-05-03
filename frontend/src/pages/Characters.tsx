@@ -31,6 +31,11 @@ import { getRegions, type Region } from '@/api/worlds'
 import { useProjectWorlds } from '@/hooks/useProjectWorlds'
 import { motion, AnimatePresence } from 'framer-motion'
 import CharacterRelationshipEditor from '@/components/characters/CharacterRelationshipEditor'
+import OutlineRequirementPanel from '@/components/OutlineRequirementPanel'
+import {
+  updateOutlineResourceRequirementStatus,
+  type OutlineResourceRequirement,
+} from '@/api/outlines'
 
 function splitCsvInput(value: string) {
   return value
@@ -117,6 +122,8 @@ export default function Characters() {
   const [batchEnabling, setBatchEnabling] = useState(false)
   const [generatingPersonality, setGeneratingPersonality] = useState(false)
   const [regions, setRegions] = useState<Region[]>([])
+  const [pendingRequirement, setPendingRequirement] = useState<OutlineResourceRequirement | null>(null)
+  const [requirementRefreshKey, setRequirementRefreshKey] = useState(0)
   const { worlds, formatWorldLabel } = useProjectWorlds(currentProject?.id, currentProject?.world_id)
 
   // 编辑窗口的标签页
@@ -215,38 +222,41 @@ export default function Characters() {
     }
   }, [selectedCharacterId, loadVoiceSamples])
 
-  const openCreateModal = () => {
+  const openCreateModal = (requirement?: OutlineResourceRequirement) => {
+    const payload = requirement?.suggested_payload || {}
     setEditingChar(null)
     setFormData({
-      name: '',
+      name: String(payload.name || payload.title || requirement?.resource_name || ''),
+      role: String(payload.role || ''),
       status: 'active',
-      description: '',
-      world_id: '',
-      current_location: '',
-      current_region_id: '',
-      current_location_reason: '',
-      importance_tier: CharacterImportanceTier.NPC,
-      personality: '',
-      appearance: '',
-      background_story: '',
-      gender: '',
-      speech_pattern: '',
-      lexicon: [],
-      forbidden_words: [],
-      voice_samples: [],
+      description: String(payload.description || payload.summary || requirement?.reason || ''),
+      world_id: String(payload.world_id || ''),
+      current_location: String(payload.current_location || payload.location || ''),
+      current_region_id: String(payload.current_region_id || ''),
+      current_location_reason: String(payload.current_location_reason || ''),
+      importance_tier: payload.importance_tier || CharacterImportanceTier.NPC,
+      personality: String(payload.personality || ''),
+      appearance: String(payload.appearance || ''),
+      background_story: String(payload.background_story || payload.background || ''),
+      gender: String(payload.gender || ''),
+      speech_pattern: String(payload.speech_pattern || ''),
+      lexicon: Array.isArray(payload.lexicon) ? payload.lexicon : [],
+      forbidden_words: Array.isArray(payload.forbidden_words) ? payload.forbidden_words : [],
+      voice_samples: Array.isArray(payload.voice_samples) ? payload.voice_samples : [],
       has_agent: false,
       agent_enabled: true,
-      agent_goals: [],
-      agent_memory: [],
-      relationships: [],
+      agent_goals: Array.isArray(payload.agent_goals) ? payload.agent_goals : [],
+      agent_memory: Array.isArray(payload.agent_memory) ? payload.agent_memory : [],
+      relationships: Array.isArray(payload.relationships) ? payload.relationships : [],
       key_relationships: {},
     })
-    setLexiconInput('')
-    setForbiddenWordsInput('')
-    setVoiceSamplesInput('')
-    setAgentGoalsInput('')
-    setAgentMemoryInput('')
+    setLexiconInput(Array.isArray(payload.lexicon) ? payload.lexicon.join('，') : '')
+    setForbiddenWordsInput(Array.isArray(payload.forbidden_words) ? payload.forbidden_words.join('，') : '')
+    setVoiceSamplesInput(Array.isArray(payload.voice_samples) ? payload.voice_samples.join('\n') : '')
+    setAgentGoalsInput(Array.isArray(payload.agent_goals) ? payload.agent_goals.join('\n') : '')
+    setAgentMemoryInput(Array.isArray(payload.agent_memory) ? payload.agent_memory.join('\n') : '')
     setActiveTab('basic')
+    setPendingRequirement(requirement || null)
     setShowModal(true)
   }
 
@@ -284,6 +294,7 @@ export default function Characters() {
     setAgentGoalsInput((character.agent_goals || []).join('\n'))
     setAgentMemoryInput((character.agent_memory || []).join('\n'))
     setActiveTab('basic')
+    setPendingRequirement(null)
     setShowModal(true)
   }
 
@@ -313,12 +324,22 @@ export default function Characters() {
         }
         await updateCharacter(editingChar.id, updateData)
       } else {
-        await createCharacter({
+        const created = await createCharacter({
           ...normalizedData,
           project_id: currentProject?.id,
         })
+        if (pendingRequirement && created.id) {
+          await updateOutlineResourceRequirementStatus(pendingRequirement.id, {
+            status: 'resolved',
+            matched_resource_id: created.id,
+            matched_resource_type: 'character',
+            resolution_method: 'create_resource',
+          })
+          setRequirementRefreshKey(value => value + 1)
+        }
       }
       await loadCharacters()
+      setPendingRequirement(null)
       setShowModal(false)
     } catch (error) {
       console.error('Failed to save character:', error)
@@ -504,7 +525,7 @@ export default function Characters() {
             <Bot size={18} className="mr-2" />
             {batchEnabling ? '启用中...' : '批量启用 Agent'}
           </Button>
-          <Button onClick={openCreateModal} disabled={!currentProject}>
+          <Button onClick={() => openCreateModal()} disabled={!currentProject}>
             <Plus size={18} className="mr-2" />
             新增角色
           </Button>
@@ -519,7 +540,29 @@ export default function Characters() {
       ) : loading ? (
         <p className={`text-center py-12 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>加载中...</p>
       ) : (
-        <div className="grid grid-cols-1 xl:grid-cols-[2fr,1fr] gap-6">
+        <div className="space-y-4">
+          <OutlineRequirementPanel
+            projectId={currentProject.id}
+            requirementTypes={['character', 'role', '角色', '人物']}
+            title="大纲待补角色"
+            description="来自已审批/已保存大纲的角色资源缺口，可直接预填创建、绑定已有角色或标记处理状态。创建/绑定后会标记需求为已解决。"
+            onCreate={openCreateModal}
+            bindableResources={characters
+              .filter(char => Boolean(char.id))
+              .map(char => ({
+                id: char.id!,
+                label: char.name,
+                type: 'character',
+                description: [char.role, char.status].filter(Boolean).join(' · '),
+              }))}
+            onBound={async () => {
+              await loadCharacters()
+              setRequirementRefreshKey(value => value + 1)
+            }}
+            refreshKey={requirementRefreshKey}
+          />
+
+          <div className="grid grid-cols-1 xl:grid-cols-[2fr,1fr] gap-6">
           {/* 角色卡片网格 */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             {characters.length === 0 ? (
@@ -883,6 +926,7 @@ export default function Characters() {
             </div>
           </Card>
         </div>
+      </div>
       )}
 
       {/* 编辑角色 Modal - 重新设计的标签页布局 */}

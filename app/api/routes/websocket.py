@@ -1202,7 +1202,7 @@ async def handle_get_characters(websocket: WebSocket, message: dict, client_id: 
     })
 
 
-WRITABLE_OUTLINE_STATUSES = {"draft", "approved", "revision"}
+WRITABLE_OUTLINE_STATUSES = {"approved"}
 
 
 def _outline_value(outline: Any, key: str, default: Any = None) -> Any:
@@ -1294,6 +1294,7 @@ async def handle_auto_write_chapter(websocket: WebSocket, message: dict, client_
     }
     """
     from app.api.app import postgres_db
+    from app.services.workflow_engine import ChapterReadinessBlockedError
 
     director = get_or_create_director(client_id)
 
@@ -1415,6 +1416,11 @@ async def handle_auto_write_chapter(websocket: WebSocket, message: dict, client_
                 chapter_goal=chapter_goal,
                 target_word_count=target_word_count,
                 style_reference=style_reference,
+                project_id=project_id,
+                chapter_num=chapter_num,
+                chapter_outline_id=chapter_outline_id,
+                chapter_outline=chapter_outline_payload,
+                db=postgres_db,
             )
 
             if result.get("success"):
@@ -1448,6 +1454,20 @@ async def handle_auto_write_chapter(websocket: WebSocket, message: dict, client_
                     "status": "error",
                     "error": result.get("error"),
                 })
+
+    except ChapterReadinessBlockedError as e:
+        payload = _serialize_for_json(e.payload if isinstance(e.payload, dict) else {})
+        message_text = payload.get("message") or str(e)
+        await send_log(websocket, f"⛔ 章节启动预检阻塞: {message_text}")
+        await send_agent_update(websocket, "Writer", "error", message_text, 0)
+        await websocket.send_json({
+            "type": "auto_write_chapter_result",
+            "status": "blocked",
+            "code": "chapter_resource_readiness_blocked",
+            "error": message_text,
+            "data": payload,
+            "detail": payload,
+        })
 
     except Exception as e:
         logger.error(f"自动写作章节失败: {e}")
@@ -1548,6 +1568,19 @@ async def handle_start_auto_mode(websocket: WebSocket, message: dict, client_id:
                 "content": data.get("content"),
                 "chapter_outline_id": data.get("chapter_outline_id"),
             })
+        elif event_type == "chapter_blocked":
+            message = data.get("message") or data.get("block_reason") or "章节启动预检阻塞"
+            await send_log(websocket, f"⛔ 章节 {data.get('chapter_num', '')} 阻塞: {message}")
+            await websocket.send_json({
+                "type": "auto_mode_chapter_blocked",
+                "status": "blocked",
+                "code": "chapter_resource_readiness_blocked",
+                "chapter_num": data.get("chapter_num"),
+                "chapter_outline_id": data.get("chapter_outline_id"),
+                "message": message,
+                "data": data,
+                "detail": data,
+            })
         elif event_type == "chapter_error":
             await send_log(websocket, f"❌ 章节 {data.get('chapter_num')} 失败: {data.get('error')}")
         elif event_type == "chapter_evaluated":
@@ -1581,14 +1614,26 @@ async def handle_start_auto_mode(websocket: WebSocket, message: dict, client_id:
         for agent in ["Summarizer", "Master Plotter", "Hook Manager", "Writer", "Evaluator", "Character Agent", "ProcGen"]:
             await send_agent_update(websocket, agent, "completed", f"{agent} 已完成", 100)
 
+        response_data = {
+            "chapters": result.get("chapters", []),
+            "blocked_chapters": result.get("blocked_chapters", []),
+            "total_words": result.get("total_words", 0),
+            "total_chapters": len(result.get("chapters", [])),
+        }
+        if response_data["blocked_chapters"]:
+            await websocket.send_json({
+                "type": "auto_mode_blocked",
+                "status": "blocked",
+                "code": "chapter_resource_readiness_blocked",
+                "data": response_data,
+                "detail": {"blocked_chapters": response_data["blocked_chapters"]},
+            })
+            return
+
         await websocket.send_json({
             "type": "auto_mode_completed",
             "status": "success",
-            "data": {
-                "chapters": result.get("chapters", []),
-                "total_words": result.get("total_words", 0),
-                "total_chapters": len(result.get("chapters", [])),
-            },
+            "data": response_data,
         })
 
     except Exception as e:
@@ -1637,7 +1682,7 @@ async def handle_workflow_start(websocket: WebSocket, message: dict, client_id: 
         "initial_context": {}  // 可选
     }
     """
-    from app.services.workflow_engine import get_workflow_engine
+    from app.services.workflow_engine import ChapterReadinessBlockedError, get_workflow_engine
     from app.api.app import postgres_db
 
     workflow_id = message.get("workflow_id")
@@ -1675,6 +1720,18 @@ async def handle_workflow_start(websocket: WebSocket, message: dict, client_id: 
         # 启动状态广播任务
         asyncio.create_task(_broadcast_workflow_status(websocket, execution_id, client_id))
 
+    except ChapterReadinessBlockedError as e:
+        payload = _serialize_for_json(e.payload if isinstance(e.payload, dict) else {})
+        message_text = payload.get("message") or str(e)
+        await send_log(websocket, f"⛔ 章节启动预检阻塞: {message_text}")
+        await websocket.send_json({
+            "type": "workflow_start_blocked",
+            "status": "blocked",
+            "code": "chapter_resource_readiness_blocked",
+            "message": message_text,
+            "data": payload,
+            "detail": payload,
+        })
     except ValueError as e:
         await send_error(websocket, f"工作流启动失败: {str(e)}")
     except Exception as e:

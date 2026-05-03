@@ -127,6 +127,7 @@ class UpdateResourceRequirementStatusRequest(BaseModel):
     status: str = Field(..., description="pending/in_progress/resolved/ignored/superseded")
     matched_resource_id: Optional[str] = Field(None, description="绑定的资源 ID")
     matched_resource_type: Optional[str] = Field(None, description="绑定的资源类型")
+    resolution_method: Optional[str] = Field(None, description="bind_existing/create_resource/manual_resolved/ignored")
 
 
 class GenerateResourceSupplementDraftsRequest(BaseModel):
@@ -157,6 +158,7 @@ class ConfirmResourceSupplementDraftsRequest(BaseModel):
 def _build_resource_supplement_draft(requirement: Dict[str, Any]) -> Dict[str, Any]:
     """把资源需求转换成可审查的补全草案；不直接创建资源。"""
     requirement_type = str(requirement.get("requirement_type") or "lore").strip().lower()
+    original_resource_type = requirement_type
     resource_name = str(requirement.get("resource_name") or "未命名资源").strip()
     reason = str(requirement.get("reason") or requirement.get("source_excerpt") or "").strip()
     suggested_payload = requirement.get("suggested_payload") if isinstance(requirement.get("suggested_payload"), dict) else {}
@@ -169,6 +171,7 @@ def _build_resource_supplement_draft(requirement: Dict[str, Any]) -> Dict[str, A
         "source_chapter_num": requirement.get("chapter_num"),
         "source_outline_id": requirement.get("outline_id"),
         "usage_guidance": reason,
+        "original_resource_type": original_resource_type,
         **suggested_payload,
     }
 
@@ -191,20 +194,50 @@ def _build_resource_supplement_draft(requirement: Dict[str, Any]) -> Dict[str, A
             "visibility": suggested_payload.get("visibility") or "draft",
         }
     elif requirement_type in {"faction", "organization", "势力", "组织"}:
-        resource_type = "faction"
+        resource_type = "lore"
         payload = {
             **base_payload,
+            "title": resource_name,
+            "category": suggested_payload.get("category") or "faction",
+            "content": suggested_payload.get("content") or suggested_payload.get("public_knowledge") or reason or f"势力/组织补全：{resource_name}",
+            "summary": suggested_payload.get("summary") or reason,
+            "tags": suggested_payload.get("tags") or ["outline_requirement", "faction"],
+            "constraints": suggested_payload.get("constraints") or ["当前阶段不得越级揭示高阶势力核心信息。"],
+            "source": suggested_payload.get("source") or "resource_requirement_supplement",
+            "original_resource_type": original_resource_type,
+            "resource_mapping_reason": "mapped_to_lore",
             "faction_type": suggested_payload.get("faction_type") or "organization",
             "tier": suggested_payload.get("tier") or "local",
-            "public_knowledge": suggested_payload.get("public_knowledge") or reason,
             "current_visibility": suggested_payload.get("current_visibility") or "mentioned_only",
         }
     elif requirement_type in {"item", "ability", "道具", "能力"}:
-        resource_type = requirement_type if requirement_type in {"item", "ability"} else "item"
+        original_resource_type = "ability" if requirement_type in {"ability", "能力"} else "item"
+        resource_type = "lore"
         payload = {
             **base_payload,
-            "category": suggested_payload.get("category") or resource_type,
-            "constraints": suggested_payload.get("constraints") or "不得越级解决关键危机，需由用户确认使用边界。",
+            "title": resource_name,
+            "category": suggested_payload.get("category") or ("skill" if original_resource_type == "ability" else "item"),
+            "content": suggested_payload.get("content") or reason or f"{('能力' if original_resource_type == 'ability' else '道具')}补全：{resource_name}",
+            "summary": suggested_payload.get("summary") or reason,
+            "tags": suggested_payload.get("tags") or ["outline_requirement", original_resource_type],
+            "constraints": suggested_payload.get("constraints") or ["不得越级解决关键危机，需由用户确认使用边界。"],
+            "source": suggested_payload.get("source") or "resource_requirement_supplement",
+            "original_resource_type": original_resource_type,
+            "resource_mapping_reason": "mapped_to_lore",
+        }
+    elif requirement_type in {"relationship", "event_rule", "crisis_resolution", "character_state", "continuity", "关系", "事件规则", "危机解决"}:
+        resource_type = "lore"
+        payload = {
+            **base_payload,
+            "title": resource_name,
+            "category": suggested_payload.get("category") or "custom",
+            "content": suggested_payload.get("content") or reason or f"剧情规则/关系补全：{resource_name}",
+            "summary": suggested_payload.get("summary") or reason,
+            "tags": suggested_payload.get("tags") or ["outline_requirement", requirement_type],
+            "constraints": suggested_payload.get("constraints") or ["需与已审批大纲、角色状态和长篇节奏保持一致。"],
+            "source": suggested_payload.get("source") or "resource_requirement_supplement",
+            "original_resource_type": requirement_type,
+            "resource_mapping_reason": "mapped_to_lore",
         }
     else:
         resource_type = "lore"
@@ -213,11 +246,14 @@ def _build_resource_supplement_draft(requirement: Dict[str, Any]) -> Dict[str, A
             "category": suggested_payload.get("category") or requirement_type or "general",
             "content": suggested_payload.get("content") or reason or f"补全资源：{resource_name}",
             "priority": suggested_payload.get("priority") or "medium",
+            "original_resource_type": original_resource_type,
+            "resource_mapping_reason": "mapped_to_lore",
         }
 
     return {
         "requirement_id": str(requirement.get("id")),
         "requirement_type": requirement_type,
+        "original_resource_type": original_resource_type,
         "resource_type": resource_type,
         "resource_name": resource_name,
         "severity": requirement.get("severity"),
@@ -230,16 +266,16 @@ def _build_resource_supplement_draft(requirement: Dict[str, Any]) -> Dict[str, A
 
 
 def _normalize_character_importance_tier(value: Any) -> str:
-    tier = str(value or "supporting").strip().lower()
+    tier = str(value or "npc").strip().lower()
     if tier in {"protagonist", "main", "主角"}:
         return "protagonist"
     if tier in {"main_support", "supporting", "配角"}:
-        return "main_support"
-    if tier in {"supporting", "minor", "npc", "临时角色"}:
-        return "supporting"
+        return "major_ally"
+    if tier in {"minor", "npc", "临时角色"}:
+        return "npc"
     if tier in {"background", "mentioned_only", "背景"}:
         return "background"
-    return "supporting"
+    return "npc"
 
 
 def _normalize_lore_category(value: Any) -> str:
@@ -268,11 +304,64 @@ def _normalize_lore_priority(value: Any) -> str:
     return "standard"
 
 
+def _normalize_region_type(value: Any) -> str:
+    region_type = str(value or "custom").strip().lower()
+    aliases = {
+        "location": "custom",
+        "story_location": "custom",
+        "place": "custom",
+        "地点": "custom",
+        "场景地点": "custom",
+        "city": "city",
+        "城市": "city",
+        "village": "village",
+        "村庄": "village",
+        "wilderness": "wilderness",
+        "荒野": "wilderness",
+        "dungeon": "dungeon",
+        "秘境": "dungeon",
+        "副本": "dungeon",
+        "building": "building",
+        "建筑": "building",
+        "water": "water",
+        "水域": "water",
+        "mountain": "mountain",
+        "山脉": "mountain",
+        "forest": "forest",
+        "森林": "forest",
+        "custom": "custom",
+    }
+    return aliases.get(region_type, "custom")
+
+
+def _normalize_terrain_type(value: Any) -> str:
+    terrain_type = str(value or "custom").strip().lower()
+    aliases = {
+        "plain": "plain",
+        "平原": "plain",
+        "hill": "hill",
+        "丘陵": "hill",
+        "mountain": "mountain",
+        "山地": "mountain",
+        "desert": "desert",
+        "沙漠": "desert",
+        "swamp": "swamp",
+        "沼泽": "swamp",
+        "ice": "ice",
+        "冰原": "ice",
+        "volcano": "volcano",
+        "火山": "volcano",
+        "custom": "custom",
+    }
+    return aliases.get(terrain_type, "custom")
+
+
 async def _create_confirmed_resource(postgres_db, project_id: str, draft: ConfirmResourceSupplementDraft) -> Dict[str, Any]:
-    """根据用户确认的草案创建最小资源；仅支持 lore / character。"""
+    """根据用户确认的草案创建最小资源；支持 character / lore / location。"""
     import uuid
     from app.models.character import Character
     from app.models.lore import LoreEntry
+    from app.models.world import Region
 
     payload = dict(draft.draft_payload or {})
     payload["project_id"] = project_id
@@ -322,6 +411,42 @@ async def _create_confirmed_resource(postgres_db, project_id: str, draft: Confir
             },
         )
         return {"resource_type": "lore", "resource_id": lore_id, "resource": params}
+
+    if resource_type == "location":
+        worlds = await postgres_db.get_all_worlds(project_id=project_id, limit=1)
+        world_id = str((worlds or [{}])[0].get("id") or "")
+        if not world_id:
+            raise ValueError("项目尚无世界，无法创建地点区域")
+
+        region_payload = {
+            "id": payload.get("id") or str(uuid.uuid4()),
+            "name": payload.get("name") or payload.get("title") or "未命名地点",
+            "world_id": world_id,
+            "region_type": _normalize_region_type(payload.get("region_type") or payload.get("location_type")),
+            "terrain_type": _normalize_terrain_type(payload.get("terrain_type")),
+            "description": payload.get("description") or payload.get("summary") or payload.get("usage_guidance") or "由大纲资源需求补全创建。",
+            "atmosphere": payload.get("atmosphere") or "",
+            "coordinates": payload.get("coordinates") or {},
+            "area_size": payload.get("area_size") or 0,
+            "terrain_features": payload.get("terrain_features") or [],
+            "landmarks": payload.get("landmarks") or [],
+            "encounters": payload.get("encounters") or [],
+            "connections": payload.get("connections") or [],
+            "local_rules": payload.get("local_rules") or [],
+            "state": payload.get("state") or "normal",
+            "state_summary": payload.get("state_summary"),
+            "is_generated": bool(payload.get("is_generated", True)),
+            "visit_count": payload.get("visit_count") or 0,
+        }
+        region = Region(**region_payload)
+        region_data = region.model_dump(mode="json")
+        resource_id = await postgres_db.save_region(region_data)
+        try:
+            from app.services.graph_projection_service import enqueue_graph_projection_best_effort
+            await enqueue_graph_projection_best_effort("region", region_data)
+        except Exception:
+            logger.warning("确认创建 location 资源后图谱投影入队失败", exc_info=True)
+        return {"resource_type": "location", "resource_id": resource_id, "resource": region_data}
 
     raise ValueError(f"暂不支持确认创建资源类型: {draft.resource_type}")
 
@@ -397,12 +522,24 @@ async def confirm_resource_supplements(request: ConfirmResourceSupplementDraftsR
 
     for draft in request.drafts:
         try:
+            requirement_rows = await postgres_db.execute_query(
+                """
+                SELECT id FROM outline_resource_requirements
+                WHERE id = CAST(:id AS UUID)
+                  AND project_id = CAST(:project_id AS UUID)
+                """,
+                {"id": draft.requirement_id, "project_id": request.project_id},
+            )
+            if not requirement_rows:
+                raise ValueError("资源需求不存在或不属于当前项目")
+
             created_resource = await _create_confirmed_resource(postgres_db, request.project_id, draft)
             updated_requirement = await postgres_db.update_outline_resource_requirement_status(
                 requirement_id=draft.requirement_id,
                 status="resolved",
                 matched_resource_id=created_resource["resource_id"],
                 matched_resource_type=created_resource["resource_type"],
+                resolution_method="create_resource",
             )
             readiness = None
             if updated_requirement and updated_requirement.get("chapter_num") is not None:
@@ -503,6 +640,7 @@ async def update_resource_requirement_status(
             status=request.status,
             matched_resource_id=request.matched_resource_id,
             matched_resource_type=request.matched_resource_type,
+            resolution_method=request.resolution_method,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -518,6 +656,81 @@ async def update_resource_requirement_status(
     else:
         readiness = None
     return {"requirement": updated, "readiness": readiness}
+
+
+@router.post("/save-outlines", response_model=SavePendingOutlinesResponse)
+async def save_pending_outlines(
+    project_id: str = Query(..., description="项目ID"),
+    request: SavePendingOutlinesRequest = None,
+):
+    """
+    保存待确认的大纲
+
+    将用户确认的大纲保存到数据库
+    """
+    from app.api.app import postgres_db
+
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+
+    if not request or not request.outlines:
+        return SavePendingOutlinesResponse(
+            success=True,
+            saved_count=0,
+            message="没有需要保存的大纲"
+        )
+
+    service = get_plot_outline_service()
+    saved_count = 0
+
+    for pending in request.outlines:
+        try:
+            # 检查是否已存在该章节大纲
+            existing = await service.get_outline(project_id, pending.chapter_number)
+
+            if existing:
+                # 更新现有大纲
+                update_data = {
+                    "title": pending.title,
+                    "summary": pending.summary,
+                    "scenes": [SceneOutline(**s) for s in pending.scenes] if pending.scenes else [],
+                    "emotion_curve": EmotionCurve(**pending.emotion_curve) if pending.emotion_curve else None,
+                    "chapter_goals": pending.chapter_goals or [],
+                    "hooks_planted": pending.hooks_planted or [],
+                    "hooks_resolved": pending.hooks_resolved or [],
+                    "target_word_count": pending.target_word_count or 3000,
+                    "status": ChapterOutlineStatus.DRAFT,
+                }
+                updated_outline = await service.update_outline(existing.id, UpdateChapterOutlineDTO(**update_data))
+                if pending.character_arcs and updated_outline:
+                    updated_outline.character_arcs = pending.character_arcs
+                    await service.persist_outline_resource_audit(updated_outline)
+            else:
+                # 创建新大纲
+                create_dto = CreateChapterOutlineDTO(
+                    project_id=project_id,
+                    chapter_number=pending.chapter_number,
+                    title=pending.title,
+                    summary=pending.summary,
+                    scenes=[SceneOutline(**s) for s in pending.scenes] if pending.scenes else [],
+                    chapter_goals=pending.chapter_goals or [],
+                    hooks_planted=pending.hooks_planted or [],
+                    hooks_resolved=pending.hooks_resolved or [],
+                    target_word_count=pending.target_word_count or 3000,
+                )
+                created = await service.create_outline(create_dto)
+                if pending.character_arcs:
+                    created.character_arcs = pending.character_arcs
+                    await service.persist_outline_resource_audit(created)
+            saved_count += 1
+        except Exception as e:
+            logger.error(f"保存大纲失败 (章节 {pending.chapter_number}): {e}")
+
+    return SavePendingOutlinesResponse(
+        success=True,
+        saved_count=saved_count,
+        message=f"成功保存 {saved_count} 个大纲" if saved_count > 0 else "没有保存任何大纲"
+    )
 
 
 @router.get("", response_model=OutlineListResponse)
@@ -746,79 +959,6 @@ async def chat_with_agent(project_id: str, chapter_number: int, request: ChatReq
         pending_outlines=pending_outlines,
         saved_outline=response.get("saved_outline"),
         saved_outlines=response.get("saved_outlines"),
-    )
-
-
-@router.post("/save-outlines", response_model=SavePendingOutlinesResponse)
-async def save_pending_outlines(
-    project_id: str = Query(..., description="项目ID"),
-    request: SavePendingOutlinesRequest = None,
-):
-    """
-    保存待确认的大纲
-
-    将用户确认的大纲保存到数据库
-    """
-    from app.api.app import postgres_db
-
-    if not postgres_db:
-        raise HTTPException(status_code=503, detail="数据库未连接")
-
-    if not request or not request.outlines:
-        return SavePendingOutlinesResponse(
-            success=True,
-            saved_count=0,
-            message="没有需要保存的大纲"
-        )
-
-    service = get_plot_outline_service()
-    saved_count = 0
-
-    for pending in request.outlines:
-        try:
-            # 检查是否已存在该章节大纲
-            existing = await service.get_outline(project_id, pending.chapter_number)
-
-            if existing:
-                # 更新现有大纲
-                update_data = {
-                    "title": pending.title,
-                    "summary": pending.summary,
-                    "scenes": [SceneOutline(**s) for s in pending.scenes] if pending.scenes else [],
-                    "emotion_curve": EmotionCurve(**pending.emotion_curve) if pending.emotion_curve else None,
-                    "chapter_goals": pending.chapter_goals or [],
-                    "hooks_planted": pending.hooks_planted or [],
-                    "hooks_resolved": pending.hooks_resolved or [],
-                    "target_word_count": pending.target_word_count or 3000,
-                    "character_arcs": pending.character_arcs or {},
-                    "status": ChapterOutlineStatus.DRAFT,
-                }
-                await service.update_outline(existing.id, UpdateChapterOutlineDTO(**update_data))
-            else:
-                # 创建新大纲
-                outline = ChapterOutline(
-                    project_id=project_id,
-                    chapter_number=pending.chapter_number,
-                    title=pending.title,
-                    summary=pending.summary,
-                    scenes=[SceneOutline(**s) for s in pending.scenes] if pending.scenes else [],
-                    emotion_curve=EmotionCurve(**pending.emotion_curve) if pending.emotion_curve else None,
-                    chapter_goals=pending.chapter_goals or [],
-                    hooks_planted=pending.hooks_planted or [],
-                    hooks_resolved=pending.hooks_resolved or [],
-                    target_word_count=pending.target_word_count or 3000,
-                    character_arcs=pending.character_arcs or {},
-                    status=ChapterOutlineStatus.DRAFT,
-                )
-                await service.create_outline(outline)
-            saved_count += 1
-        except Exception as e:
-            logger.error(f"保存大纲失败 (章节 {pending.chapter_number}): {e}")
-
-    return SavePendingOutlinesResponse(
-        success=True,
-        saved_count=saved_count,
-        message=f"成功保存 {saved_count} 个大纲" if saved_count > 0 else "没有保存任何大纲"
     )
 
 

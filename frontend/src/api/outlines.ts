@@ -153,6 +153,17 @@ export interface ChatResponse {
 
 export type ResourceRequirementSeverity = 'blocking' | 'advisory' | 'optional'
 export type ResourceRequirementStatus = 'pending' | 'in_progress' | 'resolved' | 'ignored' | 'superseded'
+export type ResourceRequirementResolutionMethod = 'bind_existing' | 'create_resource' | 'manual_resolved' | 'ignored'
+
+export interface OutlineResourceRequirementMetadata {
+  original_resource_type?: string
+  resolution_method?: ResourceRequirementResolutionMethod
+  resolution_recorded_at?: string
+  previous_status?: ResourceRequirementStatus | string
+  resolved_with_resource_type?: string
+  reopened_at?: string
+  [key: string]: any
+}
 
 export interface OutlineResourceRequirement {
   id: string
@@ -162,6 +173,7 @@ export interface OutlineResourceRequirement {
   chapter_id?: string | null
   chapter_num?: number | null
   requirement_type: string
+  original_resource_type?: string
   resource_name: string
   severity: ResourceRequirementSeverity
   status: ResourceRequirementStatus
@@ -173,7 +185,7 @@ export interface OutlineResourceRequirement {
   source_agent?: string
   source_node_id?: string
   source_execution_id?: string
-  metadata?: Record<string, any>
+  metadata?: OutlineResourceRequirementMetadata
   created_at?: string
   updated_at?: string
   resolved_at?: string | null
@@ -196,6 +208,7 @@ export interface ChapterResourceReadiness {
 export interface ResourceSupplementDraft {
   requirement_id: string
   requirement_type?: string
+  original_resource_type?: string
   resource_type: string
   resource_name?: string
   severity?: ResourceRequirementSeverity
@@ -443,6 +456,7 @@ export async function updateOutlineResourceRequirementStatus(
     status: ResourceRequirementStatus
     matched_resource_id?: string
     matched_resource_type?: string
+    resolution_method?: ResourceRequirementResolutionMethod
   }
 ): Promise<{ requirement: OutlineResourceRequirement; readiness?: ChapterResourceReadiness | null }> {
   return await api.patch(`${API_BASE}/resource-requirements/${requirementId}`, data)

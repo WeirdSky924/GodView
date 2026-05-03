@@ -14,6 +14,11 @@ import {
   type CreateRegionDTO,
   type Region,
 } from '@/api/worlds'
+import OutlineRequirementPanel from '@/components/OutlineRequirementPanel'
+import {
+  updateOutlineResourceRequirementStatus,
+  type OutlineResourceRequirement,
+} from '@/api/outlines'
 
 const REGION_TYPES = [
   { value: 'custom', label: '自定义' },
@@ -116,6 +121,8 @@ export default function WorldMap() {
   const [showModal, setShowModal] = useState(false)
   const [editingRegion, setEditingRegion] = useState<Region | null>(null)
   const [formData, setFormData] = useState<RegionFormState>(emptyForm)
+  const [pendingRequirement, setPendingRequirement] = useState<OutlineResourceRequirement | null>(null)
+  const [requirementRefreshKey, setRequirementRefreshKey] = useState(0)
 
   const loadRegions = useCallback(async () => {
     if (!selectedWorldId) {
@@ -224,9 +231,25 @@ export default function WorldMap() {
     })
   }, [filteredRegions, charactersByRegion])
 
-  const openCreateModal = () => {
+  const openCreateModal = (requirement?: OutlineResourceRequirement) => {
+    const payload = requirement?.suggested_payload || {}
     setEditingRegion(null)
-    setFormData(emptyForm)
+    setFormData({
+      ...emptyForm,
+      name: String(payload.name || payload.title || requirement?.resource_name || ''),
+      region_type: String(payload.region_type || payload.location_type || 'custom'),
+      terrain_type: String(payload.terrain_type || 'custom'),
+      description: String(payload.description || payload.summary || requirement?.reason || ''),
+      atmosphere: String(payload.atmosphere || ''),
+      connections: Array.isArray(payload.connections) ? payload.connections : [],
+      terrain_features_text: Array.isArray(payload.terrain_features)
+        ? payload.terrain_features.map((item: any) => String(item.name || item.title || item.description || item)).filter(Boolean).join('\n')
+        : '',
+      landmarks_text: Array.isArray(payload.landmarks)
+        ? payload.landmarks.map((item: any) => String(item.name || item.title || item.description || item)).filter(Boolean).join('\n')
+        : '',
+    })
+    setPendingRequirement(requirement || null)
     setShowModal(true)
   }
 
@@ -244,6 +267,7 @@ export default function WorldMap() {
       terrain_features_text: stringifyItems(region.terrain_features),
       landmarks_text: stringifyItems(region.landmarks),
     })
+    setPendingRequirement(null)
     setShowModal(true)
   }
 
@@ -277,7 +301,17 @@ export default function WorldMap() {
       } else {
         const result = await createRegion(selectedWorldId, payload)
         setSelectedRegionId(result.id)
+        if (pendingRequirement && result.id) {
+          await updateOutlineResourceRequirementStatus(pendingRequirement.id, {
+            status: 'resolved',
+            matched_resource_id: result.id,
+            matched_resource_type: 'location',
+            resolution_method: 'create_resource',
+          })
+          setRequirementRefreshKey(value => value + 1)
+        }
       }
+      setPendingRequirement(null)
       setShowModal(false)
       await loadRegions()
     } catch (error) {
@@ -303,7 +337,7 @@ export default function WorldMap() {
 
   const actions = (
     <button
-      onClick={openCreateModal}
+      onClick={() => openCreateModal()}
       disabled={!selectedWorldId}
       className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:bg-gray-300 flex items-center gap-2"
     >
@@ -320,6 +354,27 @@ export default function WorldMap() {
         <div className="h-full flex items-center justify-center text-gray-500">当前项目没有世界，请先到世界管理创建世界</div>
       ) : (
         <div className="h-full flex flex-col gap-4">
+          <OutlineRequirementPanel
+            projectId={currentProject.id}
+            requirementTypes={['location', 'place', '地点', '场景地点']}
+            title="大纲待补地点"
+            description="来自大纲的地点/区域资源缺口，可预填新建区域、绑定已有区域或标记处理状态。创建/绑定后会标记需求为已解决。"
+            onCreate={selectedWorldId ? openCreateModal : undefined}
+            bindableResources={regions
+              .filter(region => Boolean(region.id))
+              .map(region => ({
+                id: region.id!,
+                label: region.name,
+                type: 'location',
+                description: getTypeLabel(REGION_TYPES, region.region_type),
+              }))}
+            onBound={async () => {
+              await loadRegions()
+              setRequirementRefreshKey(value => value + 1)
+            }}
+            refreshKey={requirementRefreshKey}
+          />
+
           <div className="bg-white rounded-xl border border-gray-200 p-4 flex flex-wrap items-center gap-3">
             <select
               value={selectedWorldId}
@@ -387,7 +442,7 @@ export default function WorldMap() {
                 <div className="h-full flex flex-col items-center justify-center text-gray-500 gap-3">
                   <MapPin className="w-10 h-10" />
                   <span>暂无可展示区域</span>
-                  <button onClick={openCreateModal} className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">创建区域</button>
+                  <button onClick={() => openCreateModal()} className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">创建区域</button>
                 </div>
               )}
             </main>

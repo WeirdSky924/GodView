@@ -2,6 +2,7 @@
 导演系统核心服务 - 协调所有 Agent 进行小说生成
 """
 
+import inspect
 import logging
 import uuid
 from datetime import datetime
@@ -14,7 +15,20 @@ from app.agents.director.master_plotter import MasterPlotterAgent
 from app.agents.director.summarizer import SummarizerAgent
 from app.agents.director.writer import WriterAgent
 from app.agents.procgen import ProcGenAgent
-from app.services.workflow_engine import ChapterReadinessBlockedError
+from app.services.workflow_engine import ChapterReadinessBlockedError, get_workflow_engine
+
+
+def _serialize_for_json(obj: Any) -> Any:
+    """递归序列化对象，处理 UUID/datetime 等非 JSON 类型。"""
+    if isinstance(obj, uuid.UUID):
+        return str(obj)
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, dict):
+        return {k: _serialize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_serialize_for_json(item) for item in obj]
+    return obj
 # Removed circular import: qdrant_db will be imported lazily
 # from app.api.app import qdrant_db
 from app.models.character import Character, CharacterStatus
@@ -1474,6 +1488,11 @@ class DirectorSystem:
         chapter_goal: str,
         target_word_count: int = 2000,
         style_reference: Optional[str] = None,
+        project_id: Optional[str] = None,
+        chapter_num: Optional[int] = None,
+        chapter_outline_id: Optional[str] = None,
+        chapter_outline: Optional[Dict[str, Any]] = None,
+        db: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         自动写作完整章节
@@ -1483,12 +1502,32 @@ class DirectorSystem:
             chapter_goal: 章节目标/大纲
             target_word_count: 目标字数
             style_reference: 风格参考文本
+            project_id: 项目 ID，用于章节资源 readiness gate
+            chapter_num: 章节号，用于章节资源 readiness gate
+            chapter_outline_id: 大纲 ID，用于章节资源 readiness gate
+            chapter_outline: 章节大纲 payload，用于章节资源 readiness gate
+            db: 数据库句柄，用于章节资源 readiness gate
 
         Returns:
             Dict: 包含生成的章节内容
         """
         if not self.writer:
             raise RuntimeError("导演系统未初始化")
+
+        active_project_id = project_id or self.project_id
+        if active_project_id and db:
+            readiness_context = {
+                "chapter_num": chapter_num,
+                "chapter_number": chapter_num,
+                "chapter_outline_id": chapter_outline_id,
+                "outline_id": chapter_outline_id,
+                "chapter_outline": chapter_outline or {},
+            }
+            await get_workflow_engine().check_chapter_resource_readiness(
+                str(active_project_id),
+                readiness_context,
+                db,
+            )
 
         # 启动新章节
         await self.start_chapter(title=chapter_title, goal=chapter_goal)
@@ -1551,6 +1590,19 @@ class DirectorSystem:
 
     _auto_running: bool = False
     _auto_stop_flag: bool = False
+
+    async def _emit_auto_mode_callback(
+        self,
+        callback: Optional[Callable[[str, Dict[str, Any]], None]],
+        event_type: str,
+        data: Dict[str, Any],
+    ) -> None:
+        """兼容同步/异步连续创作回调。"""
+        if not callback:
+            return
+        result = callback(event_type, data)
+        if inspect.isawaitable(result):
+            await result
 
     async def start_auto_mode(
         self,
@@ -1629,7 +1681,7 @@ class DirectorSystem:
 
                 writable = [
                     outline for outline in all_outlines
-                    if outline_status(outline) in {"draft", "approved", "revision"}
+                    if outline_status(outline) == "approved"
                 ]
 
                 if outline_mode == "selected":
@@ -1652,21 +1704,21 @@ class DirectorSystem:
                     return {"success": False, "error": "未找到可用于连续创作的章节大纲"}
 
                 if callback:
-                    callback("phase", {
+                    await self._emit_auto_mode_callback(callback,"phase", {
                         "phase": "outline_sequence",
                         "message": f"已选择 {len(selected_outlines)} 个章节大纲，准备按大纲生成",
                     })
             else:
                 # 1. 基于项目状态规划剧情
                 if callback:
-                    callback("phase", {"phase": "plot_planning", "message": "正在基于项目规划剧情..."})
+                    await self._emit_auto_mode_callback(callback,"phase", {"phase": "plot_planning", "message": "正在基于项目规划剧情..."})
 
                 plot_plan = await self._plan_overall_plot(
                     chapter_count=chapter_count,
                 )
 
                 if callback:
-                    callback("plot_planned", {"plan": plot_plan})
+                    await self._emit_auto_mode_callback(callback,"plot_planned", {"plan": plot_plan})
 
                 selected_outlines = []
 
@@ -1701,7 +1753,7 @@ class DirectorSystem:
             for index, chapter_item in enumerate(chapter_items, start=1):
                 if self._auto_stop_flag:
                     if callback:
-                        callback("stopped", {"reason": "用户停止", "chapters_completed": index - 1})
+                        await self._emit_auto_mode_callback(callback,"stopped", {"reason": "用户停止", "chapters_completed": index - 1})
                     break
 
                 chapter_num = chapter_item["chapter_num"]
@@ -1711,7 +1763,7 @@ class DirectorSystem:
                 target_word_count = chapter_item.get("target_word_count") or words_per_chapter
 
                 if callback:
-                    callback("chapter_start", {
+                    await self._emit_auto_mode_callback(callback,"chapter_start", {
                         "chapter_num": chapter_num,
                         "title": chapter_title,
                         "goal": chapter_goal,
@@ -1762,7 +1814,7 @@ class DirectorSystem:
                             results["total_words"] += word_count
 
                             if callback:
-                                callback("chapter_completed", {
+                                await self._emit_auto_mode_callback(callback,"chapter_completed", {
                                     "chapter_num": chapter_num,
                                     "chapter_outline_id": chapter_outline_id,
                                     "title": chapter_title,
@@ -1772,13 +1824,18 @@ class DirectorSystem:
                     else:
                         # 工作流执行失败，使用备用方案：直接调用 Director 方法
                         if callback:
-                            callback("agent_working", {"agent": "Writer", "message": f"正在写作: {chapter_title}..."})
+                            await self._emit_auto_mode_callback(callback,"agent_working", {"agent": "Writer", "message": f"正在写作: {chapter_title}..."})
 
                         chapter_result = await self.auto_write_chapter(
                             chapter_title=chapter_title,
                             chapter_goal=chapter_goal,
                             target_word_count=target_word_count,
                             style_reference=style_reference,
+                            project_id=str(active_project_id),
+                            chapter_num=chapter_num,
+                            chapter_outline_id=chapter_outline_id,
+                            chapter_outline=chapter_item.get("chapter_outline"),
+                            db=postgres_db,
                         )
 
                         if chapter_result.get("success"):
@@ -1788,7 +1845,7 @@ class DirectorSystem:
                             results["total_words"] += chapter_result.get("word_count", 0)
 
                             if callback:
-                                callback("chapter_completed", {
+                                await self._emit_auto_mode_callback(callback,"chapter_completed", {
                                     "chapter_num": chapter_num,
                                     "chapter_outline_id": chapter_outline_id,
                                     "title": chapter_title,
@@ -1798,14 +1855,15 @@ class DirectorSystem:
 
                 except ChapterReadinessBlockedError as e:
                     logger.warning("章节资源未就绪，跳过工作流执行: %s", e.payload)
+                    blocked_payload = _serialize_for_json(e.payload)
                     if callback:
-                        callback("chapter_blocked", e.payload)
-                    results.setdefault("blocked_chapters", []).append(e.payload)
+                        await self._emit_auto_mode_callback(callback,"chapter_blocked", blocked_payload)
+                    results.setdefault("blocked_chapters", []).append(blocked_payload)
                     continue
                 except Exception as e:
                     logger.error(f"工作流执行失败: {e}")
                     if callback:
-                        callback("chapter_error", {
+                        await self._emit_auto_mode_callback(callback,"chapter_error", {
                             "chapter_num": chapter_num,
                             "error": str(e),
                         })
@@ -1816,12 +1874,12 @@ class DirectorSystem:
                     branch_reason=f"连续创作 - {chapter_title}",
                 )
                 if callback:
-                    callback("snapshot_created", {"snapshot_id": snapshot.get("id", "")})
+                    await self._emit_auto_mode_callback(callback,"snapshot_created", {"snapshot_id": snapshot.get("id", "")})
 
         except Exception as e:
             logger.error(f"连续创作模式运行失败: {e}")
             if callback:
-                callback("error", {"error": str(e)})
+                await self._emit_auto_mode_callback(callback,"error", {"error": str(e)})
             return {"success": False, "error": str(e)}
 
         finally:
@@ -1829,7 +1887,7 @@ class DirectorSystem:
             self._auto_stop_flag = False
 
         if callback:
-            callback("completed", {
+            await self._emit_auto_mode_callback(callback,"completed", {
                 "total_chapters": len(results["chapters"]),
                 "blocked_chapters": len(results.get("blocked_chapters", [])),
                 "total_words": results["total_words"],

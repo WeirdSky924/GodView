@@ -323,12 +323,21 @@ class PostgresDatabase:
             params[field] = json.dumps(value)
 
         # 确保可选字段有默认值
-        if params.get('background_story') is None:
-            params['background_story'] = None
-        if params.get('speech_pattern') is None:
-            params['speech_pattern'] = None
-        if params.get('personality') is None:
-            params['personality'] = None
+        scalar_defaults = {
+            'name': '未命名角色',
+            'description': '',
+            'role': 'npc',
+            'status': 'active',
+            'appearance': '',
+            'age': None,
+            'gender': '',
+            'personality': None,
+            'background_story': None,
+            'speech_pattern': None,
+        }
+        for field, default_value in scalar_defaults.items():
+            if params.get(field) is None:
+                params[field] = default_value
 
         # 处理可选的 UUID 字段 - 验证是否为有效 UUID
         params['world_id'] = _validate_uuid(params.get('world_id'))
@@ -1996,34 +2005,163 @@ class PostgresDatabase:
         status: str,
         matched_resource_id: Optional[str] = None,
         matched_resource_type: Optional[str] = None,
+        resolution_method: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """更新大纲资源需求处理状态。"""
         normalized_status = str(status or "").strip().lower()
         if normalized_status not in {"pending", "in_progress", "resolved", "ignored", "superseded"}:
             raise ValueError(f"无效的资源需求状态: {status}")
+
+        existing_rows = await self.execute_query(
+            "SELECT * FROM outline_resource_requirements WHERE id = CAST(:id AS UUID)",
+            {"id": requirement_id},
+        )
+        if not existing_rows:
+            return None
+        existing = existing_rows[0]
+
+        normalized_resource_id = str(matched_resource_id).strip() if matched_resource_id else None
+        normalized_resource_type = str(matched_resource_type).strip().lower() if matched_resource_type else None
+        if bool(normalized_resource_id) != bool(normalized_resource_type):
+            raise ValueError("绑定资源时必须同时提供 matched_resource_id 和 matched_resource_type")
+        if normalized_resource_id and normalized_resource_type:
+            valid_resource_id = _validate_uuid(normalized_resource_id)
+            if not valid_resource_id:
+                raise ValueError("绑定资源 ID 不是有效 UUID")
+            normalized_resource_id = valid_resource_id
+            normalized_resource_type = await self._validate_requirement_matched_resource(
+                project_id=str(existing.get("project_id")),
+                resource_id=normalized_resource_id,
+                resource_type=normalized_resource_type,
+            )
+
+        normalized_method = self._normalize_requirement_resolution_method(
+            status=normalized_status,
+            resolution_method=resolution_method,
+            matched_resource_id=normalized_resource_id,
+        )
+        previous_metadata = existing.get("metadata") if isinstance(existing.get("metadata"), dict) else {}
+        next_metadata = previous_metadata.copy()
+        now = datetime.now()
+        if normalized_status in {"resolved", "ignored", "superseded"} and normalized_method:
+            next_metadata.update({
+                "resolution_method": normalized_method,
+                "resolution_recorded_at": now.isoformat(),
+                "previous_status": existing.get("status"),
+            })
+            if normalized_resource_type:
+                next_metadata["resolved_with_resource_type"] = normalized_resource_type
+        elif normalized_status in {"pending", "in_progress"}:
+            next_metadata.update({
+                "reopened_at": now.isoformat(),
+                "previous_status": existing.get("status"),
+            })
+
         params = {
             "id": requirement_id,
             "status": normalized_status,
-            "matched_resource_id": str(matched_resource_id) if matched_resource_id else None,
-            "matched_resource_type": matched_resource_type,
-            "updated_at": datetime.now(),
-            "resolved_at": datetime.now() if normalized_status in {"resolved", "ignored", "superseded"} else None,
+            "matched_resource_id": normalized_resource_id,
+            "matched_resource_type": normalized_resource_type,
+            "metadata": json.dumps(next_metadata, default=str),
+            "updated_at": now,
         }
-        resolved_at_sql = "CURRENT_TIMESTAMP" if normalized_status in {"resolved", "ignored", "superseded"} else "NULL"
-        query = f"""
+        query = """
         UPDATE outline_resource_requirements
         SET status = :status,
-            matched_resource_id = COALESCE(CAST(:matched_resource_id AS TEXT), matched_resource_id),
-            matched_resource_type = COALESCE(CAST(:matched_resource_type AS TEXT), matched_resource_type),
+            matched_resource_id = CASE
+                WHEN CAST(:matched_resource_id AS TEXT) IS NULL THEN matched_resource_id
+                ELSE CAST(:matched_resource_id AS TEXT)
+            END,
+            matched_resource_type = CASE
+                WHEN CAST(:matched_resource_type AS TEXT) IS NULL THEN matched_resource_type
+                ELSE CAST(:matched_resource_type AS TEXT)
+            END,
+            metadata = CAST(:metadata AS jsonb),
             updated_at = :updated_at,
             resolved_at = CASE
                 WHEN :status IN ('pending', 'in_progress') THEN NULL
-                ELSE {resolved_at_sql}
+                WHEN resolved_at IS NULL THEN :updated_at
+                ELSE resolved_at
             END
         WHERE id = CAST(:id AS UUID)
         RETURNING *
         """
         rows = await self.execute_query(query, params)
+        return rows[0] if rows else None
+
+    async def _validate_requirement_matched_resource(
+        self,
+        project_id: str,
+        resource_id: str,
+        resource_type: str,
+    ) -> str:
+        """校验资源需求绑定的资源存在且属于同一项目。"""
+        normalized_type = resource_type.strip().lower()
+        if normalized_type in {"region", "place"}:
+            normalized_type = "location"
+        if normalized_type not in {"character", "lore", "location"}:
+            raise ValueError(f"不支持的绑定资源类型: {resource_type}")
+
+        if normalized_type == "character":
+            resource = await self.get_character(resource_id)
+            if not resource or str(resource.get("project_id")) != str(project_id):
+                raise ValueError("绑定的角色资源不存在或不属于当前项目")
+            return normalized_type
+
+        if normalized_type == "lore":
+            resource = await self.get_lore_entry(resource_id)
+            if not resource or str(resource.get("project_id")) != str(project_id):
+                raise ValueError("绑定的设定资源不存在或不属于当前项目")
+            return normalized_type
+
+        rows = await self.execute_query(
+            """
+            SELECT r.id
+            FROM regions r
+            JOIN worlds w ON w.id = r.world_id
+            WHERE r.id = CAST(:resource_id AS UUID)
+              AND w.project_id = CAST(:project_id AS UUID)
+            LIMIT 1
+            """,
+            {"resource_id": resource_id, "project_id": project_id},
+        )
+        if not rows:
+            raise ValueError("绑定的地点资源不存在或不属于当前项目")
+        return normalized_type
+
+    def _normalize_requirement_resolution_method(
+        self,
+        status: str,
+        resolution_method: Optional[str],
+        matched_resource_id: Optional[str],
+    ) -> Optional[str]:
+        """规范化资源需求处理方式。"""
+        allowed_methods = {"bind_existing", "create_resource", "manual_resolved", "ignored"}
+        if resolution_method:
+            normalized_method = str(resolution_method).strip().lower()
+            if normalized_method not in allowed_methods:
+                raise ValueError(f"无效的资源需求处理方式: {resolution_method}")
+            if normalized_method in {"bind_existing", "create_resource"} and not matched_resource_id:
+                raise ValueError("绑定或创建资源解决需求时必须提供 matched_resource_id 和 matched_resource_type")
+            if normalized_method in {"manual_resolved", "ignored"} and matched_resource_id:
+                raise ValueError("人工解决或忽略需求时不能同时绑定资源")
+            if normalized_method == "ignored" and status != "ignored":
+                raise ValueError("ignored 处理方式只能用于 ignored 状态")
+            if normalized_method != "ignored" and status != "resolved":
+                raise ValueError("资源需求处理方式只能用于 resolved 或 ignored 状态")
+            return normalized_method
+        if status == "ignored":
+            return "ignored"
+        if status == "resolved":
+            return "bind_existing" if matched_resource_id else "manual_resolved"
+        return None
+
+    async def get_lore_entry(self, lore_id: str) -> Optional[Dict[str, Any]]:
+        """获取设定条目。"""
+        rows = await self.execute_query(
+            "SELECT * FROM lore_entries WHERE id = CAST(:id AS UUID)",
+            {"id": lore_id},
+        )
         return rows[0] if rows else None
 
     async def get_chapter_resource_readiness(
@@ -2063,7 +2201,7 @@ class PostgresDatabase:
             "chapter_num": chapter_num,
             "updated_at": datetime.now(),
         }
-        outline_filter = "outline_id = :outline_id" if outline_id else "outline_id IS NULL"
+        outline_filter = "outline_id = :outline_id" if outline_id else "TRUE"
         query = f"""
         WITH stats AS (
             SELECT
@@ -2084,7 +2222,6 @@ class PostgresDatabase:
                 readiness_status = CASE
                     WHEN stats.blocking_total > stats.blocking_resolved THEN 'blocked'
                     WHEN stats.advisory_total > stats.advisory_resolved THEN 'ready_with_warnings'
-                    WHEN stats.blocking_total = 0 AND stats.advisory_total = 0 THEN 'not_audited'
                     ELSE 'ready'
                 END,
                 last_audited_at = :updated_at,
@@ -2105,7 +2242,6 @@ class PostgresDatabase:
                 CASE
                     WHEN blocking_total > blocking_resolved THEN 'blocked'
                     WHEN advisory_total > advisory_resolved THEN 'ready_with_warnings'
-                    WHEN blocking_total = 0 AND advisory_total = 0 THEN 'not_audited'
                     ELSE 'ready'
                 END,
                 :updated_at,

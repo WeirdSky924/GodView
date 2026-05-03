@@ -668,7 +668,7 @@ async def execute_workflow(
             "deduplicated": bool(execution and request_id and execution.request_id == request_id and execution.id == execution_id),
         }
     except ChapterReadinessBlockedError as e:
-        raise HTTPException(status_code=409, detail=e.payload)
+        raise HTTPException(status_code=409, detail=engine._serialize_for_json(e.payload))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

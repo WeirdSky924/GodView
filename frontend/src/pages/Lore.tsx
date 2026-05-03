@@ -28,6 +28,11 @@ import { LoreTree } from '@/components/lore'
 import { SettingAgentChat } from '@/components/setting'
 import { useProject } from '@/contexts/ProjectContext'
 import { useTheme } from '@/contexts/ThemeContext'
+import OutlineRequirementPanel from '@/components/OutlineRequirementPanel'
+import {
+  updateOutlineResourceRequirementStatus,
+  type OutlineResourceRequirement,
+} from '@/api/outlines'
 
 const categoryIcons: Record<LoreCategory, React.ReactNode> = {
   world_rule: <Shield size={18} />,
@@ -118,6 +123,8 @@ export default function Lore() {
     source: '',
   })
   const [keywordsInput, setKeywordsInput] = useState('')
+  const [pendingRequirement, setPendingRequirement] = useState<OutlineResourceRequirement | null>(null)
+  const [requirementRefreshKey, setRequirementRefreshKey] = useState(0)
   const [viewMode, setViewMode] = useState<'list' | 'tree'>('list')
   const [showAgentChat, setShowAgentChat] = useState(false)
 
@@ -186,27 +193,32 @@ export default function Lore() {
     loadOptions()
   }, [])
 
-  const openCreateModal = () => {
+  const openCreateModal = (requirement?: OutlineResourceRequirement) => {
     if (!currentProject) return
+    const payload = requirement?.suggested_payload || {}
+    const title = String(payload.title || payload.name || requirement?.resource_name || '')
+    const content = String(payload.content || payload.description || payload.summary || requirement?.reason || '')
+    const keywords = normalizeStringArray(payload.keywords)
     setEditingLore(null)
     setFormData({
-      id: `lore_${Date.now()}`,
+      id: String(payload.id || `lore_${Date.now()}`),
       project_id: currentProject.id,
-      title: '',
-      category: 'custom',
-      priority: 'standard',
-      content: '',
-      summary: '',
-      keywords: [],
-      tags: [],
-      constraints: [],
-      related_characters: [],
-      related_locations: [],
-      related_items: [],
-      forbidden_actions: [],
-      source: '',
+      title,
+      category: (payload.category as LoreCategory) || 'custom',
+      priority: normalizeLorePriority(payload.priority),
+      content,
+      summary: String(payload.summary || ''),
+      keywords,
+      tags: normalizeStringArray(payload.tags),
+      constraints: normalizeStringArray(payload.constraints),
+      related_characters: normalizeStringArray(payload.related_characters),
+      related_locations: normalizeStringArray(payload.related_locations),
+      related_items: normalizeStringArray(payload.related_items),
+      forbidden_actions: normalizeStringArray(payload.forbidden_actions),
+      source: requirement ? `outline_resource_requirement:${requirement.id}` : String(payload.source || ''),
     })
-    setKeywordsInput('')
+    setKeywordsInput(keywords.join('，'))
+    setPendingRequirement(requirement || null)
     setShowModal(true)
   }
 
@@ -232,6 +244,7 @@ export default function Lore() {
       source: lore.source || '',
     })
     setKeywordsInput(keywords.join('，'))
+    setPendingRequirement(null)
     setShowModal(true)
   }
 
@@ -289,9 +302,19 @@ export default function Lore() {
           related_items: relatedItems,
           forbidden_actions: forbiddenActions,
         }
-        await createLore(data)
+        const created = await createLore(data)
+        if (pendingRequirement && created.id) {
+          await updateOutlineResourceRequirementStatus(pendingRequirement.id, {
+            status: 'resolved',
+            matched_resource_id: created.id,
+            matched_resource_type: 'lore',
+            resolution_method: 'create_resource',
+          })
+          setRequirementRefreshKey(value => value + 1)
+        }
       }
       await loadLore()
+      setPendingRequirement(null)
       setShowModal(false)
     } catch (error: any) {
       const responseData = error?.response?.data
@@ -349,7 +372,7 @@ export default function Lore() {
               <MessageCircle size={20} className="mr-2" />
               设定助手
             </Button>
-            <Button onClick={openCreateModal} disabled={!currentProject}>
+            <Button onClick={() => openCreateModal()} disabled={!currentProject}>
               <Plus size={20} className="mr-2" />
               新建设定
             </Button>
@@ -370,6 +393,30 @@ export default function Lore() {
           <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
             {/* 左侧：筛选器和列表 */}
             <div className="lg:col-span-1 space-y-4">
+              <OutlineRequirementPanel
+                projectId={currentProject.id}
+                requirementTypes={[
+                  'lore', 'setting', '设定',
+                  'faction', 'organization', '势力', '组织',
+                  'item', 'ability', '道具', '能力',
+                  'relationship', 'character_state', 'continuity', 'event_rule', 'crisis_resolution',
+                  '关系', '关系变化', '角色状态', '连续性', '事件规则', '危机解法',
+                ]}
+                title="大纲待补设定"
+                description="来自大纲的设定、势力、道具、能力、关系和危机解法等资源缺口，可预填新建设定、绑定已有设定或标记处理状态。创建/绑定后会标记需求为已解决。"
+                onCreate={openCreateModal}
+                bindableResources={loreList.map(lore => ({
+                  id: lore.id,
+                  label: lore.title,
+                  type: 'lore',
+                  description: lore.category,
+                }))}
+                onBound={async () => {
+                  await loadLore()
+                  setRequirementRefreshKey(value => value + 1)
+                }}
+                refreshKey={requirementRefreshKey}
+              />
               {/* 搜索 */}
               <Card className="p-4">
                 <div className="relative">

@@ -67,8 +67,11 @@ class ChapterReadinessBlockedError(ValueError):
     def __init__(self, payload: Dict[str, Any]):
         self.payload = payload
         chapter_num = payload.get("chapter_num")
-        blocking_count = len(payload.get("blocking_requirements") or [])
-        super().__init__(f"第 {chapter_num or '未知'} 章资源未就绪，存在 {blocking_count} 个 blocking 需求")
+        message = payload.get("message")
+        if not message:
+            blocking_count = len(payload.get("blocking_requirements") or [])
+            message = f"第 {chapter_num or '未知'} 章资源未就绪，存在 {blocking_count} 个 blocking 需求"
+        super().__init__(str(message))
 
 
 class WorkflowEngine:
@@ -949,6 +952,18 @@ class WorkflowEngine:
         if db:
             if context.get("chapter_outline"):
                 explicit_outline = self._ensure_context_dict(context.get("chapter_outline"))
+                outline_status = str(explicit_outline.get("status") or "").lower()
+                if outline_status and outline_status not in {"approved", "completed"}:
+                    raise ChapterReadinessBlockedError({
+                        "readiness_status": "blocked",
+                        "block_reason": "outline_not_approved",
+                        "message": f"第 {context.get('chapter_num') or '未知'} 章大纲尚未审批，不能启动章节生成工作流。",
+                        "chapter_num": context.get("chapter_num"),
+                        "chapter_outline_id": explicit_outline.get("id"),
+                        "outline_status": outline_status,
+                        "blocking_requirements": [],
+                        "advisory_requirements": [],
+                    })
                 if explicit_outline.get("id") and not context.get("chapter_outline_id"):
                     context["chapter_outline_id"] = str(explicit_outline.get("id"))
                 context.setdefault("chapter_title", explicit_outline.get("title", f"第{context.get('chapter_num')}章"))
@@ -982,12 +997,33 @@ class WorkflowEngine:
                         context.setdefault("chapter_outline_source", "auto_loaded")
                         logger.info(f"自动加载第 {context.get('chapter_num')} 章大纲: {outline.get('title')}")
                     else:
-                        logger.warning(f"未找到第 {context.get('chapter_num')} 章大纲，将由大纲Agent生成")
+                        raise ChapterReadinessBlockedError({
+                            "readiness_status": "blocked",
+                            "block_reason": "approved_outline_missing",
+                            "message": f"第 {context.get('chapter_num') or '未知'} 章没有已审批大纲，不能启动章节生成工作流。",
+                            "chapter_num": context.get("chapter_num"),
+                            "chapter_outline_id": context.get("chapter_outline_id"),
+                            "outline_status": None,
+                            "blocking_requirements": [],
+                            "advisory_requirements": [],
+                        })
+                except ChapterReadinessBlockedError:
+                    raise
                 except Exception as e:
                     logger.warning(f"加载章节大纲失败: {e}")
+                    raise ChapterReadinessBlockedError({
+                        "readiness_status": "blocked",
+                        "block_reason": "outline_load_failed",
+                        "message": f"第 {context.get('chapter_num') or '未知'} 章大纲加载失败，不能启动章节生成工作流。",
+                        "chapter_num": context.get("chapter_num"),
+                        "chapter_outline_id": context.get("chapter_outline_id"),
+                        "outline_status": None,
+                        "blocking_requirements": [],
+                        "advisory_requirements": [],
+                    })
 
         try:
-            readiness_context = await self._check_chapter_resource_readiness(project_id, context, db)
+            readiness_context = await self.check_chapter_resource_readiness(project_id, context, db)
         except ChapterReadinessBlockedError as exc:
             if operation and db:
                 operation_service = OperationLifecycleService(db=db, redis=redis_service)
@@ -6619,6 +6655,15 @@ class WorkflowEngine:
         if isinstance(value, tuple):
             return list(value)
         return [value]
+
+    async def check_chapter_resource_readiness(
+        self,
+        project_id: str,
+        context: Dict[str, Any],
+        db,
+    ) -> Dict[str, Any]:
+        """检查章节资源 readiness，供 workflow 与直连章节生成入口复用。"""
+        return await self._check_chapter_resource_readiness(project_id, context, db)
 
     async def _check_chapter_resource_readiness(
         self,

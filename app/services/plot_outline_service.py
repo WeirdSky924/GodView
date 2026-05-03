@@ -7,10 +7,11 @@ GodView v9: PlotOutlineAgent 专用
 
 import json
 import logging
+import re
 import time
 import uuid
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from app.models.chapter_outline import (
     ChapterOutline,
@@ -578,6 +579,327 @@ class PlotOutlineService:
             return {key: self._to_plain_data(item) for key, item in value.items()}
         return value
 
+    def _normalize_resource_name(self, value: Any) -> str:
+        """标准化资源名，避免空值和明显占位符进入资源需求。"""
+        text = str(value or "").strip()
+        text = re.sub(r"\s+", " ", text)
+        invalid_values = {
+            "",
+            "无",
+            "无地点",
+            "未知",
+            "未知地点",
+            "待定",
+            "tbd",
+            "none",
+            "null",
+            "n/a",
+            "未命名",
+            "未指定",
+        }
+        if text.lower() in invalid_values or text in invalid_values:
+            return ""
+        return text
+
+    def _known_resource_names(self, items: List[Dict[str, Any]], fields: Tuple[str, ...]) -> Set[str]:
+        names: Set[str] = set()
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            for field in fields:
+                name = self._normalize_resource_name(item.get(field))
+                if name:
+                    names.add(name.lower())
+        return names
+
+    def _outline_text_excerpt(self, outline: ChapterOutline, needle: str) -> str:
+        if not needle:
+            return outline.summary or outline.title
+
+        chunks = [outline.summary, *outline.chapter_goals, *outline.hooks_planted, *outline.hooks_resolved]
+        for scene in outline.scenes:
+            chunks.extend([
+                scene.title,
+                scene.summary,
+                scene.conflict_description,
+                *scene.key_events,
+                *scene.writing_hints,
+            ])
+        for chunk in chunks:
+            text = str(chunk or "").strip()
+            if needle in text:
+                return text[:500]
+        return (outline.summary or outline.title or needle)[:500]
+
+    def _collect_outline_resource_candidates(self, outline: ChapterOutline) -> Dict[str, Set[str]]:
+        candidates: Dict[str, Set[str]] = {
+            "character": set(),
+            "location": set(),
+            "lore": set(),
+        }
+
+        for name in (outline.character_arcs or {}).keys():
+            normalized = self._normalize_resource_name(name)
+            if normalized:
+                candidates["character"].add(normalized)
+
+        for scene in outline.scenes or []:
+            for name in scene.participating_characters or []:
+                normalized = self._normalize_resource_name(name)
+                if normalized:
+                    candidates["character"].add(normalized)
+            pov = self._normalize_resource_name(scene.pov_character)
+            if pov:
+                candidates["character"].add(pov)
+            location = self._normalize_resource_name(scene.location)
+            if location:
+                candidates["location"].add(location)
+
+        return candidates
+
+    async def _get_known_location_names(self, project_id: str) -> Set[str]:
+        names: Set[str] = set()
+        if not self._db:
+            return names
+
+        try:
+            if hasattr(self._db, "get_locations"):
+                locations = await self._db.get_locations(project_id=project_id, limit=500)
+                names.update(self._known_resource_names(locations, ("name", "title")))
+        except Exception as e:
+            logger.warning(f"[PlotOutline] 获取地点资源失败: {e}")
+
+        try:
+            rows = await self._db.execute_query(
+                """
+                SELECT r.name
+                FROM regions r
+                JOIN worlds w ON w.id = r.world_id
+                WHERE w.project_id = CAST(:project_id AS UUID)
+                """,
+                {"project_id": project_id},
+            )
+            names.update(self._known_resource_names(rows, ("name", "title")))
+        except Exception as e:
+            logger.debug(f"[PlotOutline] 查询区域地点名失败: {e}")
+
+        return names
+
+    def _build_outline_resource_requirements(
+        self,
+        outline: ChapterOutline,
+        full_context: Dict[str, Any],
+        known_location_names: Set[str],
+    ) -> List[Dict[str, Any]]:
+        candidates = self._collect_outline_resource_candidates(outline)
+        known_characters = self._known_resource_names(full_context.get("characters", []), ("name",))
+        known_lore = self._known_resource_names(full_context.get("world_settings", []), ("title", "name"))
+        requirements: List[Dict[str, Any]] = []
+
+        for name in sorted(candidates["character"]):
+            if name.lower() in known_characters:
+                continue
+            requirements.append({
+                "project_id": outline.project_id,
+                "outline_id": outline.id,
+                "chapter_num": outline.chapter_number,
+                "requirement_type": "character",
+                "resource_name": name,
+                "severity": "blocking",
+                "status": "pending",
+                "reason": f"第 {outline.chapter_number} 章大纲安排角色“{name}”出场，但项目角色资源中尚未找到同名角色。",
+                "source_excerpt": self._outline_text_excerpt(outline, name),
+                "source_agent": "plot_outline.resource_audit",
+                "source_node_id": "outline_save_audit",
+                "suggested_payload": {
+                    "name": name,
+                    "role": "supporting",
+                    "status": "active",
+                    "importance_tier": "supporting",
+                    "description": f"由第 {outline.chapter_number} 章大纲资源审计发现，需要用户确认后补全角色档案。",
+                },
+                "metadata": {
+                    "audit_type": "outline_save",
+                    "audit_basis": "scene.participating_characters/pov_character/character_arcs",
+                },
+            })
+
+        for name in sorted(candidates["location"]):
+            lowered = name.lower()
+            if lowered in known_location_names or lowered in known_lore:
+                continue
+            requirements.append({
+                "project_id": outline.project_id,
+                "outline_id": outline.id,
+                "chapter_num": outline.chapter_number,
+                "requirement_type": "location",
+                "resource_name": name,
+                "severity": "advisory",
+                "status": "pending",
+                "reason": f"第 {outline.chapter_number} 章大纲使用地点“{name}”，但当前地点/设定资源中尚未找到同名资源。",
+                "source_excerpt": self._outline_text_excerpt(outline, name),
+                "source_agent": "plot_outline.resource_audit",
+                "source_node_id": "outline_save_audit",
+                "suggested_payload": {
+                    "title": name,
+                    "name": name,
+                    "category": "location",
+                    "summary": f"由第 {outline.chapter_number} 章大纲资源审计发现，需要补充地点用途、可见层级和场景限制。",
+                    "related_locations": [name],
+                },
+                "metadata": {
+                    "audit_type": "outline_save",
+                    "audit_basis": "scene.location",
+                },
+            })
+
+        lore_keywords = {
+            "能力": "ability",
+            "秘法": "ability",
+            "术式": "ability",
+            "法术": "ability",
+            "阵法": "ability",
+            "仪式": "event_rule",
+            "规则": "event_rule",
+            "协议": "event_rule",
+            "神器": "item",
+            "法器": "item",
+            "道具": "item",
+            "组织": "faction",
+            "势力": "faction",
+        }
+        outline_text = "\n".join([
+            outline.title,
+            outline.summary,
+            *outline.chapter_goals,
+            *outline.hooks_planted,
+            *outline.hooks_resolved,
+            *[scene.summary for scene in outline.scenes],
+            *[event for scene in outline.scenes for event in scene.key_events],
+        ])
+        for keyword, requirement_type in lore_keywords.items():
+            if keyword not in outline_text:
+                continue
+            resource_name = f"第{outline.chapter_number}章{keyword}规则"
+            source_excerpt = self._outline_text_excerpt(outline, keyword)
+            if resource_name.lower() in known_lore or any(
+                lore_name and (lore_name in source_excerpt.lower() or keyword in lore_name)
+                for lore_name in known_lore
+            ):
+                continue
+            requirements.append({
+                "project_id": outline.project_id,
+                "outline_id": outline.id,
+                "chapter_num": outline.chapter_number,
+                "requirement_type": requirement_type,
+                "resource_name": resource_name,
+                "severity": "advisory",
+                "status": "pending",
+                "reason": f"第 {outline.chapter_number} 章大纲涉及“{keyword}”相关剧情，建议补充或绑定对应设定，避免写作阶段临场发明规则。",
+                "source_excerpt": source_excerpt,
+                "source_agent": "plot_outline.resource_audit",
+                "source_node_id": "outline_save_audit",
+                "suggested_payload": {
+                    "title": resource_name,
+                    "category": requirement_type,
+                    "priority": "standard",
+                    "content": f"补充第 {outline.chapter_number} 章中“{keyword}”相关剧情的使用边界、限制和与既有设定的关系。",
+                },
+                "metadata": {
+                    "audit_type": "outline_save",
+                    "audit_basis": "outline_text_keyword",
+                    "keyword": keyword,
+                },
+            })
+
+        return requirements
+
+    def _requirement_identity(self, requirement: Dict[str, Any]) -> Tuple[str, str, str, str]:
+        return (
+            str(requirement.get("requirement_type") or "").strip(),
+            str(requirement.get("resource_name") or "").strip(),
+            str(requirement.get("reason") or "").strip(),
+            str(requirement.get("source_node_id") or "").strip(),
+        )
+
+    async def _supersede_stale_outline_audit_requirements(
+        self,
+        outline: ChapterOutline,
+        active_requirements: List[Dict[str, Any]],
+    ):
+        if not self._db or not hasattr(self._db, "execute_query"):
+            return
+
+        active_identities = {self._requirement_identity(requirement) for requirement in active_requirements}
+        existing_requirements = await self._db.execute_query(
+            """
+            SELECT id, requirement_type, resource_name, reason, source_node_id, status
+            FROM outline_resource_requirements
+            WHERE project_id = CAST(:project_id AS UUID)
+              AND outline_id = :outline_id
+              AND chapter_num = :chapter_num
+              AND source_agent = 'plot_outline.resource_audit'
+              AND source_node_id = 'outline_save_audit'
+              AND status IN ('pending', 'in_progress')
+            """,
+            {
+                "project_id": outline.project_id,
+                "outline_id": outline.id,
+                "chapter_num": outline.chapter_number,
+            },
+        )
+
+        stale_ids = [
+            str(requirement["id"])
+            for requirement in existing_requirements or []
+            if self._requirement_identity(requirement) not in active_identities
+        ]
+        for requirement_id in stale_ids:
+            if hasattr(self._db, "update_outline_resource_requirement_status"):
+                await self._db.update_outline_resource_requirement_status(
+                    requirement_id=requirement_id,
+                    status="superseded",
+                )
+        if stale_ids:
+            logger.info(f"[PlotOutline] 已将 {len(stale_ids)} 条过期大纲资源需求标记为 superseded: {outline.id}")
+
+    async def persist_outline_resource_audit(self, outline: ChapterOutline):
+        """公开入口：按当前大纲内容重新执行资源审计。"""
+        await self._persist_outline_resource_audit(outline)
+
+    async def _persist_outline_resource_audit(self, outline: ChapterOutline):
+        """保存或更新大纲后自动审计资源缺口，并刷新章节 readiness。"""
+        if not self._db or not hasattr(self._db, "save_outline_resource_requirements"):
+            return
+
+        try:
+            full_context = await self.get_full_project_context(outline.project_id, outline.chapter_number)
+            known_location_names = await self._get_known_location_names(outline.project_id)
+            requirements = self._build_outline_resource_requirements(outline, full_context, known_location_names)
+
+            if requirements:
+                await self._db.save_outline_resource_requirements(requirements)
+                logger.info(f"[PlotOutline] 大纲资源审计写入 {len(requirements)} 条需求: {outline.id}")
+            else:
+                logger.info(f"[PlotOutline] 大纲资源审计未发现缺口: {outline.id}")
+
+            await self._supersede_stale_outline_audit_requirements(outline, requirements)
+
+            if hasattr(self._db, "update_chapter_resource_readiness"):
+                await self._db.update_chapter_resource_readiness(
+                    outline.project_id,
+                    outline_id=outline.id,
+                    chapter_num=outline.chapter_number,
+                )
+                await self._db.update_chapter_resource_readiness(
+                    outline.project_id,
+                    outline_id=None,
+                    chapter_num=outline.chapter_number,
+                )
+        except Exception as e:
+            logger.warning(f"[PlotOutline] 大纲资源自动审计失败: {e}")
+
+
     def _outline_saved_response(self, outline: Optional[ChapterOutline]) -> Optional[Dict[str, Any]]:
         if not outline:
             return None
@@ -929,6 +1251,7 @@ class PlotOutlineService:
 
         self._merge_outline_into_list(outline)
         self._mark_outline_project_dirty(outline.project_id, outline.chapter_number)
+        await self._persist_outline_resource_audit(outline)
         return outline
 
     async def get_outline(self, project_id: str, chapter_number: int) -> Optional[ChapterOutline]:
@@ -1020,6 +1343,7 @@ class PlotOutlineService:
                 logger.error(f"更新章节大纲失败: {e}")
 
         self._mark_outline_project_dirty(outline.project_id, outline.chapter_number)
+        await self._persist_outline_resource_audit(outline)
         return outline
 
     async def generate_outline(
@@ -1757,7 +2081,8 @@ class PlotOutlineService:
         """
         自动确定下一章节序号
 
-        根据已存在的最大章节号（大纲+已完成的章节）+1
+        优先返回最小的、已有 approved/completed 大纲但正文尚未完成的章节号。
+        如果没有可写大纲，再回退到已完成章节最大值 + 1。
 
         Args:
             project_id: 项目ID
@@ -1770,29 +2095,36 @@ class PlotOutlineService:
             return 1
 
         try:
-            # 查询已批准/已完成的大纲最大章节号
+            try:
+                chapters = await self._db.get_chapters_by_project(project_id, status="completed")
+                completed_chapter_numbers = {
+                    int(c.chapter_number) for c in chapters or []
+                    if getattr(c, "chapter_number", None) is not None
+                }
+            except Exception:
+                completed_chapter_numbers = set()
+
             outline_result = await self._db.execute_query('''
-                SELECT MAX(chapter_number) as max_outline
+                SELECT chapter_number
                 FROM chapter_outlines
                 WHERE project_id = :project_id
                   AND status IN ('approved', 'completed')
+                ORDER BY chapter_number ASC
             ''', {"project_id": project_id})
 
-            max_outline = 0
-            if outline_result and outline_result[0].get("max_outline"):
-                max_outline = outline_result[0]["max_outline"]
+            for row in outline_result or []:
+                chapter_number = row.get("chapter_number")
+                if chapter_number is None:
+                    continue
+                chapter_number = int(chapter_number)
+                if chapter_number not in completed_chapter_numbers:
+                    logger.info(f"项目 {project_id} 下一可写章节序号: {chapter_number}")
+                    return chapter_number
 
-            # 查询已完成的章节最大章节号
-            try:
-                chapters = await self._db.get_chapters_by_project(project_id, status="completed")
-                max_chapter = max((c.chapter_number for c in chapters), default=0) if chapters else 0
-            except Exception:
-                max_chapter = 0
+            max_chapter = max(completed_chapter_numbers, default=0)
+            next_num = max_chapter + 1
 
-            # 取两者最大值 + 1
-            next_num = max(max_outline, max_chapter) + 1
-
-            logger.info(f"项目 {project_id} 下一章节序号: {next_num} (大纲最大: {max_outline}, 章节最大: {max_chapter})")
+            logger.info(f"项目 {project_id} 无待写 approved 大纲，回退下一章节序号: {next_num} (已完成正文最大: {max_chapter})")
             return next_num
 
         except Exception as e:
@@ -1826,7 +2158,7 @@ class PlotOutlineService:
                 SELECT * FROM chapter_outlines
                 WHERE project_id = :project_id
                   AND chapter_number = :chapter_num
-                  AND status IN ('draft', 'approved', 'completed')
+                  AND status IN ('approved', 'completed')
                 LIMIT 1
             ''', {"project_id": project_id, "chapter_num": chapter_number})
 

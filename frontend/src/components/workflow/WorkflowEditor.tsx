@@ -26,10 +26,22 @@ import {
   createWorkflow,
   updateWorkflow,
   executeWorkflow,
+  extractChapterReadinessGateDetail,
+  formatChapterReadinessGateMessage,
   type WorkflowNode as WfNode,
   type WorkflowEdge as WfEdge,
   type WorkflowDefinition,
 } from '@/api/workflows'
+import { getChapters } from '@/api/chapters'
+import {
+  getOutlines,
+  getOutlineResourceRequirements,
+  getChapterResourceReadiness,
+  type ChapterOutline,
+  type OutlineResourceRequirement,
+  type ChapterResourceReadiness,
+} from '@/api/outlines'
+import { formatRequirementList } from '@/utils/resourceRequirementDisplay'
 
 import AgentNode from './AgentNode'
 import ConditionNode from './ConditionNode'
@@ -162,6 +174,84 @@ export default function WorkflowEditor({
   const [executing, setExecuting] = useState(false)
   const [executionId, setExecutionId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [prechecking, setPrechecking] = useState(false)
+  const [precheckError, setPrecheckError] = useState<string | null>(null)
+  const [precheckOutline, setPrecheckOutline] = useState<ChapterOutline | null>(null)
+  const [precheckReadiness, setPrecheckReadiness] = useState<ChapterResourceReadiness | null>(null)
+  const [precheckBlockingRequirements, setPrecheckBlockingRequirements] = useState<OutlineResourceRequirement[]>([])
+  const [precheckAdvisoryRequirements, setPrecheckAdvisoryRequirements] = useState<OutlineResourceRequirement[]>([])
+
+  const loadStartReadinessPrecheck = useCallback(async () => {
+    setPrechecking(true)
+    setPrecheckError(null)
+    setPrecheckOutline(null)
+    setPrecheckReadiness(null)
+    setPrecheckBlockingRequirements([])
+    setPrecheckAdvisoryRequirements([])
+
+    try {
+      const [outlinesResult, chaptersResult] = await Promise.all([
+        getOutlines(projectId),
+        getChapters(projectId),
+      ])
+      const completedChapterNumbers = new Set(
+        (chaptersResult || [])
+          .filter(chapter => chapter.status === 'completed')
+          .map(chapter => {
+            const match = String(chapter.title || '').match(/第\s*(\d+)\s*章/)
+            return match ? Number(match[1]) : null
+          })
+          .filter((value): value is number => Number.isFinite(value as number)),
+      )
+      const targetOutline = [...(outlinesResult.outlines || [])]
+        .filter(outline => ['approved', 'completed'].includes(outline.status))
+        .sort((a, b) => a.chapter_number - b.chapter_number)
+        .find(outline => !completedChapterNumbers.has(outline.chapter_number)) || null
+
+      if (!targetOutline) {
+        setPrecheckError('当前项目没有可启动的已审批大纲（所有已审批章节都已完成，或尚未审批）。请先在大纲页准备下一章的已审批大纲。')
+        return
+      }
+
+      setPrecheckOutline(targetOutline)
+      const [requirementsResult, readinessResult] = await Promise.all([
+        getOutlineResourceRequirements(projectId, {
+          outline_id: targetOutline.id,
+          chapter_num: targetOutline.chapter_number,
+        }),
+        getChapterResourceReadiness(projectId, {
+          outline_id: targetOutline.id,
+          chapter_num: targetOutline.chapter_number,
+          refresh: true,
+        }),
+      ])
+
+      const unresolvedStatuses = new Set(['pending', 'in_progress'])
+      const blocking = requirementsResult.requirements.filter(requirement => (
+        requirement.severity === 'blocking' && unresolvedStatuses.has(requirement.status)
+      ))
+      const advisory = requirementsResult.requirements.filter(requirement => (
+        requirement.severity === 'advisory' && unresolvedStatuses.has(requirement.status)
+      ))
+      setPrecheckBlockingRequirements(blocking)
+      setPrecheckAdvisoryRequirements(advisory)
+      setPrecheckReadiness(readinessResult.readiness[0] || null)
+      if (blocking.length > 0) {
+        setPrecheckError(`第 ${targetOutline.chapter_number} 章存在 unresolved blocking 资源需求：${formatRequirementList(blocking)}`)
+      }
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail
+      setPrecheckError(
+        detail?.message || (typeof detail === 'string' ? detail : err?.message) || '启动前资源预检失败',
+      )
+    } finally {
+      setPrechecking(false)
+    }
+  }, [projectId])
+
+  useEffect(() => {
+    loadStartReadinessPrecheck()
+  }, [loadStartReadinessPrecheck])
 
   // 节点变化处理
   const onNodesChange: OnNodesChange = useCallback(
@@ -468,15 +558,36 @@ export default function WorkflowEditor({
       return
     }
 
+    if (precheckError) {
+      setError(precheckError)
+      return
+    }
+
+    if (!precheckOutline) {
+      setError('启动前预检尚未找到已审批大纲，请刷新预检或先到大纲页审批章节大纲。')
+      return
+    }
+
     setExecuting(true)
     setError(null)
 
     try {
-      const result = await executeWorkflow(workflow?.id || '', projectId)
+      const result = await executeWorkflow(workflow?.id || '', projectId, {
+        chapter_num: precheckOutline.chapter_number,
+        chapter_outline_id: precheckOutline.id,
+        chapter_outline: precheckOutline,
+      })
       setExecutionId(result.execution_id)
       onExecutionStart?.(result.execution_id)
-    } catch (err) {
-      setError('执行失败')
+    } catch (err: any) {
+      const gateDetail = extractChapterReadinessGateDetail(err)
+      if (gateDetail) {
+        setError(formatChapterReadinessGateMessage(gateDetail, formatRequirementList))
+      } else {
+        const detail = err?.response?.data?.detail
+        const message = detail?.message || (typeof detail === 'string' ? detail : err?.message) || '执行失败'
+        setError(message)
+      }
       console.error(err)
     } finally {
       setExecuting(false)
@@ -567,11 +678,21 @@ export default function WorkflowEditor({
 
           <button
             onClick={handleExecute}
-            disabled={executing || !workflow?.id}
+            disabled={executing || prechecking || !workflow?.id || !!precheckError || !precheckOutline}
             className="flex items-center gap-1 px-3 py-1.5 bg-green-500 text-white rounded text-sm hover:bg-green-600 disabled:opacity-50"
+            title={precheckError || (!precheckOutline ? '等待启动前预检完成' : undefined)}
           >
             <Play size={14} />
-            执行
+            {prechecking ? '预检中...' : '执行'}
+          </button>
+
+          <button
+            onClick={loadStartReadinessPrecheck}
+            disabled={prechecking}
+            className="flex items-center gap-1 px-3 py-1.5 bg-gray-500 text-white rounded text-sm hover:bg-gray-600 disabled:opacity-50"
+          >
+            <AlertCircle size={14} />
+            刷新预检
           </button>
 
           <button
@@ -582,6 +703,32 @@ export default function WorkflowEditor({
           >
             <Trash2 size={16} />
           </button>
+        </div>
+
+        {/* 启动前资源预检 */}
+        <div className={`px-4 py-2 border-b text-xs ${
+          precheckError
+            ? 'bg-red-50 border-red-100 text-red-700'
+            : precheckAdvisoryRequirements.length > 0
+              ? 'bg-yellow-50 border-yellow-100 text-yellow-700'
+              : isDark
+                ? 'bg-gray-900 border-gray-700 text-gray-300'
+                : 'bg-gray-50 border-gray-100 text-gray-600'
+        }`}>
+          {prechecking ? (
+            <span>正在检查已审批大纲和章节资源 readiness...</span>
+          ) : precheckError ? (
+            <span>{precheckError}</span>
+          ) : precheckOutline ? (
+            <span>
+              启动目标：第 {precheckOutline.chapter_number} 章《{precheckOutline.title}》；
+              readiness: {precheckReadiness?.readiness_status || 'ready'}；
+              blocking: {precheckBlockingRequirements.length}；
+              advisory: {precheckAdvisoryRequirements.length}
+            </span>
+          ) : (
+            <span>等待启动前预检...</span>
+          )}
         </div>
 
         {/* 错误提示 */}

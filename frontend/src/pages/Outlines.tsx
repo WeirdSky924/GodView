@@ -6,6 +6,9 @@
 import { useEffect, useState } from 'react'
 import { Card, Button, Input } from '@/components/ui'
 import PageLayout from '@/components/PageLayout'
+import { getCharacters, type Character } from '@/api/characters'
+import { getLoreList, type LoreEntry } from '@/api/lore'
+import { getRegions, getWorlds, type Region } from '@/api/worlds'
 import { useProject } from '@/contexts/ProjectContext'
 import { useTheme } from '@/contexts/ThemeContext'
 import {
@@ -29,6 +32,13 @@ import {
   type ResourceSupplementDraft,
   type ResourceRequirementStatus,
 } from '@/api/outlines'
+import {
+  formatRequirementResolutionResult,
+  formatRequirementTypeFlow,
+  getRequirementOriginalType,
+  getRequirementTargetType,
+  getRequirementTypeLabel,
+} from '@/utils/resourceRequirementDisplay'
 import {
   BookOpen, Plus, Edit2, Check, MessageSquare, Send, RefreshCw,
   ChevronLeft, ChevronRight, Play, Sparkles, Target, Users,
@@ -71,6 +81,16 @@ const STATUS_CONFIG: Record<OutlineStatus, { label: string; color: string }> = {
   revision: { label: '需修改', color: 'bg-orange-100 text-orange-700' },
 }
 
+type BindableResourceType = 'character' | 'lore' | 'location'
+
+interface BindableResourceOption {
+  id: string
+  name: string
+  type: BindableResourceType
+  subtitle?: string
+  description?: string
+}
+
 export default function Outlines() {
   const { theme } = useTheme()
   const isDark = theme === 'dark'
@@ -98,6 +118,18 @@ export default function Outlines() {
   const [loadingResources, setLoadingResources] = useState(false)
   const [generatingDrafts, setGeneratingDrafts] = useState(false)
   const [confirmingDrafts, setConfirmingDrafts] = useState(false)
+  const [bindingRequirement, setBindingRequirement] = useState<OutlineResourceRequirement | null>(null)
+  const [bindableResources, setBindableResources] = useState<BindableResourceOption[]>([])
+  const [selectedBindableResourceId, setSelectedBindableResourceId] = useState('')
+  const [loadingBindableResources, setLoadingBindableResources] = useState(false)
+  const [bindingResource, setBindingResource] = useState(false)
+
+  const directlyCreatableResourceTypes = ['character', 'lore', 'location']
+
+  const getDraftDisplayResourceType = (draft: ResourceSupplementDraft) => formatRequirementTypeFlow(draft)
+
+  const isDirectlyCreatableDraft = (draft: ResourceSupplementDraft) =>
+    directlyCreatableResourceTypes.includes(draft.resource_type)
 
   const mergeOutlines = (current: ChapterOutline[], incoming: ChapterOutline[]) => {
     const outlineMap = new Map(current.map(outline => [outline.chapter_number, outline]))
@@ -150,23 +182,26 @@ export default function Outlines() {
     }
   }
 
-  const loadResourceStatus = async (chapterNumber: number, outlineId?: string, refresh = false) => {
+  const loadResourceStatus = async (chapterNumber: number, outlineId?: string, refresh = true) => {
     if (!currentProject?.id) return
     setLoadingResources(true)
     try {
+      const resourceFilters = {
+        chapter_num: chapterNumber,
+        ...(outlineId ? { outline_id: outlineId } : {}),
+      }
       const [requirementsResult, readinessResult] = await Promise.all([
-        getOutlineResourceRequirements(currentProject.id, {
-          chapter_num: chapterNumber,
-          outline_id: outlineId,
-        }),
+        getOutlineResourceRequirements(currentProject.id, resourceFilters),
         getChapterResourceReadiness(currentProject.id, {
-          chapter_num: chapterNumber,
-          outline_id: outlineId,
+          ...resourceFilters,
           refresh,
         }),
       ])
       setResourceRequirements(requirementsResult.requirements)
-      setResourceReadiness(readinessResult.readiness[0] ?? null)
+      const readiness = outlineId
+        ? readinessResult.readiness.find(item => item.outline_id === outlineId) ?? readinessResult.readiness[0] ?? null
+        : readinessResult.readiness.find(item => !item.outline_id) ?? readinessResult.readiness[0] ?? null
+      setResourceReadiness(readiness)
     } catch (error) {
       console.error('Failed to load resource readiness:', error)
       setResourceRequirements([])
@@ -205,8 +240,8 @@ export default function Outlines() {
     try {
       const result = await generateResourceSupplementDrafts({
         project_id: currentProject.id,
-        outline_id: currentOutline?.id,
         chapter_num: selectedChapter,
+        outline_id: currentOutline?.id,
         include_advisory: includeAdvisory,
       })
       setResourceDrafts(result.drafts)
@@ -223,9 +258,9 @@ export default function Outlines() {
 
   const handleConfirmResourceDrafts = async () => {
     if (!currentProject?.id || resourceDrafts.length === 0) return
-    const creatableDrafts = resourceDrafts.filter(draft => ['character', 'lore'].includes(draft.resource_type))
+    const creatableDrafts = resourceDrafts.filter(isDirectlyCreatableDraft)
     if (creatableDrafts.length === 0) {
-      alert('当前草案暂不包含可直接创建的角色或设定资源')
+      alert('当前草案暂不包含可直接创建的角色、设定或地点资源')
       return
     }
     setConfirmingDrafts(true)
@@ -250,13 +285,118 @@ export default function Outlines() {
     }
   }
 
+  const getBindableResourceType = (requirement: OutlineResourceRequirement): BindableResourceType | null => {
+    const type = requirement.requirement_type.toLowerCase()
+    if (['character', 'role', '人物', '角色'].includes(type)) return 'character'
+    if (['lore', 'setting', '设定'].includes(type)) return 'lore'
+    if (['location', 'place', '地点', '场景地点'].includes(type)) return 'location'
+    return null
+  }
+
+  const loadBindableResources = async (requirement: OutlineResourceRequirement) => {
+    if (!currentProject?.id) return
+    const resourceType = getBindableResourceType(requirement)
+    if (!resourceType) {
+      alert('当前需求类型暂不支持绑定已有资源')
+      return
+    }
+
+    setBindingRequirement(requirement)
+    setSelectedBindableResourceId('')
+    setBindableResources([])
+    setLoadingBindableResources(true)
+    try {
+      if (resourceType === 'character') {
+        const characters = await getCharacters(currentProject.id)
+        setBindableResources(characters
+          .filter((character: Character) => character.id)
+          .map((character: Character) => ({
+            id: character.id as string,
+            name: character.name,
+            type: 'character',
+            subtitle: character.role || character.importance_tier,
+            description: character.description,
+          })))
+      } else if (resourceType === 'lore') {
+        let lores = await getLoreList(currentProject.id, undefined, undefined, requirement.resource_name)
+        if (lores.length === 0) {
+          lores = await getLoreList(currentProject.id)
+        }
+        setBindableResources(lores.map((lore: LoreEntry) => ({
+          id: lore.id,
+          name: lore.title,
+          type: 'lore',
+          subtitle: lore.category,
+          description: lore.summary || lore.content,
+        })))
+      } else if (resourceType === 'location') {
+        const worlds = await getWorlds(currentProject.id)
+        const regionGroups = await Promise.all(
+          worlds
+            .filter(world => world.id)
+            .map(async world => ({
+              world,
+              regions: await getRegions(world.id as string),
+            }))
+        )
+        const options: BindableResourceOption[] = regionGroups.flatMap(({ world, regions }) =>
+          regions
+            .map((region: Region) => ({
+              id: region.id || region.name,
+              name: region.name,
+              type: 'location' as const,
+              subtitle: `${world.name || '未命名世界'} · ${region.region_type || 'location'}`,
+              description: region.description || region.atmosphere,
+            }))
+            .filter(resource => resource.id)
+        )
+        setBindableResources(options)
+      }
+    } catch (error) {
+      console.error('Failed to load bindable resources:', error)
+      alert('加载可绑定资源失败')
+      setBindingRequirement(null)
+    } finally {
+      setLoadingBindableResources(false)
+    }
+  }
+
   const handleUpdateRequirementStatus = async (requirementId: string, status: ResourceRequirementStatus) => {
     try {
-      await updateOutlineResourceRequirementStatus(requirementId, { status })
+      await updateOutlineResourceRequirementStatus(requirementId, {
+        status,
+        ...(status === 'resolved' ? { resolution_method: 'manual_resolved' as const } : {}),
+        ...(status === 'ignored' ? { resolution_method: 'ignored' as const } : {}),
+      })
       await refreshResourceStatus(true)
     } catch (error) {
       console.error('Failed to update resource requirement:', error)
       alert('更新资源需求状态失败')
+    }
+  }
+
+  const handleBindExistingResource = async () => {
+    if (!bindingRequirement || !selectedBindableResourceId) return
+    const selected = bindableResources.find(resource => resource.id === selectedBindableResourceId)
+    if (!selected) return
+
+    setBindingResource(true)
+    try {
+      await updateOutlineResourceRequirementStatus(bindingRequirement.id, {
+        status: 'resolved',
+        matched_resource_id: selected.id,
+        matched_resource_type: selected.type,
+        resolution_method: 'bind_existing',
+      })
+      setBindingRequirement(null)
+      setBindableResources([])
+      setSelectedBindableResourceId('')
+      await refreshResourceStatus(true)
+    } catch (error) {
+      console.error('Failed to bind existing resource:', error)
+      alert('绑定已有资源失败')
+    } finally {
+      setBindingResource(false)
     }
   }
 
@@ -383,13 +523,16 @@ export default function Outlines() {
 
   const requirementLabel = (requirement: OutlineResourceRequirement) => {
     const severityLabel = requirement.severity === 'blocking' ? '阻塞' : requirement.severity === 'advisory' ? '建议' : '可选'
-    return `${severityLabel} · ${requirement.requirement_type}`
+    return `${severityLabel} · ${formatRequirementTypeFlow(requirement)}`
   }
+
+  const isRequirementActionable = (status: ResourceRequirementStatus) => ['pending', 'in_progress'].includes(status)
 
   const renderResourceReadinessPanel = () => {
     const config = readinessConfig(resourceReadiness?.readiness_status)
     const unresolvedRequirements = resourceRequirements.filter(req => !['resolved', 'ignored', 'superseded'].includes(req.status))
-    const supportedDrafts = resourceDrafts.filter(draft => ['character', 'lore'].includes(draft.resource_type))
+    const unresolvedBlockingRequirements = unresolvedRequirements.filter(req => req.severity === 'blocking')
+    const supportedDrafts = resourceDrafts.filter(isDirectlyCreatableDraft)
 
     return (
       <Card className="p-4 mb-6">
@@ -399,7 +542,7 @@ export default function Outlines() {
               资源就绪检查
             </h3>
             <p className={`text-xs mt-1 ${isDark ? 'text-gray-500' : 'text-gray-500'}`}>
-              生成补全草案不会直接创建资源，确认后才会写入角色/设定并更新需求状态。
+              生成补全草案不会直接创建资源，确认后才会写入角色/设定/地点并更新需求状态。
             </p>
           </div>
           <span className={`px-3 py-1 text-xs rounded-full ${config.color}`}>{config.label}</span>
@@ -433,9 +576,9 @@ export default function Outlines() {
             {loadingResources ? <Loader2 className="w-4 h-4 mr-1 animate-spin" /> : <RefreshCw className="w-4 h-4 mr-1" />}
             刷新资源状态
           </Button>
-          <Button size="sm" onClick={() => handleGenerateResourceDrafts(false)} disabled={generatingDrafts || unresolvedRequirements.length === 0}>
+          <Button size="sm" onClick={() => handleGenerateResourceDrafts(false)} disabled={generatingDrafts || unresolvedBlockingRequirements.length === 0}>
             {generatingDrafts ? <Loader2 className="w-4 h-4 mr-1 animate-spin" /> : <Sparkles className="w-4 h-4 mr-1" />}
-            生成 blocking 草案
+            生成 blocking 草案 ({unresolvedBlockingRequirements.length})
           </Button>
           <Button size="sm" variant="secondary" onClick={() => handleGenerateResourceDrafts(true)} disabled={generatingDrafts || unresolvedRequirements.length === 0}>
             包含 advisory
@@ -447,6 +590,12 @@ export default function Outlines() {
             </Button>
           )}
         </div>
+
+        {unresolvedRequirements.length > 0 && unresolvedBlockingRequirements.length === 0 && (
+          <p className={`text-xs mb-3 ${isDark ? 'text-yellow-300' : 'text-yellow-700'}`}>
+            当前没有 blocking 缺口；如需处理建议类缺口，请使用“包含 advisory”，或直接忽略/标记解决。
+          </p>
+        )}
 
         {resourceRequirements.length === 0 ? (
           <p className={`text-sm ${isDark ? 'text-gray-500' : 'text-gray-500'}`}>暂无资源需求记录。</p>
@@ -465,19 +614,29 @@ export default function Outlines() {
                       </span>
                     </div>
                     <p className={`text-sm font-medium ${isDark ? 'text-gray-200' : 'text-gray-800'}`}>{requirement.resource_name}</p>
+                    <div className={`text-xs mt-1 flex flex-wrap gap-2 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>
+                      <span>需求类型：{getRequirementTypeLabel(getRequirementOriginalType(requirement))}</span>
+                      <span>处理入口：{getRequirementTypeLabel(getRequirementTargetType(requirement))}</span>
+                      <span>状态：{requirement.status}</span>
+                    </div>
                     {requirement.reason && (
                       <p className={`text-xs mt-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>{requirement.reason}</p>
                     )}
                   </div>
                   <div className="flex flex-wrap gap-1 justify-end">
-                    {requirement.status !== 'resolved' && (
-                      <Button size="sm" variant="secondary" onClick={() => handleUpdateRequirementStatus(requirement.id, 'in_progress')}>处理中</Button>
-                    )}
-                    {requirement.status !== 'resolved' && (
-                      <Button size="sm" variant="secondary" onClick={() => handleUpdateRequirementStatus(requirement.id, 'ignored')}>忽略</Button>
-                    )}
-                    {requirement.status !== 'resolved' && (
-                      <Button size="sm" onClick={() => handleUpdateRequirementStatus(requirement.id, 'resolved')}>标记解决</Button>
+                    {isRequirementActionable(requirement.status) ? (
+                      <>
+                        {getBindableResourceType(requirement) && (
+                          <Button size="sm" variant="secondary" onClick={() => loadBindableResources(requirement)}>绑定已有</Button>
+                        )}
+                        <Button size="sm" variant="secondary" onClick={() => handleUpdateRequirementStatus(requirement.id, 'in_progress')}>设为处理中</Button>
+                        <Button size="sm" variant="secondary" onClick={() => handleUpdateRequirementStatus(requirement.id, 'ignored')}>忽略此需求</Button>
+                        <Button size="sm" onClick={() => handleUpdateRequirementStatus(requirement.id, 'resolved')}>人工标记解决</Button>
+                      </>
+                    ) : (
+                      <span className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-500'}`}>
+                        {formatRequirementResolutionResult(requirement) || '已关闭'}
+                      </span>
                     )}
                   </div>
                 </div>
@@ -496,13 +655,17 @@ export default function Outlines() {
                     {draft.resource_name || draft.draft_payload?.name || '未命名资源'}
                   </p>
                   <span className={`text-xs px-2 py-0.5 rounded ${isDark ? 'bg-blue-900 text-blue-200' : 'bg-blue-100 text-blue-700'}`}>
-                    {draft.resource_type}
+                    {getDraftDisplayResourceType(draft)}
                   </span>
                 </div>
                 {draft.reason && <p className={`text-xs ${isDark ? 'text-blue-300' : 'text-blue-700'}`}>{draft.reason}</p>}
-                {!['character', 'lore'].includes(draft.resource_type) && (
+                <div className={`text-xs mt-1 flex flex-wrap gap-2 ${isDark ? 'text-blue-300' : 'text-blue-700'}`}>
+                  <span>需求类型：{getRequirementTypeLabel(getRequirementOriginalType(draft))}</span>
+                  <span>处理入口：{getRequirementTypeLabel(getRequirementTargetType(draft))}</span>
+                </div>
+                {!isDirectlyCreatableDraft(draft) && (
                   <p className={`text-xs mt-1 ${isDark ? 'text-yellow-300' : 'text-yellow-700'}`}>
-                    当前仅支持直接确认创建 character / lore，此草案需后续资源界面处理。
+                    当前仅支持直接确认创建 character / lore / location，此草案需后续资源界面处理。
                   </p>
                 )}
               </div>
@@ -943,6 +1106,71 @@ export default function Outlines() {
             </div>
           )}
         </div>
+
+        {bindingRequirement && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+            <div className={`w-full max-w-lg rounded-lg shadow-xl ${isDark ? 'bg-gray-900 text-gray-100' : 'bg-white text-gray-900'}`}>
+              <div className={`p-4 border-b flex items-start justify-between gap-3 ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+                <div>
+                  <h3 className="font-medium">绑定已有资源</h3>
+                  <p className={`text-xs mt-1 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+                    将“{bindingRequirement.resource_name}”绑定到已有资源，并把该需求标记为 resolved。
+                  </p>
+                </div>
+                <Button variant="ghost" size="sm" onClick={() => setBindingRequirement(null)}>
+                  <X className="w-4 h-4" />
+                </Button>
+              </div>
+              <div className="p-4 space-y-3">
+                {loadingBindableResources ? (
+                  <div className={`flex items-center gap-2 text-sm ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    正在加载可绑定资源...
+                  </div>
+                ) : bindableResources.length === 0 ? (
+                  <p className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>未找到可绑定的已有资源。</p>
+                ) : (
+                  <select
+                    value={selectedBindableResourceId}
+                    onChange={event => setSelectedBindableResourceId(event.target.value)}
+                    className={`w-full px-3 py-2 rounded border ${isDark ? 'bg-gray-800 border-gray-700 text-gray-100' : 'bg-white border-gray-300 text-gray-900'}`}
+                  >
+                    <option value="">请选择已有资源</option>
+                    {bindableResources.map(resource => (
+                      <option key={`${resource.type}:${resource.id}`} value={resource.id}>
+                        {resource.name}{resource.subtitle ? ` · ${resource.subtitle}` : ''}
+                      </option>
+                    ))}
+                  </select>
+                )}
+
+                {selectedBindableResourceId && (
+                  <div className={`p-3 rounded ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
+                    {(() => {
+                      const selected = bindableResources.find(resource => resource.id === selectedBindableResourceId)
+                      if (!selected) return null
+                      return (
+                        <>
+                          <p className="text-sm font-medium">{selected.name}</p>
+                          {selected.description && (
+                            <p className={`text-xs mt-1 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>{selected.description.slice(0, 180)}</p>
+                          )}
+                        </>
+                      )
+                    })()}
+                  </div>
+                )}
+              </div>
+              <div className={`p-4 border-t flex justify-end gap-2 ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+                <Button variant="secondary" onClick={() => setBindingRequirement(null)}>取消</Button>
+                <Button onClick={handleBindExistingResource} disabled={!selectedBindableResourceId || bindingResource}>
+                  {bindingResource ? <Loader2 className="w-4 h-4 mr-1 animate-spin" /> : <Check className="w-4 h-4 mr-1" />}
+                  确认绑定
+                </Button>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* 右侧：Agent 聊天面板 */}
         {showChat && (

@@ -22,12 +22,23 @@ import 'reactflow/dist/style.css'
 import { getVisualizationData } from '@/api/visualization'
 import { getWorlds, getRegions, type Region, type World } from '@/api/worlds'
 import { getCharacters, type Character } from '@/api/characters'
+import { getChapters } from '@/api/chapters'
+import {
+  getOutlines,
+  getOutlineResourceRequirements,
+  getChapterResourceReadiness,
+  type ChapterOutline,
+  type OutlineResourceRequirement,
+  type ChapterResourceReadiness,
+} from '@/api/outlines'
 import {
   getWorkflows,
   createWorkflow,
   updateWorkflow,
   deleteWorkflow,
   executeWorkflow,
+  extractChapterReadinessGateDetail,
+  formatChapterReadinessGateMessage,
   getActiveWorkflowExecution,
   getExecution,
   pauseExecution,
@@ -46,6 +57,7 @@ import WorkflowMonitor from '@/components/workflow/WorkflowMonitor'
 import WorkflowTrace from '@/components/workflow/WorkflowTrace'
 import { Network, Users, GitBranch, Play, Save, Trash2, Plus, Loader2, Pause, Square, RotateCcw, Orbit, Map } from 'lucide-react'
 import { useTheme } from '@/contexts/ThemeContext'
+import { formatRequirementList } from '@/utils/resourceRequirementDisplay'
 import { useProject } from '@/contexts/ProjectContext'
 import WorkflowHelp from '@/components/workflow/WorkflowHelp'
 import WorldMap3D from '@/components/visualizer/WorldMap3D'
@@ -728,6 +740,12 @@ export default function Visualizer() {
   const [workflowName, setWorkflowName] = useState('新工作流')
   const [saving, setSaving] = useState(false)
   const [executing, setExecuting] = useState(false)
+  const [startPrechecking, setStartPrechecking] = useState(false)
+  const [startPrecheckError, setStartPrecheckError] = useState<string | null>(null)
+  const [startPrecheckOutline, setStartPrecheckOutline] = useState<ChapterOutline | null>(null)
+  const [startPrecheckReadiness, setStartPrecheckReadiness] = useState<ChapterResourceReadiness | null>(null)
+  const [startPrecheckBlockingRequirements, setStartPrecheckBlockingRequirements] = useState<OutlineResourceRequirement[]>([])
+  const [startPrecheckAdvisoryRequirements, setStartPrecheckAdvisoryRequirements] = useState<OutlineResourceRequirement[]>([])
   const [currentExecutionId, setCurrentExecutionId] = useState<string | null>(null)
   const [currentExecutionStatus, setCurrentExecutionStatus] = useState<string | null>(null)
   const [currentExecution, setCurrentExecution] = useState<WorkflowExecution | null>(null)
@@ -1049,6 +1067,81 @@ export default function Visualizer() {
 
     void restoreExecution()
   }, [currentProject, selectedWorkflow])
+  const loadStartReadinessPrecheck = useCallback(async () => {
+    if (!currentProject) return null
+
+    setStartPrechecking(true)
+    setStartPrecheckError(null)
+    setStartPrecheckOutline(null)
+    setStartPrecheckReadiness(null)
+    setStartPrecheckBlockingRequirements([])
+    setStartPrecheckAdvisoryRequirements([])
+
+    try {
+      const [outlinesResult, chaptersResult] = await Promise.all([
+        getOutlines(currentProject.id),
+        getChapters(currentProject.id),
+      ])
+      const completedChapterNumbers = new Set(
+        (chaptersResult || [])
+          .filter(chapter => chapter.status === 'completed')
+          .map(chapter => {
+            const match = String(chapter.title || '').match(/第\s*(\d+)\s*章/)
+            return match ? Number(match[1]) : null
+          })
+          .filter((value): value is number => Number.isFinite(value as number)),
+      )
+      const targetOutline = [...(outlinesResult.outlines || [])]
+        .filter(outline => ['approved', 'completed'].includes(outline.status))
+        .sort((a, b) => a.chapter_number - b.chapter_number)
+        .find(outline => !completedChapterNumbers.has(outline.chapter_number)) || null
+
+      if (!targetOutline) {
+        setStartPrecheckError('当前项目没有可启动的已审批大纲（所有已审批章节都已完成，或尚未审批）。请先在大纲页准备下一章的已审批大纲。')
+        return null
+      }
+
+      setStartPrecheckOutline(targetOutline)
+      const [requirementsResult, readinessResult] = await Promise.all([
+        getOutlineResourceRequirements(currentProject.id, {
+          outline_id: targetOutline.id,
+          chapter_num: targetOutline.chapter_number,
+        }),
+        getChapterResourceReadiness(currentProject.id, {
+          outline_id: targetOutline.id,
+          chapter_num: targetOutline.chapter_number,
+          refresh: true,
+        }),
+      ])
+
+      const unresolvedStatuses = new Set(['pending', 'in_progress'])
+      const blocking = requirementsResult.requirements.filter(requirement => (
+        requirement.severity === 'blocking' && unresolvedStatuses.has(requirement.status)
+      ))
+      const advisory = requirementsResult.requirements.filter(requirement => (
+        requirement.severity === 'advisory' && unresolvedStatuses.has(requirement.status)
+      ))
+      setStartPrecheckBlockingRequirements(blocking)
+      setStartPrecheckAdvisoryRequirements(advisory)
+      setStartPrecheckReadiness(readinessResult.readiness[0] || null)
+
+      if (blocking.length > 0) {
+        setStartPrecheckError(`第 ${targetOutline.chapter_number} 章存在 unresolved blocking 资源需求：${formatRequirementList(blocking)}`)
+        return null
+      }
+
+      return targetOutline
+    } catch (error: any) {
+      const detail = error?.response?.data?.detail
+      setStartPrecheckError(
+        detail?.message || (typeof detail === 'string' ? detail : error?.message) || '启动前资源预检失败',
+      )
+      return null
+    } finally {
+      setStartPrechecking(false)
+    }
+  }, [currentProject])
+
   const handleExecuteWorkflow = async (forceNew = false) => {
     if (!currentProject) return
 
@@ -1069,12 +1162,20 @@ export default function Visualizer() {
         await loadWorkflows()
       }
 
+      const targetOutline = await loadStartReadinessPrecheck()
+      if (!targetOutline) {
+        alert('启动前预检失败，请先修复阻塞项后再执行。')
+        return
+      }
+
       const requestId = `workflow_${workflow.id}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`
       const result = await executeWorkflow(
         workflow.id,
         currentProject.id,
         {
-          chapter_num: workflow.variables?.chapter_num || 1,
+          chapter_num: targetOutline.chapter_number,
+          chapter_outline_id: targetOutline.id,
+          chapter_outline: targetOutline,
           ...(selectedWorldId ? { world_id: selectedWorldId } : {}),
         },
         { requestId, forceNew },
@@ -1087,13 +1188,26 @@ export default function Visualizer() {
       params.set('execution_id', result.execution_id)
       window.history.replaceState(null, '', `${window.location.pathname}?${params.toString()}`)
       alert(`工作流已启动！执行ID: ${result.execution_id}`)
-    } catch (error) {
+    } catch (error: any) {
+      const gateDetail = extractChapterReadinessGateDetail(error)
+      if (gateDetail) {
+        alert(formatChapterReadinessGateMessage(gateDetail, formatRequirementList))
+      } else {
+        const detail = error?.response?.data?.detail
+        const message = detail?.message || (typeof detail === 'string' ? detail : error?.message) || '执行失败'
+        alert(message)
+      }
       console.error('Failed to execute workflow:', error)
-      alert('执行失败')
     } finally {
       setExecuting(false)
     }
   }
+
+  useEffect(() => {
+    if (currentProject && activeTab === 'workflow') {
+      void loadStartReadinessPrecheck()
+    }
+  }, [activeTab, currentProject, loadStartReadinessPrecheck])
 
   const handlePauseExecution = async () => {
     if (!currentExecutionId) return
@@ -1446,12 +1560,54 @@ export default function Visualizer() {
             <Card className="p-3">
               <button
                 onClick={() => handleExecuteWorkflow()}
-                disabled={executing || !selectedWorkflow || Boolean(currentExecutionId && isActiveExecutionStatus(currentExecutionStatus || undefined))}
+                disabled={executing || startPrechecking || !selectedWorkflow || Boolean(currentExecutionId && isActiveExecutionStatus(currentExecutionStatus || undefined)) || !!startPrecheckError || !startPrecheckOutline}
                 className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-green-500 text-white rounded text-sm hover:bg-green-600 disabled:opacity-50"
+                title={startPrecheckError || (!startPrecheckOutline ? '等待启动前预检完成' : '')}
               >
                 <Play size={14} />
-                {executing ? '执行中...' : currentExecutionId && isActiveExecutionStatus(currentExecutionStatus || undefined) ? '已有执行运行中' : '执行'}
+                {executing ? '执行中...' : startPrechecking ? '预检中...' : currentExecutionId && isActiveExecutionStatus(currentExecutionStatus || undefined) ? '已有执行运行中' : '执行'}
               </button>
+              <div className="mt-2 flex items-center gap-2">
+                <button
+                  onClick={() => { void loadStartReadinessPrecheck() }}
+                  disabled={startPrechecking}
+                  className="flex-1 px-3 py-2 rounded bg-gray-100 text-gray-700 text-sm hover:bg-gray-200 disabled:opacity-50"
+                >
+                  刷新预检
+                </button>
+                {startPrecheckOutline && (
+                  <div className="flex-1 text-xs text-gray-500 text-right truncate" title={`第 ${startPrecheckOutline.chapter_number} 章《${startPrecheckOutline.title}》`}>
+                    启动目标：第 {startPrecheckOutline.chapter_number} 章
+                  </div>
+                )}
+              </div>
+              <div className={`mt-2 rounded border p-2 text-xs ${
+                startPrecheckError
+                  ? 'border-red-200 bg-red-50 text-red-700'
+                  : startPrecheckAdvisoryRequirements.length > 0
+                    ? 'border-yellow-200 bg-yellow-50 text-yellow-700'
+                    : 'border-gray-200 bg-gray-50 text-gray-600'
+              }`}>
+                {startPrechecking ? (
+                  <div>正在检查已审批大纲和章节资源 readiness...</div>
+                ) : startPrecheckError ? (
+                  <div>{startPrecheckError}</div>
+                ) : startPrecheckOutline ? (
+                  <div className="space-y-1">
+                    <div>
+                      readiness: {startPrecheckReadiness?.readiness_status || 'ready'}；blocking: {startPrecheckBlockingRequirements.length}；advisory: {startPrecheckAdvisoryRequirements.length}
+                    </div>
+                    {startPrecheckBlockingRequirements.length > 0 && (
+                      <div>阻塞资源：{formatRequirementList(startPrecheckBlockingRequirements)}</div>
+                    )}
+                    {startPrecheckAdvisoryRequirements.length > 0 && (
+                      <div>建议补齐：{formatRequirementList(startPrecheckAdvisoryRequirements)}</div>
+                    )}
+                  </div>
+                ) : (
+                  <div>等待启动前预检...</div>
+                )}
+              </div>
               {currentExecutionId && (
                 <div className="mt-2 space-y-2 text-xs">
                   <div className="truncate text-gray-500" title={currentExecutionId}>执行ID: {currentExecutionId}</div>
@@ -1504,7 +1660,7 @@ export default function Visualizer() {
                   )}
                   <button
                     onClick={handleForceNewExecution}
-                    disabled={executing || !selectedWorkflow}
+                    disabled={executing || startPrechecking || !selectedWorkflow}
                     className="w-full px-2 py-1 rounded border border-gray-300 text-gray-600 hover:bg-gray-50 disabled:opacity-50"
                   >
                     强制新执行

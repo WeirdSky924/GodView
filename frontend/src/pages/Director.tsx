@@ -5,6 +5,8 @@ import { useDynamicWebSocket } from '@/hooks/useWebSocket'
 import { getDirectorState, getSnapshotTree } from '@/api/director'
 import { getCharacters } from '@/api/characters'
 import {
+  extractChapterReadinessGateDetail,
+  formatChapterReadinessGateMessage,
   getActiveWorkflowExecution,
   getWorkflows,
   getExecution,
@@ -13,7 +15,16 @@ import {
   type WorkflowExecution,
   type WorkflowEventMessage,
 } from '@/api/workflows'
-import { getOutlines, type ChapterOutline, type OutlineStatus } from '@/api/outlines'
+import {
+  getOutlines,
+  getOutlineResourceRequirements,
+  getChapterResourceReadiness,
+  type ChapterOutline,
+  type OutlineStatus,
+  type OutlineResourceRequirement,
+  type ChapterResourceReadiness,
+} from '@/api/outlines'
+import { formatRequirementList } from '@/utils/resourceRequirementDisplay'
 import { useWorkflowAgents, type AgentStatus, getAgentDisplayName } from '@/hooks/useWorkflowAgents'
 import {
   Play, Pause, RotateCcw, Target, BookOpen, MessageSquare, GitBranch, Settings,
@@ -59,7 +70,7 @@ const OUTLINE_STATUS_CONFIG: Record<OutlineStatus, { label: string; className: s
 }
 
 function isOutlineWritable(outline?: ChapterOutline | null) {
-  return !!outline && ['draft', 'approved', 'revision'].includes(outline.status)
+  return !!outline && outline.status === 'approved'
 }
 
 interface SnapshotNode {
@@ -862,6 +873,8 @@ export default function Director() {
     style_reference: '',
   })
   const [chapterOutlines, setChapterOutlines] = useState<ChapterOutline[]>([])
+  const [outlineResourceRequirementsByKey, setOutlineResourceRequirementsByKey] = useState<Record<string, OutlineResourceRequirement[]>>({})
+  const [outlineReadinessByKey, setOutlineReadinessByKey] = useState<Record<string, ChapterResourceReadiness>>({})
   const [outlinesLoading, setOutlinesLoading] = useState(false)
   const [selectedSingleOutlineId, setSelectedSingleOutlineId] = useState('')
   const [selectedAutoOutlineIds, setSelectedAutoOutlineIds] = useState<string[]>([])
@@ -1051,6 +1064,15 @@ export default function Director() {
         setIsGenerating(false)
         setPendingUserInput(null)
         setWorkflowUserInput('')
+        return true
+      }
+      case 'workflow_start_blocked': {
+        const detail = extractChapterReadinessGateDetail({ data: eventData || payload })
+        addLog(`⛔ 工作流启动阻塞: ${formatChapterReadinessGateMessage(
+          detail,
+          requirements => formatRequirementList(requirements as OutlineResourceRequirement[], 5),
+        )}`)
+        setIsGenerating(false)
         return true
       }
       case 'workflow_failed': {
@@ -1362,9 +1384,19 @@ export default function Director() {
             addLog(`🎉 连续创作完成！共 ${data.data?.total_chapters} 章，${data.data?.total_words} 字`)
             loadRuntimePanels()
             break
+          case 'auto_mode_blocked':
+            setAutoModeRunning(false)
+            addLog(`⛔ 连续创作启动阻塞: ${formatGatePayloadMessage(data)}`)
+            void loadChapterOutlines()
+            break
           case 'auto_mode_error':
             setAutoModeRunning(false)
             addLog(`❌ 错误: ${data.error}`)
+            break
+          case 'auto_mode_chapter_blocked':
+            setAutoModeRunning(false)
+            addLog(`⛔ 第 ${data.chapter_num || data.data?.chapter_num || '?'} 章启动阻塞: ${formatGatePayloadMessage(data)}`)
+            void loadChapterOutlines()
             break
           case 'auto_write_chapter_started':
             if (data.data?.execution_id) {
@@ -1383,6 +1415,10 @@ export default function Director() {
                 content: data.data?.content || '',
               }])
               loadRuntimePanels()
+            } else if (data.status === 'blocked') {
+              setIsGenerating(false)
+              addLog(`⛔ 章节启动阻塞: ${formatGatePayloadMessage(data)}`)
+              void loadChapterOutlines()
             } else {
               addLog(`❌ 章节生成失败: ${data.error}`)
             }
@@ -1472,6 +1508,8 @@ export default function Director() {
   const loadChapterOutlines = useCallback(async () => {
     if (!currentProject) {
       setChapterOutlines([])
+      setOutlineResourceRequirementsByKey({})
+      setOutlineReadinessByKey({})
       return
     }
 
@@ -1479,6 +1517,27 @@ export default function Director() {
     try {
       const result = await getOutlines(currentProject.id)
       const sorted = [...result.outlines].sort((a, b) => a.chapter_number - b.chapter_number)
+      const [requirementsResult, readinessResult] = await Promise.all([
+        getOutlineResourceRequirements(currentProject.id),
+        getChapterResourceReadiness(currentProject.id, { refresh: true }),
+      ])
+      const nextRequirementsByKey: Record<string, OutlineResourceRequirement[]> = {}
+      for (const requirement of requirementsResult.requirements || []) {
+        const keys = [
+          requirement.outline_id ? `outline:${requirement.outline_id}` : '',
+          requirement.chapter_num !== null && requirement.chapter_num !== undefined ? `chapter:${requirement.chapter_num}` : '',
+        ].filter(Boolean)
+        for (const key of keys) {
+          nextRequirementsByKey[key] = [...(nextRequirementsByKey[key] || []), requirement]
+        }
+      }
+      const nextReadinessByKey: Record<string, ChapterResourceReadiness> = {}
+      for (const readiness of readinessResult.readiness || []) {
+        if (readiness.outline_id) nextReadinessByKey[`outline:${readiness.outline_id}`] = readiness
+        nextReadinessByKey[`chapter:${readiness.chapter_num}`] = readiness
+      }
+      setOutlineResourceRequirementsByKey(nextRequirementsByKey)
+      setOutlineReadinessByKey(nextReadinessByKey)
       setChapterOutlines(sorted)
       setSelectedSingleOutlineId((currentId) => {
         if (currentId && sorted.some(outline => outline.id === currentId)) return currentId
@@ -1521,6 +1580,82 @@ export default function Director() {
         : [...currentIds, outlineId]
     ))
   }
+
+  const getOutlineRequirements = useCallback((outline?: ChapterOutline | null) => {
+    if (!outline) return []
+    return outlineResourceRequirementsByKey[`outline:${outline.id}`] || outlineResourceRequirementsByKey[`chapter:${outline.chapter_number}`] || []
+  }, [outlineResourceRequirementsByKey])
+
+  const getOutlineReadiness = useCallback((outline?: ChapterOutline | null) => {
+    if (!outline) return null
+    return outlineReadinessByKey[`outline:${outline.id}`] || outlineReadinessByKey[`chapter:${outline.chapter_number}`] || null
+  }, [outlineReadinessByKey])
+
+  const getOutlineBlockingRequirements = useCallback((outline?: ChapterOutline | null) => {
+    if (!outline) return []
+    const unresolvedStatuses = new Set(['pending', 'in_progress'])
+    return getOutlineRequirements(outline).filter(requirement => requirement.severity === 'blocking' && unresolvedStatuses.has(requirement.status))
+  }, [getOutlineRequirements])
+
+  const getOutlineReadinessBlockMessage = useCallback((outline?: ChapterOutline | null) => {
+    if (!outline) return ''
+    const readiness = getOutlineReadiness(outline)
+    const blocking = getOutlineBlockingRequirements(outline)
+    if (readiness?.readiness_status !== 'blocked' && blocking.length === 0) return ''
+    const requirementText = blocking.length > 0 ? formatRequirementList(blocking, 5) : ''
+    return requirementText
+      ? `第 ${outline.chapter_number} 章资源未就绪：${requirementText}`
+      : `第 ${outline.chapter_number} 章资源未就绪，请先刷新资源 readiness。`
+  }, [getOutlineBlockingRequirements, getOutlineReadiness])
+
+  const formatGatePayloadMessage = useCallback((payload?: any) => {
+    const detail = extractChapterReadinessGateDetail({ data: payload }) || payload?.detail || payload?.data || payload
+    return formatChapterReadinessGateMessage(
+      detail,
+      requirements => formatRequirementList(requirements as OutlineResourceRequirement[], 5),
+    )
+  }, [])
+
+  const renderOutlineReadiness = useCallback((outline?: ChapterOutline | null, compact = false) => {
+    if (!outline) return null
+    const readiness = getOutlineReadiness(outline)
+    const requirements = getOutlineRequirements(outline)
+    const unresolvedStatuses = new Set(['pending', 'in_progress'])
+    const blocking = requirements.filter(requirement => requirement.severity === 'blocking' && unresolvedStatuses.has(requirement.status))
+    const advisory = requirements.filter(requirement => requirement.severity === 'advisory' && unresolvedStatuses.has(requirement.status))
+    const status = readiness?.readiness_status || (blocking.length > 0 ? 'blocked' : 'not_audited')
+    const statusLabel = status === 'ready'
+      ? 'ready'
+      : status === 'ready_with_warnings'
+        ? 'ready with warnings'
+        : status === 'blocked'
+          ? 'blocked'
+          : status === 'stale'
+            ? 'stale'
+            : 'not audited'
+    const statusClass = status === 'ready'
+      ? isDark ? 'bg-green-900/30 text-green-300' : 'bg-green-100 text-green-700'
+      : status === 'ready_with_warnings'
+        ? isDark ? 'bg-yellow-900/30 text-yellow-300' : 'bg-yellow-100 text-yellow-700'
+        : status === 'blocked'
+          ? isDark ? 'bg-red-900/30 text-red-300' : 'bg-red-100 text-red-700'
+          : isDark ? 'bg-gray-800 text-gray-400' : 'bg-gray-100 text-gray-600'
+
+    return (
+      <div className={compact ? 'mt-2 space-y-1' : 'mt-3 space-y-2'}>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className={`rounded px-2 py-0.5 text-xs ${statusClass}`}>readiness: {statusLabel}</span>
+          <span className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>blocking {blocking.length} · advisory {advisory.length}</span>
+        </div>
+        {blocking.length > 0 && (
+          <p className={`text-xs ${isDark ? 'text-red-300' : 'text-red-600'}`}>阻塞资源：{formatRequirementList(blocking, compact ? 2 : 5)}</p>
+        )}
+        {!compact && advisory.length > 0 && (
+          <p className={`text-xs ${isDark ? 'text-yellow-300' : 'text-yellow-700'}`}>建议补齐：{formatRequirementList(advisory, 5)}</p>
+        )}
+      </div>
+    )
+  }, [getOutlineReadiness, getOutlineRequirements, isDark])
 
   const openWriteChapterModal = () => {
     void loadChapterOutlines()
@@ -1756,9 +1891,14 @@ export default function Director() {
     if (!currentProject) return addLog('请先选择项目')
 
     if (autoOutlineMode === 'selected') {
-      if (selectedAutoOutlines.length === 0) return addLog('请至少选择一个可写章节大纲')
+      if (selectedAutoOutlines.length === 0) return addLog('请至少选择一个已审批章节大纲')
+      if (selectedAutoOutlines.some(outline => !isOutlineWritable(outline))) return addLog('连续创作只能选择已审批章节大纲')
+      const blockedOutline = selectedAutoOutlines.find(outline => getOutlineReadinessBlockMessage(outline))
+      if (blockedOutline) return addLog(`⛔ ${getOutlineReadinessBlockMessage(blockedOutline)}`)
     } else {
-      if (!selectedAutoStartOutline || !isOutlineWritable(selectedAutoStartOutline)) return addLog('请选择可写的起始章节大纲')
+      if (!selectedAutoStartOutline || !isOutlineWritable(selectedAutoStartOutline)) return addLog('请选择已审批的起始章节大纲')
+      const blockMessage = getOutlineReadinessBlockMessage(selectedAutoStartOutline)
+      if (blockMessage) return addLog(`⛔ ${blockMessage}`)
     }
 
     setAutoModeRunning(true)
@@ -1778,7 +1918,7 @@ export default function Director() {
       addLog(`🚀 开始按 ${selectedAutoOutlines.length} 个大纲连续创作`)
     } else {
       const startOutline = selectedAutoStartOutline
-      if (!startOutline || !isOutlineWritable(startOutline)) return addLog('请选择可写的起始章节大纲')
+      if (!startOutline || !isOutlineWritable(startOutline)) return addLog('请选择已审批的起始章节大纲')
       send({
         type: 'start_auto_mode',
         workflow_id: selectedWorkflowId,
@@ -1866,13 +2006,16 @@ export default function Director() {
   const handleWriteChapter = () => {
     if (!selectedWorkflowId) return addLog('请先选择工作流')
     if (!currentProject) return addLog('请先选择项目')
-    if (!selectedSingleOutline || !isOutlineWritable(selectedSingleOutline)) return addLog('请选择可写章节大纲')
+    if (!selectedSingleOutline || !isOutlineWritable(selectedSingleOutline)) return addLog('请选择已审批章节大纲')
+    const blockMessage = getOutlineReadinessBlockMessage(selectedSingleOutline)
+    if (blockMessage) return addLog(`⛔ ${blockMessage}`)
 
     send({
       type: 'auto_write_chapter',
       workflow_id: selectedWorkflowId,
       project_id: currentProject.id,
       chapter_outline_id: selectedSingleOutline.id,
+      chapter_outline: selectedSingleOutline,
       director_session_id: sessionId.trim(),
       chapter_num: selectedSingleOutline.chapter_number,
       target_word_count: chapterForm.targetWordCount || selectedSingleOutline.target_word_count,
@@ -2640,6 +2783,7 @@ export default function Director() {
                         </div>
                         <p className={`mt-1 line-clamp-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>{outline.summary || '暂无摘要'}</p>
                         <p className={`mt-1 text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>{outline.scenes.length} 个场景 · 目标 {outline.target_word_count} 字</p>
+                        {renderOutlineReadiness(outline, true)}
                       </div>
                     </label>
                   )
@@ -2663,6 +2807,7 @@ export default function Director() {
                       </option>
                     ))}
                   </select>
+                  {selectedAutoStartOutline && renderOutlineReadiness(selectedAutoStartOutline)}
                 </div>
                 <div>
                   <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
@@ -2780,6 +2925,7 @@ export default function Director() {
                 <span>{selectedSingleOutline.scenes.length} 个场景</span>
                 <span>目标 {selectedSingleOutline.target_word_count} 字</span>
               </div>
+              {renderOutlineReadiness(selectedSingleOutline)}
             </div>
           )}
 

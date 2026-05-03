@@ -20,6 +20,20 @@ export type DataInputSource = 'database' | 'context' | 'upstream' | 'variable' |
 // 数据输出目标
 export type DataOutputTarget = 'context' | 'downstream' | 'database'
 
+// 章节资源 readiness gate 阻断详情
+export interface ChapterReadinessGateDetail {
+  readiness_status?: string
+  block_reason?: string
+  message?: string
+  chapter_num?: number | string | null
+  chapter_outline_id?: string | null
+  outline_status?: string | null
+  readiness?: Record<string, any> | null
+  blocking_requirements?: Array<Record<string, any>>
+  advisory_requirements?: Array<Record<string, any>>
+  [key: string]: any
+}
+
 // 节点输入配置
 export interface NodeInputConfig {
   name: string
@@ -303,6 +317,47 @@ export async function executeWorkflow(
     { params: { project_id: projectId } },
   )
   return response.data
+}
+
+export function extractChapterReadinessGateDetail(error: any): ChapterReadinessGateDetail | null {
+  const status = error?.response?.status
+  const responseDetail = error?.response?.data?.detail
+  const directDetail = error?.detail || error?.data
+  const detail = responseDetail || directDetail
+  if (status !== 409 && error?.code !== 'chapter_resource_readiness_blocked' && detail?.code !== 'chapter_resource_readiness_blocked') {
+    const hasReadinessPayload = detail && (
+      Array.isArray(detail.blocking_requirements) ||
+      detail.readiness_status === 'blocked' ||
+      detail.block_reason
+    )
+    if (!hasReadinessPayload) return null
+  }
+  if (!detail || typeof detail !== 'object') return null
+  if (detail.detail && typeof detail.detail === 'object') return detail.detail as ChapterReadinessGateDetail
+  if (detail.data && typeof detail.data === 'object' && (
+    detail.data.readiness_status === 'blocked' ||
+    Array.isArray(detail.data.blocking_requirements) ||
+    detail.data.block_reason
+  )) {
+    return detail.data as ChapterReadinessGateDetail
+  }
+  return detail as ChapterReadinessGateDetail
+}
+
+export function isChapterReadinessGateError(error: any): boolean {
+  return extractChapterReadinessGateDetail(error) !== null
+}
+
+export function formatChapterReadinessGateMessage(
+  detail: ChapterReadinessGateDetail | null,
+  formatRequirements?: (requirements: Array<Record<string, any>>) => string,
+): string {
+  if (!detail) return '章节资源未就绪，不能启动生成工作流。'
+  const message = detail.message || detail.block_reason || '章节资源未就绪，不能启动生成工作流。'
+  const blockingRequirements = Array.isArray(detail.blocking_requirements) ? detail.blocking_requirements : []
+  if (!blockingRequirements.length) return message
+  const requirementText = formatRequirements ? formatRequirements(blockingRequirements) : ''
+  return requirementText ? `${message} 阻塞资源：${requirementText}` : message
 }
 
 /**
