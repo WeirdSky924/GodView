@@ -17,7 +17,7 @@ from app.data.system_prompts import SYSTEM_PROMPTS, PROMPTS_FOR_AGENT_TYPE
 from app.data.system_agent_templates import TEMPLATES_BY_TYPE, SYSTEM_AGENT_TEMPLATES
 from app.models.agent_config import AgentConfig, ConfigOverrideType, ModelConfig
 from app.models.agent_template import AgentTemplate, AgentType, PromptSlot, SkillSlot
-from app.models.prompt_template import PromptTemplate
+from app.models.prompt_template import PromptCategory, PromptTemplate
 from app.models.skill import Skill, SkillType, SkillLoadMode
 from app.services.prompt_builder import PromptBuilder
 from app.services.writing_rule_rag import get_writing_rule_rag_service
@@ -472,8 +472,54 @@ class AgentPromptService:
             "total_cached_skills": sum(len(s) for s in self._skills_cache.values()),
         }
 
+    def _build_prompt_template_from_md(self, template_id: str) -> Optional[PromptTemplate]:
+        """从 prompts/**/*.md 资产构建运行时 PromptTemplate，并写入缓存。"""
+        try:
+            from app.services.md_file_service import get_md_file_service
+
+            md_service = get_md_file_service()
+            prompt = md_service.get_prompt(template_id)
+            if not prompt:
+                return None
+
+            frontmatter = prompt.get("frontmatter") or {}
+            category_value = frontmatter.get("category") or "function"
+            category_mapping = {
+                "identity": PromptCategory.ROLE,
+                "instruction": PromptCategory.FUNCTION,
+                "constraint": PromptCategory.CONSTRAINT,
+                "output": PromptCategory.OUTPUT,
+                "base": PromptCategory.BASE,
+                "role": PromptCategory.ROLE,
+                "function": PromptCategory.FUNCTION,
+                "value": PromptCategory.VALUE,
+            }
+            variables = frontmatter.get("variables") or []
+            default_values = {
+                item.get("name"): item.get("default")
+                for item in variables
+                if isinstance(item, dict) and "name" in item and "default" in item
+            }
+            template = PromptTemplate(
+                id=template_id,
+                name=frontmatter.get("name") or template_id,
+                description=frontmatter.get("description", ""),
+                category=category_mapping.get(str(category_value), PromptCategory.FUNCTION),
+                tags=frontmatter.get("tags") or [],
+                content=(prompt.get("content") or "").strip(),
+                variables=variables,
+                default_values=default_values,
+                priority=frontmatter.get("priority", 50),
+                is_system=frontmatter.get("is_system", True),
+            )
+            self._prompt_cache[template_id] = template
+            return template
+        except Exception as e:
+            logger.debug(f"从 MD prompt 资产构建模板失败: {template_id}, error={e}")
+            return None
+
     async def get_prompt_template(self, template_id: str) -> Optional[PromptTemplate]:
-        """获取 Prompt 模板，优先使用运行时 PromptTemplateService。"""
+        """获取 Prompt 模板，优先使用运行时服务，随后使用系统缓存和 md 资产。"""
         if self._prompt_template_service:
             try:
                 template = await self._prompt_template_service.get_template(template_id)
@@ -482,7 +528,11 @@ class AgentPromptService:
             except Exception as e:
                 logger.debug(f"从 PromptTemplateService 获取模板失败: {template_id}, error={e}")
 
-        return self._prompt_cache.get(template_id)
+        cached_template = self._prompt_cache.get(template_id)
+        if cached_template:
+            return cached_template
+
+        return self._build_prompt_template_from_md(template_id)
 
     def get_agent_template(self, agent_type: str) -> Optional[AgentTemplate]:
         """获取 Agent 模板"""
@@ -521,6 +571,7 @@ class AgentPromptService:
         project_id: str,
         variables: Optional[Dict[str, Any]] = None,
         scenario: Optional[str] = None,
+        resolved_template: Optional[AgentTemplate] = None,
     ) -> Dict[str, Any]:
         """基于项目级 AgentConfig + AgentTemplate 构建 prompt，并返回解析 trace。"""
         trace: Dict[str, Any] = {
@@ -541,7 +592,7 @@ class AgentPromptService:
             prompt_service = self._prompt_template_service or get_prompt_template_service()
 
             state = await config_service.resolve_agent_runtime_state(project_id, agent_type, scenario)
-            template = state.get("template")
+            template = state.get("template") or resolved_template
             config = state.get("config")
 
             if not template:
@@ -578,7 +629,6 @@ class AgentPromptService:
                     created_at=datetime.now(),
                     updated_at=datetime.now(),
                 )
-                self._extend_trace_values(trace, "fallbacks_used", ["runtime_agent_config_fallback"])
 
             self.set_services(
                 prompt_template_service=prompt_service,
@@ -722,6 +772,7 @@ class AgentPromptService:
                 project_id=project_id,
                 variables=variables,
                 scenario=runtime_scenario,
+                resolved_template=template,
             )
             config_prompt = config_data.get("content", "")
             config_trace = config_data.get("trace", {})
