@@ -256,7 +256,10 @@ async def preview_agent_template(
     render_trace: Dict[str, Any] = {
         "agent_type": agent_type_value,
         "scenario": template.scenario,
+        "project_id": project_id,
         "template_id": template.id,
+        "template_scenario": template.scenario,
+        "config_id": None,
         "prompt_ids": [],
         "skill_ids": skills_trace.get("skill_ids", []),
         "skills": skills_trace,
@@ -266,6 +269,17 @@ async def preview_agent_template(
         "deprecated_sources_used": list(skills_trace.get("deprecated_sources_used", [])),
         "writing_rules": None,
     }
+    def _extend_trace_values(key: str, values: Optional[List[str]]) -> None:
+        if not values:
+            return
+        existing = render_trace.setdefault(key, [])
+        seen = set(existing)
+        for value in values:
+            if value in seen:
+                continue
+            seen.add(value)
+            existing.append(value)
+
     prompt_order = template.default_prompt_order or []
     prompt_slots_by_name = {slot.slot_name: slot for slot in template.prompt_slots}
     ordered_slots = []
@@ -300,8 +314,8 @@ async def preview_agent_template(
             writing_rules_trace = writing_rules_data.get("trace", {})
             render_trace["writing_rules"] = writing_rules_trace
             render_trace["writing_rule_ids"] = writing_rules_trace.get("writing_rule_ids", [])
-            render_trace["fallbacks_used"].extend(writing_rules_trace.get("fallbacks_used", []))
-            render_trace["deprecated_sources_used"].extend(writing_rules_trace.get("deprecated_sources_used", []))
+            _extend_trace_values("fallbacks_used", writing_rules_trace.get("fallbacks_used", []))
+            _extend_trace_values("deprecated_sources_used", writing_rules_trace.get("deprecated_sources_used", []))
             # 替换 available_skills 占位符
             prompt_content = _inject_skills(prompt_content, skills_content)
             rendered_prompts.append({
@@ -326,12 +340,12 @@ async def preview_agent_template(
                 try:
                     result = await prompt_service.render_template(request)
                     prompt_content = result.rendered_content
-                    render_trace["prompt_ids"].append(slot.prompt_template_id)
+                    _extend_trace_values("prompt_ids", [slot.prompt_template_id])
                 except Exception as e:
                     logger.warning(f"Failed to render prompt {slot.prompt_template_id}: {e}")
                     prompt_content = prompt_template.content
-                    render_trace["prompt_ids"].append(slot.prompt_template_id)
-                    render_trace["fallbacks_used"].append(f"prompt_template_raw:{slot.prompt_template_id}")
+                    _extend_trace_values("prompt_ids", [slot.prompt_template_id])
+                    _extend_trace_values("fallbacks_used", [f"prompt_template_raw:{slot.prompt_template_id}"])
 
         # 替换 available_skills 占位符
         prompt_content = _inject_skills(prompt_content, skills_content)

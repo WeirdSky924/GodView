@@ -99,6 +99,94 @@ class EvaluatorAgent(BaseAgent):
         self._evaluator_config_prompt_source = "missing"
         return ""
 
+    def _evaluator_chapter_end_output_schema(self, word_count: int, target_word_count: int) -> str:
+        return f"""{{
+  "should_end": true/false,
+  "quality_passed": true/false,
+  "score": 0.0,
+  "reason": "判断理由",
+  "issues": ["主要问题"],
+  "suggestions": ["修改建议"],
+  "missing_elements": ["缺失元素列表"],
+  "suggested_continuation": "建议的后续发展方向",
+  "outline_adherence_check": {{"passed": true/false, "issues": ["大纲偏离问题"]}},
+  "world_rule_check": {{"passed": true/false, "issues": ["项目/世界规则问题"]}},
+  "lore_conflict_check": {{"passed": true/false, "issues": ["设定冲突问题"]}},
+  "character_participation_check": {{"passed": true/false, "issues": ["角色参与问题"]}},
+  "word_count_check": {{"passed": true/false, "actual": {word_count}, "target": {target_word_count}, "min_required": {int(target_word_count * 0.8) if target_word_count else 0}, "max_allowed": {int(target_word_count * 1.25) if target_word_count else 0}}},
+  "upstream_context_usage_check": {{"passed": true/false, "used_context": ["已使用的上游状态"], "missing_context": ["缺失上下文"]}},
+  "asset_persistence_check": {{"passed": true/false, "issues": ["地图/伏笔/设定持久化问题"]}},
+  "pacing_check": {{"is_appropriate": true/false, "note": "节奏是否适合当前章节位置"}},
+  "long_term_check": {{"has_room_for_future": true/false, "note": "是否为后续剧情留有余地"}},
+  "world_consistency_check": {{"is_consistent": true/false, "issues": ["世界观一致性问题"]}},
+  "scores": {{"info_gain": 0.0, "suspense": 0.0, "pacing": 0.0, "completeness": 0.0, "world_consistency": 0.0}}
+}}"""
+
+    def _evaluator_reader_simulation_output_schema(self) -> str:
+        return """{
+    "scores": {
+        "opening": 0,
+        "pacing": 0,
+        "suspense": 0,
+        "character": 0,
+        "emotion": 0,
+        "flow": 0,
+        "long_term_appeal": 0,
+        "world_immersion": 0
+    },
+    "overall": 0,
+    "comments": "具体评价（尽可能详细）",
+    "detailed_analysis": {
+        "opening_analysis": "开篇详细分析",
+        "pacing_analysis": "节奏详细分析",
+        "character_analysis": "角色表现详细分析",
+        "world_building_analysis": "世界观呈现详细分析"
+    },
+    "suggestions": ["改进建议列表（详细）"],
+    "long_term_feedback": "作为读者，对后续内容的期待或担忧（详细描述）",
+    "world_feedback": "对世界观呈现的评价和期待（详细描述）"
+}"""
+
+    def _evaluator_ooc_output_schema(self) -> str:
+        return """{
+    "is_ooc": true/false,
+    "confidence": 0.0-1.0,
+    "issues": ["问题列表"],
+    "suggestion": "修改建议（如有）"
+}"""
+
+    def _evaluator_task_title(self, task_type: str) -> str:
+        titles = {
+            "chapter_end": "评估当前章节是否可以收尾，并判断是否通过质量门禁。",
+            "reader_simulate": "以首次阅读的挑剔长篇网文读者视角，对刚生成的章节进行评分。",
+            "ooc_review": "检查生成的台词是否符合角色设定、禁用语和典型台词样本。",
+        }
+        return titles.get(task_type, task_type)
+
+    def _evaluator_task_notes(self, task_type: str) -> List[str]:
+        notes = {
+            "chapter_end": [
+                "必须以 Agent Template / md prompt / writing-rules 中的门禁为准。",
+                "确定性角色约束预检问题必须作为阻断问题写入 character_participation_check。",
+                "确定性 role_performance_gate 问题必须写入 character_participation_check 或 upstream_context_usage_check；若正文采纳 blocker 指向素材，quality_passed=false。",
+            ],
+            "reader_simulate": [],
+            "ooc_review": [],
+        }
+        return notes.get(task_type, [])
+
+    def _evaluator_task_schema(self, task_type: str, **kwargs: Any) -> str:
+        if task_type == "chapter_end":
+            return self._evaluator_chapter_end_output_schema(
+                kwargs.get("word_count", 0),
+                kwargs.get("target_word_count", 0),
+            )
+        if task_type == "reader_simulate":
+            return self._evaluator_reader_simulation_output_schema()
+        if task_type == "ooc_review":
+            return self._evaluator_ooc_output_schema()
+        return "{}"
+
     def _format_evaluator_task_prompt(
         self,
         task_title: str,
@@ -132,7 +220,7 @@ class EvaluatorAgent(BaseAgent):
         return {
             "config_prompt_source": getattr(self, "_evaluator_config_prompt_source", None),
             "config_prompt_length": len(config_prompt),
-            "scenario": self.scenario,
+            **self._get_runtime_trace_metadata(),
         }
 
     def _format_context_block(self, title: str, value: Any, max_chars: Optional[int] = None) -> str:
@@ -239,29 +327,40 @@ class EvaluatorAgent(BaseAgent):
         return value if isinstance(value, dict) else {}
 
     def _role_performance_value(self, input_data: Dict[str, Any], key: str, default: Any = None) -> Any:
-        """从顶层、role_performance_context 或 performance_result 中读取角色演绎上下文。"""
+        """从顶层、scene/role performance context 或 performance_result 中读取角色演绎上下文。"""
         if input_data.get(key) is not None:
             return input_data.get(key)
+        scene_context = self._context_dict(input_data.get("scene_performance_context"))
+        if scene_context.get(key) is not None:
+            return scene_context.get(key)
         role_context = self._context_dict(input_data.get("role_performance_context"))
         if role_context.get(key) is not None:
             return role_context.get(key)
         performance_result = self._context_dict(input_data.get("performance_result"))
         if performance_result.get(key) is not None:
             return performance_result.get(key)
+        nested_scene_context = self._context_dict(performance_result.get("scene_performance_context"))
+        if nested_scene_context.get(key) is not None:
+            return nested_scene_context.get(key)
         return default
 
     def _private_performance_fragments(self, input_data: Dict[str, Any]) -> List[Dict[str, str]]:
         """提取 Writer/Evaluator-only 的私有演绎片段，用于检测是否被正文公开采纳。"""
         private_performances = self._context_list(self._role_performance_value(input_data, "private_performances", []))
         public_performances = self._context_list(self._role_performance_value(input_data, "public_performances", []))
+        packets = self._context_list(self._role_performance_value(input_data, "character_performance_packets", []))
         fragments: List[Dict[str, str]] = []
 
-        for item in [*private_performances, *public_performances]:
+        for item in [*private_performances, *packets, *public_performances]:
             if not isinstance(item, dict):
                 continue
             agent = str(item.get("agent") or item.get("source_character") or item.get("character") or "未知角色")
             for key in ("private_thought", "inner_thought", "intent"):
                 text = str(item.get(key) or "").strip()
+                if key == "intent":
+                    if len(text) >= 2:
+                        fragments.append({"agent": agent, "field": key, "value": text})
+                    continue
                 if len(text) >= 8:
                     fragments.append({"agent": agent, "field": key, "value": text})
             for key in ("withheld_information", "misinterpretations"):
@@ -349,7 +448,7 @@ class EvaluatorAgent(BaseAgent):
         Returns:
             AgentResponse: 评估结果
         """
-        task_type = input_data.get("task_type", "chapter_end")
+        task_type = str(input_data.get("task_type", "chapter_end"))
 
         if task_type == "chapter_end":
             return await self._evaluate_chapter_end(input_data)
@@ -415,7 +514,7 @@ class EvaluatorAgent(BaseAgent):
         })
 
         prompt = self._format_evaluator_task_prompt(
-            "评估当前章节是否可以收尾，并判断是否通过质量门禁。",
+            self._evaluator_task_title(task_type),
             [
                 ("工作流上下文", workflow_context if workflow_context else "（未提供工作流上下文；只能根据正文保守评估）"),
                 ("当前章节数据", {
@@ -432,32 +531,12 @@ class EvaluatorAgent(BaseAgent):
                     "chapter_content": chapter_content or "无",
                 }),
             ],
-            output_schema=f"""{{
-  "should_end": true/false,
-  "quality_passed": true/false,
-  "score": 0.0,
-  "reason": "判断理由",
-  "issues": ["主要问题"],
-  "suggestions": ["修改建议"],
-  "missing_elements": ["缺失元素列表"],
-  "suggested_continuation": "建议的后续发展方向",
-  "outline_adherence_check": {{"passed": true/false, "issues": ["大纲偏离问题"]}},
-  "world_rule_check": {{"passed": true/false, "issues": ["项目/世界规则问题"]}},
-  "lore_conflict_check": {{"passed": true/false, "issues": ["设定冲突问题"]}},
-  "character_participation_check": {{"passed": true/false, "issues": ["角色参与问题"]}},
-  "word_count_check": {{"passed": true/false, "actual": {word_count}, "target": {target_word_count}, "min_required": {int(target_word_count * 0.8) if target_word_count else 0}, "max_allowed": {int(target_word_count * 1.25) if target_word_count else 0}}},
-  "upstream_context_usage_check": {{"passed": true/false, "used_context": ["已使用的上游状态"], "missing_context": ["缺失上下文"]}},
-  "asset_persistence_check": {{"passed": true/false, "issues": ["地图/伏笔/设定持久化问题"]}},
-  "pacing_check": {{"is_appropriate": true/false, "note": "节奏是否适合当前章节位置"}},
-  "long_term_check": {{"has_room_for_future": true/false, "note": "是否为后续剧情留有余地"}},
-  "world_consistency_check": {{"is_consistent": true/false, "issues": ["世界观一致性问题"]}},
-  "scores": {{"info_gain": 0.0, "suspense": 0.0, "pacing": 0.0, "completeness": 0.0, "world_consistency": 0.0}}
-}}""",
-            task_notes=[
-                "必须以 Agent Template / md prompt / writing-rules 中的门禁为准。",
-                "确定性角色约束预检问题必须作为阻断问题写入 character_participation_check。",
-                "确定性 role_performance_gate 问题必须写入 character_participation_check 或 upstream_context_usage_check；若正文采纳 blocker 指向素材，quality_passed=false。",
-            ],
+            output_schema=self._evaluator_task_schema(
+                "chapter_end",
+                word_count=word_count,
+                target_word_count=target_word_count,
+            ),
+            task_notes=self._evaluator_task_notes("chapter_end"),
             config_prompt=evaluator_config_prompt,
         )
 
@@ -565,7 +644,7 @@ class EvaluatorAgent(BaseAgent):
         })
 
         prompt = self._format_evaluator_task_prompt(
-            "以首次阅读的挑剔长篇网文读者视角，对刚生成的章节进行评分。",
+            self._evaluator_task_title("reader_simulate"),
             [
                 ("世界观设定", {
                     "name": world_info.get("name", "未知世界") if isinstance(world_info, dict) else "未知世界",
@@ -579,29 +658,8 @@ class EvaluatorAgent(BaseAgent):
                 }),
                 ("章节内容", chapter_content),
             ],
-            output_schema="""{
-    "scores": {
-        "opening": 0,
-        "pacing": 0,
-        "suspense": 0,
-        "character": 0,
-        "emotion": 0,
-        "flow": 0,
-        "long_term_appeal": 0,
-        "world_immersion": 0
-    },
-    "overall": 0,
-    "comments": "具体评价（尽可能详细）",
-    "detailed_analysis": {
-        "opening_analysis": "开篇详细分析",
-        "pacing_analysis": "节奏详细分析",
-        "character_analysis": "角色表现详细分析",
-        "world_building_analysis": "世界观呈现详细分析"
-    },
-    "suggestions": ["改进建议列表（详细）"],
-    "long_term_feedback": "作为读者，对后续内容的期待或担忧（详细描述）",
-    "world_feedback": "对世界观呈现的评价和期待（详细描述）"
-}""",
+            output_schema=self._evaluator_task_schema("reader_simulate"),
+            task_notes=self._evaluator_task_notes("reader_simulate"),
             config_prompt=evaluator_config_prompt,
         )
 
@@ -659,7 +717,7 @@ class EvaluatorAgent(BaseAgent):
             AgentResponse: 审查结果
         """
         prompt = self._format_evaluator_task_prompt(
-            "检查生成的台词是否符合角色设定、禁用语和典型台词样本。",
+            self._evaluator_task_title("ooc_review"),
             [
                 ("角色信息", {
                     "name": character_name,
@@ -669,12 +727,7 @@ class EvaluatorAgent(BaseAgent):
                 }),
                 ("待审查台词", dialogue),
             ],
-            output_schema="""{
-    "is_ooc": true/false,
-    "confidence": 0.0-1.0,
-    "issues": ["问题列表"],
-    "suggestion": "修改建议（如有）"
-}""",
+            output_schema=self._evaluator_task_schema("ooc_review"),
             config_prompt=await self._get_evaluator_config_prompt({"task_type": "ooc_review"}),
         )
 

@@ -82,11 +82,94 @@ class SettingAgentService:
 
         self._setting_config_prompt_cache: Dict[str, str] = {}
         self._setting_config_prompt_source_cache: Dict[str, str] = {}
+        self._setting_config_prompt_trace_cache: Dict[str, Dict[str, Any]] = {}
 
     def _setting_scenario_for_mode(self, session: Optional[SettingAgentSession]) -> str:
         if session and session.mode == SettingAgentMode.MANAGEMENT:
             return "resource_management"
         return "workflow_context"
+
+    def _build_setting_prompt_fallback_trace(
+        self,
+        project_id: Optional[str],
+        scenario: str,
+        *,
+        fallback: Optional[str] = None,
+        deprecated_source: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "agent_type": AgentType.SETTING.value,
+            "scenario": scenario or "workflow_context",
+            "project_id": project_id,
+            "template_id": None,
+            "template_scenario": None,
+            "config_id": None,
+            "prompt_ids": [],
+            "skill_ids": [],
+            "skills": None,
+            "writing_rule_ids": [],
+            "writing_rules": None,
+            "context_blocks": [],
+            "fallbacks_used": [fallback] if fallback else [],
+            "deprecated_sources_used": [deprecated_source] if deprecated_source else [],
+        }
+
+    async def _get_setting_config_prompt_with_trace(
+        self,
+        project_id: Optional[str],
+        scenario: str,
+        variables: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        cache_key = f"{project_id or 'global'}::{scenario or 'workflow_context'}"
+        if cache_key in self._setting_config_prompt_cache and cache_key in self._setting_config_prompt_trace_cache:
+            return {
+                "content": self._setting_config_prompt_cache[cache_key],
+                "trace": self._setting_config_prompt_trace_cache[cache_key],
+                "source": self._setting_config_prompt_source_cache.get(cache_key, "missing"),
+            }
+
+        prompt = ""
+        trace: Dict[str, Any] = {}
+        if project_id:
+            try:
+                from app.services.agent_prompt_service import get_agent_prompt_service
+
+                service = get_agent_prompt_service()
+                prompt_data = await service.build_agent_prompt_with_trace(
+                    agent_type=AgentType.SETTING,
+                    project_id=project_id,
+                    scenario=scenario,
+                    variables=variables or {},
+                )
+                prompt = prompt_data.get("content", "")
+                trace = prompt_data.get("trace", {}) or {}
+            except Exception as e:
+                logger.warning(f"[SettingAgent] 加载 Setting Agent Template prompt 失败: {e}")
+
+        if prompt:
+            self._setting_config_prompt_cache[cache_key] = prompt
+            self._setting_config_prompt_source_cache[cache_key] = "agent_template_runtime"
+            self._setting_config_prompt_trace_cache[cache_key] = trace
+            return {"content": prompt, "trace": trace, "source": "agent_template_runtime"}
+
+        fallback = self._build_md_setting_fallback_prompt()
+        if fallback:
+            trace = self._build_setting_prompt_fallback_trace(
+                project_id,
+                scenario,
+                fallback="setting_md_prompt_fallback",
+                deprecated_source="SettingAgentService._build_md_setting_fallback_prompt",
+            )
+            self._setting_config_prompt_cache[cache_key] = fallback
+            self._setting_config_prompt_source_cache[cache_key] = "md_prompt_fallback"
+            self._setting_config_prompt_trace_cache[cache_key] = trace
+            return {"content": fallback, "trace": trace, "source": "md_prompt_fallback"}
+
+        trace = self._build_setting_prompt_fallback_trace(project_id, scenario)
+        self._setting_config_prompt_cache[cache_key] = ""
+        self._setting_config_prompt_source_cache[cache_key] = "missing"
+        self._setting_config_prompt_trace_cache[cache_key] = trace
+        return {"content": "", "trace": trace, "source": "missing"}
 
     async def _get_setting_config_prompt(
         self,
@@ -94,39 +177,8 @@ class SettingAgentService:
         scenario: str,
         variables: Optional[Dict[str, Any]] = None,
     ) -> str:
-        cache_key = f"{project_id or 'global'}::{scenario or 'workflow_context'}"
-        if cache_key in self._setting_config_prompt_cache:
-            return self._setting_config_prompt_cache[cache_key]
-
-        prompt = ""
-        if project_id:
-            try:
-                from app.services.agent_prompt_service import get_agent_prompt_service
-
-                service = get_agent_prompt_service()
-                prompt = await service.build_agent_prompt(
-                    agent_type=AgentType.SETTING,
-                    project_id=project_id,
-                    scenario=scenario,
-                    variables=variables or {},
-                )
-            except Exception as e:
-                logger.warning(f"[SettingAgent] 加载 Setting Agent Template prompt 失败: {e}")
-
-        if prompt:
-            self._setting_config_prompt_cache[cache_key] = prompt
-            self._setting_config_prompt_source_cache[cache_key] = "agent_template_runtime"
-            return prompt
-
-        fallback = self._build_md_setting_fallback_prompt()
-        if fallback:
-            self._setting_config_prompt_cache[cache_key] = fallback
-            self._setting_config_prompt_source_cache[cache_key] = "md_prompt_fallback"
-            return fallback
-
-        self._setting_config_prompt_cache[cache_key] = ""
-        self._setting_config_prompt_source_cache[cache_key] = "missing"
-        return ""
+        prompt_data = await self._get_setting_config_prompt_with_trace(project_id, scenario, variables)
+        return prompt_data.get("content", "")
 
     def _build_md_setting_fallback_prompt(self) -> str:
         prompt_ids = [
@@ -980,11 +1032,13 @@ class SettingAgentService:
         # 构建系统提示（异步）
         scenario = self._setting_scenario_for_mode(session)
         system_prompt = await self._build_management_system_prompt(session)
-        config_prompt = await self._get_setting_config_prompt(
+        prompt_data = await self._get_setting_config_prompt_with_trace(
             project_id,
             scenario,
             variables={"scenario": scenario, "mode": session.mode.value if hasattr(session.mode, "value") else str(session.mode)},
         )
+        config_prompt = prompt_data.get("content", "")
+        prompt_render_trace = prompt_data.get("trace", {}) or {}
         if config_prompt:
             system_prompt = (
                 "【Setting 配置规则】\n"
@@ -993,6 +1047,7 @@ class SettingAgentService:
                 "【当前运行任务补充】\n"
                 f"{system_prompt}"
             )
+
 
         # ========== 优化2：增量上下文加载 ==========
         # 第一次消息加载完整项目上下文并缓存；后续消息复用缓存
@@ -1150,7 +1205,7 @@ class SettingAgentService:
             await postgres_db.append_setting_agent_message(session.id, "assistant", response, request_id=request_id)
         await self._persist_session_snapshot(session)
 
-        return self._build_chat_response(
+        result = self._build_chat_response(
             session,
             message=response,
             pending_lores=pending_lores or None,
@@ -1158,6 +1213,9 @@ class SettingAgentService:
             pending_hooks=pending_hooks or None,
             improvement_suggestions=improvement_suggestions or None,
         )
+        result["prompt_render_trace"] = prompt_render_trace
+        result["config_prompt_source"] = prompt_data.get("source") or "missing"
+        return result
 
     async def _sync_to_agent_memory(
         self,

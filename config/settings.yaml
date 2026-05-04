@@ -1,7 +1,7 @@
 # Application Settings
 app:
   name: "Godview"
-  version: "1.3.30"
+  version: "1.3.44"
   env: "development"
   log_level: "DEBUG"
 

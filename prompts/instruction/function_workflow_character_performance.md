@@ -57,4 +57,39 @@ is_system: true
 
 ## 输出要求
 
-直接输出角色表演内容，不要 JSON，不要标题，不要格式标记，不要解释自己遵循了哪些规则。
+优先输出结构化 JSON，供工作流形成 `character_performance_packet`。如果调用方明确要求纯文本，仍需在纯文本中遵守下列字段边界。
+
+```json
+{
+  "public_content": "其他角色可见/可听的动作和台词",
+  "dialogue": "角色实际说出口的台词，没有则为空字符串",
+  "action": "角色可见动作，没有则为空字符串",
+  "private_thought": "仅供 Writer/Evaluator 参考的内心，不传给其他角色",
+  "emotion": "当前情绪",
+  "intent": "角色下一步意图",
+  "perceived_facts": ["角色实际感知到的信息"],
+  "misinterpretations": ["角色可能误解的信息"],
+  "withheld_information": ["角色知道但未说出的信息"],
+  "relationship_delta": [
+    {
+      "target_character": "角色名",
+      "dimension": "trust/fear/suspicion/debt/affection/hostility/respect",
+      "delta": 0,
+      "reason": "变化原因",
+      "visibility": "private/public/writer_only"
+    }
+  ],
+  "state_delta": [
+    {
+      "field": "injury/emotion/goal/knowledge/item/location/status",
+      "change": "变化内容",
+      "persistence": "scene_only/chapter/long_term",
+      "requires_confirmation": false
+    }
+  ],
+  "continuity_notes": ["后续必须记住的承诺、伤口、矛盾、误解、线索"],
+  "warnings": ["OOC、信息越界、出场越界、缺资源等警告"]
+}
+```
+
+`public_content` 不能包含 `private_thought`、`intent`、`withheld_information` 或只有当前角色知道的隐藏信息。关系/状态变化只是待确认 delta，不能写成已持久化事实。

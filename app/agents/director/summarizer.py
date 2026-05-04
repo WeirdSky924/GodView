@@ -34,9 +34,11 @@ class SummarizerAgent(BaseAgent):
         project_id: Optional[str] = None,
         system_prompt: Optional[str] = None,
     ):
-        # 如果没有提供 system_prompt 且没有 project_id，使用默认的硬编码 prompt（向后兼容）
+        legacy_trace = None
+        # 如果没有提供 system_prompt 且没有 project_id，使用 md prompt 资产 fallback（向后兼容）
         if not system_prompt and not project_id:
             system_prompt = self._build_default_system_prompt()
+            legacy_trace = getattr(self, "_legacy_fallback_trace", None)
 
         super().__init__(
             name="SummarizerAgent",
@@ -45,6 +47,8 @@ class SummarizerAgent(BaseAgent):
             config=config,
             project_id=project_id,
         )
+        if legacy_trace and not self.get_system_prompt_render_trace():
+            self._system_prompt_render_trace = legacy_trace
 
     def _get_default_variables(self) -> Dict[str, Any]:
         """获取默认变量（Summarizer 特定）"""
@@ -53,8 +57,52 @@ class SummarizerAgent(BaseAgent):
             "task_description": "将角色之间的对话压缩成干练的事件摘要",
         }
 
+    def _load_md_prompt_content(self, prompt_id: str) -> str:
+        try:
+            from app.services.md_file_service import get_md_file_service
+
+            md_service = get_md_file_service()
+            prompt = md_service.get_prompt(prompt_id)
+            if prompt:
+                content = prompt.get("content") or prompt.get("raw_content") or ""
+                if content:
+                    return content.strip()
+        except Exception as e:
+            logger.warning("加载 Summarizer md prompt 失败: prompt_id=%s, error=%s", prompt_id, e)
+        return ""
+
+    def _build_md_summarizer_fallback_prompt(self) -> str:
+        prompt_ids = ["role_summarizer", "function_workflow_discussion_summary", "function_workflow_performance_summary"]
+        parts = [content for prompt_id in prompt_ids if (content := self._load_md_prompt_content(prompt_id))]
+        return "\n\n".join(parts).strip()
+
+    def _summarizer_fallback_trace(self, *, deprecated: bool = False, prompt_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+        return {
+            "agent_type": self.AGENT_TYPE.value,
+            "scenario": getattr(self, "scenario", None) or self.DEFAULT_SCENARIO,
+            "project_id": getattr(self, "project_id", None),
+            "template_id": None,
+            "template_scenario": None,
+            "config_id": None,
+            "prompt_ids": prompt_ids or [],
+            "skill_ids": [],
+            "writing_rule_ids": [],
+            "context_blocks": [],
+            "fallbacks_used": ["summarizer_deprecated_minimal_system_prompt" if deprecated else "summarizer_md_prompt_fallback"],
+            "deprecated_sources_used": ["SummarizerAgent._build_default_system_prompt"] if deprecated else [],
+        }
+
     def _build_default_system_prompt(self) -> str:
-        """构建默认系统提示（向后兼容）"""
+        """构建默认系统提示（优先使用 prompts/**/*.md 资产）。"""
+        md_prompt = self._build_md_summarizer_fallback_prompt()
+        if md_prompt:
+            self._legacy_fallback_trace = self._summarizer_fallback_trace(
+                prompt_ids=["role_summarizer", "function_workflow_discussion_summary", "function_workflow_performance_summary"],
+            )
+            return md_prompt
+
+        logger.warning("Summarizer md prompt 资产不可用，使用 deprecated 最小硬编码默认系统提示")
+        self._legacy_fallback_trace = self._summarizer_fallback_trace(deprecated=True)
         return """你是剧情总结员。你的任务是将角色之间的对话压缩成干练的"事件摘要"。
 
 要求：
@@ -73,6 +121,53 @@ class SummarizerAgent(BaseAgent):
     "raw_dialogue_refs": ["需要保留原始对话的引用 ID"]
 }"""
 
+    async def _ensure_system_prompt_loaded(self):
+        """加载 Summarizer Agent Template prompt，失败时回退到 md prompt 资产。"""
+        if self._system_prompt_loaded or not self._pending_system_prompt_load:
+            return
+
+        if not self.project_id or not self.AGENT_TYPE:
+            self._system_prompt_loaded = True
+            self._pending_system_prompt_load = False
+            return
+
+        try:
+            from app.services.agent_prompt_service import get_agent_prompt_service
+
+            service = get_agent_prompt_service()
+            prompt_data = await service.build_agent_prompt_with_trace(
+                agent_type=self.AGENT_TYPE.value,
+                project_id=self.project_id,
+                variables=self._get_default_variables(),
+                scenario=self.scenario,
+                context_query="剧情总结 场景演绎总结 公开私有边界 连续性整理",
+            )
+            prompt = prompt_data.get("content", "")
+            self._system_prompt_render_trace = prompt_data.get("trace", {}) or {}
+            if prompt.strip():
+                self.system_prompt = prompt.strip()
+        except Exception as e:
+            logger.warning(
+                "Summarizer 加载模板 prompt 失败: project=%s, scenario=%s, error=%s",
+                self.project_id,
+                self.scenario,
+                e,
+            )
+
+        if not self.system_prompt:
+            md_prompt = self._build_md_summarizer_fallback_prompt()
+            if md_prompt:
+                self.system_prompt = md_prompt
+                self._system_prompt_render_trace = self._summarizer_fallback_trace(
+                    prompt_ids=["role_summarizer", "function_workflow_discussion_summary", "function_workflow_performance_summary"],
+                )
+            else:
+                self.system_prompt = self._build_default_system_prompt()
+                self._system_prompt_render_trace = self._legacy_fallback_trace
+
+        self._system_prompt_loaded = True
+        self._pending_system_prompt_load = False
+
     async def execute(self, input_data: Dict[str, Any]) -> AgentResponse:
         """
         执行剧情总结
@@ -89,6 +184,8 @@ class SummarizerAgent(BaseAgent):
             AgentResponse: 总结结果
         """
         try:
+            await self._ensure_system_prompt_loaded()
+
             # 检查是否为设定检查模式
             setting_check_mode = input_data.get("setting_check_mode", False)
             if setting_check_mode:
@@ -115,6 +212,12 @@ class SummarizerAgent(BaseAgent):
                 participants=normalized_participants,
                 context=context,
                 active_hooks=active_hooks,
+                scene_performance_context=input_data.get("scene_performance_context"),
+                private_performances=input_data.get("private_performances"),
+                relationship_deltas=input_data.get("relationship_deltas"),
+                state_deltas=input_data.get("state_deltas"),
+                continuity_notes=input_data.get("continuity_notes"),
+                performance_warnings=input_data.get("performance_warnings"),
             )
 
             # 调用 LLM (structured)
@@ -129,7 +232,11 @@ class SummarizerAgent(BaseAgent):
             return AgentResponse(
                 success=True,
                 data=result,
-                metadata={"participant_count": len(normalized_participants), "dialogue_turns": len(dialogue_history)},
+                metadata={
+                    "participant_count": len(normalized_participants),
+                    "dialogue_turns": len(dialogue_history),
+                    **self._get_runtime_trace_metadata(),
+                },
             )
 
         except StructuredOutputError as e:
@@ -138,6 +245,20 @@ class SummarizerAgent(BaseAgent):
         except Exception as e:
             logger.error(f"SummarizerAgent 执行失败：{e}")
             return AgentResponse(success=False, error=str(e))
+
+    def _build_setting_check_instruction(self, *, has_chapter_content: bool) -> str:
+        """从 md 资产构建设定检查任务说明，保留 schema 字段约束在代码侧。"""
+        prompt_ids = [
+            "role_setting",
+            "function_setting_resource_management",
+            "function_setting_lore_interconnection",
+        ]
+        parts = [content for prompt_id in prompt_ids if (content := self._load_md_prompt_content(prompt_id))]
+        if parts:
+            mode = "章节内容一致性检查" if has_chapter_content else "世界观设定确认"
+            return "\n\n".join(parts + [f"【当前任务模式】\n{mode}"]).strip()
+        logger.warning("Summarizer setting_check md prompt 资产不可用，使用最小任务说明")
+        return "你是世界观设定管理员，负责确认世界观设定并检查章节内容与设定的一致性。"
 
     async def _execute_setting_check(self, input_data: Dict[str, Any]) -> AgentResponse:
         """
@@ -175,11 +296,13 @@ class SummarizerAgent(BaseAgent):
 
         # 如果没有章节内容，返回世界观确认
         if not chapter_content or len(chapter_content) < 50:
-            prompt = f"""你是世界观设定管理员。请确认以下世界观设定，并提供设定管理建议。
+            task_instruction = self._build_setting_check_instruction(has_chapter_content=False)
+            prompt = f"""{task_instruction}
 
+【待确认设定】
 {setting_info}
 
-请输出 JSON 格式：
+请按 SummarizerSettingConfirmSchema 输出 JSON：
 {{
     "status": "confirmed",
     "world_name": "世界名称",
@@ -219,20 +342,22 @@ class SummarizerAgent(BaseAgent):
                 )
 
         # 有章节内容，进行一致性检查
-        prompt = f"""你是世界观设定管理员。请检查以下章节内容与世界观设定的一致性。
+        task_instruction = self._build_setting_check_instruction(has_chapter_content=True)
+        prompt = f"""{task_instruction}
 
+【设定资料】
 {setting_info}
 
 【章节内容】
 {chapter_content}
 
-请检查：
+请重点检查：
 1. 角色能力使用是否符合设定
 2. 世界规则是否被遵守
 3. 是否有设定冲突或矛盾
 4. 是否有需要补充的设定
 
-请输出 JSON 格式：
+请按 SummarizerSettingCheckSchema 输出 JSON：
 {{
     "consistency_status": "consistent/inconsistent/partial",
     "world_name": "世界名称",
@@ -271,6 +396,12 @@ class SummarizerAgent(BaseAgent):
         participants: List[str],
         context: str,
         active_hooks: List[Dict[str, Any]],
+        scene_performance_context: Optional[Dict[str, Any]] = None,
+        private_performances: Optional[List[Dict[str, Any]]] = None,
+        relationship_deltas: Optional[List[Dict[str, Any]]] = None,
+        state_deltas: Optional[List[Dict[str, Any]]] = None,
+        continuity_notes: Optional[List[Dict[str, Any]]] = None,
+        performance_warnings: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """构建用户消息"""
         message_parts = []
@@ -299,8 +430,53 @@ class SummarizerAgent(BaseAgent):
             message_parts.append(f"【活跃伏笔】\n{hooks_text}")
             message_parts.append("如果对话触发了任何伏笔，请在 hook_triggers 中列出相关 ID。")
 
+        # 场景演绎分层上下文
+        scene_performance_context = scene_performance_context or {}
+        public_performances = scene_performance_context.get("public_performances") or []
+        private_performances = private_performances or scene_performance_context.get("private_performances") or []
+        relationship_deltas = relationship_deltas or scene_performance_context.get("relationship_deltas") or []
+        state_deltas = state_deltas or scene_performance_context.get("state_deltas") or []
+        continuity_notes = continuity_notes or scene_performance_context.get("continuity_notes") or []
+        performance_warnings = performance_warnings or scene_performance_context.get("performance_warnings") or []
+
+        if public_performances:
+            public_lines = [
+                f"- {item.get('agent', '未知角色')}：{item.get('content') or item.get('public_content') or ''}"
+                for item in public_performances[:12]
+            ]
+            message_parts.append("【公开表演素材】\n" + "\n".join(public_lines))
+
+        private_lines = []
+        for item in private_performances[:12]:
+            if item.get("private_thought"):
+                private_lines.append(f"- {item.get('agent', '未知角色')} 私有内心：{item.get('private_thought')}")
+            if item.get("intent"):
+                private_lines.append(f"- {item.get('agent', '未知角色')} 下一步意图：{item.get('intent')}")
+            for hidden in item.get("withheld_information", []) or []:
+                private_lines.append(f"- {item.get('agent', '未知角色')} 隐瞒信息：{hidden}")
+        if private_lines:
+            message_parts.append(
+                "【私有表演素材（仅供 Writer/Evaluator 参考，不得总结成场内公开事实）】\n"
+                + "\n".join(private_lines)
+            )
+
+        if relationship_deltas or state_deltas or continuity_notes:
+            delta_lines = []
+            for item in relationship_deltas[:10]:
+                delta_lines.append(f"- 关系变化提案：{item}")
+            for item in state_deltas[:10]:
+                delta_lines.append(f"- 状态变化提案：{item}")
+            for item in continuity_notes[:10]:
+                delta_lines.append(f"- 连续性记录：{item}")
+            message_parts.append("【关系/状态/连续性提案】\n" + "\n".join(delta_lines))
+
+        if performance_warnings:
+            warning_lines = [f"- {item}" for item in performance_warnings[:10]]
+            message_parts.append("【演绎素材警告】\n" + "\n".join(warning_lines))
+
         message_parts.append(
             "\n请将以上对话压缩成事件摘要，识别潜台词，检测伏笔触发。"
+            "如果使用私有表演素材，必须标明它只是潜台词/写作参考，不得写成所有角色已知事实。"
         )
 
         return "\n\n".join(message_parts)

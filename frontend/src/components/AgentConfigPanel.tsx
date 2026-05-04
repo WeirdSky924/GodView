@@ -15,7 +15,7 @@ import {
   ModelConfig,
   SlotOverride,
 } from '@/api/agentConfigs'
-import { getAgentTemplates, AgentTemplate, AgentType } from '@/api/agentTemplates'
+import { getAgentTemplates, AgentTemplate, AgentType, PreviewRenderTrace } from '@/api/agentTemplates'
 import { getPrompts, PromptTemplate } from '@/api/prompts'
 import { useAgentTypes } from '@/hooks/useAgentTypes'
 import { Eye, RefreshCw, Settings, ChevronDown, ChevronUp, Layers, CheckCircle2 } from 'lucide-react'
@@ -59,6 +59,7 @@ export default function AgentConfigPanel({
   const [showEditModal, setShowEditModal] = useState(false)
   const [showPreviewModal, setShowPreviewModal] = useState(false)
   const [previewContent, setPreviewContent] = useState('')
+  const [previewTrace, setPreviewTrace] = useState<PreviewRenderTrace | null>(null)
   const [previewTitle, setPreviewTitle] = useState('')
 
   const [formData, setFormData] = useState<{
@@ -211,11 +212,13 @@ export default function AgentConfigPanel({
   const handlePreview = async (row: AgentConfigRow) => {
     setPreviewTitle(row.label)
     setPreviewContent('')
+    setPreviewTrace(null)
     setShowPreviewModal(true)
 
     try {
       const result = await previewAgentConfig(projectId, row.agentType, {}, row.scenario)
       setPreviewContent(result.final_prompt)
+      setPreviewTrace(result.render_trace || null)
 
       if (!row.config) {
         await loadData()
@@ -590,6 +593,24 @@ export default function AgentConfigPanel({
         title={`${previewTitle || 'Agent'} 最终 Prompt 预览`}
         className="max-w-4xl"
       >
+        {previewTrace && (
+          <div className={`mb-3 rounded border p-3 text-xs space-y-1 ${isDark ? 'border-gray-700 bg-gray-900 text-gray-200' : 'border-gray-200 bg-gray-50 text-gray-700'}`}>
+            <div>Agent：{previewTrace.agent_type}</div>
+            <div>Scenario：{previewTrace.scenario || 'default'}</div>
+            <div>Template：{previewTrace.template_id || '无'}</div>
+            <div>Template Scenario：{previewTrace.template_scenario || 'default'}</div>
+            <div>Config：{previewTrace.config_id || '无'}</div>
+            <div>Prompt IDs：{previewTrace.prompt_ids?.length ? previewTrace.prompt_ids.join(', ') : '无'}</div>
+            <div>Skill IDs：{previewTrace.skill_ids?.length ? previewTrace.skill_ids.join(', ') : '无'}</div>
+            <div>Writing Rule IDs：{previewTrace.writing_rule_ids?.length ? previewTrace.writing_rule_ids.join(', ') : '无'}</div>
+            {previewTrace.fallbacks_used?.length ? (
+              <div>Fallbacks：{previewTrace.fallbacks_used.join(', ')}</div>
+            ) : null}
+            {previewTrace.deprecated_sources_used?.length ? (
+              <div>Deprecated：{previewTrace.deprecated_sources_used.join(', ')}</div>
+            ) : null}
+          </div>
+        )}
         <pre className={`p-4 rounded text-sm overflow-auto max-h-[500px] whitespace-pre-wrap ${isDark ? 'bg-gray-900 text-gray-100' : 'bg-gray-50 text-gray-800'}`}>
           {previewContent || '加载中...'}
         </pre>

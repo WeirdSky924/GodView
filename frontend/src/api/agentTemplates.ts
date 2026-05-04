@@ -104,9 +104,21 @@ export interface UpdateAgentTemplateDTO {
 export interface PreviewRenderTrace {
   agent_type: AgentType | string
   scenario?: string | null
-  template_id: string
+  project_id?: string | null
+  template_id?: string | null
+  template_scenario?: string | null
+  config_id?: string | null
   prompt_ids: string[]
   skill_ids: string[]
+  skills?: {
+    agent_type?: AgentType | string
+    scenario?: string | null
+    skill_ids?: string[]
+    source?: string
+    scope?: Record<string, any>
+    fallbacks_used?: string[]
+    deprecated_sources_used?: string[]
+  } | null
   writing_rule_ids: string[]
   context_blocks: string[]
   fallbacks_used: string[]

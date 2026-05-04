@@ -34,9 +34,11 @@ class MasterPlotterAgent(BaseAgent):
         project_id: Optional[str] = None,
         system_prompt: Optional[str] = None,
     ):
-        # 如果没有提供 system_prompt 且没有 project_id，使用默认的硬编码 prompt（向后兼容）
+        # 如果没有提供 system_prompt 且没有 project_id，使用 md prompt 资产 fallback（向后兼容）
+        legacy_trace = None
         if not system_prompt and not project_id:
             system_prompt = self._build_default_system_prompt()
+            legacy_trace = getattr(self, "_legacy_fallback_trace", None)
 
         super().__init__(
             name="MasterPlotterAgent",
@@ -45,6 +47,8 @@ class MasterPlotterAgent(BaseAgent):
             config=config,
             project_id=project_id,
         )
+        if legacy_trace and not self.get_system_prompt_render_trace():
+            self._system_prompt_render_trace = legacy_trace
 
     def _as_list(self, value: Any) -> List[Any]:
         if value in (None, ""):
@@ -153,12 +157,77 @@ class MasterPlotterAgent(BaseAgent):
             "task_description": "把控主线进度和剧情走向",
         }
 
+    def _load_md_prompt_content(self, prompt_id: str) -> str:
+        try:
+            from app.services.md_file_service import get_md_file_service
+
+            md_service = get_md_file_service()
+            prompt = md_service.get_prompt(prompt_id)
+            if prompt:
+                content = prompt.get("content") or prompt.get("raw_content") or ""
+                if content:
+                    return content.strip()
+        except Exception as e:
+            logger.warning("加载 MasterPlotter md prompt 失败: prompt_id=%s, error=%s", prompt_id, e)
+        return ""
+
+    def _master_plotter_md_prompt_id(self, scenario: str) -> Optional[str]:
+        return {
+            "workflow_plot_planning": "function_master_plotter_plot_planning",
+            "workflow_chapter_planning": "function_master_plotter_chapter_writing_plan",
+            "workflow_forced_event": "function_master_plotter_forced_event",
+            "workflow_advance_decision": "function_master_plotter_advance_decision",
+        }.get(scenario or "")
+
+    def _build_md_master_plotter_fallback_prompt(self, scenario: Optional[str] = None) -> str:
+        prompt_ids = ["role_master_plotter"]
+        scenario_prompt_id = self._master_plotter_md_prompt_id(scenario or self.DEFAULT_SCENARIO)
+        if scenario_prompt_id:
+            prompt_ids.append(scenario_prompt_id)
+        parts = [content for prompt_id in prompt_ids if (content := self._load_md_prompt_content(prompt_id))]
+        return "\n\n".join(parts).strip()
+
+    def _master_plotter_fallback_trace(
+        self,
+        scenario: str,
+        prompt_ids: Optional[List[str]] = None,
+        deprecated: bool = False,
+    ) -> Dict[str, Any]:
+        return {
+            "agent_type": self.AGENT_TYPE.value,
+            "scenario": scenario or self.DEFAULT_SCENARIO,
+            "project_id": getattr(self, "project_id", None),
+            "template_id": None,
+            "template_scenario": None,
+            "config_id": None,
+            "prompt_ids": prompt_ids or [],
+            "skill_ids": [],
+            "writing_rule_ids": [],
+            "context_blocks": [],
+            "fallbacks_used": [
+                "master_plotter_deprecated_minimal_system_prompt" if deprecated else "master_plotter_md_prompt_fallback"
+            ],
+            "deprecated_sources_used": ["MasterPlotterAgent._build_default_system_prompt"] if deprecated else [],
+        }
+
     def _build_default_system_prompt(self) -> str:
-        """构建默认系统提示（向后兼容）。"""
+        """构建默认系统提示（优先使用 prompts/**/*.md 资产）。"""
+        md_prompt = self._build_md_master_plotter_fallback_prompt(self.DEFAULT_SCENARIO)
+        if md_prompt:
+            self._legacy_fallback_trace = self._master_plotter_fallback_trace(
+                self.DEFAULT_SCENARIO,
+                ["role_master_plotter", "function_master_plotter_plot_planning"],
+            )
+            return md_prompt
+
+        logger.warning("MasterPlotter md prompt 资产不可用，使用 deprecated 最小硬编码默认系统提示")
+        self._legacy_fallback_trace = self._master_plotter_fallback_trace(
+            self.DEFAULT_SCENARIO,
+            deprecated=True,
+        )
         return (
-            "你是总编剧，负责把控主线进度和剧情走向。"
-            "优先使用 Agent Template 绑定的 md prompt / skills / writing-rules；"
-            "仅在未能加载配置资产时，将此最小提示作为 deprecated fallback。"
+            "你是 Master Plotter Agent。优先使用 Agent Template 绑定的 md prompt、skills 和 writing-rules；"
+            "当前仅因配置资产不可用而启用 deprecated 最小 fallback。"
         )
 
     async def _get_master_plotter_config_prompt(
@@ -171,14 +240,23 @@ class MasterPlotterAgent(BaseAgent):
             from app.services.agent_prompt_service import get_agent_prompt_service
 
             service = get_agent_prompt_service()
-            prompt = await service.build_agent_prompt(
+            prompt_data = await service.build_agent_prompt_with_trace(
                 agent_type=self.AGENT_TYPE.value,
                 project_id=self.project_id,
                 variables=variables or {},
                 scenario=scenario,
             )
+            prompt = prompt_data.get("content", "")
+            self._system_prompt_render_trace = prompt_data.get("trace", {}) or {}
             if prompt.strip():
                 return prompt.strip()
+            fallback_prompt = self._build_md_master_plotter_fallback_prompt(scenario)
+            if fallback_prompt:
+                self._system_prompt_render_trace = self._master_plotter_fallback_trace(
+                    scenario,
+                    ["role_master_plotter", self._master_plotter_md_prompt_id(scenario)] if self._master_plotter_md_prompt_id(scenario) else ["role_master_plotter"],
+                )
+                return fallback_prompt
         except Exception as e:
             logger.warning(
                 "加载 MasterPlotter Agent Template prompt 失败: scenario=%s, error=%s",
@@ -188,7 +266,20 @@ class MasterPlotterAgent(BaseAgent):
 
         if scenario == self.DEFAULT_SCENARIO:
             await self._ensure_system_prompt_loaded()
+            if not getattr(self, "_system_prompt_render_trace", None):
+                self._system_prompt_render_trace = self._master_plotter_fallback_trace(
+                    self.DEFAULT_SCENARIO,
+                    deprecated=not bool(self.system_prompt and self.system_prompt.strip()),
+                )
             return (self.system_prompt or "").strip()
+
+        fallback_prompt = self._build_md_master_plotter_fallback_prompt(scenario)
+        if fallback_prompt:
+            self._system_prompt_render_trace = self._master_plotter_fallback_trace(
+                scenario,
+                ["role_master_plotter", self._master_plotter_md_prompt_id(scenario)] if self._master_plotter_md_prompt_id(scenario) else ["role_master_plotter"],
+            )
+            return fallback_prompt
         return ""
 
     def _build_task_prompt(
@@ -497,6 +588,7 @@ class MasterPlotterAgent(BaseAgent):
                     "progress": main_plot_progress,
                     "turns": interaction_turns,
                     "threshold": max_turns_threshold,
+                    **self._get_runtime_trace_metadata(),
                 },
             )
 
@@ -597,7 +689,11 @@ class MasterPlotterAgent(BaseAgent):
                 result.setdefault("resource_requirements", [])
                 if isinstance(result["resource_requirements"], list):
                     result["resource_requirements"].extend(role_delta_resource_requirements)
-            return AgentResponse(success=True, data=result)
+            return AgentResponse(
+                success=True,
+                data=result,
+                metadata=self._get_runtime_trace_metadata(),
+            )
         except StructuredOutputError as e:
             logger.error(f"章节写作计划 structured 失败: {e}")
             return AgentResponse(success=False, error=str(e))
@@ -795,7 +891,11 @@ class MasterPlotterAgent(BaseAgent):
             if not result.get("chapter_goals"):
                 result["chapter_goals"] = [initial_plot for _ in range(chapter_count)]
 
-            return AgentResponse(success=True, data=result)
+            return AgentResponse(
+                success=True,
+                data=result,
+                metadata=self._get_runtime_trace_metadata(),
+            )
 
         except StructuredOutputError as e:
             logger.error(f"剧情规划 structured 失败: {e}")

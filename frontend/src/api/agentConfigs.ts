@@ -4,6 +4,7 @@
  */
 
 import { api } from './client'
+import type { PreviewRenderTrace } from './agentTemplates'
 
 const API_BASE = ''
 
@@ -77,6 +78,7 @@ export interface PreviewConfigResult {
   final_prompt: string
   prompt_length: number
   variables_used: Record<string, any>
+  render_trace?: PreviewRenderTrace
 }
 
 // ==================== API 函数 ====================

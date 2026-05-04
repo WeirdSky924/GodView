@@ -182,6 +182,7 @@ class BaseAgent(ABC):
         # 延迟加载 system prompt 的标记
         self._system_prompt_loaded: bool = False
         self._pending_system_prompt_load: bool = False
+        self._system_prompt_render_trace: Dict[str, Any] = {}
 
         # 如果有 project_id 且没有手动指定 system_prompt，标记为需要延迟加载
         if project_id and not system_prompt and self.AGENT_TYPE:
@@ -429,21 +430,55 @@ class BaseAgent(ABC):
             from app.services.agent_prompt_service import get_agent_prompt_service
 
             service = get_agent_prompt_service()
-            prompt = await service.build_agent_prompt(
+            prompt_data = await service.build_agent_prompt_with_trace(
                 agent_type=self.AGENT_TYPE,
                 project_id=self.project_id,
                 scenario=self.scenario,
             )
+            prompt = prompt_data.get("content", "")
+            self._system_prompt_render_trace = prompt_data.get("trace", {}) or {}
 
             if prompt:
                 self.system_prompt = prompt
-                logger.debug(f"Agent {self.name} 从模板加载 prompt 成功 (project={self.project_id}, type={self.AGENT_TYPE})")
+                logger.debug(
+                    "Agent %s 从模板加载 prompt 成功 (project=%s, type=%s, scenario=%s, template=%s)",
+                    self.name,
+                    self.project_id,
+                    self.AGENT_TYPE,
+                    self.scenario or "default",
+                    self._system_prompt_render_trace.get("template_id"),
+                )
 
         except Exception as e:
             logger.warning(f"Agent {self.name} 加载 prompt 失败: {e}")
+            self._system_prompt_render_trace = {
+                "agent_type": self.AGENT_TYPE,
+                "scenario": self.scenario or "default",
+                "project_id": self.project_id,
+                "template_id": None,
+                "template_scenario": None,
+                "config_id": None,
+                "prompt_ids": [],
+                "skill_ids": [],
+                "writing_rule_ids": [],
+                "context_blocks": [],
+                "fallbacks_used": [f"{self.AGENT_TYPE}_deprecated_system_prompt"],
+                "deprecated_sources_used": [f"{self.__class__.__name__}._build_default_system_prompt"],
+            }
 
         self._system_prompt_loaded = True
         self._pending_system_prompt_load = False
+
+    def get_system_prompt_render_trace(self) -> Dict[str, Any]:
+        """返回本 Agent 最近一次系统 prompt 渲染 trace。"""
+        return dict(self._system_prompt_render_trace or {})
+
+    def _get_runtime_trace_metadata(self) -> Dict[str, Any]:
+        trace = self.get_system_prompt_render_trace()
+        return {
+            "scenario": self.scenario or "default",
+            "prompt_render_trace": trace or None,
+        }
 
     @abstractmethod
     async def execute(self, input_data: Dict[str, Any]) -> AgentResponse:

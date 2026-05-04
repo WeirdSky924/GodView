@@ -113,6 +113,80 @@ class AgentPromptService:
             "scenario": resolved_scenario,
         }
 
+    @staticmethod
+    def _normalize_trace_scenario(scenario: Optional[str]) -> str:
+        scenario_value = (scenario or "default").strip()
+        return scenario_value or "default"
+
+    def _build_prompt_id_trace(self, template: Optional[AgentTemplate]) -> List[str]:
+        """按模板启用插槽顺序提取 PromptTemplate ID。"""
+        if not template:
+            return []
+
+        prompt_slots_by_name = {slot.slot_name: slot for slot in template.prompt_slots}
+        ordered_slots: List[PromptSlot] = []
+        used_slot_names: Set[str] = set()
+        for slot_name in template.default_prompt_order or []:
+            slot = prompt_slots_by_name.get(slot_name)
+            if slot and slot.is_enabled:
+                ordered_slots.append(slot)
+                used_slot_names.add(slot.slot_name)
+
+        remaining_slots = [
+            slot
+            for slot in template.prompt_slots
+            if slot.is_enabled and slot.slot_name not in used_slot_names
+        ]
+        remaining_slots.sort(key=lambda slot: -slot.priority)
+        ordered_slots.extend(remaining_slots)
+
+        prompt_ids: List[str] = []
+        seen_ids: Set[str] = set()
+        for slot in ordered_slots:
+            if slot.slot_name in {"writing_rules", "character_hierarchy"}:
+                continue
+            if not slot.prompt_template_id or slot.prompt_template_id in seen_ids:
+                continue
+            seen_ids.add(slot.prompt_template_id)
+            prompt_ids.append(slot.prompt_template_id)
+        return prompt_ids
+
+    def _build_base_render_trace(
+        self,
+        *,
+        agent_type: str,
+        scenario: Optional[str],
+        project_id: Optional[str],
+    ) -> Dict[str, Any]:
+        return {
+            "agent_type": agent_type,
+            "scenario": self._normalize_trace_scenario(scenario),
+            "project_id": project_id,
+            "template_id": None,
+            "template_scenario": None,
+            "config_id": None,
+            "prompt_ids": [],
+            "skill_ids": [],
+            "skills": None,
+            "writing_rule_ids": [],
+            "writing_rules": None,
+            "context_blocks": [],
+            "fallbacks_used": [],
+            "deprecated_sources_used": [],
+        }
+
+    @staticmethod
+    def _extend_trace_values(trace: Dict[str, Any], key: str, values: Optional[List[str]]) -> None:
+        if not values:
+            return
+        existing = trace.setdefault(key, [])
+        seen = set(existing)
+        for value in values:
+            if value in seen:
+                continue
+            seen.add(value)
+            existing.append(value)
+
     def _skill_applies_to_scope(
         self,
         skill: Skill,
@@ -441,14 +515,22 @@ class AgentPromptService:
             "enabled_rule_set_ids": [],
         })
 
-    async def _build_prompt_from_config(
+    async def _build_prompt_from_config_with_trace(
         self,
         agent_type: str,
         project_id: str,
         variables: Optional[Dict[str, Any]] = None,
         scenario: Optional[str] = None,
-    ) -> str:
-        """基于项目级 AgentConfig + AgentTemplate 构建 prompt。"""
+    ) -> Dict[str, Any]:
+        """基于项目级 AgentConfig + AgentTemplate 构建 prompt，并返回解析 trace。"""
+        trace: Dict[str, Any] = {
+            "config_id": None,
+            "template_id": None,
+            "template_scenario": None,
+            "prompt_ids": [],
+            "fallbacks_used": [],
+            "deprecated_sources_used": [],
+        }
         try:
             from app.services.agent_config_service import get_agent_config_service
             from app.api.routes.agent_templates import get_agent_template_service
@@ -465,12 +547,15 @@ class AgentPromptService:
             if not template:
                 try:
                     template = await template_service.get_template_by_type(AgentType(agent_type), scenario)
+                    if template:
+                        self._extend_trace_values(trace, "fallbacks_used", ["agent_template_service_type_lookup"])
                 except ValueError:
                     logger.debug(f"未知 Agent 类型，无法按项目配置构建 prompt: {agent_type}")
-                    return ""
+                    return {"content": "", "trace": trace, "config": None, "template": None}
 
             if not template:
-                return ""
+                self._extend_trace_values(trace, "fallbacks_used", ["missing_agent_template"])
+                return {"content": "", "trace": trace, "config": config, "template": None}
 
             if not config:
                 config = AgentConfig(
@@ -493,17 +578,51 @@ class AgentPromptService:
                     created_at=datetime.now(),
                     updated_at=datetime.now(),
                 )
+                self._extend_trace_values(trace, "fallbacks_used", ["runtime_agent_config_fallback"])
 
             self.set_services(
                 prompt_template_service=prompt_service,
                 agent_template_service=template_service,
             )
-            return await self._prompt_builder.build_prompt(config, template, variables or {})
+            content = await self._prompt_builder.build_prompt(config, template, variables or {})
+            trace.update({
+                "config_id": config.id,
+                "template_id": template.id,
+                "template_scenario": template.scenario,
+                "prompt_ids": self._build_prompt_id_trace(template),
+            })
+            requested_scenario = self._normalize_trace_scenario(scenario)
+            actual_scenario = self._normalize_trace_scenario(template.scenario)
+            if requested_scenario != actual_scenario:
+                self._extend_trace_values(
+                    trace,
+                    "fallbacks_used",
+                    [f"template_scenario_fallback:{requested_scenario}->{actual_scenario}"],
+                )
+            return {"content": content, "trace": trace, "config": config, "template": template}
         except Exception as e:
             logger.warning(
                 f"按项目配置构建 Agent prompt 失败: project={project_id}, agent={agent_type}, scenario={scenario}, error={e}"
             )
-            return ""
+            self._extend_trace_values(trace, "fallbacks_used", ["agent_config_prompt_error"])
+            trace["error"] = str(e)
+            return {"content": "", "trace": trace, "config": None, "template": None}
+
+    async def _build_prompt_from_config(
+        self,
+        agent_type: str,
+        project_id: str,
+        variables: Optional[Dict[str, Any]] = None,
+        scenario: Optional[str] = None,
+    ) -> str:
+        """基于项目级 AgentConfig + AgentTemplate 构建 prompt。"""
+        data = await self._build_prompt_from_config_with_trace(
+            agent_type=agent_type,
+            project_id=project_id,
+            variables=variables,
+            scenario=scenario,
+        )
+        return data.get("content", "")
 
     async def build_agent_prompt(
         self,
@@ -519,7 +638,40 @@ class AgentPromptService:
         use_intelligent_retrieval: bool = True,
     ) -> str:
         """构建 Agent 的完整 system prompt。"""
+        data = await self.build_agent_prompt_with_trace(
+            agent_type=agent_type,
+            project_id=project_id,
+            variables=variables,
+            characters=characters,
+            include_skills=include_skills,
+            context_query=context_query,
+            context_keywords=context_keywords,
+            context_scene=context_scene,
+            scenario=scenario,
+            use_intelligent_retrieval=use_intelligent_retrieval,
+        )
+        return data.get("content", "")
+
+    async def build_agent_prompt_with_trace(
+        self,
+        agent_type: str,
+        project_id: Optional[str] = None,
+        variables: Optional[Dict[str, Any]] = None,
+        characters: Optional[List[Any]] = None,
+        include_skills: bool = True,
+        context_query: Optional[str] = None,
+        context_keywords: Optional[List[str]] = None,
+        context_scene: Optional[str] = None,
+        scenario: Optional[str] = None,
+        use_intelligent_retrieval: bool = True,
+    ) -> Dict[str, Any]:
+        """构建 Agent 的完整 system prompt，并返回统一 runtime/preview trace。"""
         runtime_scenario = scenario or (variables or {}).get("scenario") or context_scene
+        trace = self._build_base_render_trace(
+            agent_type=agent_type,
+            scenario=runtime_scenario,
+            project_id=project_id,
+        )
         template = await self._resolve_template_for_agent(
             agent_type,
             project_id=project_id,
@@ -527,12 +679,24 @@ class AgentPromptService:
         )
         if not template:
             logger.warning(f"未找到 Agent 类型 {agent_type} 的模板")
-            return ""
+            self._extend_trace_values(trace, "fallbacks_used", ["missing_agent_template"])
+            return {"content": "", "trace": trace}
 
-        prompt_pieces = []
+        trace["template_id"] = template.id
+        trace["template_scenario"] = template.scenario
+        requested_scenario = self._normalize_trace_scenario(runtime_scenario)
+        actual_scenario = self._normalize_trace_scenario(template.scenario)
+        if requested_scenario != actual_scenario:
+            self._extend_trace_values(
+                trace,
+                "fallbacks_used",
+                [f"template_scenario_fallback:{requested_scenario}->{actual_scenario}"],
+            )
+
+        prompt_pieces: List[str] = []
 
         if include_skills:
-            skills_content = await self._build_skills_prompt(
+            skills_data = await self.build_skills_prompt_with_trace(
                 agent_type,
                 project_id=project_id,
                 variables=variables,
@@ -542,17 +706,32 @@ class AgentPromptService:
                 scenario=runtime_scenario,
                 use_intelligent_retrieval=use_intelligent_retrieval,
             )
+            skills_content = skills_data.get("content", "")
+            skills_trace = skills_data.get("trace", {})
+            trace["skills"] = skills_trace
+            trace["skill_ids"] = skills_trace.get("skill_ids", [])
+            self._extend_trace_values(trace, "fallbacks_used", skills_trace.get("fallbacks_used", []))
+            self._extend_trace_values(trace, "deprecated_sources_used", skills_trace.get("deprecated_sources_used", []))
             if skills_content:
                 prompt_pieces.append(skills_content)
 
         config_prompt = ""
         if project_id:
-            config_prompt = await self._build_prompt_from_config(
+            config_data = await self._build_prompt_from_config_with_trace(
                 agent_type=agent_type,
                 project_id=project_id,
                 variables=variables,
                 scenario=runtime_scenario,
             )
+            config_prompt = config_data.get("content", "")
+            config_trace = config_data.get("trace", {})
+            trace["config_id"] = config_trace.get("config_id")
+            trace["template_id"] = config_trace.get("template_id") or trace["template_id"]
+            trace["template_scenario"] = config_trace.get("template_scenario") or trace["template_scenario"]
+            trace["prompt_ids"] = config_trace.get("prompt_ids", [])
+            self._extend_trace_values(trace, "fallbacks_used", config_trace.get("fallbacks_used", []))
+            self._extend_trace_values(trace, "deprecated_sources_used", config_trace.get("deprecated_sources_used", []))
+            template = config_data.get("template") or template
 
         if config_prompt:
             prompt_pieces.append(config_prompt)
@@ -567,16 +746,23 @@ class AgentPromptService:
                     context_query=context_query,
                     context_keywords=context_keywords,
                 )
-                writing_prompt = await self._build_writing_rules_prompt(project_id, writing_context)
+                writing_rules_data = await self._build_writing_rules_prompt_data(project_id, writing_context)
+                writing_prompt = writing_rules_data.get("content", "")
+                writing_trace = writing_rules_data.get("trace", {})
+                trace["writing_rules"] = writing_trace
+                trace["writing_rule_ids"] = writing_trace.get("writing_rule_ids", [])
+                self._extend_trace_values(trace, "fallbacks_used", writing_trace.get("fallbacks_used", []))
+                self._extend_trace_values(trace, "deprecated_sources_used", writing_trace.get("deprecated_sources_used", []))
                 if writing_prompt:
                     prompt_pieces.append(writing_prompt)
 
             if "character_hierarchy" in slot_names:
                 hierarchy_prompt = self._build_character_hierarchy_prompt(characters)
                 if hierarchy_prompt:
+                    self._extend_trace_values(trace, "context_blocks", ["character_hierarchy"])
                     prompt_pieces.append(hierarchy_prompt)
 
-            return "\n\n".join(piece for piece in prompt_pieces if piece)
+            return {"content": "\n\n".join(piece for piece in prompt_pieces if piece), "trace": trace}
 
         sorted_slots = sorted(template.prompt_slots, key=lambda x: -x.priority)
         for slot in sorted_slots:
@@ -592,7 +778,13 @@ class AgentPromptService:
                     context_query=context_query,
                     context_keywords=context_keywords,
                 )
-                writing_prompt = await self._build_writing_rules_prompt(project_id, writing_context)
+                writing_rules_data = await self._build_writing_rules_prompt_data(project_id, writing_context)
+                writing_prompt = writing_rules_data.get("content", "")
+                writing_trace = writing_rules_data.get("trace", {})
+                trace["writing_rules"] = writing_trace
+                trace["writing_rule_ids"] = writing_trace.get("writing_rule_ids", [])
+                self._extend_trace_values(trace, "fallbacks_used", writing_trace.get("fallbacks_used", []))
+                self._extend_trace_values(trace, "deprecated_sources_used", writing_trace.get("deprecated_sources_used", []))
                 if writing_prompt:
                     prompt_pieces.append(writing_prompt)
                 continue
@@ -600,6 +792,7 @@ class AgentPromptService:
             if slot.slot_name == "character_hierarchy":
                 hierarchy_prompt = self._build_character_hierarchy_prompt(characters)
                 if hierarchy_prompt:
+                    self._extend_trace_values(trace, "context_blocks", ["character_hierarchy"])
                     prompt_pieces.append(hierarchy_prompt)
                 continue
 
@@ -610,6 +803,7 @@ class AgentPromptService:
             prompt_template = await self.get_prompt_template(prompt_template_id)
             if not prompt_template:
                 logger.warning(f"未找到 Prompt 模板: {prompt_template_id}")
+                self._extend_trace_values(trace, "fallbacks_used", [f"missing_prompt_template:{prompt_template_id}"])
                 continue
 
             merged_vars = {}
@@ -621,8 +815,10 @@ class AgentPromptService:
             rendered = self._render_template(prompt_template, merged_vars)
             if rendered:
                 prompt_pieces.append(rendered)
+                if prompt_template_id not in trace["prompt_ids"]:
+                    trace["prompt_ids"].append(prompt_template_id)
 
-        return "\n\n".join(prompt_pieces)
+        return {"content": "\n\n".join(prompt_pieces), "trace": trace}
 
     async def build_skills_prompt_with_trace(
         self,

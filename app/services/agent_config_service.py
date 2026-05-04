@@ -434,12 +434,12 @@ class AgentConfigService:
 
     # ==================== Prompt 构建和预览 ====================
 
-    async def get_final_prompt(
+    async def get_final_prompt_with_trace(
         self,
         config_id: str,
         variables: Optional[Dict[str, Any]] = None,
-    ) -> str:
-        """获取最终拼接的 prompt"""
+    ) -> Dict[str, Any]:
+        """获取最终 prompt 及统一渲染 trace。"""
         config = await self.get_config(config_id)
         if not config:
             raise ValueError(f"配置不存在: {config_id}")
@@ -447,12 +447,21 @@ class AgentConfigService:
         from app.services.agent_prompt_service import get_agent_prompt_service
 
         prompt_service = get_agent_prompt_service()
-        return await prompt_service.build_agent_prompt(
+        return await prompt_service.build_agent_prompt_with_trace(
             agent_type=config.agent_type,
             project_id=config.project_id,
             variables=variables,
             scenario=config.scenario,
         )
+
+    async def get_final_prompt(
+        self,
+        config_id: str,
+        variables: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """获取最终拼接的 prompt"""
+        data = await self.get_final_prompt_with_trace(config_id, variables)
+        return data.get("content", "")
 
     async def preview_prompt(
         self,
@@ -464,7 +473,9 @@ class AgentConfigService:
         if not config:
             raise ValueError(f"配置不存在: {config_id}")
 
-        final_prompt = await self.get_final_prompt(config_id, variables)
+        prompt_data = await self.get_final_prompt_with_trace(config_id, variables)
+        final_prompt = prompt_data.get("content", "")
+        render_trace = prompt_data.get("trace", {})
 
         template_info = None
         if self._agent_template_service:
@@ -493,6 +504,7 @@ class AgentConfigService:
             "final_prompt": final_prompt,
             "prompt_length": len(final_prompt),
             "variables_used": variables or {},
+            "render_trace": render_trace,
         }
 
     # ==================== 配置验证 ====================

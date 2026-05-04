@@ -41,8 +41,10 @@ class EventGeneratorAgent(BaseAgent):
         system_prompt: Optional[str] = None,
         agent_id: Optional[str] = None,
     ):
+        legacy_trace = None
         if not system_prompt and not project_id:
             system_prompt = self._build_system_prompt()
+            legacy_trace = getattr(self, "_legacy_fallback_trace", None)
 
         super().__init__(
             name="EventGeneratorAgent",
@@ -52,6 +54,8 @@ class EventGeneratorAgent(BaseAgent):
             project_id=project_id,
             agent_id=agent_id or "event_generator",
         )
+        if legacy_trace and not self.get_system_prompt_render_trace():
+            self._system_prompt_render_trace = legacy_trace
 
         # 事件池缓存
         self._event_pool: List[Dict[str, Any]] = []
@@ -63,43 +67,100 @@ class EventGeneratorAgent(BaseAgent):
             "task_description": "生成符合世界观的事件和剧情转折",
         }
 
+    def _load_md_prompt_content(self, prompt_id: str) -> str:
+        try:
+            from app.services.md_file_service import get_md_file_service
+
+            md_service = get_md_file_service()
+            prompt = md_service.get_prompt(prompt_id)
+            if prompt:
+                content = prompt.get("content") or prompt.get("raw_content") or ""
+                if content:
+                    return content.strip()
+        except Exception as e:
+            logger.warning("加载 EventGenerator md prompt 失败: prompt_id=%s, error=%s", prompt_id, e)
+        return ""
+
+    def _build_md_event_generator_fallback_prompt(self) -> str:
+        prompt_ids = ["role_event_generator", "function_event_generation"]
+        parts = [content for prompt_id in prompt_ids if (content := self._load_md_prompt_content(prompt_id))]
+        return "\n\n".join(parts).strip()
+
+    def _event_generator_fallback_trace(self, *, deprecated: bool = False, prompt_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+        return {
+            "agent_type": self.AGENT_TYPE.value,
+            "scenario": getattr(self, "scenario", None) or self.DEFAULT_SCENARIO,
+            "project_id": getattr(self, "project_id", None),
+            "template_id": None,
+            "template_scenario": None,
+            "config_id": None,
+            "prompt_ids": prompt_ids or [],
+            "skill_ids": [],
+            "writing_rule_ids": [],
+            "context_blocks": [],
+            "fallbacks_used": ["event_generator_deprecated_minimal_system_prompt" if deprecated else "event_generator_md_prompt_fallback"],
+            "deprecated_sources_used": ["EventGeneratorAgent._build_system_prompt"] if deprecated else [],
+        }
+
     def _build_system_prompt(self) -> str:
-        """构建系统提示"""
-        return """你是事件生成器（Event Generator），专门负责为小说创作生成各类事件。
+        """构建系统提示（优先使用 prompts/**/*.md 资产）。"""
+        md_prompt = self._build_md_event_generator_fallback_prompt()
+        if md_prompt:
+            self._legacy_fallback_trace = self._event_generator_fallback_trace(
+                prompt_ids=["role_event_generator", "function_event_generation"],
+            )
+            return md_prompt
 
-【核心职责】
-1. 生成随机事件：根据世界观和剧情需要生成合适的事件
-2. 事件池管理：维护可用事件的列表，确保事件多样性
-3. 事件触发设计：为事件设计合理的触发条件和影响
+        logger.warning("EventGenerator md prompt 资产不可用，使用 deprecated 最小硬编码默认系统提示")
+        self._legacy_fallback_trace = self._event_generator_fallback_trace(deprecated=True)
+        return """你是事件生成器。优先使用 Agent Template 绑定的 md prompt / skills / writing-rules；仅在未能加载配置资产时，将此最小提示作为 deprecated fallback。"""
 
-【事件类型】
-- 主线事件：推动剧情发展的关键事件
-- 支线事件：丰富剧情的次要事件
-- 随机事件：增加趣味性的随机遭遇
-- 角色事件：与特定角色相关的事件
-- 环境事件：天气、灾害等环境变化
+    async def _ensure_system_prompt_loaded(self):
+        """加载 EventGenerator Agent Template prompt，失败时回退到 md prompt 资产。"""
+        if self._system_prompt_loaded or not self._pending_system_prompt_load:
+            return
 
-【输出格式】
-生成事件时，输出 JSON 格式：
-```json
-{
-    "event_id": "event_xxx",
-    "event_name": "事件名称",
-    "event_type": "main/side/random/character/environment",
-    "description": "事件描述",
-    "trigger_condition": "触发条件",
-    "participants": ["参与角色"],
-    "consequences": ["事件影响"],
-    "narrative_purpose": "叙事目的",
-    "suggested_chapter": "建议出现章节"
-}
-```
+        if not self.project_id or not self.AGENT_TYPE:
+            self._system_prompt_loaded = True
+            self._pending_system_prompt_load = False
+            return
 
-【工作原则】
-- 事件要有因果逻辑
-- 要考虑对现有剧情的影响
-- 事件要有戏剧张力
-- 避免重复和陈腐的事件设计"""
+        try:
+            from app.services.agent_prompt_service import get_agent_prompt_service
+
+            service = get_agent_prompt_service()
+            prompt_data = await service.build_agent_prompt_with_trace(
+                agent_type=self.AGENT_TYPE.value,
+                project_id=self.project_id,
+                variables=self._get_default_variables(),
+                scenario=self.scenario,
+                context_query="事件生成 章节目标 因果链 当前阶段 长篇节奏",
+            )
+            prompt = prompt_data.get("content", "")
+            self._system_prompt_render_trace = prompt_data.get("trace", {}) or {}
+            if prompt.strip():
+                self.system_prompt = prompt.strip()
+        except Exception as e:
+            logger.warning(
+                "EventGenerator 加载模板 prompt 失败: project=%s, scenario=%s, error=%s",
+                self.project_id,
+                self.scenario,
+                e,
+            )
+
+        if not self.system_prompt:
+            md_prompt = self._build_md_event_generator_fallback_prompt()
+            if md_prompt:
+                self.system_prompt = md_prompt
+                self._system_prompt_render_trace = self._event_generator_fallback_trace(
+                    prompt_ids=["role_event_generator", "function_event_generation"],
+                )
+            else:
+                self.system_prompt = self._build_system_prompt()
+                self._system_prompt_render_trace = self._legacy_fallback_trace
+
+        self._system_prompt_loaded = True
+        self._pending_system_prompt_load = False
 
     async def execute(self, input_data: Dict[str, Any]) -> AgentResponse:
         """
@@ -155,7 +216,7 @@ class EventGeneratorAgent(BaseAgent):
             return AgentResponse(
                 success=True,
                 data=event_data,
-                metadata={"task": task, "event_type": event_type},
+                metadata={"task": task, "event_type": event_type, **self._get_runtime_trace_metadata()},
             )
 
         except StructuredOutputError as e:
@@ -228,7 +289,11 @@ class EventGeneratorAgent(BaseAgent):
             elif isinstance(entry, str):
                 lore_titles.append(entry)
 
-        prompt = f"""请基于当前项目上下文生成一个服务于当前章节的事件。
+        event_instruction = self._load_md_prompt_content("function_event_generation") or "请生成符合世界观、章节目标和因果链的事件。"
+        prompt = f"""{event_instruction}
+
+【当前子任务】
+请基于当前项目上下文生成一个服务于当前章节的事件。
 
 【当前章节】
 - 章节号：{chapter_num or '未提供'}

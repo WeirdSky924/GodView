@@ -164,13 +164,21 @@ class SceneCoordinatorAgent(BaseAgent):
         config: Optional[Dict[str, Any]] = None,
         db=None,  # 数据库连接，用于字数统计 skill
     ):
+        legacy_trace = None
+        system_prompt = None
+        if not project_id:
+            system_prompt = self._build_system_prompt()
+            legacy_trace = getattr(self, "_legacy_fallback_trace", None)
+
         super().__init__(
             name="SceneCoordinatorAgent",
             model=model,
-            system_prompt=None if project_id else self._build_system_prompt(),
+            system_prompt=system_prompt,
             config=config,
             project_id=project_id,
         )
+        if legacy_trace and not self.get_system_prompt_render_trace():
+            self._system_prompt_render_trace = legacy_trace
 
         # 数据库连接
         self._db = db
@@ -188,12 +196,114 @@ class SceneCoordinatorAgent(BaseAgent):
             "task_description": "统筹多角色演绎场景，协调信息分配，汇总表演结果",
         }
 
+    def _load_md_prompt_content(self, prompt_id: str) -> str:
+        try:
+            from app.services.md_file_service import get_md_file_service
+
+            md_service = get_md_file_service()
+            prompt = md_service.get_prompt(prompt_id)
+            if prompt:
+                content = prompt.get("content") or prompt.get("raw_content") or ""
+                if content:
+                    return content.strip()
+        except Exception as e:
+            logger.warning("加载 SceneCoordinator md prompt 失败: prompt_id=%s, error=%s", prompt_id, e)
+        return ""
+
+    def _build_md_scene_coordinator_fallback_prompt(self) -> str:
+        """从 md prompt 资产构建 SceneCoordinator 备用 prompt。"""
+        prompt_ids = ["role_scene_coordinator", "function_scene_coordination", "function_workflow_scene_direction", "function_workflow_character_performance"]
+        parts = [content for prompt_id in prompt_ids if (content := self._load_md_prompt_content(prompt_id))]
+        return "\n\n".join(parts).strip()
+
+    def _scene_coordinator_fallback_trace(self, *, deprecated: bool = False, prompt_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+        return {
+            "agent_type": self.AGENT_TYPE,
+            "scenario": getattr(self, "scenario", None) or self.DEFAULT_SCENARIO,
+            "project_id": getattr(self, "project_id", None),
+            "template_id": None,
+            "template_scenario": None,
+            "config_id": None,
+            "prompt_ids": prompt_ids or [],
+            "skill_ids": [],
+            "writing_rule_ids": [],
+            "context_blocks": [],
+            "fallbacks_used": ["scene_coordinator_deprecated_minimal_system_prompt" if deprecated else "scene_coordinator_md_prompt_fallback"],
+            "deprecated_sources_used": ["SceneCoordinatorAgent._build_system_prompt"] if deprecated else [],
+        }
+
     def _build_system_prompt(self) -> str:
+        md_prompt = self._build_md_scene_coordinator_fallback_prompt()
+        if md_prompt:
+            self._legacy_fallback_trace = self._scene_coordinator_fallback_trace(
+                prompt_ids=[
+                    "role_scene_coordinator",
+                    "function_scene_coordination",
+                    "function_workflow_scene_direction",
+                    "function_workflow_character_performance",
+                ],
+            )
+            return md_prompt
+
+        logger.warning("SceneCoordinator md prompt 资产不可用，使用 deprecated 最小硬编码默认系统提示")
+        self._legacy_fallback_trace = self._scene_coordinator_fallback_trace(deprecated=True)
         return (
             "你是场景协调者，负责统筹多角色演绎场景。"
             "优先使用 Agent Template 绑定的 md prompt / skills / writing-rules；"
             "仅在未能加载配置资产时，将此最小提示作为 deprecated fallback。"
         )
+
+    async def _ensure_system_prompt_loaded(self):
+        """加载场景协调 Agent Template prompt，失败时回退到 md prompt 资产。"""
+        if self._system_prompt_loaded or not self._pending_system_prompt_load:
+            return
+
+        if not self.project_id or not self.AGENT_TYPE:
+            self._system_prompt_loaded = True
+            self._pending_system_prompt_load = False
+            return
+
+        try:
+            from app.services.agent_prompt_service import get_agent_prompt_service
+
+            service = get_agent_prompt_service()
+            prompt_data = await service.build_agent_prompt_with_trace(
+                agent_type=self.AGENT_TYPE,
+                project_id=self.project_id,
+                variables=self._get_default_variables(),
+                scenario=self.scenario,
+                context_query="场景协调 角色演绎 信息隔离 公开私有分层",
+            )
+            prompt = prompt_data.get("content", "")
+            self._system_prompt_render_trace = prompt_data.get("trace", {}) or {}
+            if prompt.strip():
+                self.system_prompt = prompt.strip()
+        except Exception as e:
+            logger.warning(
+                "SceneCoordinator 加载模板 prompt 失败: project=%s, scenario=%s, error=%s",
+                self.project_id,
+                self.scenario,
+                e,
+            )
+
+        if not self.system_prompt:
+            md_prompt = self._build_md_scene_coordinator_fallback_prompt()
+            if md_prompt:
+                self.system_prompt = md_prompt
+                self._system_prompt_render_trace = self._scene_coordinator_fallback_trace(
+                    prompt_ids=[
+                        "role_scene_coordinator",
+                        "function_scene_coordination",
+                        "function_workflow_scene_direction",
+                        "function_workflow_character_performance",
+                    ],
+                )
+            else:
+                self.system_prompt = self._build_system_prompt()
+                self._system_prompt_render_trace = self._legacy_fallback_trace
+
+        self._system_prompt_loaded = True
+        self._pending_system_prompt_load = False
 
     def _build_supplement_context(
         self,
@@ -250,6 +360,7 @@ class SceneCoordinatorAgent(BaseAgent):
                 config={"scenario": "roleplay"},
                 project_id=self.project_id,
             )
+            agent._stream_callback = self._stream_callback
 
             self._character_agents[char_id] = agent
             logger.info(f"为角色 '{character_data.get('name')}' 创建了独立的 Agent 实例")
@@ -437,6 +548,7 @@ class SceneCoordinatorAgent(BaseAgent):
                     "scene_type": scene_directions.get("scene_type", "interactive"),
                     "iteration_count": iteration_count,
                     "word_count": final_result["actual_word_count"],
+                    **self._get_runtime_trace_metadata(),
                 },
             )
 
@@ -556,6 +668,76 @@ class SceneCoordinatorAgent(BaseAgent):
 
         return relevant
 
+    def _normalize_character_result(self, result_data: Dict[str, Any]) -> Dict[str, Any]:
+        """规范化 CharacterAgent 输出，防止 malformed/缺字段破坏分层上下文。"""
+        data = dict(result_data or {})
+        dialogue = str(data.get("dialogue") or "")
+        action = str(data.get("action") or "")
+        public_content = str(data.get("public_content") or "").strip()
+        if not public_content:
+            content_parts = []
+            if action:
+                content_parts.append(f"（{action}）")
+            if dialogue:
+                content_parts.append(dialogue)
+            public_content = " ".join(content_parts).strip()
+
+        private_thought = str(data.get("private_thought") or data.get("inner_thought") or "")
+        data["dialogue"] = dialogue
+        data["action"] = action
+        data["public_content"] = public_content
+        data["inner_thought"] = str(data.get("inner_thought") or private_thought)
+        data["private_thought"] = private_thought
+        data["emotion"] = str(data.get("emotion") or "")
+        data["intent"] = str(data.get("intent") or "")
+        data["perceived_facts"] = self._normalize_string_list(data.get("perceived_facts"))
+        data["misinterpretations"] = self._normalize_string_list(data.get("misinterpretations"))
+        data["withheld_information"] = self._normalize_string_list(data.get("withheld_information"))
+        data["relationship_delta"] = self._normalize_dict_list(data.get("relationship_delta"))
+        data["state_delta"] = self._normalize_dict_list(data.get("state_delta"))
+        data["continuity_notes"] = self._normalize_string_list(data.get("continuity_notes"))
+        data["warnings"] = self._normalize_string_list(data.get("warnings"))
+        leakage_warnings = self._detect_private_leakage(data)
+        if leakage_warnings:
+            data["warnings"] = [*data["warnings"], *leakage_warnings]
+        return data
+
+    def _normalize_string_list(self, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            items = value
+        elif isinstance(value, str):
+            items = [value]
+        else:
+            items = [value]
+        return [str(item) for item in items if str(item).strip()]
+
+    def _normalize_dict_list(self, value: Any) -> List[Dict[str, Any]]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+        return [value] if isinstance(value, dict) else []
+
+    def _detect_private_leakage(self, data: Dict[str, Any]) -> List[str]:
+        public_content = str(data.get("public_content") or "")
+        if not public_content:
+            return []
+        warnings = []
+        private_fragments = [
+            str(data.get("private_thought") or ""),
+            str(data.get("intent") or ""),
+            *self._normalize_string_list(data.get("withheld_information")),
+            *self._normalize_string_list(data.get("misinterpretations")),
+        ]
+        for fragment in private_fragments:
+            fragment = fragment.strip()
+            if fragment and len(fragment) >= 6 and fragment in public_content:
+                warnings.append("public_content 疑似包含私有思考、隐藏意图或误解；后续节点只能将其作为需审查素材。")
+                break
+        return warnings
+
     def _build_performance_message(
         self,
         *,
@@ -566,6 +748,7 @@ class SceneCoordinatorAgent(BaseAgent):
         round_value: Any = None,
     ) -> Dict[str, Any]:
         """从 CharacterAgent 输出构建公开/私有分层表演消息。"""
+        result_data = self._normalize_character_result(result_data)
         dialogue = result_data.get("dialogue", "")
         action = result_data.get("action", "")
         content_parts = []
@@ -575,6 +758,37 @@ class SceneCoordinatorAgent(BaseAgent):
             content_parts.append(dialogue)
         public_content = result_data.get("public_content") or " ".join(content_parts)
         private_thought = result_data.get("private_thought") or result_data.get("inner_thought", "")
+
+        packet = {
+            "character": char_name,
+            "public_content": public_content,
+            "dialogue": dialogue,
+            "action": action,
+            "private_thought": private_thought,
+            "emotion": result_data.get("emotion", ""),
+            "intent": result_data.get("intent", ""),
+            "perceived_facts": result_data.get("perceived_facts", []),
+            "misinterpretations": result_data.get("misinterpretations", []),
+            "withheld_information": result_data.get("withheld_information", []),
+            "relationship_delta": result_data.get("relationship_delta", []),
+            "state_delta": result_data.get("state_delta", []),
+            "continuity_notes": result_data.get("continuity_notes", []),
+            "warnings": result_data.get("warnings", []),
+            "visibility": {
+                "public_fields": ["public_content", "dialogue", "action", "emotion"],
+                "writer_only_fields": [
+                    "private_thought",
+                    "intent",
+                    "withheld_information",
+                    "misinterpretations",
+                    "relationship_delta",
+                    "state_delta",
+                    "continuity_notes",
+                ],
+            },
+        }
+        if round_value is not None:
+            packet["round"] = round_value
 
         message = {
             "agent": char_name,
@@ -594,6 +808,7 @@ class SceneCoordinatorAgent(BaseAgent):
             "state_delta": result_data.get("state_delta", []),
             "continuity_notes": result_data.get("continuity_notes", []),
             "warnings": result_data.get("warnings", []),
+            "character_performance_packet": packet,
             "importance_tier": _get_importance_tier(char_data, 3),
         }
         if round_value is not None:
@@ -1032,11 +1247,54 @@ class SceneCoordinatorAgent(BaseAgent):
         }
 
         actions = templates.get(atmosphere, templates["正剧"])
+        action = random.choice(actions)
 
         return {
             "agent": char_name,
             "type": "background_action",
-            "content": random.choice(actions),
+            "content": action,
+            "public_content": action,
+            "dialogue": "",
+            "action": action,
+            "private_thought": "",
+            "inner_thought": "",
+            "emotion": "",
+            "intent": "",
+            "perceived_facts": [],
+            "misinterpretations": [],
+            "withheld_information": [],
+            "relationship_delta": [],
+            "state_delta": [],
+            "continuity_notes": [],
+            "warnings": [],
+            "character_performance_packet": {
+                "character": char_name,
+                "public_content": action,
+                "dialogue": "",
+                "action": action,
+                "private_thought": "",
+                "emotion": "",
+                "intent": "",
+                "perceived_facts": [],
+                "misinterpretations": [],
+                "withheld_information": [],
+                "relationship_delta": [],
+                "state_delta": [],
+                "continuity_notes": [],
+                "warnings": [],
+                "visibility": {
+                    "public_fields": ["public_content", "dialogue", "action", "emotion"],
+                    "writer_only_fields": [
+                        "private_thought",
+                        "intent",
+                        "withheld_information",
+                        "misinterpretations",
+                        "relationship_delta",
+                        "state_delta",
+                        "continuity_notes",
+                    ],
+                },
+            },
             "importance": "background",
             "importance_tier": 5,
         }
@@ -1066,9 +1324,13 @@ class SceneCoordinatorAgent(BaseAgent):
         state_deltas = []
         continuity_notes = []
         performance_warnings = []
+        character_performance_packets = []
 
         for perf in performance_results:
             agent = perf.get("agent", "")
+            packet = perf.get("character_performance_packet")
+            if isinstance(packet, dict):
+                character_performance_packets.append(packet)
             private_thought = perf.get("private_thought") or perf.get("inner_thought")
             if private_thought or perf.get("intent") or perf.get("withheld_information"):
                 private_performances.append({
@@ -1122,6 +1384,28 @@ class SceneCoordinatorAgent(BaseAgent):
             "state_deltas": state_deltas,
             "continuity_notes": continuity_notes,
             "performance_warnings": performance_warnings,
+            "character_performance_packets": character_performance_packets,
+            "scene_performance_context": {
+                "public_performances": [
+                    {
+                        "agent": p.get("agent"),
+                        "content": p.get("public_content") or p.get("content", ""),
+                        "dialogue": p.get("dialogue", ""),
+                        "action": p.get("action", ""),
+                        "emotion": p.get("emotion", ""),
+                        "round": p.get("round"),
+                    }
+                    for p in performance_results
+                    if p.get("public_content") or p.get("content")
+                ],
+                "character_performance_packets": character_performance_packets,
+                "private_performances": private_performances,
+                "relationship_deltas": relationship_deltas,
+                "state_deltas": state_deltas,
+                "continuity_notes": continuity_notes,
+                "performance_warnings": performance_warnings,
+                "visibility_policy": "public_performances 可进入其他角色上下文；private_performances 与 delta 仅供 Writer/Evaluator/Summarizer 使用。",
+            },
             "full_content": "\n".join(full_content_lines),
             "main_dialogues": [p for p in main_performances if p.get("public_content") or p.get("content")],
             "background_actions": background_actions,

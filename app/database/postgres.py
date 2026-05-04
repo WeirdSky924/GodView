@@ -3138,6 +3138,7 @@ class PostgresDatabase:
 
             agent_config_schema_updates = [
                 "ALTER TABLE agent_templates ADD COLUMN IF NOT EXISTS scenario TEXT DEFAULT 'default'",
+                "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS scenario TEXT DEFAULT 'default'",
                 "ALTER TABLE skill_assignments ADD COLUMN IF NOT EXISTS scenario TEXT DEFAULT 'default'",
                 "ALTER TABLE skill_assignments ADD COLUMN IF NOT EXISTS slot_name TEXT DEFAULT ''",
                 "ALTER TABLE skill_assignments ADD COLUMN IF NOT EXISTS is_required BOOLEAN DEFAULT FALSE",
@@ -3147,7 +3148,7 @@ class PostgresDatabase:
                 "ALTER TABLE skill_assignments ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP",
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_skill_assignments_skill_agent_scenario_slot ON skill_assignments(skill_id, agent_type, scenario, slot_name)",
             ]
-            if 'agent_templates' in existing_tables or 'skill_assignments' in existing_tables:
+            if 'agent_templates' in existing_tables or 'agent_configs' in existing_tables or 'skill_assignments' in existing_tables:
                 for statement in agent_config_schema_updates:
                     try:
                         await session.execute(text(statement))

@@ -35,10 +35,12 @@ class CharacterAgent(BaseAgent):
     ):
         self.character = character
         self._manual_prompt_provided = bool(prompt_template)
+        legacy_trace = None
 
-        # 如果没有提供 prompt_template 且没有 project_id，使用最小 fallback（向后兼容）
+        # 如果没有提供 prompt_template 且没有 project_id，使用 md prompt 资产 fallback（向后兼容）
         if not prompt_template and not project_id:
             system_prompt = self._build_system_prompt()
+            legacy_trace = getattr(self, "_legacy_fallback_trace", None)
         else:
             system_prompt = prompt_template
 
@@ -50,6 +52,8 @@ class CharacterAgent(BaseAgent):
             project_id=project_id,
             agent_id=agent_id or character.id,
         )
+        if legacy_trace and not self.get_system_prompt_render_trace():
+            self._system_prompt_render_trace = legacy_trace
 
     def _get_default_variables(self) -> Dict[str, Any]:
         """获取默认变量（Character 特定）"""
@@ -81,8 +85,53 @@ class CharacterAgent(BaseAgent):
             "inventory": ", ".join(char.inventory) if char.inventory else "无",
         }
 
+    def _load_md_prompt_content(self, prompt_id: str) -> str:
+        try:
+            from app.services.md_file_service import get_md_file_service
+
+            md_service = get_md_file_service()
+            prompt = md_service.get_prompt(prompt_id)
+            if prompt:
+                content = prompt.get("content") or prompt.get("raw_content") or ""
+                if content:
+                    return content.strip()
+        except Exception as e:
+            logger.warning("加载 Character md prompt 失败: prompt_id=%s, error=%s", prompt_id, e)
+        return ""
+
+    def _build_md_character_fallback_prompt(self) -> str:
+        """从 md prompt 资产构建 Character 备用 prompt。"""
+        prompt_ids = ["role_character", "function_character_roleplay_decision", "function_workflow_character_performance"]
+        parts = [content for prompt_id in prompt_ids if (content := self._load_md_prompt_content(prompt_id))]
+        return "\n\n".join(parts).strip()
+
+    def _character_fallback_trace(self, *, deprecated: bool = False, prompt_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+        return {
+            "agent_type": self.AGENT_TYPE.value,
+            "scenario": getattr(self, "scenario", None) or self.DEFAULT_SCENARIO,
+            "project_id": getattr(self, "project_id", None),
+            "template_id": None,
+            "template_scenario": None,
+            "config_id": None,
+            "prompt_ids": prompt_ids or [],
+            "skill_ids": [],
+            "writing_rule_ids": [],
+            "context_blocks": [],
+            "fallbacks_used": ["character_deprecated_minimal_system_prompt" if deprecated else "character_md_prompt_fallback"],
+            "deprecated_sources_used": ["CharacterAgent._build_system_prompt"] if deprecated else [],
+        }
+
     def _build_system_prompt(self) -> str:
-        """构建角色系统提示（deprecated fallback）。"""
+        """构建角色系统提示（优先使用 prompts/**/*.md 资产）。"""
+        md_prompt = self._build_md_character_fallback_prompt()
+        if md_prompt:
+            self._legacy_fallback_trace = self._character_fallback_trace(
+                prompt_ids=["role_character", "function_character_roleplay_decision", "function_workflow_character_performance"],
+            )
+            return md_prompt
+
+        logger.warning("Character md prompt 资产不可用，使用 deprecated 最小硬编码默认系统提示")
+        self._legacy_fallback_trace = self._character_fallback_trace(deprecated=True)
         return (
             f"你是{self.character.name}，一个虚构故事中的角色。"
             "优先使用 Agent Template 绑定的 md prompt / skills / writing-rules；"
@@ -126,13 +175,15 @@ class CharacterAgent(BaseAgent):
             variables = self._get_default_variables()
             variables.update({"scenario": self.scenario})
             service = get_agent_prompt_service()
-            prompt = await service.build_agent_prompt(
+            prompt_data = await service.build_agent_prompt_with_trace(
                 agent_type=self.AGENT_TYPE.value,
                 project_id=self.project_id,
                 variables=variables,
                 scenario=self.scenario,
                 context_query=f"{self.character.name} 角色扮演 决策 信息隔离",
             )
+            prompt = prompt_data.get("content", "")
+            self._system_prompt_render_trace = prompt_data.get("trace", {}) or {}
             if prompt.strip():
                 self.system_prompt = prompt.strip()
                 logger.debug(
@@ -151,7 +202,15 @@ class CharacterAgent(BaseAgent):
             )
 
         if not self.system_prompt:
-            self.system_prompt = self._build_system_prompt()
+            md_prompt = self._build_md_character_fallback_prompt()
+            if md_prompt:
+                self.system_prompt = md_prompt
+                self._system_prompt_render_trace = self._character_fallback_trace(
+                    prompt_ids=["role_character", "function_character_roleplay_decision", "function_workflow_character_performance"],
+                )
+            else:
+                self.system_prompt = self._build_system_prompt()
+                self._system_prompt_render_trace = self._legacy_fallback_trace
         self._system_prompt_loaded = True
         self._pending_system_prompt_load = False
 
@@ -194,6 +253,7 @@ class CharacterAgent(BaseAgent):
                 category=UsageCategory.CHARACTER,
             )
             response_data = parsed.model_dump()
+            response_data = self._normalize_decision_packet(response_data)
 
             return AgentResponse(
                 success=True,
@@ -251,6 +311,38 @@ class CharacterAgent(BaseAgent):
         message_parts.append("【当前任务】\n" + "\n".join(f"- {line}" for line in task_lines))
 
         return "\n\n".join(message_parts)
+
+    def _normalize_decision_packet(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """规范化角色输出，确保公开/私有边界和兼容字段稳定。"""
+        packet = dict(data or {})
+        dialogue = str(packet.get("dialogue") or "")
+        action = str(packet.get("action") or "")
+        public_content = str(packet.get("public_content") or "").strip()
+        inner_thought = str(packet.get("inner_thought") or packet.get("private_thought") or "")
+        private_thought = str(packet.get("private_thought") or inner_thought or "")
+        if not public_content:
+            public_parts = []
+            if action:
+                public_parts.append(f"（{action}）")
+            if dialogue:
+                public_parts.append(dialogue)
+            public_content = " ".join(part for part in public_parts if part).strip()
+
+        packet["dialogue"] = dialogue
+        packet["action"] = action
+        packet["public_content"] = public_content
+        packet["inner_thought"] = inner_thought
+        packet["private_thought"] = private_thought
+        packet["emotion"] = str(packet.get("emotion") or "neutral")
+        packet["intent"] = str(packet.get("intent") or "")
+        packet["perceived_facts"] = [str(item) for item in packet.get("perceived_facts", []) if str(item).strip()]
+        packet["misinterpretations"] = [str(item) for item in packet.get("misinterpretations", []) if str(item).strip()]
+        packet["withheld_information"] = [str(item) for item in packet.get("withheld_information", []) if str(item).strip()]
+        packet["relationship_delta"] = [item for item in packet.get("relationship_delta", []) if isinstance(item, dict)]
+        packet["state_delta"] = [item for item in packet.get("state_delta", []) if isinstance(item, dict)]
+        packet["continuity_notes"] = [str(item) for item in packet.get("continuity_notes", []) if str(item).strip()]
+        packet["warnings"] = [str(item) for item in packet.get("warnings", []) if str(item).strip()]
+        return packet
 
     def update_character(self, updates: Dict[str, Any]):
         """

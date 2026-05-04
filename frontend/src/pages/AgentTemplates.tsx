@@ -19,6 +19,7 @@ import {
   SkillSlot,
   CreateAgentTemplateDTO,
   UpdateAgentTemplateDTO,
+  PreviewRenderTrace,
 } from '@/api/agentTemplates'
 import { getAgentConfigs } from '@/api/agentConfigs'
 import { getPrompts, PromptTemplate } from '@/api/prompts'
@@ -50,23 +51,7 @@ export default function AgentTemplates() {
   const [previewResult, setPreviewResult] = useState<{
     rendered_prompts: Array<{ slot_name: string; description: string; content: string }>
     final_prompt: string
-    render_trace?: {
-      agent_type: string
-      scenario?: string | null
-      template_id: string
-      prompt_ids: string[]
-      skill_ids: string[]
-      writing_rule_ids: string[]
-      context_blocks: string[]
-      fallbacks_used: string[]
-      deprecated_sources_used: string[]
-      writing_rules?: {
-        retrieved_rules?: Array<{ id?: string; name?: string; severity?: string; reason?: string; score?: number }>
-        always_rule_ids?: string[]
-        resolved_scope?: Record<string, any> | null
-        query?: string
-      } | null
-    }
+    render_trace?: PreviewRenderTrace
   } | null>(null)
 
   // Skills 状态
@@ -164,7 +149,7 @@ export default function AgentTemplates() {
 
   const loadAllSkills = async () => {
     try {
-      const data = await getSkills(undefined, undefined, undefined, undefined, undefined, undefined, 300)
+      const data = await getSkills(undefined, undefined, undefined, undefined, undefined, undefined, 200)
       if (Array.isArray(data)) {
         setAllSkills(data)
       } else {
@@ -987,8 +972,10 @@ export default function AgentTemplates() {
                 <h4 className={`text-sm mb-2 ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>Render Trace</h4>
                 <div className={`p-3 rounded text-sm space-y-2 ${isDark ? 'bg-gray-800 text-gray-300' : 'bg-gray-100 text-gray-700'}`}>
                   <div>Agent：{previewResult.render_trace.agent_type}</div>
-                  <div>Template：{previewResult.render_trace.template_id}</div>
+                  <div>Template：{previewResult.render_trace.template_id || '无'}</div>
                   {previewResult.render_trace.scenario && <div>Scenario：{previewResult.render_trace.scenario}</div>}
+                  <div>Template Scenario：{previewResult.render_trace.template_scenario || 'default'}</div>
+                  <div>Config：{previewResult.render_trace.config_id || '无'}</div>
                   <div>Prompt IDs：{previewResult.render_trace.prompt_ids.length ? previewResult.render_trace.prompt_ids.join(', ') : '无'}</div>
                   <div>Skill IDs：{previewResult.render_trace.skill_ids.length ? previewResult.render_trace.skill_ids.join(', ') : '无'}</div>
                   <div>Writing Rule IDs：{previewResult.render_trace.writing_rule_ids.length ? previewResult.render_trace.writing_rule_ids.join(', ') : '无'}</div>

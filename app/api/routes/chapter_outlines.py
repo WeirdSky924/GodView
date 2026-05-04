@@ -108,6 +108,7 @@ class ChatResponse(BaseModel):
     pending_outlines: Optional[List[PendingOutline]] = None
     saved_outline: Optional[Dict[str, Any]] = None
     saved_outlines: Optional[List[Dict[str, Any]]] = None  # 多章大纲保存
+    prompt_render_trace: Optional[Dict[str, Any]] = None
 
 
 class SavePendingOutlinesRequest(BaseModel):
@@ -959,6 +960,7 @@ async def chat_with_agent(project_id: str, chapter_number: int, request: ChatReq
         pending_outlines=pending_outlines,
         saved_outline=response.get("saved_outline"),
         saved_outlines=response.get("saved_outlines"),
+        prompt_render_trace=response.get("prompt_render_trace"),
     )
 
 

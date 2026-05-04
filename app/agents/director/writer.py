@@ -111,9 +111,26 @@ class WriterAgent(BaseAgent):
         project_id: Optional[str] = None,
         system_prompt: Optional[str] = None,
     ):
-        # 如果没有提供 system_prompt 且没有 project_id，使用默认的硬编码 prompt（向后兼容）
+        # 如果没有提供 system_prompt 且没有 project_id，使用 md prompt 资产作为 legacy 备用 prompt
         if not system_prompt and not project_id:
             system_prompt = self._build_default_system_prompt()
+            self._legacy_fallback_trace = {
+                "agent_type": AgentType.WRITER.value,
+                "scenario": self.DEFAULT_SCENARIO,
+                "project_id": None,
+                "template_id": None,
+                "template_scenario": None,
+                "config_id": None,
+                "prompt_ids": [],
+                "skill_ids": [],
+                "writing_rule_ids": [],
+                "context_blocks": [],
+                "fallbacks_used": ["writer_legacy_md_prompt_fallback"],
+                "deprecated_sources_used": [],
+            }
+            if "deprecated 最小 fallback" in system_prompt:
+                self._legacy_fallback_trace["fallbacks_used"] = ["writer_deprecated_minimal_system_prompt"]
+                self._legacy_fallback_trace["deprecated_sources_used"] = ["WriterAgent._build_default_system_prompt"]
 
         super().__init__(
             name="WriterAgent",
@@ -122,6 +139,9 @@ class WriterAgent(BaseAgent):
             config=config,
             project_id=project_id,
         )
+        legacy_trace = getattr(self, "_legacy_fallback_trace", None)
+        if legacy_trace and not self.get_system_prompt_render_trace():
+            self._system_prompt_render_trace = legacy_trace
 
     def _get_default_variables(self) -> Dict[str, Any]:
         """获取默认变量（Writer 特定）"""
@@ -146,7 +166,15 @@ class WriterAgent(BaseAgent):
 
     def _build_md_writer_fallback_prompt(self) -> str:
         """从 md prompt 资产构建 Writer 备用 prompt。"""
-        prompt_ids = ["role_writer", "function_writing"]
+        prompt_ids = [
+            "role_writer",
+            "function_writing",
+            "function_writer_workflow_context_binding",
+            "function_writer_segment_generation",
+            "function_writer_style_consistency",
+            "function_writer_scene_description",
+            "function_writer_character_voice_rewrite",
+        ]
         parts = [content for prompt_id in prompt_ids if (content := self._load_md_prompt_content(prompt_id))]
         return "\n\n".join(parts).strip()
 
@@ -156,52 +184,11 @@ class WriterAgent(BaseAgent):
         if md_prompt:
             return md_prompt
 
-        logger.warning("writer md prompt 资产不可用，使用 deprecated 硬编码默认系统提示")
-        return """你是内容执行官，负责将剧情意图润色成有网文质感的连贯文本。
-
-【重要：长篇网文创作原则】
-这是一部长篇小说，不是短篇故事！你需要：
-1. **可持续发展**：所有剧情、设定、伏笔都要能够支撑后续几百章的发展
-2. **渐进式展开**：不要一次性揭露所有设定和秘密，要留有余地
-3. **避免急躁感**：不要让读者感觉"开头就是高潮，马上要大结局"
-4. **承接后续大纲**：如果已有后续大纲，本章新增角色、伏笔和事件要服务后续剧情，不要堵死后续发展；如果没有后续大纲，不要自行创建完整后续大纲，只按当前绑定大纲推进并做轻量铺垫
-5. **埋下长线伏笔**：为后续剧情埋下可回收的伏笔，不是所有伏笔都要立刻揭晓
-6. **角色成长空间**：主角和配角都要有成长的空间，不要一开始就无敌
-7. **世界观层次**：世界观要有多层次，让读者感觉还有更深的内容待探索
-
-【网文写作技巧】
-1. 展示，而不是告知 (Show, Don't Tell)
-2. 描写比例：动作 35% + 神态 35% + 对话 30%
-3. 段落简短有力，便于移动端阅读
-4. 使用生动的感官描写（视觉、听觉、嗅觉、触觉）
-5. 对话要符合角色性格和口癖
-
-【字数要求】
-- 必须达到目标字数
-- 如果字数不足，系统会要求你继续写作
-- 你会在一次生成中完成足够字数的内容
-
-【网文节奏技巧】
-- 关键时刻要有"卡点"感
-- 战斗场面要有画面感和节奏感
-- 对话要有"梗"和记忆点
-- 适当安排反转和惊喜
-- 爽点设计要到位（升级、打脸、逆袭、揭秘等）
-
-输出 JSON 格式：
-{
-    "content": "生成的网文正文",
-    "word_count": 字数统计（必须自行统计）,
-    "style_check": {
-        "action_ratio": 0.35,
-        "expression_ratio": 0.35,
-        "dialogue_ratio": 0.3
-    },
-    "climax_points": ["本章爽点描述"],
-    "hooks_embedded": ["嵌入的伏笔描述"],
-    "future_setup": ["为后续剧情埋下的铺垫"],
-    "character_candidates": [{"name": "仅当总编剧计划允许且首次出场时填写", "importance_tier": "supporting/recurring/catalyst/informant/npc", "description": "剧情功能", "background_story": "符合设定的背景", "goals": ["目标"], "future_plot_usage": "如有后续大纲，说明后续用途"}]
-}"""
+        logger.warning("writer md prompt 资产不可用，使用 deprecated 最小硬编码默认系统提示")
+        return (
+            "你是 Writer Agent。优先使用 Agent Template 绑定的 md prompt、skills 和 writing-rules；"
+            "当前仅因配置资产不可用而启用 deprecated 最小 fallback。"
+        )
 
     def _extract_discussion_summary(self, input_data: Dict[str, Any]) -> str:
         """提取讨论总结，优先读取统一后的 discussion 结构。"""
@@ -485,6 +472,7 @@ class WriterAgent(BaseAgent):
                 "use_segmented": use_segmented,
                 "config_prompt_source": getattr(self, "_writer_config_prompt_source", None),
                 "config_prompt_length": len(getattr(self, "_writer_config_prompt", "") or ""),
+                **self._get_runtime_trace_metadata(),
             }
             result["metadata"] = {**metadata, **result.get("metadata", {})}
             chapter_content = result.get("chapter_content") or result.get("content", "")
@@ -989,18 +977,7 @@ class WriterAgent(BaseAgent):
                 "每段必须有明确叙事焦点、关键元素和因果推进。",
                 "不得规划未授权角色、组织、能力、地点或专有概念。",
             ],
-            output_schema='''{
-    "segments": [
-        {
-            "focus": "该段的叙事焦点",
-            "key_elements": ["该段需要包含的关键元素"],
-            "tone": "该段的情感基调",
-            "suggested_word_count": 建议字数
-        }
-    ],
-    "overall_structure": "整体结构说明",
-    "pacing_note": "节奏把控建议"
-}''',
+            output_schema=self._writer_segment_plan_output_schema(),
             config_prompt=config_prompt,
         )
 
@@ -1077,12 +1054,7 @@ class WriterAgent(BaseAgent):
                 "与前文自然衔接，突出本段叙事焦点并覆盖关键元素。",
                 "严格遵守工作流绑定上下文；具体分段、续写、补写规则以 Writer 配置规则中的 md 资产为准。",
             ],
-            output_schema='''{
-    "content": "本段正文内容",
-    "word_count": 字数,
-    "key_points_covered": ["已覆盖的关键元素"],
-    "transition_to_next": "与下一段的衔接思路"
-}''',
+            output_schema=self._writer_segment_output_schema(),
             config_prompt=config_prompt,
         )
 
@@ -1109,11 +1081,7 @@ class WriterAgent(BaseAgent):
                 "补写只能扩展已有合法场景中的前因、行动、阻力、线索或后果，不能开启新剧情线。",
                 "不得新增未授权角色、组织、能力、地点或专有概念。",
             ],
-            output_schema='''{
-    "content": "补充的内容",
-    "word_count": 字数,
-    "supplement_direction": "选择的补充方向"
-}''',
+            output_schema=self._writer_supplement_output_schema(),
             config_prompt=config_prompt,
         )
 
@@ -1145,11 +1113,7 @@ class WriterAgent(BaseAgent):
                 "优先写前因、角色行动、外部阻力、线索发现、环境变化或上一段行动后果。",
                 "不得开启新剧情线，不得新增未授权角色、组织、能力、地点或专有概念。",
             ],
-            output_schema='''{
-    "content": "续写的内容",
-    "word_count": 续写字数,
-    "continue_direction": "选择的续写方向说明"
-}''',
+            output_schema=self._writer_continue_output_schema(),
             config_prompt=config_prompt,
         )
 
@@ -1258,6 +1222,14 @@ class WriterAgent(BaseAgent):
             ("角色出场硬约束", workflow_context.get("character_constraints")),
             ("场景方向", workflow_context.get("scene_directions")),
             ("场景演绎素材（参考材料，不得照抄或覆盖大纲）", workflow_context.get("performance_result")),
+            ("场景演绎分层上下文（public 可写入正文；private/delta 仅用于潜台词、连续性和评估线索，不得让其他角色无故知晓）", workflow_context.get("scene_performance_context") or workflow_context.get("role_performance_context")),
+            ("角色表演包", workflow_context.get("character_performance_packets")),
+            ("关系/状态/连续性变化", {
+                "relationship_deltas": workflow_context.get("relationship_deltas"),
+                "state_deltas": workflow_context.get("state_deltas"),
+                "continuity_notes": workflow_context.get("continuity_notes"),
+                "performance_warnings": workflow_context.get("performance_warnings"),
+            }),
             ("总编剧写作计划", workflow_context.get("writing_plan") or workflow_context.get("plot_guidance")),
             ("次要角色辅助计划", workflow_context.get("supporting_character_plan")),
             ("已确认/待使用次要角色", workflow_context.get("plotter_created_characters") or workflow_context.get("character_candidates")),
@@ -1387,6 +1359,68 @@ class WriterAgent(BaseAgent):
 
         return "\n\n".join(message_parts)
 
+    def _writer_segment_plan_output_schema(self) -> str:
+        return '''{
+    "segments": [
+        {
+            "focus": "该段的叙事焦点",
+            "key_elements": ["该段需要包含的关键元素"],
+            "tone": "该段的情感基调",
+            "suggested_word_count": 建议字数
+        }
+    ],
+    "overall_structure": "整体结构说明",
+    "pacing_note": "节奏把控建议"
+}'''
+
+    def _writer_segment_output_schema(self) -> str:
+        return '''{
+    "content": "本段正文内容",
+    "word_count": 字数,
+    "key_points_covered": ["已覆盖的关键元素"],
+    "transition_to_next": "与下一段的衔接思路"
+}'''
+
+    def _writer_supplement_output_schema(self) -> str:
+        return '''{
+    "content": "补充的内容",
+    "word_count": 字数,
+    "supplement_direction": "选择的补充方向"
+}'''
+
+    def _writer_continue_output_schema(self) -> str:
+        return '''{
+    "content": "续写的内容",
+    "word_count": 续写字数,
+    "continue_direction": "选择的续写方向说明"
+}'''
+
+    def _writer_style_consistency_output_schema(self) -> str:
+        return '''{
+    "is_consistent": true/false,
+    "confidence": 0.0-1.0,
+    "differences": ["风格差异列表"],
+    "suggestions": ["修改建议"]
+}'''
+
+    def _writer_scene_description_output_schema(self) -> str:
+        return '''{
+    "description": "场景描写文本",
+    "word_count": 字数,
+    "sensory_elements": {
+        "visual": "视觉元素",
+        "auditory": "听觉元素",
+        "olfactory": "嗅觉元素",
+        "tactile": "触觉元素"
+    }
+}'''
+
+    def _writer_character_voice_rewrite_output_schema(self) -> str:
+        return '''{
+    "rewritten_text": "改写后的文本",
+    "changes_made": ["修改说明列表"]
+}'''
+
     async def _check_style_consistency(
         self,
         generated_text: str,
@@ -1402,27 +1436,16 @@ class WriterAgent(BaseAgent):
         Returns:
             Dict: 风格一致性检查结果
         """
-        prompt = f"""请检查以下两段文本的风格一致性：
-
-【前文样本】
-{previous_style}
-
-【新生成文本】
-{generated_text}
-
-请从以下维度评估：
-1. 叙述视角是否一致
-2. 句式长短是否相似
-3. 用词风格是否统一
-4. 节奏感是否连贯
-
-输出 JSON 格式：
-{{
-    "is_consistent": true/false,
-    "confidence": 0.0-1.0,
-    "differences": ["风格差异列表"],
-    "suggestions": ["修改建议"]
-}}"""
+        config_prompt = await self._get_writer_config_prompt({"task_type": "style_check"})
+        prompt = self._format_writer_task_prompt(
+            task_title="检查新生成文本与前文样本的风格一致性。",
+            sections=[
+                ("前文样本", previous_style),
+                ("新生成文本", generated_text),
+            ],
+            output_schema=self._writer_style_consistency_output_schema(),
+            config_prompt=config_prompt,
+        )
 
         try:
             parsed = await self._call_structured(
@@ -1452,33 +1475,17 @@ class WriterAgent(BaseAgent):
         Returns:
             AgentResponse: 场景描写
         """
-        prompt = f"""请生成一段场景描写：
-
-【地点】
-{location}
-
-【氛围】
-{atmosphere}
-
-【感官细节】
-{sensory_details if sensory_details else '自由发挥'}
-
-要求：
-- 调动多种感官（视觉、听觉、嗅觉、触觉）
-- 100-200 字
-- 有画面感
-
-输出 JSON 格式：
-{{
-    "description": "场景描写文本",
-    "word_count": 字数，
-    "sensory_elements": {{
-        "visual": "视觉元素",
-        "auditory": "听觉元素",
-        "olfactory": "嗅觉元素",
-        "tactile": "触觉元素"
-    }}
-}}"""
+        config_prompt = await self._get_writer_config_prompt({"task_type": "scene_description"})
+        prompt = self._format_writer_task_prompt(
+            task_title="生成一段服务情节和氛围的短场景描写。",
+            sections=[
+                ("地点", location),
+                ("氛围", atmosphere),
+                ("感官细节", sensory_details if sensory_details else "自由发挥"),
+            ],
+            output_schema=self._writer_scene_description_output_schema(),
+            config_prompt=config_prompt,
+        )
 
         try:
             parsed = await self._call_structured(
@@ -1527,27 +1534,21 @@ class WriterAgent(BaseAgent):
         Returns:
             AgentResponse: 重写后的文本
         """
-        prompt = f"""请将以下文本改写为符合角色声音的版本：
-
-【角色信息】
-- 名称：{character_name}
-- 说话风格：{speech_pattern}
-- 常用词汇：{', '.join(lexicon) if lexicon else '无特殊要求'}
-- 禁止使用：{', '.join(forbidden_words) if forbidden_words else '无禁止'}
-
-【原始文本】
-{original_text}
-
-要求：
-1. 保持原意不变
-2. 调整用词和句式以符合角色声音
-3. 不使用禁用语
-
-输出 JSON 格式：
-{{
-    "rewritten_text": "改写后的文本",
-    "changes_made": ["修改说明列表"]
-}}"""
+        config_prompt = await self._get_writer_config_prompt({"task_type": "character_voice_rewrite"})
+        prompt = self._format_writer_task_prompt(
+            task_title="将原始文本改写为符合指定角色声音的版本。",
+            sections=[
+                ("角色信息", {
+                    "name": character_name,
+                    "speech_pattern": speech_pattern,
+                    "lexicon": lexicon,
+                    "forbidden_words": forbidden_words,
+                }),
+                ("原始文本", original_text),
+            ],
+            output_schema=self._writer_character_voice_rewrite_output_schema(),
+            config_prompt=config_prompt,
+        )
 
         try:
             parsed = await self._call_structured(

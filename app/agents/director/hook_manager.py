@@ -40,9 +40,11 @@ class HookManagerAgent(BaseAgent):
         project_id: Optional[str] = None,
         system_prompt: Optional[str] = None,
     ):
-        # 如果没有提供 system_prompt 且没有 project_id，使用默认的硬编码 prompt（向后兼容）
+        legacy_trace = None
+        # 如果没有提供 system_prompt 且没有 project_id，使用 md prompt 资产 fallback（向后兼容）
         if not system_prompt and not project_id:
             system_prompt = self._build_default_system_prompt()
+            legacy_trace = getattr(self, "_legacy_fallback_trace", None)
 
         super().__init__(
             name="HookManagerAgent",
@@ -51,6 +53,8 @@ class HookManagerAgent(BaseAgent):
             config=config,
             project_id=project_id,
         )
+        if legacy_trace and not self.get_system_prompt_render_trace():
+            self._system_prompt_render_trace = legacy_trace
 
     def _get_default_variables(self) -> Dict[str, Any]:
         """获取默认变量（HookManager 特定）"""
@@ -59,73 +63,100 @@ class HookManagerAgent(BaseAgent):
             "task_description": "负责管理故事伏笔的埋设与回收",
         }
 
+    def _load_md_prompt_content(self, prompt_id: str) -> str:
+        try:
+            from app.services.md_file_service import get_md_file_service
+
+            md_service = get_md_file_service()
+            prompt = md_service.get_prompt(prompt_id)
+            if prompt:
+                content = prompt.get("content") or prompt.get("raw_content") or ""
+                if content:
+                    return content.strip()
+        except Exception as e:
+            logger.warning("加载 HookManager md prompt 失败: prompt_id=%s, error=%s", prompt_id, e)
+        return ""
+
+    def _build_md_hook_manager_fallback_prompt(self) -> str:
+        prompt_ids = ["role_hook_manager", "function_hook_management"]
+        parts = [content for prompt_id in prompt_ids if (content := self._load_md_prompt_content(prompt_id))]
+        return "\n\n".join(parts).strip()
+
+    def _hook_manager_fallback_trace(self, *, deprecated: bool = False, prompt_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+        return {
+            "agent_type": self.AGENT_TYPE.value,
+            "scenario": getattr(self, "scenario", None) or self.DEFAULT_SCENARIO,
+            "project_id": getattr(self, "project_id", None),
+            "template_id": None,
+            "template_scenario": None,
+            "config_id": None,
+            "prompt_ids": prompt_ids or [],
+            "skill_ids": [],
+            "writing_rule_ids": [],
+            "context_blocks": [],
+            "fallbacks_used": ["hook_manager_deprecated_minimal_system_prompt" if deprecated else "hook_manager_md_prompt_fallback"],
+            "deprecated_sources_used": ["HookManagerAgent._build_default_system_prompt"] if deprecated else [],
+        }
+
     def _build_default_system_prompt(self) -> str:
-        """构建默认系统提示"""
-        return """你是伏笔管理员，负责管理小说中的伏笔系统。
+        """构建默认系统提示（优先使用 prompts/**/*.md 资产）。"""
+        md_prompt = self._build_md_hook_manager_fallback_prompt()
+        if md_prompt:
+            self._legacy_fallback_trace = self._hook_manager_fallback_trace(
+                prompt_ids=["role_hook_manager", "function_hook_management"],
+            )
+            return md_prompt
 
-## 核心职责
+        logger.warning("HookManager md prompt 资产不可用，使用 deprecated 最小硬编码默认系统提示")
+        self._legacy_fallback_trace = self._hook_manager_fallback_trace(deprecated=True)
+        return """你是伏笔管理员。优先使用 Agent Template 绑定的 md prompt / skills / writing-rules；仅在未能加载配置资产时，将此最小提示作为 deprecated fallback。"""
 
-1. **管理现有伏笔** - 首先检查数据库中已有的伏笔，评估其状态
-2. **战略性埋设** - 根据剧情发展需要，决定是否埋设新伏笔
-3. **适时回收** - 识别已有伏笔回收的最佳时机
-4. **状态追踪** - 更新伏笔的生命周期状态
+    async def _ensure_system_prompt_loaded(self):
+        """加载 HookManager Agent Template prompt，失败时回退到 md prompt 资产。"""
+        if self._system_prompt_loaded or not self._pending_system_prompt_load:
+            return
 
-## 伏笔类型
+        if not self.project_id or not self.AGENT_TYPE:
+            self._system_prompt_loaded = True
+            self._pending_system_prompt_load = False
+            return
 
-- **mystery** (谜团): 让读者产生疑问，期待后续解答
-- **object** (物件): 与特殊物品、遗物、装备相关的伏笔
-- **character** (角色): 与角色身份、动机、命运相关的伏笔
-- **event** (事件): 与后续事件、事故、行动相关的伏笔
-- **location** (地点): 与地点、地图、隐藏区域相关的伏笔
-- **relationship** (关系): 与角色关系变化相关的伏笔
-- **custom** (自定义): 不适合以上类型时使用
+        try:
+            from app.services.agent_prompt_service import get_agent_prompt_service
 
-## 伏笔原则
+            service = get_agent_prompt_service()
+            prompt_data = await service.build_agent_prompt_with_trace(
+                agent_type=self.AGENT_TYPE.value,
+                project_id=self.project_id,
+                variables=self._get_default_variables(),
+                scenario=self.scenario,
+                context_query="伏笔 埋设 回收 触发 状态追踪 长篇连续性",
+            )
+            prompt = prompt_data.get("content", "")
+            self._system_prompt_render_trace = prompt_data.get("trace", {}) or {}
+            if prompt.strip():
+                self.system_prompt = prompt.strip()
+        except Exception as e:
+            logger.warning(
+                "HookManager 加载模板 prompt 失败: project=%s, scenario=%s, error=%s",
+                self.project_id,
+                self.scenario,
+                e,
+            )
 
-1. **展示而非告知** - 通过细节、对话、行为暗示，而非直接说明
-2. **自然融入** - 伏笔不应突兀，要与场景和角色行为融合
-3. **有始有终** - 埋设的伏笔必须在合适时机回收
-4. **情感价值** - 回收时能给读者带来惊喜或情感冲击
+        if not self.system_prompt:
+            md_prompt = self._build_md_hook_manager_fallback_prompt()
+            if md_prompt:
+                self.system_prompt = md_prompt
+                self._system_prompt_render_trace = self._hook_manager_fallback_trace(
+                    prompt_ids=["role_hook_manager", "function_hook_management"],
+                )
+            else:
+                self.system_prompt = self._build_default_system_prompt()
+                self._system_prompt_render_trace = self._legacy_fallback_trace
 
-## 输出格式
-
-```json
-{
-    "reasoning": "决策理由，说明为什么这样处理伏笔",
-    "hooks_to_plant": [
-        {
-            "title": "伏笔标题",
-            "description": "伏笔内容描述",
-            "hook_type": "mystery/object/character/event/location/relationship/custom",
-            "resolution_hint": "未来如何回收这个伏笔",
-            "priority": 1-5,
-            "related_characters": ["相关角色"],
-            "related_objects": ["相关物品"]
-        }
-    ],
-    "hooks_to_resolve": [
-        {
-            "id": "伏笔ID（从现有伏笔中选择）",
-            "resolution_context": "回收的具体方式"
-        }
-    ],
-    "hooks_status_updates": [
-        {
-            "id": "伏笔ID",
-            "new_status": "triggered/ready_for_resolution",
-            "reason": "状态变更原因"
-        }
-    ],
-    "suggestions": ["对伏笔管理的建议"]
-}
-```
-
-## 重要原则
-
-- 不要随意创建新伏笔，优先考虑现有伏笔
-- 如果现有伏笔已经足够，不需要新增
-- 回收伏笔比创建新伏笔更重要
-- 伏笔数量要适中，太多会让故事混乱"""
+        self._system_prompt_loaded = True
+        self._pending_system_prompt_load = False
 
     async def execute(self, input_data: Dict[str, Any]) -> AgentResponse:
         """
@@ -223,6 +254,7 @@ class HookManagerAgent(BaseAgent):
                 metadata={
                     "existing_hooks_count": len(existing_hooks),
                     "planted_in_chapter_count": len(planted_in_chapter),
+                    **self._get_runtime_trace_metadata(),
                 },
             )
 
@@ -399,7 +431,11 @@ class HookManagerAgent(BaseAgent):
         Returns:
             AgentResponse: 埋设建议
         """
-        prompt = f"""请为以下伏笔设计一个自然的埋设方式：
+        hook_instruction = self._load_md_prompt_content("function_hook_management") or "请遵循伏笔管理原则，优先复用现有伏笔并保持埋设自然。"
+        prompt = f"""{hook_instruction}
+
+【当前子任务】
+请为以下伏笔设计一个自然的埋设方式。
 
 【伏笔信息】
 - ID: {hook.get('id')}
@@ -413,12 +449,7 @@ class HookManagerAgent(BaseAgent):
 【在场角色】
 {', '.join(character_ids)}
 
-要求：
-1. 埋设方式要自然，不突兀
-2. 符合"展示而非告知"原则
-3. 与场景和角色行为融合
-
-输出 JSON 格式：
+请按 HookPlantSuggestionSchema 输出 JSON：
 {{
     "method": "埋设方式（如：对话暗示/物品发现/行为异常）",
     "context": "具体情境描述",
@@ -457,7 +488,11 @@ class HookManagerAgent(BaseAgent):
         Returns:
             AgentResponse: 回收建议
         """
-        prompt = f"""请为以下伏笔设计一个令人满意的回收方式：
+        hook_instruction = self._load_md_prompt_content("function_hook_management") or "请遵循伏笔管理原则，确保回收自然、有因果支撑，并优先处理已存在伏笔。"
+        prompt = f"""{hook_instruction}
+
+【当前子任务】
+请为以下伏笔设计一个令人满意的回收方式。
 
 【伏笔信息】
 - ID: {hook.get('id')}
@@ -468,12 +503,7 @@ class HookManagerAgent(BaseAgent):
 【当前上下文】
 {current_context}
 
-要求：
-1. 回收要自然，有"原来如此"的感觉
-2. 如果能产生情感冲击更好
-3. 与当前情境融合
-
-输出 JSON 格式：
+请按 HookResolutionSuggestionSchema 输出 JSON：
 {{
     "resolution": "回收方式描述",
     "emotional_impact": "low/medium/high",

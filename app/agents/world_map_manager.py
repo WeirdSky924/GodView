@@ -41,8 +41,10 @@ class WorldMapManagerAgent(BaseAgent):
         system_prompt: Optional[str] = None,
         agent_id: Optional[str] = None,
     ):
+        legacy_trace = None
         if not system_prompt and not project_id:
             system_prompt = self._build_system_prompt()
+            legacy_trace = getattr(self, "_legacy_fallback_trace", None)
 
         super().__init__(
             name="WorldMapManagerAgent",
@@ -52,6 +54,8 @@ class WorldMapManagerAgent(BaseAgent):
             project_id=project_id,
             agent_id=agent_id or "world_map_manager",
         )
+        if legacy_trace and not self.get_system_prompt_render_trace():
+            self._system_prompt_render_trace = legacy_trace
 
         # 地图缓存
         self._regions: Dict[str, Dict[str, Any]] = {}
@@ -64,45 +68,100 @@ class WorldMapManagerAgent(BaseAgent):
             "task_description": "管理世界地图、区域和角色位置",
         }
 
+    def _load_md_prompt_content(self, prompt_id: str) -> str:
+        try:
+            from app.services.md_file_service import get_md_file_service
+
+            md_service = get_md_file_service()
+            prompt = md_service.get_prompt(prompt_id)
+            if prompt:
+                content = prompt.get("content") or prompt.get("raw_content") or ""
+                if content:
+                    return content.strip()
+        except Exception as e:
+            logger.warning("加载 WorldMapManager md prompt 失败: prompt_id=%s, error=%s", prompt_id, e)
+        return ""
+
+    def _build_md_world_map_manager_fallback_prompt(self) -> str:
+        prompt_ids = ["role_world_map_manager", "function_map_management"]
+        parts = [content for prompt_id in prompt_ids if (content := self._load_md_prompt_content(prompt_id))]
+        return "\n\n".join(parts).strip()
+
+    def _world_map_manager_fallback_trace(self, *, deprecated: bool = False, prompt_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+        return {
+            "agent_type": self.AGENT_TYPE.value,
+            "scenario": getattr(self, "scenario", None) or self.DEFAULT_SCENARIO,
+            "project_id": getattr(self, "project_id", None),
+            "template_id": None,
+            "template_scenario": None,
+            "config_id": None,
+            "prompt_ids": prompt_ids or [],
+            "skill_ids": [],
+            "writing_rule_ids": [],
+            "context_blocks": [],
+            "fallbacks_used": ["world_map_manager_deprecated_minimal_system_prompt" if deprecated else "world_map_manager_md_prompt_fallback"],
+            "deprecated_sources_used": ["WorldMapManagerAgent._build_system_prompt"] if deprecated else [],
+        }
+
     def _build_system_prompt(self) -> str:
-        """构建系统提示"""
-        return """你是地图管理员（World Map Manager），专门负责管理小说世界的地图和地点。
+        """构建系统提示（优先使用 prompts/**/*.md 资产）。"""
+        md_prompt = self._build_md_world_map_manager_fallback_prompt()
+        if md_prompt:
+            self._legacy_fallback_trace = self._world_map_manager_fallback_trace(
+                prompt_ids=["role_world_map_manager", "function_map_management"],
+            )
+            return md_prompt
 
-【核心职责】
-1. 地图管理：维护世界地图的结构和区域信息
-2. 位置追踪：追踪角色当前位置和移动路径
-3. 区域生成：在需要时生成新的地点和区域
+        logger.warning("WorldMapManager md prompt 资产不可用，使用 deprecated 最小硬编码默认系统提示")
+        self._legacy_fallback_trace = self._world_map_manager_fallback_trace(deprecated=True)
+        return """你是地图管理员。优先使用 Agent Template 绑定的 md prompt / skills / writing-rules；仅在未能加载配置资产时，将此最小提示作为 deprecated fallback。"""
 
-【地图层级】
-- 世界（World）：整个故事世界
-- 大陆/国家（Continent/Kingdom）：主要地理划分
-- 区域（Region）：具体的地点，如城市、森林、山脉等
-- 地点（Location）：区域内的具体位置，如酒馆、商店等
+    async def _ensure_system_prompt_loaded(self):
+        """加载 WorldMapManager Agent Template prompt，失败时回退到 md prompt 资产。"""
+        if self._system_prompt_loaded or not self._pending_system_prompt_load:
+            return
 
-【输出格式】
-管理地图时，输出 JSON 格式：
-```json
-{
-    "action": "create/update/query/move",
-    "region": {
-        "region_id": "region_xxx",
-        "region_name": "区域名称",
-        "region_type": "city/village/wilderness/dungeon/...",
-        "description": "区域描述",
-        "connections": ["相邻区域"],
-        "features": ["区域特征"]
-    },
-    "character_positions": {
-        "character_id": "position"
-    }
-}
-```
+        if not self.project_id or not self.AGENT_TYPE:
+            self._system_prompt_loaded = True
+            self._pending_system_prompt_load = False
+            return
 
-【工作原则】
-- 保持地图的一致性
-- 区域之间要有合理的连接
-- 地点描述要有画面感
-- 考虑地理位置对剧情的影响"""
+        try:
+            from app.services.agent_prompt_service import get_agent_prompt_service
+
+            service = get_agent_prompt_service()
+            prompt_data = await service.build_agent_prompt_with_trace(
+                agent_type=self.AGENT_TYPE.value,
+                project_id=self.project_id,
+                variables=self._get_default_variables(),
+                scenario=self.scenario,
+                context_query="地图管理 地点匹配 区域生成 空间连续性 章节场景",
+            )
+            prompt = prompt_data.get("content", "")
+            self._system_prompt_render_trace = prompt_data.get("trace", {}) or {}
+            if prompt.strip():
+                self.system_prompt = prompt.strip()
+        except Exception as e:
+            logger.warning(
+                "WorldMapManager 加载模板 prompt 失败: project=%s, scenario=%s, error=%s",
+                self.project_id,
+                self.scenario,
+                e,
+            )
+
+        if not self.system_prompt:
+            md_prompt = self._build_md_world_map_manager_fallback_prompt()
+            if md_prompt:
+                self.system_prompt = md_prompt
+                self._system_prompt_render_trace = self._world_map_manager_fallback_trace(
+                    prompt_ids=["role_world_map_manager", "function_map_management"],
+                )
+            else:
+                self.system_prompt = self._build_system_prompt()
+                self._system_prompt_render_trace = self._legacy_fallback_trace
+
+        self._system_prompt_loaded = True
+        self._pending_system_prompt_load = False
 
     async def execute(self, input_data: Dict[str, Any]) -> AgentResponse:
         """
@@ -146,6 +205,7 @@ class WorldMapManagerAgent(BaseAgent):
                         "current_location": self._current_location,
                         "region_count": len(existing_regions or self._regions),
                     },
+                    metadata=self._get_runtime_trace_metadata(),
                 )
 
             elif task == "match_or_generate":
@@ -207,7 +267,11 @@ class WorldMapManagerAgent(BaseAgent):
                 region_type = region.get("region_type") or ""
                 region_summaries.append(f"- {name}（{region_type}）：{description[:180]}")
 
-            prompt = f"""请判断现有地图区域是否适合当前章节大纲的发展。
+            map_instruction = self._load_md_prompt_content("function_map_management") or "请遵循地图管理原则，优先复用现有地点并维护空间连续性。"
+            prompt = f"""{map_instruction}
+
+【当前子任务】
+请判断现有地图区域是否适合当前章节大纲的发展。
 
 【当前章节大纲】
 {outline_text}
@@ -235,7 +299,11 @@ class WorldMapManagerAgent(BaseAgent):
                     category=UsageCategory.WORLD,
                 )
                 map_data = parsed.model_dump()
-                return AgentResponse(success=True, data={**map_data, "existing_region_count": len(existing_regions)})
+                return AgentResponse(
+                    success=True,
+                    data={**map_data, "existing_region_count": len(existing_regions)},
+                    metadata=self._get_runtime_trace_metadata(),
+                )
             except StructuredOutputError as e:
                 logger.error(f"地图匹配 structured 失败: {e}")
                 return AgentResponse(success=False, error=str(e))
@@ -257,6 +325,7 @@ class WorldMapManagerAgent(BaseAgent):
                 "direction": direction,
                 "new_location": f"location_{direction}",
             },
+            metadata=self._get_runtime_trace_metadata(),
         )
 
     async def _create_region(
@@ -274,6 +343,7 @@ class WorldMapManagerAgent(BaseAgent):
                 "action": "create",
                 "region": region_data,
             },
+            metadata=self._get_runtime_trace_metadata(),
         )
 
     async def _generate_map_overview(
@@ -296,7 +366,11 @@ class WorldMapManagerAgent(BaseAgent):
             elif isinstance(entry, str):
                 lore_titles.append(entry)
 
-        prompt = f"""请基于当前项目世界观生成地图/区域概述。
+        map_instruction = self._load_md_prompt_content("function_map_management") or "请遵循地图管理原则，生成与世界观和当前剧情匹配的区域概述。"
+        prompt = f"""{map_instruction}
+
+【当前子任务】
+请基于当前项目世界观生成地图/区域概述。
 
 【世界信息】
 - 名称：{world_name}
@@ -340,4 +414,5 @@ class WorldMapManagerAgent(BaseAgent):
         return AgentResponse(
             success=True,
             data=map_data,
+            metadata=self._get_runtime_trace_metadata(),
         )

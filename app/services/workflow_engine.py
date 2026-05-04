@@ -52,6 +52,7 @@ from app.services.trace_service import TraceService, get_trace_service
 from app.services.workflow_state import (
     CANONICAL_STATE_KEYS,
     PROTECTED_CONTEXT_KEYS,
+    RUNTIME_STATE_KEYS,
     get_workflow_state,
     is_protected_context_key,
 )
@@ -87,6 +88,7 @@ class WorkflowEngine:
         self._workflows: Dict[str, WorkflowDefinition] = {}
         # WebSocket 广播回调
         self._broadcast_callback: Optional[Callable] = None
+        self._broadcast_discussion_message: Optional[Callable] = None
         # 执行事件订阅者：execution_id -> queues
         self._event_subscribers: Dict[str, Set[asyncio.Queue]] = defaultdict(set)
         # Agent 实例获取回调
@@ -97,10 +99,116 @@ class WorkflowEngine:
         self._intervention_locks: Dict[str, asyncio.Lock] = {}
         # 输入完成事件：execution_id -> asyncio.Event
         self._input_events: Dict[str, asyncio.Event] = {}
+        self._workflow_config_prompt_traces: Dict[str, Dict[str, Any]] = {}
+
+    def _workflow_config_trace_key(
+        self,
+        agent_type: AgentType,
+        project_id: Optional[str],
+        scenario: str,
+    ) -> str:
+        return f"{project_id or 'global'}::{agent_type.value}::{scenario or 'default'}"
+
+    async def _build_workflow_node_prompt_trace(
+        self,
+        agent_type: str,
+        project_id: Optional[str],
+        scenario: Optional[str],
+        variables: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """解析工作流节点运行时 prompt trace，供 node output metadata 使用。"""
+        normalized_agent_type = (agent_type or "").strip() or "unknown"
+        resolved_scenario = scenario or "default"
+        if not project_id:
+            return {
+                "agent_type": normalized_agent_type,
+                "scenario": resolved_scenario,
+                "project_id": project_id,
+                "template_id": None,
+                "template_scenario": None,
+                "config_id": None,
+                "prompt_ids": [],
+                "skill_ids": [],
+                "skills": None,
+                "writing_rule_ids": [],
+                "writing_rules": None,
+                "context_blocks": [],
+                "fallbacks_used": [],
+                "deprecated_sources_used": [],
+            }
+
+        try:
+            from app.services.agent_prompt_service import get_agent_prompt_service
+
+            prompt_data = await get_agent_prompt_service().build_agent_prompt_with_trace(
+                agent_type=normalized_agent_type,
+                project_id=project_id,
+                variables=variables or {},
+                scenario=resolved_scenario,
+            )
+            return prompt_data.get("trace", {}) or {}
+        except Exception as e:
+            logger.warning(
+                "解析 workflow node prompt trace 失败: agent=%s, scenario=%s, error=%s",
+                normalized_agent_type,
+                resolved_scenario,
+                e,
+            )
+            return {
+                "agent_type": normalized_agent_type,
+                "scenario": resolved_scenario,
+                "project_id": project_id,
+                "template_id": None,
+                "template_scenario": None,
+                "config_id": None,
+                "prompt_ids": [],
+                "skill_ids": [],
+                "skills": None,
+                "writing_rule_ids": [],
+                "writing_rules": None,
+                "context_blocks": [],
+                "fallbacks_used": ["workflow_node_prompt_trace_unavailable"],
+                "deprecated_sources_used": [],
+            }
+
+    def _attach_prompt_render_trace_metadata(
+        self,
+        output: Any,
+        trace: Optional[Dict[str, Any]],
+        source: str = "agent_template_runtime",
+    ) -> Any:
+        """把 prompt render trace 附加到节点输出 metadata，不覆盖已有 trace。"""
+        if not isinstance(output, dict) or not trace:
+            return output
+
+        metadata = output.get("metadata") if isinstance(output.get("metadata"), dict) else {}
+        metadata.setdefault("prompt_render_trace", trace)
+        metadata.setdefault("config_prompt_source", source)
+        output["metadata"] = metadata
+        return output
 
     def set_broadcast_callback(self, callback: Callable):
         """设置 WebSocket 广播回调"""
         self._broadcast_callback = callback
+
+    def set_discussion_broadcast_callback(self, callback: Optional[Callable]):
+        """设置讨论/角色演绎消息广播回调。"""
+        self._broadcast_discussion_message = callback
+
+    async def _broadcast_discussion_message_event(
+        self,
+        execution_id: str,
+        message: Dict[str, Any],
+        **flags: Any,
+    ) -> None:
+        """广播讨论/角色演绎消息，未注册专用回调时降级为普通 workflow event。"""
+        if self._broadcast_discussion_message:
+            await self._broadcast_discussion_message(execution_id, message, **flags)
+            return
+        payload = {"message": message}
+        if flags:
+            payload.update(flags)
+        await self._broadcast_status(execution_id, "discussion_message", payload)
 
     def subscribe_execution_events(
         self,
@@ -811,16 +919,16 @@ class WorkflowEngine:
             retrieved_updates: Dict[str, Any] = {}
             blocked_updates: Dict[str, Any] = {}
             for key, value in pred_output.items():
+                if key in {"fixed_lore_entries", "dynamic_lore_entries", "selected_lore_entries"} or key in RUNTIME_STATE_KEYS:
+                    retrieved_updates[key] = value
+                    merged_context[key] = value
+                    continue
                 if is_protected_context_key(key):
-                    if key in {"fixed_lore_entries", "dynamic_lore_entries", "selected_lore_entries"}:
-                        retrieved_updates[key] = value
-                        merged_context[key] = value
-                    else:
-                        blocked_updates[key] = {
-                            "existing": merged_context.get(key),
-                            "attempted": value,
-                            "reason": "protected_predecessor_output",
-                        }
+                    blocked_updates[key] = {
+                        "existing": merged_context.get(key),
+                        "attempted": value,
+                        "reason": "protected_predecessor_output",
+                    }
                     continue
                 allowed_updates[key] = value
                 merged_context[key] = value
@@ -1795,10 +1903,32 @@ class WorkflowEngine:
                     "required": input_config.required,
                 }
 
+            runtime_snapshot_keys = [
+                "scene_performance_context",
+                "role_performance_context",
+                "character_performance_packets",
+                "public_performances",
+                "private_performances",
+                "relationship_deltas",
+                "state_deltas",
+                "continuity_notes",
+                "performance_warnings",
+                "role_performance_gate",
+                "role_performance_gate_passed",
+                "role_performance_gate_blockers",
+                "role_performance_gate_warnings",
+            ]
+            for key in runtime_snapshot_keys:
+                if source_context.get(key) is not None and key not in snapshot:
+                    snapshot[key] = source_context.get(key)
+
             if sources:
                 snapshot["_input_trace"] = {
                     "configured_inputs": list(sources.keys()),
                     "sources": sources,
+                    "included_runtime_context": [
+                        key for key in runtime_snapshot_keys if key in snapshot
+                    ],
                 }
             return self._make_json_safe(snapshot)
 
@@ -1828,6 +1958,7 @@ class WorkflowEngine:
             "asset_state",
             "state_transitions",
             "context_propagation_trace",
+            "scene_performance_context",
             "role_performance_context",
             "public_performances",
             "private_performances",
@@ -2034,13 +2165,15 @@ class WorkflowEngine:
                         normalized[contract.text_field] = alias_value
                         break
 
-        if contract.contract_id == "writer.workflow_output" and "metadata" not in normalized:
-            metadata = {}
+        if response and response.metadata:
+            metadata = normalized.get("metadata") if isinstance(normalized.get("metadata"), dict) else {}
+            normalized["metadata"] = {**response.metadata, **metadata}
+
+        if contract.contract_id == "writer.workflow_output":
+            metadata = normalized.get("metadata") if isinstance(normalized.get("metadata"), dict) else {}
             for field_name in ("word_count", "style_check", "hooks_embedded", "future_setup"):
                 if field_name in normalized:
                     metadata[field_name] = normalized[field_name]
-            if response and response.metadata:
-                metadata = {**response.metadata, **metadata}
             if metadata:
                 normalized["metadata"] = metadata
 
@@ -2730,6 +2863,12 @@ class WorkflowEngine:
                     output,
                     response=agent_response,
                 )
+                if agent_response and agent_response.metadata:
+                    output = self._attach_prompt_render_trace_metadata(
+                        output,
+                        agent_response.metadata.get("prompt_render_trace"),
+                        agent_response.metadata.get("config_prompt_source", "agent_template_runtime"),
+                    )
 
             elif node.node_type == NodeType.CONDITION:
                 # 条件节点：评估条件
@@ -3392,8 +3531,8 @@ class WorkflowEngine:
                     context[key] = value
 
         if resolved_scenario:
-            context.setdefault("scenario", resolved_scenario)
-            context.setdefault("agent_scenario", resolved_scenario)
+            context["scenario"] = resolved_scenario
+            context["agent_scenario"] = resolved_scenario
 
         if resolved_agent_type == "writer":
             canonical_target = (
@@ -3463,7 +3602,14 @@ class WorkflowEngine:
         if adapter:
             execution.context.update(context)
             logger.info(f"节点 '{node.label}' 使用 workflow adapter 执行: {resolved_agent_type}")
+            prompt_trace = await self._build_workflow_node_prompt_trace(
+                resolved_agent_type,
+                project_id,
+                resolved_scenario,
+                context,
+            )
             adapter_output = await adapter.execute(node, execution, db)
+            adapter_output = self._attach_prompt_render_trace_metadata(adapter_output, prompt_trace)
             return adapter_output, None, None
 
         if not self._agent_provider:
@@ -4191,10 +4337,12 @@ class WorkflowEngine:
                     public_content = data.get("public_content") or " ".join(part for part in [f"（{action}）" if action else "", dialogue] if part)
                     private_thought = data.get("private_thought") or data.get("inner_thought", "")
 
+                    performance_packet = self._build_character_performance_packet(data, source_character=character_name)
                     aggregated_outputs.append({
                         "character": character_name,
                         "agent_id": getattr(sub_agent, 'agent_id', None),
                         "success": True,
+                        "character_performance_packet": performance_packet,
                         **data,
                     })
 
@@ -4284,6 +4432,12 @@ class WorkflowEngine:
                         logger.warning(f"保存多 Agent 子实例记忆失败: {sub_agent_name}, error={e}")
 
             role_context_source = {
+                "public_performances": aggregated_dialogues,
+                "character_performance_packets": [
+                    item.get("character_performance_packet")
+                    for item in aggregated_outputs
+                    if isinstance(item, dict) and isinstance(item.get("character_performance_packet"), dict)
+                ],
                 "private_performances": execution.context.get("private_performances", []),
                 "relationship_deltas": execution.context.get("relationship_deltas", []),
                 "state_deltas": execution.context.get("state_deltas", []),
@@ -4396,6 +4550,17 @@ class WorkflowEngine:
                 resolved_contract = self._resolve_node_output_contract(node, result)
             except Exception as e:
                 logger.warning(f"解析 Agent 输出契约失败: node={node.id}, error={e}")
+
+        result.metadata = result.metadata or {}
+        if "prompt_render_trace" not in result.metadata:
+            prompt_trace = await self._build_workflow_node_prompt_trace(
+                node.agent_type,
+                execution.project_id,
+                context.get("agent_scenario") or context.get("scenario"),
+                context,
+            )
+            result.metadata["prompt_render_trace"] = prompt_trace
+            result.metadata.setdefault("config_prompt_source", "agent_template_runtime")
 
         # 日志记录流式输出统计
         if chunk_count > 0:
@@ -6164,6 +6329,82 @@ class WorkflowEngine:
             "previous_node_output": previous_node_output,
         }
 
+    def _build_character_performance_packet(
+        self,
+        performance: Dict[str, Any],
+        *,
+        source_character: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """统一角色表演包结构，兼容旧字段并显式标记公开/私有边界。"""
+        character = source_character or performance.get("character") or performance.get("agent") or performance.get("source_character") or "未知角色"
+        public_content = performance.get("public_content") or performance.get("content") or ""
+        dialogue = performance.get("dialogue") or ""
+        action = performance.get("action") or ""
+        private_thought = performance.get("private_thought") or performance.get("inner_thought") or ""
+
+        packet = {
+            "character": character,
+            "public_content": public_content,
+            "dialogue": dialogue,
+            "action": action,
+            "private_thought": private_thought,
+            "emotion": performance.get("emotion") or performance.get("mood") or "",
+            "intent": performance.get("intent") or "",
+            "perceived_facts": self._ensure_context_list(performance.get("perceived_facts")),
+            "misinterpretations": self._ensure_context_list(performance.get("misinterpretations")),
+            "withheld_information": self._ensure_context_list(performance.get("withheld_information")),
+            "relationship_delta": self._ensure_context_list(performance.get("relationship_delta")),
+            "state_delta": self._ensure_context_list(performance.get("state_delta")),
+            "continuity_notes": self._ensure_context_list(performance.get("continuity_notes")),
+            "warnings": self._ensure_context_list(performance.get("warnings")),
+            "visibility": {
+                "public_fields": ["public_content", "dialogue", "action", "emotion"],
+                "writer_only_fields": [
+                    "private_thought",
+                    "intent",
+                    "perceived_facts",
+                    "misinterpretations",
+                    "withheld_information",
+                    "relationship_delta",
+                    "state_delta",
+                    "continuity_notes",
+                    "warnings",
+                ],
+            },
+        }
+        if performance.get("round") is not None:
+            packet["round"] = performance.get("round")
+        return packet
+
+    def _build_scene_performance_context(self, role_context: Dict[str, Any]) -> Dict[str, Any]:
+        """构建 Writer/Evaluator 可消费的分层场景演绎上下文。"""
+        public_performances = self._ensure_context_list(role_context.get("public_performances"))
+        packets = self._ensure_context_list(role_context.get("character_performance_packets"))
+        if not packets:
+            packets = [
+                self._build_character_performance_packet(item)
+                for item in public_performances
+                if isinstance(item, dict)
+            ]
+
+        return {
+            "public_performances": public_performances,
+            "character_performance_packets": packets,
+            "private_performances": self._ensure_context_list(role_context.get("private_performances")),
+            "relationship_deltas": self._ensure_context_list(role_context.get("relationship_deltas")),
+            "state_deltas": self._ensure_context_list(role_context.get("state_deltas")),
+            "continuity_notes": self._ensure_context_list(role_context.get("continuity_notes")),
+            "performance_warnings": self._ensure_context_list(role_context.get("performance_warnings")),
+            "role_performance_gate": role_context.get("role_performance_gate") or {},
+            "role_performance_gate_passed": role_context.get("role_performance_gate_passed", True),
+            "role_performance_gate_blockers": self._ensure_context_list(role_context.get("role_performance_gate_blockers")),
+            "role_performance_gate_warnings": self._ensure_context_list(role_context.get("role_performance_gate_warnings")),
+            "last_performance_content": role_context.get("last_performance_content", ""),
+            "last_performance_summary": role_context.get("last_performance_summary", ""),
+            "last_scene_directions": role_context.get("last_scene_directions", {}),
+            "visibility_policy": "public_performances 可进入其他角色上下文；private_performances、relationship/state delta 和 continuity 仅供 Writer/Evaluator/Summarizer 使用。",
+        }
+
     def _extract_role_performance_context(
         self,
         performance_result: Any,
@@ -6181,6 +6422,8 @@ class WorkflowEngine:
             "state_deltas",
             "continuity_notes",
             "performance_warnings",
+            "character_performance_packets",
+            "scene_performance_context",
             "role_performance_gate",
             "role_performance_gate_passed",
             "role_performance_gate_blockers",
@@ -6196,6 +6439,14 @@ class WorkflowEngine:
             extracted["last_performance_summary"] = result.get("summary")
         if result.get("scene_directions"):
             extracted["last_scene_directions"] = result.get("scene_directions")
+
+        if extracted and "scene_performance_context" not in extracted:
+            extracted["scene_performance_context"] = self._build_scene_performance_context(extracted)
+        elif extracted.get("scene_performance_context") and "character_performance_packets" not in extracted:
+            scene_context = self._ensure_context_dict(extracted.get("scene_performance_context"))
+            packets = self._ensure_context_list(scene_context.get("character_performance_packets"))
+            if packets:
+                extracted["character_performance_packets"] = packets
 
         return extracted
 
@@ -6479,7 +6730,6 @@ class WorkflowEngine:
                     })
 
                 scene_coordinator._stream_callback = stream_callback
-
             iteration_count = node_config.get("iteration_count", default_iteration_count)
             plot_intents = execution.context.get("intents", [])
             chapter_word_count = execution.context.get("target_word_count", 2000)
@@ -6525,7 +6775,7 @@ class WorkflowEngine:
             performance_messages = list(performance_result.get("performances", []))
 
             for msg in performance_messages:
-                await self._broadcast_discussion_message(execution.id, msg)
+                await self._broadcast_discussion_message_event(execution.id, msg)
                 await asyncio.sleep(0.2)
 
             performance_result.update({
@@ -6562,7 +6812,7 @@ class WorkflowEngine:
                 )
                 if summary:
                     performance_messages.append(summary)
-                    await self._broadcast_discussion_message(execution.id, summary)
+                    await self._broadcast_discussion_message_event(execution.id, summary)
 
             performance_summary = self._extract_discussion_summary_text(performance_result)
             performance_result.setdefault("summary", performance_summary)
@@ -6602,6 +6852,8 @@ class WorkflowEngine:
                 "state_deltas": performance_result.get("state_deltas", []),
                 "continuity_notes": performance_result.get("continuity_notes", []),
                 "performance_warnings": performance_result.get("performance_warnings", []),
+                "character_performance_packets": performance_result.get("character_performance_packets", []),
+                "scene_performance_context": performance_result.get("scene_performance_context") or execution.context.get("scene_performance_context", {}),
                 "role_performance_gate": performance_result.get("role_performance_gate", {}),
                 "role_performance_gate_passed": performance_result.get("role_performance_gate_passed", False),
                 "role_performance_gate_blockers": performance_result.get("role_performance_gate_blockers", []),
@@ -8241,7 +8493,7 @@ class WorkflowEngine:
                 )
                 if opening_message:
                     discussion_messages.append(opening_message)
-                    await self._broadcast_discussion_message(execution.id, opening_message, is_leader_action=True)
+                    await self._broadcast_discussion_message_event(execution.id, opening_message, is_leader_action=True)
 
             # 广播讨论开始
             await self._broadcast_status(execution.id, "group_discussion_started", {
@@ -8280,7 +8532,7 @@ class WorkflowEngine:
                         )
                         if message:
                             discussion_messages.append(message)
-                            await self._broadcast_discussion_message(execution.id, message, broadcast_to_all=True)
+                            await self._broadcast_discussion_message_event(execution.id, message, broadcast_to_all=True)
 
             # ========== 第三步：领头人汇总，请求用户确认 ==========
             if leader_agent and discussion_messages:
@@ -8289,7 +8541,7 @@ class WorkflowEngine:
                 )
                 if summary_request:
                     discussion_messages.append(summary_request)
-                    await self._broadcast_discussion_message(execution.id, summary_request, is_leader_action=True)
+                    await self._broadcast_discussion_message_event(execution.id, summary_request, is_leader_action=True)
 
             # ========== 第四步：存储讨论结果 ==========
             full_content = "\n".join([
@@ -8484,6 +8736,106 @@ class WorkflowEngine:
                 text = str(value)
         return f"【{title}】\n{text}"
 
+    def _workflow_md_prompt_id(self, scenario: str) -> Optional[str]:
+        """将工作流场景映射到 prompts/**/*.md 资产。"""
+        return {
+            "workflow_discussion_opening": "function_workflow_discussion_opening",
+            "workflow_discussion_summary": "function_workflow_discussion_summary",
+            "workflow_agent_opinion": "function_workflow_agent_opinion",
+            "workflow_scene_direction": "function_workflow_scene_direction",
+            "workflow_character_performance": "function_workflow_character_performance",
+            "workflow_performance_summary": "function_workflow_performance_summary",
+        }.get(scenario or "")
+
+    def _load_workflow_md_prompt_content(self, prompt_id: str) -> str:
+        """加载工作流 md prompt 资产，供 Agent Template 不可用时短期兜底。"""
+        try:
+            from app.services.md_file_service import get_md_file_service
+
+            md_service = get_md_file_service()
+            prompt = md_service.get_prompt(prompt_id)
+            if prompt:
+                content = prompt.get("content") or prompt.get("raw_content") or ""
+                if content:
+                    return content.strip()
+        except Exception as e:
+            logger.warning("加载工作流 md prompt 失败: prompt_id=%s, error=%s", prompt_id, e)
+        return ""
+
+    def _build_workflow_md_prompt_fallback_with_trace(
+        self,
+        agent_type: AgentType,
+        project_id: Optional[str],
+        scenario: str,
+    ) -> Dict[str, Any]:
+        """构建工作流辅助 prompt 的 md fallback trace。"""
+        prompt_id = self._workflow_md_prompt_id(scenario)
+        content = self._load_workflow_md_prompt_content(prompt_id) if prompt_id else ""
+        fallback_used = "workflow_md_prompt_fallback" if content else "workflow_agent_template_fallback"
+        trace = {
+            "agent_type": agent_type.value,
+            "scenario": scenario or "default",
+            "project_id": project_id,
+            "template_id": None,
+            "template_scenario": None,
+            "config_id": None,
+            "prompt_ids": [prompt_id] if content and prompt_id else [],
+            "skill_ids": [],
+            "skills": None,
+            "writing_rule_ids": [],
+            "writing_rules": None,
+            "context_blocks": [],
+            "fallbacks_used": [fallback_used],
+            "deprecated_sources_used": [] if content else ["WorkflowEngine._build_workflow_config_prompt"],
+        }
+        return {
+            "content": content,
+            "trace": trace,
+            "source": "md_prompt_fallback" if content else "missing",
+        }
+
+    async def _build_workflow_config_prompt_with_trace(
+        self,
+        agent_type: AgentType,
+        project_id: Optional[str],
+        scenario: str,
+        variables: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """通过 Agent Template 构建工作流辅助 prompt，并返回 trace。"""
+        if not project_id:
+            return self._build_workflow_md_prompt_fallback_with_trace(agent_type, project_id, scenario)
+        try:
+            from app.services.agent_prompt_service import get_agent_prompt_service
+
+            service = get_agent_prompt_service()
+            prompt_data = await service.build_agent_prompt_with_trace(
+                agent_type=agent_type.value,
+                project_id=project_id,
+                variables=variables or {},
+                scenario=scenario,
+            )
+            prompt = prompt_data.get("content", "")
+            if not prompt:
+                fallback_data = self._build_workflow_md_prompt_fallback_with_trace(agent_type, project_id, scenario)
+                cache_key = self._workflow_config_trace_key(agent_type, project_id, scenario)
+                self._workflow_config_prompt_traces[cache_key] = fallback_data["trace"]
+                return fallback_data
+            trace = prompt_data.get("trace", {}) or {}
+            cache_key = self._workflow_config_trace_key(agent_type, project_id, scenario)
+            self._workflow_config_prompt_traces[cache_key] = trace
+            return {"content": prompt, "trace": trace, "source": "agent_template_runtime"}
+        except Exception as e:
+            logger.warning(
+                "加载工作流 Agent Template prompt 失败: agent=%s, scenario=%s, error=%s",
+                agent_type.value,
+                scenario,
+                e,
+            )
+            fallback_data = self._build_workflow_md_prompt_fallback_with_trace(agent_type, project_id, scenario)
+            cache_key = self._workflow_config_trace_key(agent_type, project_id, scenario)
+            self._workflow_config_prompt_traces[cache_key] = fallback_data["trace"]
+            return fallback_data
+
     async def _build_workflow_config_prompt(
         self,
         agent_type: AgentType,
@@ -8492,26 +8844,13 @@ class WorkflowEngine:
         variables: Optional[Dict[str, Any]] = None,
     ) -> str:
         """通过 Agent Template 构建工作流辅助 prompt。"""
-        if not project_id:
-            return ""
-        try:
-            from app.services.agent_prompt_service import get_agent_prompt_service
-
-            service = get_agent_prompt_service()
-            return await service.build_agent_prompt(
-                agent_type=agent_type.value,
-                project_id=project_id,
-                variables=variables or {},
-                scenario=scenario,
-            )
-        except Exception as e:
-            logger.warning(
-                "加载工作流 Agent Template prompt 失败: agent=%s, scenario=%s, error=%s",
-                agent_type.value,
-                scenario,
-                e,
-            )
-            return ""
+        prompt_data = await self._build_workflow_config_prompt_with_trace(
+            agent_type,
+            project_id,
+            scenario,
+            variables,
+        )
+        return prompt_data.get("content", "")
 
     async def _generate_leader_opening(
         self,
@@ -8529,12 +8868,15 @@ class WorkflowEngine:
             participant_names = [p["name"] for p in participants if not p.get("is_leader")]
             context = context or {}
             constraint_text = self._format_agent_constraint_context(context)
-            config_prompt = await self._build_workflow_config_prompt(
+            config_prompt_data = await self._build_workflow_config_prompt_with_trace(
                 AgentType.MASTER_PLOTTER,
                 context.get("project_id"),
                 "workflow_discussion_opening",
                 {"scenario": "workflow_discussion_opening", "chapter_title": chapter_title},
             )
+            config_prompt = config_prompt_data.get("content", "")
+            prompt_render_trace = config_prompt_data.get("trace", {}) or {}
+            config_prompt_source = config_prompt_data.get("source", "missing")
             sections = [
                 self._format_workflow_prompt_block("Master Plotter 配置规则", config_prompt),
                 self._format_workflow_prompt_block("参会人员", ", ".join(participant_names) or "暂无"),
@@ -8544,7 +8886,6 @@ class WorkflowEngine:
                 self._format_workflow_prompt_block("剧情大纲", plot_outline or "暂无"),
                 self._format_workflow_prompt_block("评估结果", {"score": evaluation_result.get("score", "N/A"), "summary": evaluation_result.get("summary", "")}),
                 self._format_workflow_prompt_block("工作流角色/设定约束", constraint_text or "当前未形成额外角色出场约束。"),
-                "【当前任务】\n请输出开场发言，宣布讨论开始，说明本次讨论目标和重点，并邀请各位发言。直接输出内容，不要 JSON，不要格式标记。",
             ]
             prompt = "\n\n".join(section for section in sections if section)
 
@@ -8558,7 +8899,8 @@ class WorkflowEngine:
                     "is_llm_generated": True,
                     "is_leader_action": True,
                     "action": "open_session",
-                    "config_prompt_source": "agent_template_runtime" if config_prompt else "missing",
+                    "config_prompt_source": config_prompt_source,
+                    "prompt_render_trace": prompt_render_trace,
                 }
         except Exception as e:
             logger.error(f"领头人开场生成失败: {e}")
@@ -8570,6 +8912,8 @@ class WorkflowEngine:
             "is_llm_generated": False,
             "is_leader_action": True,
             "action": "open_session",
+            "config_prompt_source": "missing",
+            "prompt_render_trace": None,
         }
 
     async def _generate_leader_summary_request(
@@ -8588,17 +8932,19 @@ class WorkflowEngine:
                 content = msg.get("content", "")
                 messages_summary.append(f"【{agent_name}】{content}")
 
-            config_prompt = await self._build_workflow_config_prompt(
+            config_prompt_data = await self._build_workflow_config_prompt_with_trace(
                 AgentType.MASTER_PLOTTER,
                 context.get("project_id"),
                 "workflow_discussion_summary",
                 {"scenario": "workflow_discussion_summary", "chapter_title": chapter_title},
             )
+            config_prompt = config_prompt_data.get("content", "")
+            prompt_render_trace = config_prompt_data.get("trace", {}) or {}
+            config_prompt_source = config_prompt_data.get("source", "missing")
             sections = [
                 self._format_workflow_prompt_block("Master Plotter 配置规则", config_prompt),
                 self._format_workflow_prompt_block("讨论记录", "\n".join(messages_summary)),
                 self._format_workflow_prompt_block("工作流角色/设定约束", self._format_agent_constraint_context(context)),
-                "【当前任务】\n请汇总讨论结果、提出后续创作建议、输出 discussion_assets JSON 代码块，并明确询问用户是否同意。",
             ]
             prompt = "\n\n".join(section for section in sections if section)
 
@@ -8612,7 +8958,8 @@ class WorkflowEngine:
                     "is_llm_generated": True,
                     "is_leader_action": True,
                     "action": "request_confirmation",
-                    "config_prompt_source": "agent_template_runtime" if config_prompt else "missing",
+                    "config_prompt_source": config_prompt_source,
+                    "prompt_render_trace": prompt_render_trace,
                 }
         except Exception as e:
             logger.error(f"领头人汇总生成失败: {e}")
@@ -8719,7 +9066,7 @@ class WorkflowEngine:
                 content_preview = m.get('content', '')
                 previous_discussion.append(f"【{speaker}】\n{content_preview}")
 
-            config_prompt = await self._build_workflow_config_prompt(
+            config_prompt_data = await self._build_workflow_config_prompt_with_trace(
                 mapped_agent_type,
                 context.get("project_id"),
                 "workflow_agent_opinion",
@@ -8729,6 +9076,9 @@ class WorkflowEngine:
                     "agent_type": agent_type,
                 },
             )
+            config_prompt = config_prompt_data.get("content", "")
+            prompt_render_trace = config_prompt_data.get("trace", {}) or {}
+            config_prompt_source = config_prompt_data.get("source", "missing")
             sections = [
                 self._format_workflow_prompt_block("Agent 配置规则", config_prompt),
                 self._format_workflow_prompt_block("当前发言身份", AGENT_NAME_MAP.get(agent_type, agent_type)),
@@ -8744,7 +9094,6 @@ class WorkflowEngine:
                 self._format_workflow_prompt_block("当前伏笔状态", context.get('existing_hooks', [])),
                 self._format_workflow_prompt_block("工作流角色/设定约束", self._format_agent_constraint_context(context)),
                 self._format_workflow_prompt_block("之前的讨论要点", "\n".join(previous_discussion)),
-                "【当前任务】\n请结合当前章节内容、评估结果、工作流约束和前序讨论，从你的专业职责出发给出具体分析、问题、改进建议、风险预警和后续创作建议。",
             ]
             prompt = "\n\n".join(section for section in sections if section)
 
@@ -8756,7 +9105,8 @@ class WorkflowEngine:
                     "type": agent_type,
                     "content": content,
                     "is_llm_generated": True,
-                    "config_prompt_source": "agent_template_runtime" if config_prompt else "missing",
+                    "config_prompt_source": config_prompt_source,
+                    "prompt_render_trace": prompt_render_trace,
                 }
         except Exception as e:
             logger.error(f"{agent_type} 意见生成失败: {e}")
@@ -8766,6 +9116,8 @@ class WorkflowEngine:
             "type": agent_type,
             "content": f"【{AGENT_NAME_MAP.get(agent_type, agent_type)}观点】从我的专业角度，本章表现符合预期，建议继续保持。",
             "is_llm_generated": False,
+            "config_prompt_source": "missing",
+            "prompt_render_trace": None,
         }
 
     def _get_agent_role_description(self, agent_type: str) -> str:
@@ -8809,12 +9161,15 @@ class WorkflowEngine:
                         f"{'，主角' if is_protag else ''}{'，反派' if is_antag else ''}）"
                     )
 
-            config_prompt = await self._build_workflow_config_prompt(
+            config_prompt_data = await self._build_workflow_config_prompt_with_trace(
                 AgentType.MASTER_PLOTTER,
                 context.get("project_id"),
                 "workflow_scene_direction",
                 {"scenario": "workflow_scene_direction"},
             )
+            config_prompt = config_prompt_data.get("content", "")
+            prompt_render_trace = config_prompt_data.get("trace", {}) or {}
+            config_prompt_source = config_prompt_data.get("source", "missing")
             sections = [
                 self._format_workflow_prompt_block("Master Plotter 配置规则", config_prompt),
                 self._format_workflow_prompt_block("世界观设定", {
@@ -8828,7 +9183,6 @@ class WorkflowEngine:
                 self._format_workflow_prompt_block("参与角色（含重要性层级）", "\n".join(char_info) or "暂无"),
                 self._format_workflow_prompt_block("剧情大纲（最近）", plot_outline or '暂无'),
                 self._format_workflow_prompt_block("工作流角色/设定约束", self._format_agent_constraint_context(context)),
-                "【当前任务】\n请生成后续角色演绎所需的场景设定、角色分工和信息边界。只输出符合配置规则的 JSON。",
             ]
             prompt = "\n\n".join(section for section in sections if section)
 
@@ -8838,6 +9192,9 @@ class WorkflowEngine:
             json_str = json_match.group(1) if json_match else content
 
             result = json.loads(json_str)
+            if isinstance(result, dict):
+                result["config_prompt_source"] = "agent_template_runtime" if config_prompt else "missing"
+                result["prompt_render_trace"] = prompt_render_trace
             logger.info(f"编剧生成场景方向: {result.get('scene_type')} - {result.get('main_scene')}")
             return result
 
@@ -8882,7 +9239,7 @@ class WorkflowEngine:
                     content = h.get("content", "")
                     history_lines.append(f"{speaker}: {content}")
 
-            config_prompt = await self._build_workflow_config_prompt(
+            config_prompt_data = await self._build_workflow_config_prompt_with_trace(
                 AgentType.CHARACTER,
                 char_data.get("project_id") or world_info.get("project_id"),
                 "workflow_character_performance",
@@ -8893,6 +9250,9 @@ class WorkflowEngine:
                     "character_goals": char_data.get("goals", ""),
                 },
             )
+            config_prompt = config_prompt_data.get("content", "")
+            prompt_render_trace = config_prompt_data.get("trace", {}) or {}
+            config_prompt_source = config_prompt_data.get("source", "missing")
             sections = [
                 self._format_workflow_prompt_block("Character 配置规则", config_prompt),
                 self._format_workflow_prompt_block("当前扮演角色", char_name),
@@ -8918,7 +9278,6 @@ class WorkflowEngine:
                     "hidden_motivation": char_role.get('secret_motivation') or char_role.get('hidden_motivation') or '',
                 }),
                 self._format_workflow_prompt_block("当前场景中你能听到/看到的对话", "\n".join(history_lines)),
-                "【当前任务】\n请用第一人称输出角色表演内容，包含动作描写、对话、心理活动或感知。直接输出正文，不要 JSON，不要格式标记或解释。",
             ]
             prompt = "\n\n".join(section for section in sections if section)
 
@@ -8933,7 +9292,8 @@ class WorkflowEngine:
                 "total_characters": total_characters,
                 "character_tier": importance_tier,
                 "character_type": character_type,
-                "config_prompt_source": "agent_template_runtime" if config_prompt else "missing",
+                "config_prompt_source": config_prompt_source,
+                "prompt_render_trace": prompt_render_trace,
             }
 
         except Exception as e:
@@ -8943,6 +9303,8 @@ class WorkflowEngine:
                 "type": "character_performance",
                 "content": "（角色表演生成失败，跳过）",
                 "is_llm_generated": False,
+                "config_prompt_source": "missing",
+                "prompt_render_trace": None,
             }
 
 
@@ -9163,12 +9525,15 @@ class WorkflowEngine:
                 "role_performance_gate_blockers": (role_performance_gate or {}).get("blockers", []),
                 "role_performance_gate_warnings": (role_performance_gate or {}).get("warnings", []),
             }
-            config_prompt = await self._build_workflow_config_prompt(
+            config_prompt_data = await self._build_workflow_config_prompt_with_trace(
                 AgentType.SUMMARIZER,
                 project_id,
                 "workflow_performance_summary",
                 summary_variables,
             )
+            config_prompt = config_prompt_data.get("content", "")
+            prompt_render_trace = config_prompt_data.get("trace", {}) or {}
+            config_prompt_source = config_prompt_data.get("source", "missing")
             sections = [
                 self._format_workflow_prompt_block("Summarizer 配置规则", config_prompt),
                 self._format_workflow_prompt_block("场景设定", {
@@ -9188,7 +9553,6 @@ class WorkflowEngine:
                     "role_performance_gate_blockers": summary_variables["role_performance_gate_blockers"],
                     "role_performance_gate_warnings": summary_variables["role_performance_gate_warnings"],
                 }),
-                "【当前任务】\n请对角色演绎进行详细总结，只输出符合配置规则的 JSON。",
             ]
             prompt = "\n\n".join(section for section in sections if section)
 
@@ -9205,7 +9569,8 @@ class WorkflowEngine:
                     "content": result.get("summary", content),
                     "data": result,
                     "is_llm_generated": True,
-                    "config_prompt_source": "agent_template_runtime" if config_prompt else "missing",
+                    "config_prompt_source": config_prompt_source,
+                    "prompt_render_trace": prompt_render_trace,
                 }
             except json.JSONDecodeError:
                 return {
@@ -9213,7 +9578,8 @@ class WorkflowEngine:
                     "type": "performance_summary",
                     "content": content,
                     "is_llm_generated": True,
-                    "config_prompt_source": "agent_template_runtime" if config_prompt else "missing",
+                    "config_prompt_source": config_prompt_source,
+                    "prompt_render_trace": prompt_render_trace,
                 }
 
         except Exception as e:
@@ -9223,6 +9589,8 @@ class WorkflowEngine:
                 "type": "performance_summary",
                 "content": "角色演绎已完成，各角色展现了精彩的表现。",
                 "is_llm_generated": False,
+                "config_prompt_source": "missing",
+                "prompt_render_trace": None,
             }
 
 
@@ -9842,7 +10210,7 @@ class WorkflowEngine:
                 leader_agent, chapter_title, approved, feedback
             )
             if closing_message:
-                await self._broadcast_discussion_message(execution_id, closing_message, is_leader_action=True)
+                await self._broadcast_discussion_message_event(execution_id, closing_message, is_leader_action=True)
 
         # 广播讨论结束
         await self._broadcast_status(execution_id, "group_discussion_ended", {

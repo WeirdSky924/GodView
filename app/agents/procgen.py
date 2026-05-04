@@ -37,9 +37,11 @@ class ProcGenAgent(BaseAgent):
         self.world = world
         self.AGENT_TYPE = agent_type or self.__class__.AGENT_TYPE
 
-        # 如果没有提供 system_prompt 且没有 project_id，使用默认的构建方式（向后兼容）
+        legacy_trace = None
+        # 如果没有提供 system_prompt 且没有 project_id，使用 md prompt 资产 fallback（向后兼容）
         if not system_prompt and not project_id:
             system_prompt = self._build_system_prompt()
+            legacy_trace = getattr(self, "_legacy_fallback_trace", None)
 
         super().__init__(
             name="ProcGenAgent",
@@ -49,6 +51,8 @@ class ProcGenAgent(BaseAgent):
             project_id=project_id,
             agent_id=agent_id,
         )
+        if legacy_trace and not self.get_system_prompt_render_trace():
+            self._system_prompt_render_trace = legacy_trace
 
     def _get_default_variables(self) -> Dict[str, Any]:
         """获取默认变量（ProcGen 特定）"""
@@ -59,32 +63,121 @@ class ProcGenAgent(BaseAgent):
             "world_type": self.world.world_type,
         }
 
+    def _load_md_prompt_content(self, prompt_id: str) -> str:
+        try:
+            from app.services.md_file_service import get_md_file_service
+
+            md_service = get_md_file_service()
+            prompt = md_service.get_prompt(prompt_id)
+            if prompt:
+                content = prompt.get("content") or prompt.get("raw_content") or ""
+                if content:
+                    return content.strip()
+        except Exception as e:
+            logger.warning("加载 ProcGen md prompt 失败: prompt_id=%s, error=%s", prompt_id, e)
+        return ""
+
+    def _build_md_procgen_fallback_prompt(self) -> str:
+        prompt_ids = ["role_proc_gen"]
+        parts = [content for prompt_id in prompt_ids if (content := self._load_md_prompt_content(prompt_id))]
+        return "\n\n".join(parts).strip()
+
+    def _procgen_fallback_trace(self, *, deprecated: bool = False, prompt_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+        agent_type = self.AGENT_TYPE.value if hasattr(self.AGENT_TYPE, "value") else str(self.AGENT_TYPE)
+        return {
+            "agent_type": agent_type,
+            "scenario": getattr(self, "scenario", None) or self.DEFAULT_SCENARIO,
+            "project_id": getattr(self, "project_id", None),
+            "template_id": None,
+            "template_scenario": None,
+            "config_id": None,
+            "prompt_ids": prompt_ids or [],
+            "skill_ids": [],
+            "writing_rule_ids": [],
+            "context_blocks": [],
+            "fallbacks_used": ["proc_gen_deprecated_minimal_system_prompt" if deprecated else "proc_gen_md_prompt_fallback"],
+            "deprecated_sources_used": ["ProcGenAgent._build_system_prompt"] if deprecated else [],
+        }
+
     def _build_system_prompt(self) -> str:
-        """构建系统提示"""
-        prompt = f"""你是造物主助理，负责根据世界观规则程序化生成新的区域和内容。
+        """构建系统提示（优先使用 prompts/**/*.md 资产）。"""
+        md_prompt = self._build_md_procgen_fallback_prompt()
+        world_block = "\n".join(
+            [
+                "【当前世界变量】",
+                f"- 世界名称：{self.world.name}",
+                f"- 世界类型：{self.world.world_type}",
+                f"- 核心法则：{chr(10).join([r.description for r in self.world.rules[:3]]) if self.world.rules else '暂无特殊规则'}",
+                f"- 力量体系：{self.world.power_system or '无特殊力量体系'}",
+                f"- 科技水平：{self.world.technology_level or '未设定'}",
+            ]
+        )
+        if md_prompt:
+            self._legacy_fallback_trace = self._procgen_fallback_trace(prompt_ids=["role_proc_gen"])
+            return f"{md_prompt}\n\n{world_block}"
 
-【世界观】
-- 世界名称：{self.world.name}
-- 世界类型：{self.world.world_type}
-- 核心法则：{chr(10).join([r.description for r in self.world.rules[:3]]) if self.world.rules else '暂无特殊规则'}
-- 力量体系：{self.world.power_system or '无特殊力量体系'}
-- 科技水平：{self.world.technology_level or '未设定'}
+        logger.warning("ProcGen md prompt 资产不可用，使用 deprecated 最小硬编码默认系统提示")
+        self._legacy_fallback_trace = self._procgen_fallback_trace(deprecated=True)
+        return f"""你是过程生成专家。优先使用 Agent Template 绑定的 md prompt / skills / writing-rules；仅在未能加载配置资产时，将此最小提示作为 deprecated fallback。
 
-请根据探索方向和世界观，生成合理的新区域内容。输出 JSON 格式：
-{{
-    "region_id": "自动生成的 ID",
-    "region_name": "区域名称",
-    "region_type": "区域类型 (city/village/wilderness/dungeon/building/water/mountain/forest)",
-    "terrain_type": "地形类型 (plain/hill/mountain/desert/swamp/ice/volcano)",
-    "description": "环境描述",
-    "atmosphere": "氛围描述",
-    "terrain_features": [{{"name": "特征名", "description": "特征描述"}}],
-    "landmarks": [{{"name": "地标名", "description": "地标描述"}}],
-    "encounters": [{{"type": "monster/npc/event/treasure", "name": "名称", "description": "描述", "weight": 1.0}}],
-    "connections": ["相邻区域 ID 列表"],
-    "loot": [{{"name": "物品名", "description": "描述"}}]
-}}"""
-        return prompt
+{world_block}"""
+
+    async def _ensure_system_prompt_loaded(self):
+        """加载 ProcGen Agent Template prompt，失败时回退到 md prompt 资产。"""
+        if self._system_prompt_loaded or not self._pending_system_prompt_load:
+            return
+
+        if not self.project_id or not self.AGENT_TYPE:
+            self._system_prompt_loaded = True
+            self._pending_system_prompt_load = False
+            return
+
+        try:
+            from app.services.agent_prompt_service import get_agent_prompt_service
+
+            variables = self._get_default_variables()
+            service = get_agent_prompt_service()
+            agent_type = self.AGENT_TYPE.value if hasattr(self.AGENT_TYPE, "value") else str(self.AGENT_TYPE)
+            prompt_data = await service.build_agent_prompt_with_trace(
+                agent_type=agent_type,
+                project_id=self.project_id,
+                variables=variables,
+                scenario=self.scenario,
+                context_query=f"{self.world.name} 程序生成 区域 遭遇 世界规则 一致性",
+            )
+            prompt = prompt_data.get("content", "")
+            self._system_prompt_render_trace = prompt_data.get("trace", {}) or {}
+            if prompt.strip():
+                self.system_prompt = prompt.strip()
+        except Exception as e:
+            logger.warning(
+                "ProcGen 加载模板 prompt 失败: project=%s, scenario=%s, error=%s",
+                self.project_id,
+                self.scenario,
+                e,
+            )
+
+        if not self.system_prompt:
+            md_prompt = self._build_md_procgen_fallback_prompt()
+            world_block = "\n".join(
+                [
+                    "【当前世界变量】",
+                    f"- 世界名称：{self.world.name}",
+                    f"- 世界类型：{self.world.world_type}",
+                    f"- 核心法则：{chr(10).join([r.description for r in self.world.rules[:3]]) if self.world.rules else '暂无特殊规则'}",
+                    f"- 力量体系：{self.world.power_system or '无特殊力量体系'}",
+                    f"- 科技水平：{self.world.technology_level or '未设定'}",
+                ]
+            )
+            if md_prompt:
+                self.system_prompt = f"{md_prompt}\n\n{world_block}"
+                self._system_prompt_render_trace = self._procgen_fallback_trace(prompt_ids=["role_proc_gen"])
+            else:
+                self.system_prompt = self._build_system_prompt()
+                self._system_prompt_render_trace = self._legacy_fallback_trace
+
+        self._system_prompt_loaded = True
+        self._pending_system_prompt_load = False
 
     async def execute(self, input_data: Dict[str, Any]) -> AgentResponse:
         """
@@ -149,6 +242,7 @@ class ProcGenAgent(BaseAgent):
                 metadata={
                     "world_id": self.world.id,
                     "generation_type": generation_type,
+                    **self._get_runtime_trace_metadata(),
                 },
             )
 
@@ -226,7 +320,11 @@ class ProcGenAgent(BaseAgent):
         Returns:
             AgentResponse: 遭遇事件数据
         """
-        prompt = f"""根据以下情境生成一个遭遇事件：
+        procgen_instruction = self._load_md_prompt_content("role_proc_gen") or "请根据区域上下文生成合理、可用且与世界观一致的遭遇事件。"
+        prompt = f"""{procgen_instruction}
+
+【当前子任务】
+根据以下情境生成一个遭遇事件：
 
 【区域信息】
 - 名称：{region.name}

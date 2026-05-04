@@ -58,6 +58,7 @@ class PlotOutlineService:
         self._context_cache: Dict[str, Dict[str, Any]] = {}
         self._formatted_context_cache: Dict[str, Dict[str, Any]] = {}
         self._system_prompt_cache: Dict[str, Dict[str, Any]] = {}
+        self._system_prompt_trace_cache: Dict[str, Dict[str, Any]] = {}
         self._output_format_cache: Dict[str, Dict[str, Any]] = {}
         self._cache_ttl = timedelta(minutes=5)
 
@@ -98,7 +99,7 @@ class PlotOutlineService:
 
     def _invalidate_project_caches(self, project_id: str, chapter_number: Optional[int] = None):
         context_prefix = f"{project_id}:"
-        for cache in (self._context_cache, self._formatted_context_cache, self._system_prompt_cache):
+        for cache in (self._context_cache, self._formatted_context_cache, self._system_prompt_cache, self._system_prompt_trace_cache):
             stale_keys = [key for key in cache if key.startswith(context_prefix)]
             for key in stale_keys:
                 del cache[key]
@@ -174,36 +175,52 @@ class PlotOutlineService:
         self._log_timing("format_project_context", started_at)
         return self._cache_entry(self._formatted_context_cache, cache_key, formatted)
 
+    async def _get_cached_system_prompt_with_trace(
+        self,
+        project_id: str,
+        chapter_number: int,
+        full_context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        cache_key = self._get_system_prompt_cache_key(project_id, chapter_number)
+        cached = self._get_cached_value(self._system_prompt_cache, cache_key)
+        cached_trace = self._get_cached_value(self._system_prompt_trace_cache, cache_key)
+        if cached is not None and cached_trace is not None:
+            return {"content": cached, "trace": cached_trace}
+
+        started_at = time.perf_counter()
+        try:
+            from app.services.agent_prompt_service import get_agent_prompt_service
+            prompt_service = get_agent_prompt_service()
+            prompt_data = await prompt_service.build_agent_prompt_with_trace(
+                agent_type="plot_outline",
+                project_id=project_id,
+                include_skills=True,
+                scenario="generate_chapter_outline",
+            )
+            base_prompt = prompt_data.get("content", "")
+            trace = prompt_data.get("trace", {}) or {}
+        except Exception as e:
+            logger.warning(f"加载 plot_outline prompt 模板失败: {e}，使用默认 prompt")
+            fallback_data = self._build_fallback_prompt_with_trace(project_id)
+            base_prompt = fallback_data["content"]
+            trace = fallback_data["trace"]
+
+        context_hints = self._build_context_hints(full_context)
+        output_format = await self._get_cached_output_format_prompt()
+        system_prompt = f"{base_prompt}\n\n{context_hints}\n\n{output_format}".strip()
+        self._log_timing("build_system_prompt", started_at)
+        self._cache_entry(self._system_prompt_cache, cache_key, system_prompt)
+        self._cache_entry(self._system_prompt_trace_cache, cache_key, trace)
+        return {"content": system_prompt, "trace": trace}
+
     async def _get_cached_system_prompt(
         self,
         project_id: str,
         chapter_number: int,
         full_context: Dict[str, Any],
     ) -> str:
-        cache_key = self._get_system_prompt_cache_key(project_id, chapter_number)
-        cached = self._get_cached_value(self._system_prompt_cache, cache_key)
-        if cached is not None:
-            return cached
-
-        started_at = time.perf_counter()
-        try:
-            from app.services.agent_prompt_service import get_agent_prompt_service
-            prompt_service = get_agent_prompt_service()
-            base_prompt = await prompt_service.build_agent_prompt(
-                agent_type="plot_outline",
-                project_id=project_id,
-                include_skills=True,
-                scenario="generate_chapter_outline",
-            )
-        except Exception as e:
-            logger.warning(f"加载 plot_outline prompt 模板失败: {e}，使用默认 prompt")
-            base_prompt = self._build_fallback_prompt()
-
-        context_hints = self._build_context_hints(full_context)
-        output_format = await self._get_cached_output_format_prompt()
-        system_prompt = f"{base_prompt}\n\n{context_hints}\n\n{output_format}".strip()
-        self._log_timing("build_system_prompt", started_at)
-        return self._cache_entry(self._system_prompt_cache, cache_key, system_prompt)
+        prompt_data = await self._get_cached_system_prompt_with_trace(project_id, chapter_number, full_context)
+        return prompt_data.get("content", "")
 
     def _build_outline_runtime_context(self, existing_outline: Optional[ChapterOutline]) -> str:
         if not existing_outline:
@@ -1428,6 +1445,7 @@ class PlotOutlineService:
                         outline=outline,
                         suggestions=data.get("suggestions", []),
                         warnings=warnings,
+                        prompt_render_trace=outline.quality_metrics.get("prompt_render_trace"),
                     )
             except Exception as e:
                 logger.warning(f"使用 Skill 生成大纲失败，fallback 到直接生成: {e}")
@@ -1444,6 +1462,7 @@ class PlotOutlineService:
             outline=outline,
             suggestions=["大纲已生成，建议人工审核后使用"],
             warnings=[],
+            prompt_render_trace=outline.quality_metrics.get("prompt_render_trace"),
         )
 
     def _build_generation_prompt(
@@ -1635,15 +1654,19 @@ class PlotOutlineService:
         try:
             from app.services.agent_prompt_service import get_agent_prompt_service
             prompt_service = get_agent_prompt_service()
-            system_prompt = await prompt_service.build_agent_prompt(
+            prompt_data = await prompt_service.build_agent_prompt_with_trace(
                 agent_type="plot_outline",
                 project_id=project_id,
                 include_skills=True,
                 scenario="generate_chapter_outline",
             )
+            system_prompt = prompt_data.get("content", "")
+            prompt_render_trace = prompt_data.get("trace", {}) or {}
         except Exception as e:
             logger.warning(f"加载 plot_outline prompt 模板失败: {e}")
-            system_prompt = self._build_fallback_prompt()
+            fallback_data = self._build_fallback_prompt_with_trace(project_id)
+            system_prompt = fallback_data["content"]
+            prompt_render_trace = fallback_data["trace"]
 
         try:
             llm_config = settings.get_llm_config(settings.llm_provider)
@@ -1675,11 +1698,13 @@ class PlotOutlineService:
                     if repaired_updates:
                         outline_updates = self._normalize_outline_updates(repaired_updates)
 
-            return self._parse_generated_outline(
+            outline = self._parse_generated_outline(
                 project_id,
                 chapter_number,
                 self._select_outline_payload(outline_updates, chapter_number),
             )
+            outline.quality_metrics["prompt_render_trace"] = prompt_render_trace
+            return outline
         except Exception as e:
             logger.error(f"直接生成大纲失败: {e}")
             # 最终 fallback：返回基本模板
@@ -2283,7 +2308,9 @@ class PlotOutlineService:
         try:
             full_context = await self._get_cached_project_context(project_id, chapter_number)
             context_str = self._get_cached_formatted_context(project_id, chapter_number, full_context)
-            base_system_prompt = await self._get_cached_system_prompt(project_id, chapter_number, full_context)
+            prompt_data = await self._get_cached_system_prompt_with_trace(project_id, chapter_number, full_context)
+            base_system_prompt = prompt_data.get("content", "")
+            prompt_render_trace = prompt_data.get("trace")
             outline_runtime_context = self._build_outline_runtime_context(existing_outline)
             system_prompt = f"{base_system_prompt}\n\n{outline_runtime_context}".strip()
 
@@ -2348,6 +2375,7 @@ class PlotOutlineService:
                 "outline_updates": outline_updates,
                 "suggestions": self._extract_suggestions(response),
                 "saved_outline": self._outline_saved_response(saved_outline),
+                "prompt_render_trace": prompt_render_trace,
             }
             if consistency_warnings:
                 result["warnings"] = consistency_warnings
@@ -2366,35 +2394,64 @@ class PlotOutlineService:
 
 
     def _get_simple_output_format(self) -> str:
-        """获取简化的输出格式（当 prompt 库加载失败时使用）"""
-        return """【重要：输出格式要求】
+        """获取简化的输出格式（仅当 md 输出格式资产不可用时使用）。"""
+        return (
+            "【Plot Outline deprecated 最小输出格式 fallback】\n"
+            "必须输出完整 JSON：单章使用 chapter_number/title/summary/chapter_goals/scenes；"
+            "多章使用 chapters 数组；不要省略必需字段。"
+        )
 
-当用户要求生成大纲时，必须输出完整的 JSON 格式：
+    def _build_fallback_prompt_with_trace(self, project_id: Optional[str]) -> Dict[str, Any]:
+        md_prompt = self._build_md_plot_outline_fallback_prompt()
+        if md_prompt:
+            return {
+                "content": md_prompt,
+                "trace": {
+                    "agent_type": "plot_outline",
+                    "scenario": "generate_chapter_outline",
+                    "project_id": project_id,
+                    "template_id": None,
+                    "template_scenario": None,
+                    "config_id": None,
+                    "prompt_ids": [],
+                    "skill_ids": [],
+                    "skills": None,
+                    "writing_rule_ids": [],
+                    "writing_rules": None,
+                    "context_blocks": [],
+                    "fallbacks_used": ["plot_outline_md_prompt_fallback"],
+                    "deprecated_sources_used": [],
+                },
+            }
 
-单章格式：
-```json
-{"chapter_number": 1, "title": "标题", "summary": "摘要", "chapter_goals": ["目标1"], "scenes": [{"scene_number": 1, "title": "场景", "summary": "内容", "estimated_words": 800}]}
-```
-
-多章格式：
-```json
-{"chapters": [{"chapter_number": 1, "title": "标题", "summary": "摘要", "scenes": [...]}, {"chapter_number": 2, ...}]}
-```
-
-规则：必须输出完整 JSON，不要省略字段。"""
+        logger.warning("plot_outline md prompt 资产不可用，使用 deprecated 最小硬编码备用 prompt")
+        return {
+            "content": (
+                "你是 Plot Outline Agent。优先使用 Agent Template 绑定的 md prompt、skills 和 writing-rules；"
+                "当前仅因配置资产不可用而启用 deprecated 最小 fallback。\n\n"
+                f"{self._get_simple_output_format()}"
+            ),
+            "trace": {
+                "agent_type": "plot_outline",
+                "scenario": "generate_chapter_outline",
+                "project_id": project_id,
+                "template_id": None,
+                "template_scenario": None,
+                "config_id": None,
+                "prompt_ids": [],
+                "skill_ids": [],
+                "skills": None,
+                "writing_rule_ids": [],
+                "writing_rules": None,
+                "context_blocks": [],
+                "fallbacks_used": ["plot_outline_deprecated_minimal_system_prompt"],
+                "deprecated_sources_used": ["PlotOutlineService._build_fallback_prompt_with_trace"],
+            },
+        }
 
     def _build_fallback_prompt(self) -> str:
         """构建备用 prompt（优先使用 prompts/**/*.md 资产）。"""
-        md_prompt = self._build_md_plot_outline_fallback_prompt()
-        if md_prompt:
-            return md_prompt
-
-        logger.warning("plot_outline md prompt 资产不可用，使用 deprecated 硬编码备用 prompt")
-        return """你是专业的章节大纲规划助手（Plot Outline Agent）。
-
-你的职责是帮助用户规划章节结构和场景设计，设计情绪曲线和节奏控制，管理章节目标、伏笔埋设和回收。
-
-""" + self._get_simple_output_format()
+        return self._build_fallback_prompt_with_trace(None)["content"]
 
     async def _build_chat_user_context(
         self,

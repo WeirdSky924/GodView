@@ -1884,6 +1884,15 @@ async def handle_workflow_user_input(websocket: WebSocket, message: dict, client
         execution = await engine.get_execution_state(execution_id, postgres_db)
         if execution:
             director = get_or_create_director(client_id, project_id=execution.project_id)
+            if not getattr(director, "_model_factory", None):
+                model_factory = create_model_factory()
+                characters = []
+                if postgres_db:
+                    try:
+                        characters = await postgres_db.get_all_characters(execution.project_id)
+                    except Exception as e:
+                        logger.warning(f"加载角色失败: {e}")
+                await director.initialize(model_factory, characters=characters)
             setup_workflow_engine_callbacks(director)
 
         result = await engine.submit_user_input(
