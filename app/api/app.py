@@ -143,10 +143,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     else:
         logger.info("Qdrant 未配置，跳过初始化")
 
+    prompt_service = None
+    agent_template_service = None
+
     # 初始化系统 Prompt 模板（从 MD 文件同步）
     try:
         from app.api.routes.prompts import set_prompt_service
-        from app.services.prompt_template_service import PromptTemplateService
+        from app.services.prompt_template_service import PromptTemplateService, set_prompt_template_service
         prompt_service = PromptTemplateService(db=postgres_db)
 
         # 先从数据库加载已有数据
@@ -160,21 +163,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
             logger.warning(f"MD 文件同步失败，使用数据库中的数据: {sync_error}")
 
         set_prompt_service(prompt_service)
+        set_prompt_template_service(prompt_service)
         logger.info(f"系统 Prompt 模板初始化完成: {len(prompt_service._templates)} 个模板")
     except Exception as e:
         logger.warning(f"系统 Prompt 模板初始化失败：{e}")
 
     # 初始化系统 Agent 模板
     try:
-        from app.api.routes.agent_templates import set_agent_template_service, set_prompt_service as set_agent_prompt_service
+        from app.api.routes.agent_templates import set_agent_template_service
         from app.services.agent_template_service import AgentTemplateService
         from app.services.agent_prompt_service import set_agent_prompt_service as set_runtime_agent_prompt_service
         from app.data.system_agent_templates import SYSTEM_AGENT_TEMPLATES
         agent_template_service = AgentTemplateService(db=postgres_db)
         await agent_template_service.initialize_system_templates(SYSTEM_AGENT_TEMPLATES)
         set_agent_template_service(agent_template_service)
-        # 共享 prompt_service 给 agent_templates
-        set_agent_prompt_service(prompt_service)
         set_runtime_agent_prompt_service(prompt_service, agent_template_service)
         logger.info(f"系统 Agent 模板初始化完成: {len(SYSTEM_AGENT_TEMPLATES)} 个模板")
     except Exception as e:

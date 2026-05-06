@@ -42,6 +42,17 @@ class WriterAgent(BaseAgent):
 
     AGENT_TYPE = AgentType.WRITER
     DEFAULT_SCENARIO = "workflow_chapter_generation"
+    TASK_SCENARIOS = {
+        "chapter_generation": "workflow_chapter_generation",
+        "segment_plan": "workflow_chapter_generation",
+        "segment_generation": "workflow_chapter_generation",
+        "supplement": "workflow_chapter_generation",
+        "continue": "workflow_chapter_generation",
+        "rewrite_by_review": "rewrite_by_review",
+        "style_check": "style_consistency_check",
+        "scene_description": "scene_description",
+        "character_voice_rewrite": "character_voice_rewrite",
+    }
     WRITER_OUTPUT_CONTRACT = DEFAULT_AGENT_OUTPUT_CONTRACT_REGISTRY.get("writer.workflow_output")
 
     def _as_list(self, value: Any) -> List[Any]:
@@ -491,26 +502,140 @@ class WriterAgent(BaseAgent):
             logger.error(f"WriterAgent 执行失败：{e}", exc_info=True)
             return AgentResponse(success=False, error=str(e))
 
+    def _scenario_for_task(self, task_type: str) -> str:
+        return self.TASK_SCENARIOS.get(task_type, self.DEFAULT_SCENARIO)
+
     async def _get_writer_config_prompt(self, variables: Optional[Dict[str, Any]] = None) -> str:
-        """获取 Writer Agent Template 渲染后的配置 prompt。"""
-        if getattr(self, "_writer_config_prompt", None):
+        """获取 Writer 指定任务场景的配置 prompt。"""
+        variables = variables or {}
+        task_type = str(variables.get("task_type") or "chapter_generation")
+        scenario = self._scenario_for_task(task_type)
+        cache_key = f"_writer_config_prompt__{scenario}"
+        source_key = f"_writer_config_prompt_source__{scenario}"
+        trace_key = f"_writer_config_prompt_trace__{scenario}"
+
+        if hasattr(self, cache_key):
+            self._writer_config_prompt = getattr(self, cache_key)
+            self._writer_config_prompt_source = getattr(self, source_key, None)
+            self._system_prompt_render_trace = getattr(self, trace_key, self._system_prompt_render_trace)
+            self.scenario = scenario
             return self._writer_config_prompt
 
-        await self._ensure_system_prompt_loaded()
-        prompt = (self.system_prompt or "").strip()
-        if prompt:
-            self._writer_config_prompt = prompt
-            self._writer_config_prompt_source = "agent_template_runtime"
-            return prompt
+        runtime_variables = {
+            **self._get_default_variables(),
+            **variables,
+            "task_type": task_type,
+            "scenario": scenario,
+        }
+
+        if self.project_id:
+            try:
+                from app.services.agent_prompt_service import get_agent_prompt_service
+
+                prompt_data = await get_agent_prompt_service().build_agent_prompt_with_trace(
+                    agent_type=self.AGENT_TYPE.value if hasattr(self.AGENT_TYPE, "value") else str(self.AGENT_TYPE),
+                    project_id=self.project_id,
+                    variables=runtime_variables,
+                    scenario=scenario,
+                )
+                prompt = (prompt_data.get("content") or "").strip()
+                trace = prompt_data.get("trace", {}) or {}
+                if prompt:
+                    setattr(self, cache_key, prompt)
+                    setattr(self, source_key, "agent_template_runtime")
+                    setattr(self, trace_key, trace)
+                    self._writer_config_prompt = prompt
+                    self._writer_config_prompt_source = "agent_template_runtime"
+                    self._system_prompt_render_trace = trace
+                    self.scenario = scenario
+                    return prompt
+            except Exception as e:
+                logger.warning(
+                    "Writer 加载场景配置 prompt 失败: project=%s, scenario=%s, error=%s",
+                    self.project_id,
+                    scenario,
+                    e,
+                )
+                self._system_prompt_render_trace = {
+                    "agent_type": self.AGENT_TYPE.value if hasattr(self.AGENT_TYPE, "value") else str(self.AGENT_TYPE),
+                    "scenario": scenario,
+                    "project_id": self.project_id,
+                    "template_id": None,
+                    "template_scenario": None,
+                    "config_id": None,
+                    "prompt_ids": [],
+                    "skill_ids": [],
+                    "writing_rule_ids": [],
+                    "context_blocks": [],
+                    "fallbacks_used": ["writer_runtime_prompt_error"],
+                    "deprecated_sources_used": [],
+                    "missing_prompt_ids": [],
+                }
 
         fallback = self._build_md_writer_fallback_prompt()
         if fallback:
+            trace = {
+                "agent_type": self.AGENT_TYPE.value if hasattr(self.AGENT_TYPE, "value") else str(self.AGENT_TYPE),
+                "scenario": scenario,
+                "project_id": self.project_id,
+                "template_id": None,
+                "template_scenario": None,
+                "config_id": None,
+                "prompt_ids": [
+                    "role_writer",
+                    "function_writing",
+                    "function_writer_workflow_context_binding",
+                    "function_writer_segment_generation",
+                    "function_writer_style_consistency",
+                    "function_writer_scene_description",
+                    "function_writer_character_voice_rewrite",
+                ],
+                "skill_ids": [],
+                "writing_rule_ids": [],
+                "context_blocks": [],
+                "fallbacks_used": ["writer_md_prompt_fallback"],
+                "deprecated_sources_used": [],
+                "missing_prompt_ids": [],
+            }
+            setattr(self, cache_key, fallback)
+            setattr(self, source_key, "md_prompt_fallback")
+            setattr(self, trace_key, trace)
             self._writer_config_prompt = fallback
             self._writer_config_prompt_source = "md_prompt_fallback"
+            self._system_prompt_render_trace = trace
+            self.scenario = scenario
             return fallback
 
+        trace = {
+            "agent_type": self.AGENT_TYPE.value if hasattr(self.AGENT_TYPE, "value") else str(self.AGENT_TYPE),
+            "scenario": scenario,
+            "project_id": self.project_id,
+            "template_id": None,
+            "template_scenario": None,
+            "config_id": None,
+            "prompt_ids": [],
+            "skill_ids": [],
+            "writing_rule_ids": [],
+            "context_blocks": [],
+            "fallbacks_used": ["writer_missing_config_prompt"],
+            "deprecated_sources_used": ["WriterAgent._build_md_writer_fallback_prompt"],
+            "missing_prompt_ids": [
+                "role_writer",
+                "function_writing",
+                "function_writer_workflow_context_binding",
+                "function_writer_segment_generation",
+                "function_writer_style_consistency",
+                "function_writer_scene_description",
+                "function_writer_character_voice_rewrite",
+            ],
+        }
+        setattr(self, cache_key, "")
+        setattr(self, source_key, "missing")
+        setattr(self, trace_key, trace)
         self._writer_config_prompt = ""
         self._writer_config_prompt_source = "missing"
+        self._system_prompt_render_trace = trace
+        self.scenario = scenario
         return ""
 
     def _format_task_context_block(self, title: str, value: Any) -> str:
@@ -947,6 +1072,7 @@ class WriterAgent(BaseAgent):
         chapter_num: int,
         total_chapters: int,
         world_info: Optional[Dict[str, Any]] = None,
+        discussion_asset_digest: str = "",
         workflow_binding_block: str = "",
         config_prompt: str = "",
     ) -> Dict[str, Any]:

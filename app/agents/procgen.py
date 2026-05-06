@@ -97,6 +97,7 @@ class ProcGenAgent(BaseAgent):
             "context_blocks": [],
             "fallbacks_used": ["proc_gen_deprecated_minimal_system_prompt" if deprecated else "proc_gen_md_prompt_fallback"],
             "deprecated_sources_used": ["ProcGenAgent._build_system_prompt"] if deprecated else [],
+            "missing_prompt_ids": ["role_proc_gen"] if deprecated else [],
         }
 
     def _build_system_prompt(self) -> str:
@@ -286,24 +287,27 @@ class ProcGenAgent(BaseAgent):
         if current_location:
             message_parts.append(f"【当前位置】\n{current_location}")
 
-        # 生成类型
-        type_desc = {
-            "first_time": "首次探索，需要完整生成",
-            "returning": "返回已访问区域，可生成新事件",
-            "expansion": "世界扩展，生成相邻区域",
+        # 生成类型：仅输出运行时参数；稳定含义由 role_proc_gen md 资产维护
+        generation_type_context = {
+            "first_time": {"mode": "first_time", "requires_full_region": True},
+            "returning": {"mode": "returning", "prefer_existing_region_changes": True},
+            "expansion": {"mode": "expansion", "prefer_adjacent_region": True},
         }
-        message_parts.append(f"【生成类型】\n{type_desc.get(generation_type, '未知')}")
+        message_parts.append(f"【生成类型】\n{generation_type_context.get(generation_type, {'mode': generation_type})}")
 
         # 已有区域（避免重复）
         if existing_regions:
             region_names = [r.get("name", "") for r in existing_regions[:10]]
             message_parts.append(f"【已有区域参考】\n{', '.join(region_names)}")
-            message_parts.append("请避免生成风格重复的区域。")
+            message_parts.append("【重复控制参数】\n- existing_region_count: " + str(len(existing_regions)))
 
-        message_parts.append(
-            "\n请根据以上信息，生成一个符合世界观的新区域。"
-            "确保区域设计有趣、有探索价值，并能与现有世界产生联系。"
-        )
+        message_parts.append("【运行时任务参数】\n" + "\n".join(
+            [
+                "- task_mode: region_generation",
+                "- output_schema: ProcGenRegionSchema",
+                "- generation_type: " + str(generation_type),
+            ]
+        ))
 
         return "\n\n".join(message_parts)
 
@@ -323,8 +327,9 @@ class ProcGenAgent(BaseAgent):
         procgen_instruction = self._load_md_prompt_content("role_proc_gen") or "请根据区域上下文生成合理、可用且与世界观一致的遭遇事件。"
         prompt = f"""{procgen_instruction}
 
-【当前子任务】
-根据以下情境生成一个遭遇事件：
+【当前子任务参数】
+- task_mode: encounter_generation
+- output_schema: ProcGenEncounterSchema
 
 【区域信息】
 - 名称：{region.name}
@@ -334,17 +339,7 @@ class ProcGenAgent(BaseAgent):
 【情境】
 - 角色：{context.get('characters', [])}
 - 时间：{context.get('time', '未知')}
-- 天气：{context.get('weather', '未知')}
-
-请生成一个符合区域特色的遭遇事件。输出 JSON 格式：
-{{
-    "id": "enc_xxx",
-    "type": "monster/npc/event/treasure",
-    "name": "事件名称",
-    "description": "详细描述",
-    "data": {{...}},
-    "weight": 1.0
-}}"""
+- 天气：{context.get('weather', '未知')}"""
 
         try:
             parsed = await self._call_structured(

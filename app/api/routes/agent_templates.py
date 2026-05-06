@@ -15,7 +15,6 @@ from app.models.agent_template import (
     AgentTemplateCreate,
     AgentTemplateUpdate,
 )
-from app.models.prompt_template import PromptRenderRequest
 from app.services.agent_prompt_service import get_agent_prompt_service
 from app.services.agent_config_service import get_agent_config_service
 
@@ -25,7 +24,6 @@ router = APIRouter()
 
 # 模拟服务实例
 _agent_template_service = None
-_prompt_service = None
 
 
 def get_agent_template_service():
@@ -41,21 +39,6 @@ def set_agent_template_service(service):
     """设置 Agent 模板服务实例（用于初始化）"""
     global _agent_template_service
     _agent_template_service = service
-
-
-def get_prompt_service():
-    """获取 Prompt 服务实例"""
-    global _prompt_service
-    if _prompt_service is None:
-        from app.services.prompt_template_service import PromptTemplateService
-        _prompt_service = PromptTemplateService()
-    return _prompt_service
-
-
-def set_prompt_service(service):
-    """设置 Prompt 服务实例（用于初始化）"""
-    global _prompt_service
-    _prompt_service = service
 
 
 # ==================== Agent Template CRUD API ====================
@@ -220,7 +203,6 @@ async def preview_agent_template(
         Dict: 预览结果
     """
     service = get_agent_template_service()
-    prompt_service = get_prompt_service()
 
     template = await service.get_template(template_id)
     if not template:
@@ -231,129 +213,34 @@ async def preview_agent_template(
     agent_type_value = template.agent_type.value if hasattr(template.agent_type, "value") else str(template.agent_type)
     preview_variables = dict(variables or {})
     preview_variables.setdefault("scenario", template.scenario)
+    preview_project_id = project_id
 
     agent_prompt_service = get_agent_prompt_service()
-    skills_data = await agent_prompt_service.build_skills_prompt_with_trace(
-        agent_type_value,
-        project_id=project_id,
+
+    prompt_data = await agent_prompt_service.build_agent_prompt_with_trace(
+        agent_type=agent_type_value,
+        project_id=preview_project_id,
         variables=preview_variables,
+        include_skills=True,
         context_scene=template.scenario,
         scenario=template.scenario,
         use_intelligent_retrieval=False,
+        use_project_config=False,
+        resolved_template=template,
     )
-    skills_content = skills_data.get("content", "")
-    skills_trace = skills_data.get("trace", {})
-    logger.info(f"resolved skills prompt 内容长度: {len(skills_content)} 字符")
 
-    # 构建渲染结果
+    final_prompt = prompt_data.get("content", "")
+    render_trace = prompt_data.get("trace", {})
+    render_trace["config_id"] = render_trace.get("config_id") or f"preview_{preview_project_id}_{agent_type_value}_{template.scenario}_{template.id}"
+    render_trace["template_id"] = template.id
+    render_trace["template_scenario"] = template.scenario
+
     rendered_prompts = []
-    if skills_content:
+    if final_prompt:
         rendered_prompts.append({
-            "slot_name": "skills",
-            "description": "Skills（按 Agent Template / Skill Assignments 解析）",
-            "content": skills_content,
-        })
-    render_trace: Dict[str, Any] = {
-        "agent_type": agent_type_value,
-        "scenario": template.scenario,
-        "project_id": project_id,
-        "template_id": template.id,
-        "template_scenario": template.scenario,
-        "config_id": None,
-        "prompt_ids": [],
-        "skill_ids": skills_trace.get("skill_ids", []),
-        "skills": skills_trace,
-        "writing_rule_ids": [],
-        "context_blocks": [],
-        "fallbacks_used": list(skills_trace.get("fallbacks_used", [])),
-        "deprecated_sources_used": list(skills_trace.get("deprecated_sources_used", [])),
-        "writing_rules": None,
-    }
-    def _extend_trace_values(key: str, values: Optional[List[str]]) -> None:
-        if not values:
-            return
-        existing = render_trace.setdefault(key, [])
-        seen = set(existing)
-        for value in values:
-            if value in seen:
-                continue
-            seen.add(value)
-            existing.append(value)
-
-    prompt_order = template.default_prompt_order or []
-    prompt_slots_by_name = {slot.slot_name: slot for slot in template.prompt_slots}
-    ordered_slots = []
-    used_slot_names = set()
-    for slot_name in prompt_order:
-        slot = prompt_slots_by_name.get(slot_name)
-        if slot and slot.is_enabled:
-            ordered_slots.append((slot_name, slot))
-            used_slot_names.add(slot_name)
-
-    remaining_slots = [
-        (slot.slot_name, slot)
-        for slot in template.prompt_slots
-        if slot.is_enabled and slot.slot_name not in used_slot_names
-    ]
-    remaining_slots.sort(key=lambda item: -item[1].priority)
-    ordered_slots.extend(remaining_slots)
-
-    for slot_name, slot in ordered_slots:
-        prompt_content = ""
-
-        # 特殊处理：writing_rules 插槽（动态加载）。复用 runtime 的 AgentPromptService，
-        # 避免 /agent-templates preview 与实际运行时规则注入逻辑分叉。
-        if slot_name == "writing_rules" and not slot.prompt_template_id:
-            writing_rules_data = await agent_prompt_service.build_writing_rules_prompt_with_trace(
-                project_id,
-                preview_variables,
-                agent_type=agent_type_value,
-                scenario=template.scenario,
-            )
-            prompt_content = writing_rules_data.get("content", "")
-            writing_rules_trace = writing_rules_data.get("trace", {})
-            render_trace["writing_rules"] = writing_rules_trace
-            render_trace["writing_rule_ids"] = writing_rules_trace.get("writing_rule_ids", [])
-            _extend_trace_values("fallbacks_used", writing_rules_trace.get("fallbacks_used", []))
-            _extend_trace_values("deprecated_sources_used", writing_rules_trace.get("deprecated_sources_used", []))
-            # 替换 available_skills 占位符
-            prompt_content = _inject_skills(prompt_content, skills_content)
-            rendered_prompts.append({
-                "slot_name": slot_name,
-                "description": slot.description,
-                "content": prompt_content,
-            })
-            continue
-
-        # 普通 Prompt 模板
-        if slot.prompt_template_id:
-            prompt_template = await prompt_service.get_template(slot.prompt_template_id)
-            if prompt_template:
-                # 渲染变量
-                merged_vars = slot.variable_overrides.copy()
-                if preview_variables:
-                    merged_vars.update(preview_variables)
-                request = PromptRenderRequest(
-                    template_id=slot.prompt_template_id,
-                    variables=merged_vars,
-                )
-                try:
-                    result = await prompt_service.render_template(request)
-                    prompt_content = result.rendered_content
-                    _extend_trace_values("prompt_ids", [slot.prompt_template_id])
-                except Exception as e:
-                    logger.warning(f"Failed to render prompt {slot.prompt_template_id}: {e}")
-                    prompt_content = prompt_template.content
-                    _extend_trace_values("prompt_ids", [slot.prompt_template_id])
-                    _extend_trace_values("fallbacks_used", [f"prompt_template_raw:{slot.prompt_template_id}"])
-
-        # 替换 available_skills 占位符
-        prompt_content = _inject_skills(prompt_content, skills_content)
-
-        rendered_prompts.append({
-            "slot_name": slot_name,
-            "description": slot.description,
-            "content": prompt_content,
+            "slot_name": "final_prompt",
+            "description": "Agent Template preview rendered by unified runtime builder",
+            "content": final_prompt,
         })
 
     return {
@@ -361,26 +248,9 @@ async def preview_agent_template(
         "template_name": template.name,
         "project_id": project_id,
         "rendered_prompts": rendered_prompts,
-        "final_prompt": "\n\n".join([p["content"] for p in rendered_prompts if p["content"]]),
+        "final_prompt": final_prompt,
         "render_trace": render_trace,
     }
-
-
-def _inject_skills(content: str, skills_content: str) -> str:
-    """
-    将 available_skills 内容注入到 prompt 中
-
-    Args:
-        content: Prompt 内容
-        skills_content: Skills 内容
-
-    Returns:
-        str: 注入后的内容
-    """
-    if "{{available_skills}}" in content:
-        logger.debug(f"发现 {{available_skills}} 占位符，注入 {len(skills_content)} 字符内容")
-        return content.replace("{{available_skills}}", skills_content)
-    return content
 
 
 async def _build_available_skills_content(template: AgentTemplate) -> str:

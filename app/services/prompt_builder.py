@@ -43,6 +43,16 @@ class PromptBuilder:
         Returns:
             构建完成的 prompt 字符串
         """
+        result = await self.build_prompt_with_trace(config, template, variables)
+        return result["content"]
+
+    async def build_prompt_with_trace(
+        self,
+        config: AgentConfig,
+        template: AgentTemplate,
+        variables: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """构建完整 prompt，并返回 PromptTemplate 解析/渲染 trace。"""
         # 获取要使用的插槽列表
         slot_order = config.custom_prompt_order or template.default_prompt_order
         enabled_slots = await self._get_enabled_slots(template, config)
@@ -63,17 +73,28 @@ class PromptBuilder:
         ]
         ordered_slots.extend(self._sort_by_priority(remaining_slots))
 
+        trace: Dict[str, Any] = {
+            "prompt_ids": [],
+            "context_blocks": [],
+            "fallbacks_used": [],
+            "deprecated_sources_used": [],
+            "missing_prompt_ids": [],
+        }
+
         # 构建 prompt 片段
         prompt_pieces = []
         for slot_name, slot in ordered_slots:
-            prompt_piece = await self._build_slot_prompt(
+            slot_result = await self._build_slot_prompt_with_trace(
                 slot, config, template, variables or {}
             )
+            prompt_piece = slot_result.get("content")
+            slot_trace = slot_result.get("trace", {})
+            self._merge_trace(trace, slot_trace)
             if prompt_piece:
                 prompt_pieces.append(prompt_piece)
 
         # 合并所有片段
-        return "\n\n".join(prompt_pieces)
+        return {"content": "\n\n".join(prompt_pieces), "trace": trace}
 
     # ==================== 辅助方法 ====================
 
@@ -116,10 +137,31 @@ class PromptBuilder:
         variables: Dict[str, Any],
     ) -> Optional[str]:
         """构建单个插槽的 prompt"""
+        result = await self._build_slot_prompt_with_trace(slot, config, template, variables)
+        return result.get("content")
+
+    async def _build_slot_prompt_with_trace(
+        self,
+        slot: PromptSlot,
+        config: AgentConfig,
+        template: AgentTemplate,
+        variables: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """构建单个插槽的 prompt，并记录模板解析 trace。"""
+        trace: Dict[str, Any] = {
+            "prompt_ids": [],
+            "fallbacks_used": [],
+            "deprecated_sources_used": [],
+            "missing_prompt_ids": [],
+        }
         # 获取要使用的 PromptTemplate ID
         prompt_template_id = await self._get_prompt_template_id(slot, config)
-        if not prompt_template_id or not self._prompt_template_service:
-            return None
+        if not prompt_template_id:
+            return {"content": None, "trace": trace}
+
+        if not self._prompt_template_service:
+            trace["fallbacks_used"].append(f"missing_prompt_template_service:{prompt_template_id}")
+            return {"content": None, "trace": trace}
 
         # 获取 PromptTemplate
         prompt_template = await self._prompt_template_service.get_template(
@@ -127,7 +169,9 @@ class PromptBuilder:
         )
         if not prompt_template:
             logger.warning(f"PromptTemplate 不存在: {prompt_template_id}")
-            return None
+            trace["fallbacks_used"].append(f"missing_prompt_template:{prompt_template_id}")
+            trace["missing_prompt_ids"].append(prompt_template_id)
+            return {"content": None, "trace": trace}
 
         # 合并变量
         merged_variables = await self._merge_variables(
@@ -135,7 +179,32 @@ class PromptBuilder:
         )
 
         # 渲染模板
-        return await self._render_template(prompt_template, merged_variables)
+        try:
+            rendered = await self._render_template(prompt_template, merged_variables)
+        except Exception as e:
+            logger.warning(f"PromptTemplate 渲染失败，使用原始内容: {prompt_template_id}, error={e}")
+            rendered = self._simple_render(prompt_template.content, merged_variables)
+            trace["fallbacks_used"].append(f"prompt_template_raw:{prompt_template_id}")
+
+        if rendered:
+            trace["prompt_ids"].append(prompt_template_id)
+
+        return {"content": rendered, "trace": trace}
+
+    @staticmethod
+    def _extend_unique(target: List[Any], values: Optional[List[Any]]) -> None:
+        if not values:
+            return
+        seen = set(target)
+        for value in values:
+            if value in seen:
+                continue
+            seen.add(value)
+            target.append(value)
+
+    def _merge_trace(self, target: Dict[str, Any], source: Dict[str, Any]) -> None:
+        for key in ("prompt_ids", "context_blocks", "fallbacks_used", "deprecated_sources_used", "missing_prompt_ids"):
+            self._extend_unique(target.setdefault(key, []), source.get(key, []))
 
     async def _get_prompt_template_id(
         self, slot: PromptSlot, config: AgentConfig
@@ -206,9 +275,10 @@ class PromptBuilder:
         rendered = content
 
         for var_name, var_value in variables.items():
-            placeholder = f"{{{var_name}}}"
-            if placeholder in rendered:
-                rendered = rendered.replace(placeholder, str(var_value))
+            value = str(var_value)
+            for placeholder in (f"{{{{{var_name}}}}}", f"{{{var_name}}}"):
+                if placeholder in rendered:
+                    rendered = rendered.replace(placeholder, value)
 
         return rendered
 

@@ -46,13 +46,26 @@ class MDFileService:
         # 内容缓存
         self._prompts_cache: Dict[str, Dict[str, Any]] = {}
         self._skills_cache: Dict[str, Dict[str, Any]] = {}
+        self._scan_errors: List[Dict[str, str]] = []
         self._cache_valid: bool = False
 
         # 目录路径
         self.prompts_dir = PROMPTS_DIR
         self.skills_dir = SKILLS_DIR
 
-    def _parse_frontmatter(self, content: str) -> Tuple[Dict[str, Any], str]:
+    def _relative_path(self, file_path: Path) -> str:
+        try:
+            return str(file_path.relative_to(PROJECT_ROOT))
+        except ValueError:
+            return str(file_path)
+
+    def _record_scan_error(self, file_path: Path, error: str):
+        self._scan_errors.append({
+            'file_path': self._relative_path(file_path),
+            'error': error,
+        })
+
+    def _parse_frontmatter(self, content: str, file_path: Optional[Path] = None) -> Tuple[Dict[str, Any], str, Optional[str]]:
         """
         解析 YAML frontmatter
 
@@ -69,13 +82,15 @@ class MDFileService:
         if match:
             try:
                 frontmatter = yaml.safe_load(match.group(1))
+                if frontmatter is not None and not isinstance(frontmatter, dict):
+                    return {}, content, "YAML frontmatter must be a mapping/object"
                 body = match.group(2).strip()
-                return frontmatter or {}, body
+                return frontmatter or {}, body, None
             except yaml.YAMLError as e:
-                logger.warning(f"解析 YAML frontmatter 失败: {e}")
-                return {}, content
+                logger.warning(f"解析 YAML frontmatter 失败 {file_path or ''}: {e}")
+                return {}, content, str(e)
 
-        return {}, content
+        return {}, content, "Missing YAML frontmatter block"
 
     def _load_md_file(self, file_path: Path) -> Optional[Dict[str, Any]]:
         """
@@ -91,16 +106,20 @@ class MDFileService:
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
 
-            frontmatter, body = self._parse_frontmatter(content)
+            frontmatter, body, parse_error = self._parse_frontmatter(content, file_path)
+            if parse_error:
+                self._record_scan_error(file_path, parse_error)
 
             return {
-                'file_path': str(file_path),
+                'file_path': self._relative_path(file_path),
                 'frontmatter': frontmatter,
                 'content': body,
                 'raw_content': content,
+                'parse_error': parse_error,
             }
         except Exception as e:
             logger.error(f"读取 MD 文件失败 {file_path}: {e}")
+            self._record_scan_error(file_path, str(e))
             return None
 
     def _scan_directory(self, directory: Path) -> List[Path]:
@@ -123,6 +142,8 @@ class MDFileService:
         """确保缓存有效"""
         if self._cache_valid:
             return
+
+        self._scan_errors.clear()
 
         # 扫描 prompts 目录
         prompts_files = self._scan_directory(self.prompts_dir)
@@ -152,6 +173,12 @@ class MDFileService:
         self._cache_valid = False
         self._prompts_cache.clear()
         self._skills_cache.clear()
+        self._scan_errors.clear()
+
+    def get_scan_errors(self) -> List[Dict[str, str]]:
+        """获取最近一次扫描中发现的文件级错误。"""
+        self._ensure_cache()
+        return list(self._scan_errors)
 
     # ==================== Prompt 相关方法 ====================
 
@@ -474,6 +501,7 @@ class MDFileService:
                 'by_category': skill_categories,
                 'by_type': skill_types,
             },
+            'errors': list(self._scan_errors),
         }
 
 

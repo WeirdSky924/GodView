@@ -63,6 +63,53 @@ class SkillRetrievalResponse(BaseModel):
     final_skills: List[Dict[str, Any]]  # 最终激活的 Skills
 
 
+# ==================== MD 文件同步 API ====================
+
+@router.post("/sync-md-files", response_model=Dict[str, Any])
+async def sync_md_files():
+    """
+    将 skills/ 目录下的 MD 文件同步到数据库
+
+    这个API会：
+    1. 扫描 skills/ 目录下的所有 MD 文件
+    2. 提取 YAML frontmatter 作为元数据
+    3. 将元数据存入数据库（内容从 MD 文件读取）
+
+    Returns:
+        Dict: 同步结果统计
+    """
+    try:
+        from app.services.skill_service import get_skill_service
+        service = get_skill_service()
+        result = await service.sync_md_files_to_db()
+        return {
+            "success": True,
+            "message": f"同步完成: {result.get('synced', 0)} 个成功",
+            "result": result,
+        }
+    except Exception as e:
+        logger.error(f"同步 MD 文件失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/md-stats", response_model=Dict[str, Any])
+async def get_md_stats():
+    """
+    获取 MD 文件统计信息
+
+    Returns:
+        Dict: MD 文件统计
+    """
+    try:
+        from app.services.md_file_service import get_md_file_service
+        md_service = get_md_file_service()
+        stats = md_service.get_stats()
+        return stats
+    except Exception as e:
+        logger.error(f"获取 MD 文件统计失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ==================== Skill CRUD ====================
 
 @router.get("/", response_model=List[Skill])
@@ -109,43 +156,8 @@ async def create_skill(dto: CreateSkillDTO):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.get("/{skill_id}", response_model=Skill)
-async def get_skill(skill_id: str):
-    """获取 Skill 详情"""
-    service = get_skill_service()
-    skill = await service.get_skill(skill_id)
-
-    if not skill:
-        raise HTTPException(status_code=404, detail="Skill 不存在")
-
-    return skill
 
 
-@router.put("/{skill_id}", response_model=Skill)
-async def update_skill(skill_id: str, dto: UpdateSkillDTO):
-    """更新 Skill"""
-    service = get_skill_service()
-    skill = await service.update_skill(skill_id, dto)
-
-    if not skill:
-        raise HTTPException(status_code=404, detail="Skill 不存在")
-
-    return skill
-
-
-@router.delete("/{skill_id}")
-async def delete_skill(skill_id: str):
-    """删除 Skill"""
-    service = get_skill_service()
-    success = await service.delete_skill(skill_id)
-
-    if not success:
-        raise HTTPException(status_code=404, detail="Skill 不存在")
-
-    return {"success": True, "message": "Skill 已删除"}
-
-
-# ==================== Skill 搜索和生成 ====================
 
 @router.post("/search", response_model=List[Skill])
 async def search_skills(query: str, limit: int = 10):
@@ -767,49 +779,39 @@ async def execute_chapter_writing_workflow(
         logger.error(f"章节写作工作流执行失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# ==================== 单个 Skill CRUD（必须位于静态路由之后） ====================
+@router.get("/{skill_id}", response_model=Skill)
+async def get_skill(skill_id: str):
+    """获取 Skill 详情"""
+    service = get_skill_service()
+    skill = await service.get_skill(skill_id)
 
-# ==================== MD 文件同步 API ====================
+    if not skill:
+        raise HTTPException(status_code=404, detail="Skill 不存在")
 
-@router.post("/sync-md-files", response_model=Dict[str, Any])
-async def sync_md_files():
-    """
-    将 skills/ 目录下的 MD 文件同步到数据库
+    return skill
 
-    这个API会：
-    1. 扫描 skills/ 目录下的所有 MD 文件
-    2. 提取 YAML frontmatter 作为元数据
-    3. 将元数据存入数据库（内容从 MD 文件读取）
+@router.put("/{skill_id}", response_model=Skill)
+async def update_skill(skill_id: str, dto: UpdateSkillDTO):
+    """更新 Skill"""
+    service = get_skill_service()
+    skill = await service.update_skill(skill_id, dto)
 
-    Returns:
-        Dict: 同步结果统计
-    """
-    try:
-        from app.services.skill_service import get_skill_service
-        service = get_skill_service()
-        result = await service.sync_md_files_to_db()
-        return {
-            "success": True,
-            "message": f"同步完成: {result.get('synced', 0)} 个成功",
-            "result": result,
-        }
-    except Exception as e:
-        logger.error(f"同步 MD 文件失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    if not skill:
+        raise HTTPException(status_code=404, detail="Skill 不存在")
+
+    return skill
+
+@router.delete("/{skill_id}")
+async def delete_skill(skill_id: str):
+    """删除 Skill"""
+    service = get_skill_service()
+    success = await service.delete_skill(skill_id)
+
+    if not success:
+        raise HTTPException(status_code=404, detail="Skill 不存在")
+
+    return {"success": True, "message": "Skill 已删除"}
 
 
-@router.get("/md-stats", response_model=Dict[str, Any])
-async def get_md_stats():
-    """
-    获取 MD 文件统计信息
-
-    Returns:
-        Dict: MD 文件统计
-    """
-    try:
-        from app.services.md_file_service import get_md_file_service
-        md_service = get_md_file_service()
-        stats = md_service.get_stats()
-        return stats
-    except Exception as e:
-        logger.error(f"获取 MD 文件统计失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+# ==================== Skill 搜索和生成 ====================

@@ -2,6 +2,7 @@
 角色 Agent - 模拟小说中的角色行为和决策
 """
 
+import json
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -101,7 +102,13 @@ class CharacterAgent(BaseAgent):
 
     def _build_md_character_fallback_prompt(self) -> str:
         """从 md prompt 资产构建 Character 备用 prompt。"""
-        prompt_ids = ["role_character", "function_character_roleplay_decision", "function_workflow_character_performance"]
+        prompt_ids = [
+            "role_character",
+            "function_character_roleplay_decision",
+            "function_workflow_character_performance",
+            "function_character_runtime_context_packet",
+            "function_character_performance_packet",
+        ]
         parts = [content for prompt_id in prompt_ids if (content := self._load_md_prompt_content(prompt_id))]
         return "\n\n".join(parts).strip()
 
@@ -119,6 +126,13 @@ class CharacterAgent(BaseAgent):
             "context_blocks": [],
             "fallbacks_used": ["character_deprecated_minimal_system_prompt" if deprecated else "character_md_prompt_fallback"],
             "deprecated_sources_used": ["CharacterAgent._build_system_prompt"] if deprecated else [],
+            "missing_prompt_ids": [
+                "role_character",
+                "function_character_roleplay_decision",
+                "function_workflow_character_performance",
+                "function_character_runtime_context_packet",
+                "function_character_performance_packet",
+            ] if deprecated else [],
         }
 
     def _build_system_prompt(self) -> str:
@@ -126,7 +140,13 @@ class CharacterAgent(BaseAgent):
         md_prompt = self._build_md_character_fallback_prompt()
         if md_prompt:
             self._legacy_fallback_trace = self._character_fallback_trace(
-                prompt_ids=["role_character", "function_character_roleplay_decision", "function_workflow_character_performance"],
+                prompt_ids=[
+                    "role_character",
+                    "function_character_roleplay_decision",
+                    "function_workflow_character_performance",
+                    "function_character_runtime_context_packet",
+                    "function_character_performance_packet",
+                ],
             )
             return md_prompt
 
@@ -206,7 +226,12 @@ class CharacterAgent(BaseAgent):
             if md_prompt:
                 self.system_prompt = md_prompt
                 self._system_prompt_render_trace = self._character_fallback_trace(
-                    prompt_ids=["role_character", "function_character_roleplay_decision", "function_workflow_character_performance"],
+                    prompt_ids=[
+                        "role_character",
+                        "function_character_roleplay_decision",
+                        "function_workflow_character_performance",
+                        "function_character_runtime_context_packet",
+                    ],
                 )
             else:
                 self.system_prompt = self._build_system_prompt()
@@ -233,6 +258,7 @@ class CharacterAgent(BaseAgent):
             present_characters = input_data.get("present_characters", [])
             recent_events = input_data.get("recent_events", [])
             dialogue_history = input_data.get("dialogue_history", [])
+            character_context_packet = input_data.get("character_context_packet") or {}
 
             # 构建用户消息
             user_message = self._build_user_message(
@@ -245,6 +271,7 @@ class CharacterAgent(BaseAgent):
                 round_focus=input_data.get("round_focus"),
                 is_supplement=bool(input_data.get("is_supplement", False)),
                 target_word_count=input_data.get("target_word_count"),
+                character_context_packet=character_context_packet,
             )
 
             parsed = await self._call_structured(
@@ -279,9 +306,14 @@ class CharacterAgent(BaseAgent):
         round_focus: Optional[str] = None,
         is_supplement: bool = False,
         target_word_count: Optional[int] = None,
+        character_context_packet: Optional[Dict[str, Any]] = None,
     ) -> str:
         """构建用户消息。"""
         message_parts = [self._build_character_profile_block()]
+
+        packet_block = self._build_character_context_packet_block(character_context_packet)
+        if packet_block:
+            message_parts.append(packet_block)
 
         if context:
             message_parts.append(f"【当前情境】\n{context}")
@@ -298,19 +330,105 @@ class CharacterAgent(BaseAgent):
             )
             message_parts.append(f"【对话历史】\n{dialogue_text}")
 
-        task_lines = ["根据当前角色档案和可见情境，生成下一步角色决策。"]
-        if round_number and total_rounds:
-            task_lines.append(f"当前是第 {round_number}/{total_rounds} 轮互动。")
-        if round_focus:
-            task_lines.append(f"本轮剧情焦点：{round_focus}")
-        if is_supplement:
-            task_lines.append("这是补充表演，只补足当前场景素材，不扩写成完整章节正文。")
-        if target_word_count:
-            task_lines.append(f"目标长度参考：约 {target_word_count} 字。")
-        task_lines.append("只使用当前角色可知信息，输出必须符合 CharacterDecisionSchema。")
-        message_parts.append("【当前任务】\n" + "\n".join(f"- {line}" for line in task_lines))
+        task_payload = {
+            "scenario": self.scenario,
+            "round_number": round_number,
+            "total_rounds": total_rounds,
+            "round_focus": round_focus,
+            "is_supplement": bool(is_supplement),
+            "target_word_count": target_word_count,
+            "output_schema": "CharacterDecisionSchema",
+        }
+        message_parts.append("【运行时任务参数】\n" + self._format_context_value(task_payload))
 
         return "\n\n".join(message_parts)
+
+    def _normalize_string_list(self, value: Any) -> List[str]:
+        """把运行期/LLM 输出中的列表字段规范为字符串列表。"""
+        if value is None:
+            return []
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return []
+            try:
+                parsed = json.loads(stripped)
+                value = parsed
+            except (json.JSONDecodeError, TypeError):
+                value = [stripped]
+        elif isinstance(value, dict):
+            value = list(value.values())
+        elif not isinstance(value, (list, tuple, set)):
+            value = [value]
+
+        result: List[str] = []
+        seen = set()
+        for item in value:
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            result.append(text)
+        return result
+
+    def _normalize_dict_list(self, value: Any) -> List[Dict[str, Any]]:
+        """把运行期/LLM 输出中的对象列表字段规范为 dict 列表。"""
+        if value is None:
+            return []
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return []
+            try:
+                value = json.loads(stripped)
+            except (json.JSONDecodeError, TypeError):
+                return []
+        if isinstance(value, dict):
+            return [value]
+        if isinstance(value, (list, tuple, set)):
+            return [item for item in value if isinstance(item, dict)]
+        return []
+
+    def _format_context_value(self, value: Any) -> str:
+        """稳定格式化角色可知上下文包，避免 prompt 中出现 Python repr 噪音。"""
+        if value in (None, "", [], {}):
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        try:
+            return json.dumps(value, ensure_ascii=False, indent=2)
+        except TypeError:
+            return str(value)
+
+    def _build_character_context_packet_block(self, packet: Any) -> str:
+        """构建 SceneCoordinator 分发给当前角色的可知上下文包。"""
+        if not isinstance(packet, dict) or not packet:
+            return ""
+
+        ordered_fields = [
+            ("visible_scene", "可见场景"),
+            ("role_objectives", "当前目标/顾虑"),
+            ("relationship_context", "当前角色可知关系"),
+            ("state_context", "当前角色状态"),
+            ("visible_events", "可见事件"),
+            ("public_history", "公开历史"),
+            ("information_boundaries", "信息边界"),
+            ("forbidden_knowledge", "禁止使用的信息"),
+            ("continuity_notes", "连续性提示"),
+        ]
+        lines = ["【角色可知上下文包】", "以下内容是当前角色可见、可听或合理可推断的信息边界；不得使用包外信息。"]
+        for key, label in ordered_fields:
+            formatted = self._format_context_value(packet.get(key))
+            if formatted:
+                lines.append(f"\n### {label}\n{formatted}")
+
+        extra_keys = [key for key in packet.keys() if key not in {field for field, _ in ordered_fields}]
+        if extra_keys:
+            extra_payload = {key: packet.get(key) for key in extra_keys if packet.get(key) not in (None, "", [], {})}
+            formatted = self._format_context_value(extra_payload)
+            if formatted:
+                lines.append(f"\n### 其他可知信息\n{formatted}")
+        return "\n".join(lines)
 
     def _normalize_decision_packet(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """规范化角色输出，确保公开/私有边界和兼容字段稳定。"""
@@ -335,13 +453,13 @@ class CharacterAgent(BaseAgent):
         packet["private_thought"] = private_thought
         packet["emotion"] = str(packet.get("emotion") or "neutral")
         packet["intent"] = str(packet.get("intent") or "")
-        packet["perceived_facts"] = [str(item) for item in packet.get("perceived_facts", []) if str(item).strip()]
-        packet["misinterpretations"] = [str(item) for item in packet.get("misinterpretations", []) if str(item).strip()]
-        packet["withheld_information"] = [str(item) for item in packet.get("withheld_information", []) if str(item).strip()]
-        packet["relationship_delta"] = [item for item in packet.get("relationship_delta", []) if isinstance(item, dict)]
-        packet["state_delta"] = [item for item in packet.get("state_delta", []) if isinstance(item, dict)]
-        packet["continuity_notes"] = [str(item) for item in packet.get("continuity_notes", []) if str(item).strip()]
-        packet["warnings"] = [str(item) for item in packet.get("warnings", []) if str(item).strip()]
+        packet["perceived_facts"] = self._normalize_string_list(packet.get("perceived_facts"))
+        packet["misinterpretations"] = self._normalize_string_list(packet.get("misinterpretations"))
+        packet["withheld_information"] = self._normalize_string_list(packet.get("withheld_information"))
+        packet["relationship_delta"] = self._normalize_dict_list(packet.get("relationship_delta"))
+        packet["state_delta"] = self._normalize_dict_list(packet.get("state_delta"))
+        packet["continuity_notes"] = self._normalize_string_list(packet.get("continuity_notes"))
+        packet["warnings"] = self._normalize_string_list(packet.get("warnings"))
         return packet
 
     def update_character(self, updates: Dict[str, Any]):

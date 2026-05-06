@@ -29,6 +29,24 @@ logger = logging.getLogger(__name__)
 class AgentPromptService:
     """Agent Prompt 动态加载服务"""
 
+    SHARED_LONG_NOVEL_RULE_IDS: Set[str] = {
+        "long_novel_slow_burn_pacing",
+        "long_novel_villain_tier_progression",
+        "long_novel_no_author_view_golden_finger_term",
+        "long_novel_no_undefined_crisis_resolution",
+        "long_novel_character_resource_gate",
+        "long_novel_chapter_event_progression",
+    }
+    LONG_NOVEL_RULE_SCENARIOS: Set[str] = {
+        "workflow_chapter_generation",
+        "rewrite_by_review",
+        "chapter_quality_review",
+        "outline_quality_review",
+        "generate_chapter_outline",
+        "validate_long_novel_pacing",
+    }
+    LONG_NOVEL_RULE_AGENT_TYPES: Set[str] = {"writer", "evaluator", "plot_outline"}
+
     def __init__(self, prompt_template_service=None, agent_template_service=None):
         self._prompt_template_service = prompt_template_service
         self._agent_template_service = agent_template_service
@@ -173,6 +191,7 @@ class AgentPromptService:
             "context_blocks": [],
             "fallbacks_used": [],
             "deprecated_sources_used": [],
+            "missing_prompt_ids": [],
         }
 
     @staticmethod
@@ -217,6 +236,7 @@ class AgentPromptService:
         context_scene: Optional[str] = None,
         scenario: Optional[str] = None,
         use_intelligent_retrieval: bool = True,
+        resolved_template: Optional[AgentTemplate] = None,
     ) -> List[tuple[Skill, Dict[str, Any]]]:
         """
         加载 Agent 的 Skills（双层加载 + 智能检索）
@@ -234,6 +254,7 @@ class AgentPromptService:
                 project_id=project_id,
                 scenario=scenario,
                 context_scene=context_scene,
+                resolved_template=resolved_template,
             )
             if slot_skills:
                 logger.info(
@@ -358,6 +379,7 @@ class AgentPromptService:
         project_id: Optional[str] = None,
         scenario: Optional[str] = None,
         context_scene: Optional[str] = None,
+        resolved_template: Optional[AgentTemplate] = None,
     ) -> List[tuple[Skill, Dict[str, Any]]]:
         """
         从 agent_templates.skill_slots 加载 Skills
@@ -366,7 +388,7 @@ class AgentPromptService:
         优先从数据库加载，如果数据库不可用则使用内存缓存。
         """
         try:
-            template = await self._resolve_template_for_agent(
+            template = resolved_template or await self._resolve_template_for_agent(
                 agent_type,
                 project_id=project_id,
                 scenario=scenario,
@@ -519,11 +541,21 @@ class AgentPromptService:
             return None
 
     async def get_prompt_template(self, template_id: str) -> Optional[PromptTemplate]:
-        """获取 Prompt 模板，优先使用运行时服务，随后使用系统缓存和 md 资产。"""
-        if self._prompt_template_service:
+        """获取 Prompt 模板，统一走 PromptTemplateService resolver，随后兼容系统缓存。"""
+        prompt_service = self._prompt_template_service
+        if not prompt_service:
             try:
-                template = await self._prompt_template_service.get_template(template_id)
+                from app.services.prompt_template_service import get_prompt_template_service
+                prompt_service = get_prompt_template_service()
+            except Exception as e:
+                logger.debug(f"获取 PromptTemplateService 失败: {template_id}, error={e}")
+                prompt_service = None
+
+        if prompt_service:
+            try:
+                template = await prompt_service.get_template(template_id)
                 if template:
+                    self._prompt_cache[template_id] = template
                     return template
             except Exception as e:
                 logger.debug(f"从 PromptTemplateService 获取模板失败: {template_id}, error={e}")
@@ -532,7 +564,7 @@ class AgentPromptService:
         if cached_template:
             return cached_template
 
-        return self._build_prompt_template_from_md(template_id)
+        return None
 
     def get_agent_template(self, agent_type: str) -> Optional[AgentTemplate]:
         """获取 Agent 模板"""
@@ -579,8 +611,10 @@ class AgentPromptService:
             "template_id": None,
             "template_scenario": None,
             "prompt_ids": [],
+            "context_blocks": [],
             "fallbacks_used": [],
             "deprecated_sources_used": [],
+            "missing_prompt_ids": [],
         }
         try:
             from app.services.agent_config_service import get_agent_config_service
@@ -592,7 +626,7 @@ class AgentPromptService:
             prompt_service = self._prompt_template_service or get_prompt_template_service()
 
             state = await config_service.resolve_agent_runtime_state(project_id, agent_type, scenario)
-            template = state.get("template") or resolved_template
+            template = resolved_template or state.get("template")
             config = state.get("config")
 
             if not template:
@@ -634,12 +668,18 @@ class AgentPromptService:
                 prompt_template_service=prompt_service,
                 agent_template_service=template_service,
             )
-            content = await self._prompt_builder.build_prompt(config, template, variables or {})
+            prompt_build = await self._prompt_builder.build_prompt_with_trace(config, template, variables or {})
+            content = prompt_build.get("content", "")
+            builder_trace = prompt_build.get("trace", {})
             trace.update({
                 "config_id": config.id,
                 "template_id": template.id,
                 "template_scenario": template.scenario,
-                "prompt_ids": self._build_prompt_id_trace(template),
+                "prompt_ids": builder_trace.get("prompt_ids", self._build_prompt_id_trace(template)),
+                "context_blocks": builder_trace.get("context_blocks", []),
+                "fallbacks_used": builder_trace.get("fallbacks_used", []),
+                "deprecated_sources_used": builder_trace.get("deprecated_sources_used", []),
+                "missing_prompt_ids": builder_trace.get("missing_prompt_ids", []),
             })
             requested_scenario = self._normalize_trace_scenario(scenario)
             actual_scenario = self._normalize_trace_scenario(template.scenario)
@@ -686,6 +726,7 @@ class AgentPromptService:
         context_scene: Optional[str] = None,
         scenario: Optional[str] = None,
         use_intelligent_retrieval: bool = True,
+        use_project_config: bool = True,
     ) -> str:
         """构建 Agent 的完整 system prompt。"""
         data = await self.build_agent_prompt_with_trace(
@@ -699,6 +740,7 @@ class AgentPromptService:
             context_scene=context_scene,
             scenario=scenario,
             use_intelligent_retrieval=use_intelligent_retrieval,
+            use_project_config=use_project_config,
         )
         return data.get("content", "")
 
@@ -714,6 +756,8 @@ class AgentPromptService:
         context_scene: Optional[str] = None,
         scenario: Optional[str] = None,
         use_intelligent_retrieval: bool = True,
+        resolved_template: Optional[AgentTemplate] = None,
+        use_project_config: bool = True,
     ) -> Dict[str, Any]:
         """构建 Agent 的完整 system prompt，并返回统一 runtime/preview trace。"""
         runtime_scenario = scenario or (variables or {}).get("scenario") or context_scene
@@ -722,7 +766,7 @@ class AgentPromptService:
             scenario=runtime_scenario,
             project_id=project_id,
         )
-        template = await self._resolve_template_for_agent(
+        template = resolved_template or await self._resolve_template_for_agent(
             agent_type,
             project_id=project_id,
             scenario=runtime_scenario,
@@ -755,6 +799,7 @@ class AgentPromptService:
                 context_scene=context_scene,
                 scenario=runtime_scenario,
                 use_intelligent_retrieval=use_intelligent_retrieval,
+                resolved_template=template,
             )
             skills_content = skills_data.get("content", "")
             skills_trace = skills_data.get("trace", {})
@@ -765,12 +810,16 @@ class AgentPromptService:
             if skills_content:
                 prompt_pieces.append(skills_content)
 
+        render_variables = dict(variables or {})
+        if include_skills:
+            render_variables["available_skills"] = skills_content
+
         config_prompt = ""
-        if project_id:
+        if project_id and use_project_config:
             config_data = await self._build_prompt_from_config_with_trace(
                 agent_type=agent_type,
                 project_id=project_id,
-                variables=variables,
+                variables=render_variables,
                 scenario=runtime_scenario,
                 resolved_template=template,
             )
@@ -780,8 +829,10 @@ class AgentPromptService:
             trace["template_id"] = config_trace.get("template_id") or trace["template_id"]
             trace["template_scenario"] = config_trace.get("template_scenario") or trace["template_scenario"]
             trace["prompt_ids"] = config_trace.get("prompt_ids", [])
-            self._extend_trace_values(trace, "fallbacks_used", config_trace.get("fallbacks_used", []))
-            self._extend_trace_values(trace, "deprecated_sources_used", config_trace.get("deprecated_sources_used", []))
+            trace["context_blocks"] = config_trace.get("context_blocks", [])
+            trace["fallbacks_used"] = config_trace.get("fallbacks_used", [])
+            trace["deprecated_sources_used"] = config_trace.get("deprecated_sources_used", [])
+            trace["missing_prompt_ids"] = config_trace.get("missing_prompt_ids", [])
             template = config_data.get("template") or template
 
         if config_prompt:
@@ -860,8 +911,7 @@ class AgentPromptService:
             merged_vars = {}
             merged_vars.update(prompt_template.default_values)
             merged_vars.update(slot.variable_overrides)
-            if variables:
-                merged_vars.update(variables)
+            merged_vars.update(render_variables)
 
             rendered = self._render_template(prompt_template, merged_vars)
             if rendered:
@@ -881,6 +931,7 @@ class AgentPromptService:
         context_scene: Optional[str] = None,
         scenario: Optional[str] = None,
         use_intelligent_retrieval: bool = True,
+        resolved_template: Optional[AgentTemplate] = None,
     ) -> Dict[str, Any]:
         """构建 Skills prompt，并返回与 runtime resolver 一致的 trace。"""
         skills_with_params = await self._load_skills_for_agent(
@@ -891,6 +942,7 @@ class AgentPromptService:
             context_scene=context_scene,
             scenario=scenario,
             use_intelligent_retrieval=use_intelligent_retrieval,
+            resolved_template=resolved_template,
         )
         content = await self._render_skills_prompt(skills_with_params, variables, update_usage=False)
         skill_ids: List[str] = []
@@ -903,7 +955,7 @@ class AgentPromptService:
             seen_ids.add(skill.id)
             skill_ids.append(skill.id)
 
-        template = await self._resolve_template_for_agent(agent_type, project_id=project_id, scenario=scenario)
+        template = resolved_template or await self._resolve_template_for_agent(agent_type, project_id=project_id, scenario=scenario)
         scope = self._build_skill_scope(agent_type, scenario, context_scene)
         source = "template_skill_slots" if template and template.skill_slots else "skill_assignments_or_retrieval"
         fallbacks_used: List[str] = []
@@ -1172,6 +1224,53 @@ class AgentPromptService:
             context["keywords"] = context_keywords
         return context
 
+    def _requires_shared_long_novel_rules(self, context: Optional[Dict[str, Any]] = None) -> bool:
+        payload = context or {}
+        agent_type = str(payload.get("agent_type") or "").strip()
+        scenario = str(payload.get("scenario") or payload.get("context_scene") or payload.get("scene") or "").strip()
+        return agent_type in self.LONG_NOVEL_RULE_AGENT_TYPES and scenario in self.LONG_NOVEL_RULE_SCENARIOS
+
+    async def _resolve_missing_shared_long_novel_rules(
+        self,
+        writing_rule_service,
+        retrieved_rules: List[Dict[str, Any]],
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[List[Any], List[str]]:
+        """补齐 Writer/Evaluator/Plot Outline 必须共用的长篇核心规则。"""
+        if not self._requires_shared_long_novel_rules(context):
+            return [], []
+
+        present_ids = {str(rule.get("id")) for rule in retrieved_rules if rule.get("id")}
+        missing_ids = [
+            rule_id for rule_id in sorted(self.SHARED_LONG_NOVEL_RULE_IDS)
+            if rule_id not in present_ids
+        ]
+        if not missing_ids:
+            return [], []
+
+        rules = []
+        unresolved_ids = []
+        for rule_id in missing_ids:
+            rule = await writing_rule_service.get_rule_merged(rule_id)
+            if not rule:
+                unresolved_ids.append(rule_id)
+                continue
+            if writing_rule_service._rule_matches_runtime_context(rule, context):
+                rules.append(rule)
+        return rules, unresolved_ids
+
+    def _serialize_forced_long_novel_rule(self, writing_rule_service, rule: Any) -> Dict[str, Any]:
+        return {
+            "id": rule.id,
+            "name": rule.name,
+            "severity": rule.severity.value,
+            "application_mode": rule.application_mode.value,
+            "score": 1.0,
+            "summary": writing_rule_service._clip_text(rule.content, 180),
+            "tags": rule.tags,
+            "reason": "shared_long_novel_core",
+        }
+
     async def build_writing_rules_prompt(
         self,
         project_id: Optional[str],
@@ -1264,10 +1363,24 @@ class AgentPromptService:
                 limit=4,
             )
             retrieved_rules = retrieval.get("retrieved_rules", [])
+            forced_rules, missing_shared_rule_ids = await self._resolve_missing_shared_long_novel_rules(
+                writing_rule_service,
+                retrieved_rules,
+                context,
+            )
+            forced_rule_payloads = [self._serialize_forced_long_novel_rule(writing_rule_service, rule) for rule in forced_rules]
+            if forced_rule_payloads:
+                retrieved_ids = {rule.get("id") for rule in retrieved_rules if rule.get("id")}
+                retrieved_rules = [
+                    *retrieved_rules,
+                    *[rule for rule in forced_rule_payloads if rule.get("id") not in retrieved_ids],
+                ]
             always_rule_ids = retrieval.get("always_rules", [])
             trace.update({
                 "writing_rule_ids": [rule.get("id") for rule in retrieved_rules if rule.get("id")],
                 "always_rule_ids": always_rule_ids,
+                "shared_long_novel_rule_ids": [rule.id for rule in forced_rules],
+                "missing_shared_long_novel_rule_ids": missing_shared_rule_ids,
                 "retrieved_rules": [
                     {
                         "id": rule.get("id"),
@@ -1285,13 +1398,19 @@ class AgentPromptService:
                 lines.append("\n## 当前命中的写作规则")
                 for rule in retrieved_rules:
                     lines.append(
-                        f"- [{rule.get('severity')}] {rule.get('name')}: {rule.get('summary')}"
+                        f"- [{rule.get('severity')}] {rule.get('name')}（{rule.get('id')}，{rule.get('reason')}）: {rule.get('summary')}"
                     )
 
             rendered_guidance = retrieval.get("rendered_guidance", "").strip()
             if rendered_guidance:
                 lines.append("\n## 写作规则约束")
                 lines.append(rendered_guidance)
+
+            if forced_rules:
+                long_novel_guidance = writing_rule_service.build_always_rule_guidance(forced_rules)
+                if long_novel_guidance:
+                    lines.append("\n## 共享长篇网文核心规则")
+                    lines.append(long_novel_guidance)
 
             return {"content": "\n".join(lines), "trace": trace}
         except Exception as e:
@@ -1313,11 +1432,12 @@ class AgentPromptService:
         """
         content = template.content
 
-        # 替换变量
+        # 替换变量，兼容 {var} 和历史 preview 使用的 {{var}} 占位符。
         for var_name, var_value in variables.items():
-            placeholder = f"{{{var_name}}}"
-            if placeholder in content:
-                content = content.replace(placeholder, str(var_value))
+            value = str(var_value)
+            for placeholder in (f"{{{{{var_name}}}}}", f"{{{var_name}}}"):
+                if placeholder in content:
+                    content = content.replace(placeholder, value)
 
         return content
 
@@ -1391,6 +1511,53 @@ class AgentPromptService:
             })
 
         return result
+
+    async def audit_system_agent_template_prompt_resolution(self) -> Dict[str, Any]:
+        """Dry-run system AgentTemplate prompt slot resolution without calling LLMs."""
+        audit: Dict[str, Any] = {
+            "template_count": 0,
+            "slot_count": 0,
+            "resolved_prompt_ids": [],
+            "missing_prompt_ids": [],
+            "templates": [],
+        }
+        seen_resolved: Set[str] = set()
+        seen_missing: Set[str] = set()
+
+        for template in SYSTEM_AGENT_TEMPLATES:
+            template_result: Dict[str, Any] = {
+                "template_id": template.id,
+                "agent_type": template.agent_type.value if hasattr(template.agent_type, "value") else str(template.agent_type),
+                "scenario": template.scenario,
+                "prompt_ids": [],
+                "missing_prompt_ids": [],
+                "fallbacks_used": [],
+                "deprecated_sources_used": [],
+            }
+
+            for slot in sorted(template.prompt_slots, key=lambda item: -item.priority):
+                if not slot.is_enabled or not slot.prompt_template_id:
+                    continue
+
+                prompt_id = slot.prompt_template_id
+                audit["slot_count"] += 1
+                prompt_template = await self.get_prompt_template(prompt_id)
+                if prompt_template:
+                    template_result["prompt_ids"].append(prompt_id)
+                    if prompt_id not in seen_resolved:
+                        seen_resolved.add(prompt_id)
+                        audit["resolved_prompt_ids"].append(prompt_id)
+                else:
+                    template_result["missing_prompt_ids"].append(prompt_id)
+                    template_result["fallbacks_used"].append(f"missing_prompt_template:{prompt_id}")
+                    if prompt_id not in seen_missing:
+                        seen_missing.add(prompt_id)
+                        audit["missing_prompt_ids"].append(prompt_id)
+
+            audit["templates"].append(template_result)
+
+        audit["template_count"] = len(audit["templates"])
+        return audit
 
     def extract_keywords_from_text(self, text: str) -> List[str]:
         """

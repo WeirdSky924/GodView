@@ -1001,10 +1001,16 @@ class WritingRuleService:
 
         lines = ["## 当前必须常驻的写作约束"]
         for rule in constitutional_rules:
-            line = f"- [{rule.severity.value}] {rule.name}: {self._clip_text(rule.content, 180)}"
+            lines.append(
+                f"- [{rule.severity.value}] {rule.name}（{rule.id}，{rule.application_mode.value}）: "
+                f"{self._clip_text(rule.content, 520)}"
+            )
+            if rule.examples:
+                lines.append(f"  示例：{self._clip_text(rule.examples[0], 160)}")
+            if rule.counter_examples and rule.severity in {RuleSeverity.REQUIRED, RuleSeverity.STRONG}:
+                lines.append(f"  反例：{self._clip_text(rule.counter_examples[0], 160)}")
             if rule.exceptions:
-                line += f"（例外：{'; '.join(rule.exceptions[:2])}）"
-            lines.append(line)
+                lines.append(f"  例外：{'; '.join(rule.exceptions[:2])}")
         return "\n".join(lines)
 
     def build_retrieved_guidance(self, rules: List[WritingRule], limit: int = 6) -> str:
@@ -1013,9 +1019,12 @@ class WritingRuleService:
 
         lines = ["## 当前任务命中的写作规则"]
         for rule in rules[:limit]:
-            lines.append(f"- [{rule.severity.value}] {rule.name}: {self._clip_text(rule.content, 220)}")
+            lines.append(
+                f"- [{rule.severity.value}] {rule.name}（{rule.id}，{rule.application_mode.value}）: "
+                f"{self._clip_text(rule.content, 420)}"
+            )
             if rule.examples:
-                lines.append(f"  示例：{self._clip_text(rule.examples[0], 120)}")
+                lines.append(f"  示例：{self._clip_text(rule.examples[0], 140)}")
         return "\n".join(lines)
 
     def describe_project_rule_scope(self, scope: Dict[str, Any]) -> Dict[str, Any]:

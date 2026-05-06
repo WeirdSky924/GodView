@@ -316,6 +316,7 @@ class SkillService:
         applicable_agent_types: List[str],
         category: str,
         priority: int,
+        applicable_scenarios: Optional[List[str]] = None,
     ):
         """
         简化版的分配关系同步（用于 MD 文件同步）
@@ -330,26 +331,29 @@ class SkillService:
             return
 
         try:
+            scenarios = applicable_scenarios or ["default"]
+            normalized_scenarios = [self._normalize_scenario(scenario) for scenario in scenarios]
             for agent_type in applicable_agent_types:
-                assignment_id = f"assign_{skill_id}_{agent_type}"
-                await self._db.execute_write(
-                    """
-                    INSERT INTO skill_assignments
-                    (id, skill_id, agent_type, scenario, slot_name, priority, is_enabled, is_required, variable_overrides, assigned_by)
-                    VALUES (:id, :skill_id, :agent_type, :scenario, :slot_name, :priority, true, false, '{}', 'system')
-                    ON CONFLICT (skill_id, agent_type, scenario, slot_name) DO UPDATE SET
-                        priority = :priority, is_enabled = true
-                    """,
-                    {
-                        "id": assignment_id,
-                        "skill_id": skill_id,
-                        "agent_type": agent_type,
-                        "scenario": "default",
-                        "slot_name": category,
-                        "priority": priority,
-                    }
-                )
-                logger.debug(f"同步 Skill {skill_id} 分配到 Agent {agent_type}")
+                for scenario in normalized_scenarios:
+                    assignment_id = f"assign_{skill_id}_{agent_type}_{scenario}"
+                    await self._db.execute_write(
+                        """
+                        INSERT INTO skill_assignments
+                        (id, skill_id, agent_type, scenario, slot_name, priority, is_enabled, is_required, variable_overrides, assigned_by)
+                        VALUES (:id, :skill_id, :agent_type, :scenario, :slot_name, :priority, true, false, '{}', 'system')
+                        ON CONFLICT (skill_id, agent_type, scenario, slot_name) DO UPDATE SET
+                            priority = :priority, is_enabled = true
+                        """,
+                        {
+                            "id": assignment_id,
+                            "skill_id": skill_id,
+                            "agent_type": agent_type,
+                            "scenario": scenario,
+                            "slot_name": category,
+                            "priority": priority,
+                        }
+                    )
+                    logger.debug(f"同步 Skill {skill_id} 分配到 Agent {agent_type} 场景 {scenario}")
 
         except Exception as e:
             logger.warning(f"同步 Skill {skill_id} 的分配关系失败: {e}")
@@ -1300,7 +1304,50 @@ class SkillService:
 
     # ==================== MD 文件同步 ====================
 
-    async def sync_md_files_to_db(self) -> Dict[str, int]:
+    @staticmethod
+    def _new_md_sync_result() -> Dict[str, Any]:
+        return {"synced": 0, "skipped": 0, "errors": 0, "files": []}
+
+    @staticmethod
+    def _add_md_sync_file_result(
+        result: Dict[str, Any],
+        *,
+        file_path: str,
+        asset_id: Optional[str],
+        status: str,
+        message: str,
+    ):
+        result["files"].append({
+            "file_path": file_path,
+            "id": asset_id,
+            "status": status,
+            "message": message,
+        })
+
+    async def _delete_stale_md_skills(self, synced_ids: set[str]):
+        """Remove database Skill rows that originated from md files but no longer exist."""
+        try:
+            rows = await self._db.execute_query(
+                "SELECT id FROM skills WHERE prompt_template IS NOT NULL"
+                " AND prompt_template <> ''"
+            )
+            stale_ids = [row['id'] for row in rows if row.get('id') not in synced_ids]
+            for skill_id in stale_ids:
+                await self._db.execute_write(
+                    "DELETE FROM skill_assignments WHERE skill_id = :id",
+                    {'id': skill_id},
+                )
+                await self._db.execute_write(
+                    "DELETE FROM skills WHERE id = :id AND prompt_template IS NOT NULL AND prompt_template <> ''",
+                    {'id': skill_id},
+                )
+                self._skills.pop(skill_id, None)
+            if stale_ids:
+                logger.info(f"清理已删除的 MD Skills: {len(stale_ids)} 个")
+        except Exception as e:
+            logger.warning(f"清理已删除的 MD Skills 失败: {e}")
+
+    async def sync_md_files_to_db(self) -> Dict[str, Any]:
         """
         将 MD 文件同步到数据库
 
@@ -1314,7 +1361,10 @@ class SkillService:
         """
         if not self._db:
             logger.warning("数据库未连接，无法同步 MD 文件")
-            return {"error": 1, "synced": 0, "skipped": 0}
+            return {"error": 1, "synced": 0, "skipped": 0, "errors": 1, "files": []}
+
+        result = self._new_md_sync_result()
+        synced_ids = set()
 
         try:
             from app.services.md_file_service import get_md_file_service
@@ -1324,12 +1374,20 @@ class SkillService:
             # 获取所有 MD 文件中的 Skills
             md_skills = md_service.list_skills()
 
-            synced = 0
-            skipped = 0
-            errors = 0
+            for scan_error in md_service.get_scan_errors():
+                if str(scan_error.get('file_path', '')).startswith('skills/'):
+                    result["errors"] += 1
+                    self._add_md_sync_file_result(
+                        result,
+                        file_path=scan_error.get('file_path', ''),
+                        asset_id=None,
+                        status="error",
+                        message=scan_error.get('error', 'Invalid markdown frontmatter'),
+                    )
 
             for md_skill in md_skills:
                 skill_id = md_skill['id']
+                file_path = md_skill.get('file_path', '')
                 content = md_skill.get('content', '')
                 logger.debug(f"同步 Skill: {skill_id}, 内容长度: {len(content)} 字符")
 
@@ -1410,25 +1468,54 @@ class SkillService:
                     applicable_agent_types = md_skill.get('applicable_agent_types', [])
                     if applicable_agent_types:
                         await self._sync_applicable_agent_types_to_assignments_simple(
-                            skill_id, applicable_agent_types, category.value, md_skill.get('priority', 50)
+                            skill_id,
+                            applicable_agent_types,
+                            category.value,
+                            md_skill.get('priority', 50),
+                            md_skill.get('applicable_scenarios') or md_skill.get('scenarios'),
                         )
 
-                    synced += 1
+                    result["synced"] += 1
+                    synced_ids.add(skill_id)
+                    self._add_md_sync_file_result(
+                        result,
+                        file_path=file_path,
+                        asset_id=skill_id,
+                        status="synced",
+                        message="Skill synced to database",
+                    )
                     logger.debug(f"同步 Skill 到数据库: {skill_id}")
 
                 except Exception as e:
-                    errors += 1
+                    result["errors"] += 1
+                    self._add_md_sync_file_result(
+                        result,
+                        file_path=file_path,
+                        asset_id=skill_id,
+                        status="error",
+                        message=str(e),
+                    )
                     logger.error(f"同步 Skill {skill_id} 失败: {e}")
+
+            await self._delete_stale_md_skills(synced_ids)
 
             # 刷新缓存
             self.invalidate_cache()
 
-            logger.info(f"MD 文件同步完成: {synced} 个成功, {skipped} 个跳过, {errors} 个错误")
-            return {"synced": synced, "skipped": skipped, "errors": errors}
+            logger.info(
+                "MD 文件同步完成: %s 个成功, %s 个跳过, %s 个错误",
+                result["synced"],
+                result["skipped"],
+                result["errors"],
+            )
+            return result
 
         except Exception as e:
             logger.error(f"同步 MD 文件失败: {e}")
-            return {"error": 1, "synced": 0, "skipped": 0}
+            result["errors"] += 1
+            result["error"] = 1
+            result["files"].append({"file_path": None, "id": None, "status": "error", "message": str(e)})
+            return result
 
 
 # 全局单例

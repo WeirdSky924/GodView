@@ -14,6 +14,8 @@ import {
   searchPrompts,
   getCategories,
   renderPrompt,
+  syncPromptMdFiles,
+  getPromptMdStats,
   PromptTemplate,
   PromptCategory,
   PromptVariable,
@@ -44,6 +46,9 @@ export default function Prompts() {
   const [selectedCategory, setSelectedCategory] = useState<PromptCategory | null>(null)
   const [selectedTags, setSelectedTags] = useState<string[]>([])
   const [showSystemOnly, setShowSystemOnly] = useState<boolean | undefined>(undefined)
+  const [mdStats, setMdStats] = useState<{ prompts?: { total: number; by_category?: Record<string, number> } } | null>(null)
+  const [syncingMd, setSyncingMd] = useState(false)
+  const [lastSyncResult, setLastSyncResult] = useState<string | null>(null)
 
   // Modal 状态
   const [showEditModal, setShowEditModal] = useState(false)
@@ -67,6 +72,7 @@ export default function Prompts() {
   useEffect(() => {
     loadPrompts()
     loadCategories()
+    loadMdStats()
   }, [selectedCategory, selectedTags, showSystemOnly])
 
   const loadPrompts = async () => {
@@ -93,6 +99,54 @@ export default function Prompts() {
     } catch (error) {
       console.error('Failed to load categories:', error)
     }
+  }
+
+  const loadMdStats = async () => {
+    try {
+      const data = await getPromptMdStats()
+      setMdStats(data)
+    } catch (error) {
+      console.error('Failed to load prompt MD stats:', error)
+    }
+  }
+
+  const formatSyncSummary = (summary: { synced?: number; skipped?: number; errors?: number; error?: number; files?: Array<{ file_path?: string | null; status: string; message: string }> }) => {
+    const errorCount = summary.errors || summary.error || 0
+    const errorSamples = (summary.files || [])
+      .filter((file) => file.status === 'error')
+      .slice(0, 3)
+      .map((file) => `${file.file_path || '未知文件'}：${file.message}`)
+    if (errorCount > 0) {
+      return [
+        `同步存在错误：成功 ${summary.synced || 0}，跳过 ${summary.skipped || 0}，错误 ${errorCount}`,
+        ...errorSamples,
+      ].join('；')
+    }
+    return `同步完成：成功 ${summary.synced || 0}，跳过 ${summary.skipped || 0}`
+  }
+
+  const handleSyncMdFiles = async () => {
+    if (!confirm('将扫描 prompts/ 目录下符合规范的 Markdown 文件，并同步到 Prompt 数据库。是否继续？')) return
+    setSyncingMd(true)
+    setLastSyncResult(null)
+    try {
+      const result = await syncPromptMdFiles()
+      const summary = result.result || {}
+      setLastSyncResult(formatSyncSummary(summary))
+      await loadPrompts()
+      await loadCategories()
+      await loadMdStats()
+    } catch (error) {
+      console.error('Failed to sync prompt MD files:', error)
+      setLastSyncResult('同步失败，请查看后端日志或浏览器控制台。')
+    } finally {
+      setSyncingMd(false)
+    }
+  }
+
+  const inferPromptSourceLabel = (prompt: PromptTemplate) => {
+    if (prompt.is_system) return '系统 / md'
+    return 'DB 自定义'
   }
 
   const handleSearch = async () => {
@@ -241,7 +295,26 @@ export default function Prompts() {
         </Button>
       }
       filters={
-        <div className="space-y-3">
+        <>
+          <div className={`mb-4 rounded-lg border p-4 ${isDark ? 'bg-gray-900 border-gray-700' : 'bg-blue-50 border-blue-200'}`}>
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <div className={`font-medium ${isDark ? 'text-gray-100' : 'text-gray-800'}`}>Markdown Prompt 同步</div>
+                <div className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>
+                  已扫描 prompts/ 目录 {mdStats?.prompts?.total ?? 0} 个规范 Prompt md；同步后可在本页和 Agent Template Prompt slot 中选择。
+                </div>
+                {lastSyncResult && (
+                  <div className={`mt-1 text-sm ${lastSyncResult.includes('失败') || lastSyncResult.includes('存在错误') ? 'text-red-500' : isDark ? 'text-green-300' : 'text-green-700'}`}>
+                    {lastSyncResult}
+                  </div>
+                )}
+              </div>
+              <Button variant="secondary" onClick={handleSyncMdFiles} disabled={syncingMd}>
+                {syncingMd ? '同步中...' : '同步 md 文件'}
+              </Button>
+            </div>
+          </div>
+          <div className="space-y-3">
           <div className="flex gap-4 flex-wrap">
             <div className="flex-1 min-w-[200px]">
               <div className="relative">
@@ -315,7 +388,8 @@ export default function Prompts() {
               ))}
             </div>
           )}
-        </div>
+          </div>
+        </>
       }
     >
       {loading ? (
@@ -331,9 +405,11 @@ export default function Prompts() {
                     <h3 className={`font-semibold text-lg ${isDark ? 'text-white' : 'text-gray-800'}`}>{prompt.name}</h3>
                     <p className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>{prompt.description}</p>
                   </div>
-                  {prompt.is_system && (
-                    <span className="px-2 py-1 text-xs bg-blue-900 text-blue-300 rounded">系统</span>
-                  )}
+                  <div className="flex gap-1 ml-2">
+                    <span className={`px-2 py-1 text-xs rounded ${prompt.is_system ? 'bg-blue-900 text-blue-300' : isDark ? 'bg-gray-700 text-gray-300' : 'bg-gray-100 text-gray-600'}`}>
+                      {inferPromptSourceLabel(prompt)}
+                    </span>
+                  </div>
                 </div>
 
                 <div className="flex items-center gap-2 mb-3">

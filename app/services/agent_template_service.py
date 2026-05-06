@@ -439,6 +439,16 @@ class AgentTemplateService:
         update_data = dto.dict(exclude_unset=True)
         for field, value in update_data.items():
             if value is not None:
+                if field == 'prompt_slots':
+                    value = [
+                        slot if isinstance(slot, PromptSlot) else PromptSlot(**slot)
+                        for slot in value
+                    ]
+                elif field == 'skill_slots':
+                    value = [
+                        slot if isinstance(slot, SkillSlot) else SkillSlot(**slot)
+                        for slot in value
+                    ]
                 setattr(template, field, value)
 
         template.updated_at = datetime.now()

@@ -3146,6 +3146,9 @@ class PostgresDatabase:
                 "ALTER TABLE skill_assignments ADD COLUMN IF NOT EXISTS execution_condition TEXT",
                 "ALTER TABLE skill_assignments ADD COLUMN IF NOT EXISTS assigned_by TEXT DEFAULT 'user'",
                 "ALTER TABLE skill_assignments ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP",
+                "ALTER TABLE skill_assignments DROP CONSTRAINT IF EXISTS skill_assignments_skill_id_agent_type_slot_name_key",
+                "DROP INDEX IF EXISTS skill_assignments_skill_id_agent_type_slot_name_key",
+                "DROP INDEX IF EXISTS uq_skill_assignments_skill_agent_scenario_slot",
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_skill_assignments_skill_agent_scenario_slot ON skill_assignments(skill_id, agent_type, scenario, slot_name)",
             ]
             if 'agent_templates' in existing_tables or 'agent_configs' in existing_tables or 'skill_assignments' in existing_tables:

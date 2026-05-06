@@ -137,6 +137,64 @@ async def get_categories():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/prompts/audit/agent-template-resolution", response_model=Dict[str, Any])
+async def audit_agent_template_prompt_resolution():
+    """Dry-run 系统 AgentTemplate 的 prompt slot 解析，不调用 LLM。"""
+    try:
+        from app.services.agent_prompt_service import get_agent_prompt_service
+
+        result = await get_agent_prompt_service().audit_system_agent_template_prompt_resolution()
+        return result
+    except Exception as e:
+        logger.error(f"审计 Agent Template Prompt 解析失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ==================== MD 文件同步 API ====================
+
+@router.post("/prompts/sync-md-files", response_model=Dict[str, Any])
+async def sync_md_files():
+    """
+    将 prompts/ 目录下的 MD 文件同步到数据库
+
+    这个API会：
+    1. 扫描 prompts/ 目录下的所有 MD 文件
+    2. 提取 YAML frontmatter 作为元数据
+    3. 将元数据存入数据库（内容从 MD 文件读取）
+
+    Returns:
+        Dict: 同步结果统计
+    """
+    service = get_prompt_service()
+
+    try:
+        result = await service.sync_md_files_to_db()
+        return {
+            "success": True,
+            "message": f"同步完成: {result.get('synced', 0)} 个成功",
+            "result": result,
+        }
+    except Exception as e:
+        logger.error(f"同步 MD 文件失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/prompts/md-stats", response_model=Dict[str, Any])
+async def get_md_stats():
+    """
+    获取 MD 文件统计信息
+
+    Returns:
+        Dict: MD 文件统计
+    """
+    try:
+        from app.services.md_file_service import get_md_file_service
+        md_service = get_md_file_service()
+        stats = md_service.get_stats()
+        return stats
+    except Exception as e:
+        logger.error(f"获取 MD 文件统计失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @router.get("/prompts/{prompt_id}", response_model=Dict[str, Any])
 async def get_prompt(prompt_id: str):
     """
@@ -276,51 +334,4 @@ async def render_prompt(
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         logger.error(f"渲染 Prompt 失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ==================== MD 文件同步 API ====================
-
-@router.post("/prompts/sync-md-files", response_model=Dict[str, Any])
-async def sync_md_files():
-    """
-    将 prompts/ 目录下的 MD 文件同步到数据库
-
-    这个API会：
-    1. 扫描 prompts/ 目录下的所有 MD 文件
-    2. 提取 YAML frontmatter 作为元数据
-    3. 将元数据存入数据库（内容从 MD 文件读取）
-
-    Returns:
-        Dict: 同步结果统计
-    """
-    service = get_prompt_service()
-
-    try:
-        result = await service.sync_md_files_to_db()
-        return {
-            "success": True,
-            "message": f"同步完成: {result.get('synced', 0)} 个成功",
-            "result": result,
-        }
-    except Exception as e:
-        logger.error(f"同步 MD 文件失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/prompts/md-stats", response_model=Dict[str, Any])
-async def get_md_stats():
-    """
-    获取 MD 文件统计信息
-
-    Returns:
-        Dict: MD 文件统计
-    """
-    try:
-        from app.services.md_file_service import get_md_file_service
-        md_service = get_md_file_service()
-        stats = md_service.get_stats()
-        return stats
-    except Exception as e:
-        logger.error(f"获取 MD 文件统计失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))

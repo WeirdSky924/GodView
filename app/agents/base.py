@@ -464,6 +464,7 @@ class BaseAgent(ABC):
                 "context_blocks": [],
                 "fallbacks_used": [f"{self.AGENT_TYPE}_deprecated_system_prompt"],
                 "deprecated_sources_used": [f"{self.__class__.__name__}._build_default_system_prompt"],
+                "missing_prompt_ids": [],
             }
 
         self._system_prompt_loaded = True

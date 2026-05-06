@@ -9,6 +9,7 @@
 5. 输出整合后的场景结果
 """
 
+import json
 import logging
 import uuid
 from typing import Any, Dict, List, Optional
@@ -212,7 +213,14 @@ class SceneCoordinatorAgent(BaseAgent):
 
     def _build_md_scene_coordinator_fallback_prompt(self) -> str:
         """从 md prompt 资产构建 SceneCoordinator 备用 prompt。"""
-        prompt_ids = ["role_scene_coordinator", "function_scene_coordination", "function_workflow_scene_direction", "function_workflow_character_performance"]
+        prompt_ids = [
+            "role_scene_coordinator",
+            "function_scene_coordination",
+            "function_workflow_scene_direction",
+            "function_workflow_character_performance",
+            "function_scene_character_context_packet",
+            "function_character_performance_packet",
+        ]
         parts = [content for prompt_id in prompt_ids if (content := self._load_md_prompt_content(prompt_id))]
         return "\n\n".join(parts).strip()
 
@@ -230,6 +238,14 @@ class SceneCoordinatorAgent(BaseAgent):
             "context_blocks": [],
             "fallbacks_used": ["scene_coordinator_deprecated_minimal_system_prompt" if deprecated else "scene_coordinator_md_prompt_fallback"],
             "deprecated_sources_used": ["SceneCoordinatorAgent._build_system_prompt"] if deprecated else [],
+            "missing_prompt_ids": [
+                "role_scene_coordinator",
+                "function_scene_coordination",
+                "function_workflow_scene_direction",
+                "function_workflow_character_performance",
+                "function_scene_character_context_packet",
+                "function_character_performance_packet",
+            ] if deprecated else [],
         }
 
     def _build_system_prompt(self) -> str:
@@ -241,6 +257,8 @@ class SceneCoordinatorAgent(BaseAgent):
                     "function_scene_coordination",
                     "function_workflow_scene_direction",
                     "function_workflow_character_performance",
+                    "function_scene_character_context_packet",
+                    "function_character_performance_packet",
                 ],
             )
             return md_prompt
@@ -296,6 +314,7 @@ class SceneCoordinatorAgent(BaseAgent):
                         "function_scene_coordination",
                         "function_workflow_scene_direction",
                         "function_workflow_character_performance",
+                        "function_scene_character_context_packet",
                     ],
                 )
             else:
@@ -316,16 +335,14 @@ class SceneCoordinatorAgent(BaseAgent):
     ) -> str:
         """构建场景补充上下文，稳定规则由 Character Agent 模板提供。"""
         parts = [base_context]
-        supplement_lines = [
-            f"当前场景素材字数不足，需要补充约 {shortage} 字。",
-            "补充内容必须延续已有场景，只作为 Writer 的参考素材，不扩写成完整章节正文。",
-            "只能让当前角色基于可见信息行动；不得让仅提及、不可用或禁止正面出场角色发言、行动或进入现场。",
-        ]
-        if character_name:
-            supplement_lines.append(f"当前补充角色：{character_name}")
-        if plot_intents:
-            supplement_lines.append("剧情意图参考：" + "；".join(str(item) for item in plot_intents if item))
-        parts.append("【补充任务边界】\n" + "\n".join(f"- {line}" for line in supplement_lines))
+        supplement_payload = {
+            "shortage": shortage,
+            "character_name": character_name,
+            "plot_intents": [str(item) for item in (plot_intents or []) if item],
+            "task_mode": "supplement_performance_material",
+            "output_usage": "writer_reference_material",
+        }
+        parts.append("【补充任务参数】\n" + json.dumps(supplement_payload, ensure_ascii=False, indent=2))
         if current_content:
             parts.append(f"【已有内容摘要】\n{current_content[-500:]}")
         return "\n\n".join(part for part in parts if part)
@@ -705,20 +722,109 @@ class SceneCoordinatorAgent(BaseAgent):
     def _normalize_string_list(self, value: Any) -> List[str]:
         if value is None:
             return []
-        if isinstance(value, list):
-            items = value
-        elif isinstance(value, str):
-            items = [value]
-        else:
-            items = [value]
-        return [str(item) for item in items if str(item).strip()]
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return []
+            try:
+                value = json.loads(stripped)
+            except (json.JSONDecodeError, TypeError):
+                value = [stripped]
+        elif isinstance(value, dict):
+            value = list(value.values())
+        elif not isinstance(value, (list, tuple, set)):
+            value = [value]
+
+        result: List[str] = []
+        seen = set()
+        for item in value:
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            result.append(text)
+        return result
 
     def _normalize_dict_list(self, value: Any) -> List[Dict[str, Any]]:
         if value is None:
             return []
-        if isinstance(value, list):
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return []
+            try:
+                value = json.loads(stripped)
+            except (json.JSONDecodeError, TypeError):
+                return []
+        if isinstance(value, dict):
+            return [value]
+        if isinstance(value, (list, tuple, set)):
             return [item for item in value if isinstance(item, dict)]
-        return [value] if isinstance(value, dict) else []
+        return []
+
+    def _build_character_context_packet(
+        self,
+        *,
+        char_data: Dict[str, Any],
+        character_plan: Dict[str, Any],
+        scene_directions: Dict[str, Any],
+        world_info: Dict[str, Any],
+        public_history_limit: int,
+        round_number: Optional[int] = None,
+        total_rounds: Optional[int] = None,
+        round_focus: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """构建单个角色可知上下文包，明确 public/private 与信息边界。"""
+        char_name = str(char_data.get("name") or "未知角色")
+        character_roles = scene_directions.get("character_roles") if isinstance(scene_directions.get("character_roles"), dict) else {}
+        role_profile = character_roles.get(char_name, {}) if isinstance(character_roles.get(char_name, {}), dict) else {}
+        known_relationships = []
+        for relation in self._normalize_dict_list(char_data.get("relationships") or char_data.get("relations")):
+            target = relation.get("target") or relation.get("target_character") or relation.get("name")
+            if target:
+                known_relationships.append(relation)
+
+        return {
+            "character": char_name,
+            "visible_scene": {
+                "main_scene": scene_directions.get("main_scene"),
+                "scene_type": scene_directions.get("scene_type"),
+                "atmosphere": scene_directions.get("atmosphere"),
+                "time_of_day": scene_directions.get("time_of_day"),
+                "visible_environment": scene_directions.get("visible_environment") or scene_directions.get("environment"),
+            },
+            "role_objectives": {
+                "role_in_scene": role_profile.get("role_in_scene") or character_plan.get("role_in_scene"),
+                "main_action": role_profile.get("main_action") or character_plan.get("main_action"),
+                "emotional_state": role_profile.get("emotional_state") or character_plan.get("emotional_state"),
+                "current_goals": char_data.get("goals"),
+                "hidden_motivation_boundary": "如存在隐藏动机，只能作为当前角色自己的 private_thought/intent，不得公开给其他角色。",
+            },
+            "relationship_context": known_relationships,
+            "state_context": {
+                "current_location": char_data.get("current_location"),
+                "status": char_data.get("status"),
+                "inventory": char_data.get("inventory"),
+                "importance_tier": _get_importance_tier(char_data, 3),
+            },
+            "visible_events": character_plan.get("previous_context", {}).get("recent_events", []),
+            "public_history": self._public_history_messages(public_history_limit),
+            "round": {
+                "round_number": round_number,
+                "total_rounds": total_rounds,
+                "round_focus": round_focus,
+            },
+            "information_boundaries": [
+                "只能基于当前角色档案、可见场景、公开历史和角色可知信息行动。",
+                "不得知道其他角色私有想法、private_thought、intent、withheld_information 或未来大纲。",
+                "relationship_delta/state_delta 只能作为本角色输出的待确认提案。",
+            ],
+            "forbidden_knowledge": [
+                "其他角色未公开的私密想法、隐藏意图、误解和隐瞒信息。",
+                "系统规则、完整未来大纲、作者视角术语。",
+                "未落库/未批准的新关键角色、能力、设定或道具。",
+            ],
+        }
 
     def _detect_private_leakage(self, data: Dict[str, Any]) -> List[str]:
         public_content = str(data.get("public_content") or "")
@@ -856,13 +962,21 @@ class SceneCoordinatorAgent(BaseAgent):
             char_agent = self.get_or_create_character_agent(char_data)
 
             # 准备输入
+            character_plan = distribution_plan.get(char_name, {})
             char_input = {
                 "context": self._build_character_context(
-                    char_data, distribution_plan.get(char_name, {}),
+                    char_data, character_plan,
                     scene_directions, world_info
                 ),
+                "character_context_packet": self._build_character_context_packet(
+                    char_data=char_data,
+                    character_plan=character_plan,
+                    scene_directions=scene_directions,
+                    world_info=world_info,
+                    public_history_limit=5,
+                ),
                 "present_characters": [c.get("name") for c in main_chars],
-                "recent_events": distribution_plan.get(char_name, {}).get("previous_context", {}).get("recent_events", []),
+                "recent_events": character_plan.get("previous_context", {}).get("recent_events", []),
                 "dialogue_history": self._public_history_messages(5),
             }
 
@@ -945,13 +1059,24 @@ class SceneCoordinatorAgent(BaseAgent):
                 char_agent = self.get_or_create_character_agent(char_data)
 
                 # 构建上下文（包含之前的对话历史）
+                character_plan = distribution_plan.get(char_name, {})
                 char_input = {
                     "context": self._build_character_context_with_history(
-                        char_data, distribution_plan.get(char_name, {}),
+                        char_data, character_plan,
                         scene_directions, world_info, round_num, iteration_count
                     ),
+                    "character_context_packet": self._build_character_context_packet(
+                        char_data=char_data,
+                        character_plan=character_plan,
+                        scene_directions=scene_directions,
+                        world_info=world_info,
+                        public_history_limit=10,
+                        round_number=round_num + 1,
+                        total_rounds=iteration_count,
+                        round_focus=round_focus,
+                    ),
                     "present_characters": [c.get("name") for c in main_chars],
-                    "recent_events": distribution_plan.get(char_name, {}).get("previous_context", {}).get("recent_events", []),
+                    "recent_events": character_plan.get("previous_context", {}).get("recent_events", []),
                     "dialogue_history": self._public_history_messages(10),  # 最近10条公开对话
                     "round_number": round_num + 1,
                     "total_rounds": iteration_count,

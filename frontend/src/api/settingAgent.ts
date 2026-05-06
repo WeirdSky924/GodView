@@ -21,6 +21,12 @@ export interface PendingLore {
   related_characters: string[]
   related_locations: string[]
   related_items: string[]
+  related_factions?: string[]
+  depends_on_lore?: string[]
+  supports_lore?: string[]
+  potential_conflicts?: string[]
+  usage_guidance?: string
+  resource_requirements?: Array<Record<string, unknown>>
 }
 
 export interface PendingCharacter {

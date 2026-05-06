@@ -41,6 +41,17 @@ is_system: true
 - `role_performance_gate_warnings` 应进入 `private_material_usage_warnings` 或 `improvement_suggestions`，作为后续改写风险提示。
 - 如果演绎素材带有 `performance_warnings`，必须把对应问题写入 `conflicts_or_rewrite_needed` 或 `private_material_usage_warnings`。
 
+## 输入上下文说明
+
+调用方会提供：
+
+- `public_performances`：其他角色可见/可听的公开动作、台词和情绪线索。
+- `private_performances`：只供 Writer/Evaluator 参考的潜台词、误解、隐瞒和动机。
+- `relationship_deltas` / `state_deltas`：角色提出的待确认关系/状态变化。
+- `role_performance_gate`：OOC、信息越界、出场越界或素材可用性检查结果。
+
+总结时必须保留这些层级，不要把私有素材、delta 或 gate warning 写成所有角色已知的公开事实。
+
 ## 输出 JSON Schema
 
 只输出 JSON：

@@ -176,6 +176,7 @@ class MasterPlotterAgent(BaseAgent):
             "workflow_plot_planning": "function_master_plotter_plot_planning",
             "workflow_chapter_planning": "function_master_plotter_chapter_writing_plan",
             "workflow_forced_event": "function_master_plotter_forced_event",
+            "workflow_plot_advance": "function_master_plotter_advance_decision",
             "workflow_advance_decision": "function_master_plotter_advance_decision",
         }.get(scenario or "")
 
@@ -208,6 +209,11 @@ class MasterPlotterAgent(BaseAgent):
                 "master_plotter_deprecated_minimal_system_prompt" if deprecated else "master_plotter_md_prompt_fallback"
             ],
             "deprecated_sources_used": ["MasterPlotterAgent._build_default_system_prompt"] if deprecated else [],
+            "missing_prompt_ids": [
+                prompt_id
+                for prompt_id in ["role_master_plotter", self._master_plotter_md_prompt_id(scenario)]
+                if prompt_id
+            ] if deprecated else [],
         }
 
     def _build_default_system_prompt(self) -> str:
@@ -298,7 +304,7 @@ class MasterPlotterAgent(BaseAgent):
                 "以下内容来自 Agent Template 绑定的 md prompt / skills / writing-rules，是本次规划的稳定规则来源。\n"
                 f"{config_prompt}"
             )
-        parts.append(f"【当前任务】\n{task_title}")
+        parts.append(f"【调用场景】\n{task_title}")
         parts.append(context_text if context_text.strip() else "【上游上下文】\n（暂无上游上下文）")
         if task_notes:
             parts.append("【本次任务补充要求】\n" + "\n".join(f"- {note}" for note in task_notes if note))
@@ -560,7 +566,7 @@ class MasterPlotterAgent(BaseAgent):
             )
             user_message = self._build_task_prompt(
                 config_prompt=config_prompt,
-                task_title="评估是否应该推进剧情到下一阶段，是否需要埋设即将发生的事件；如需强制推进，提供合理的外部事件。",
+                task_title="workflow_plot_advance",
                 context_text=context_text,
                 output_schema=self._get_advance_output_schema(),
             )
@@ -669,7 +675,7 @@ class MasterPlotterAgent(BaseAgent):
         )
         prompt = self._build_task_prompt(
             config_prompt=config_prompt,
-            task_title="整理上游状态，给 Writer 提供写作计划、检查清单和冲突提示。",
+            task_title="workflow_chapter_planning",
             context_text=context_text,
             output_schema=self._get_writing_plan_output_schema(target_word_count),
         )
@@ -871,7 +877,7 @@ class MasterPlotterAgent(BaseAgent):
         )
         prompt = self._build_task_prompt(
             config_prompt=config_prompt,
-            task_title="根据初始剧情、世界观、角色、伏笔和已确认讨论资产规划长篇小说整体剧情大纲。",
+            task_title="workflow_plot_planning",
             context_text=context_text,
             output_schema=self._get_plot_planning_output_schema(),
         )
@@ -994,7 +1000,7 @@ class MasterPlotterAgent(BaseAgent):
         )
         prompt = self._build_task_prompt(
             config_prompt=config_prompt,
-            task_title="基于当前情境生成一个 50 字以内、低侵入、可写的外部事件来强制推进剧情。",
+            task_title="workflow_forced_event",
             context_text=context_text,
             task_notes=["直接输出事件描述，不要 JSON，不要解释。"],
         )

@@ -13,6 +13,8 @@ import {
   initializeDefaultSkills,
   getSkillCategories,
   getSkillTypes,
+  syncSkillMdFiles,
+  getSkillMdStats,
   type Skill,
   type SkillType,
   type SkillStatus,
@@ -100,6 +102,9 @@ export default function Skills() {
   const [filterStatus, setFilterStatus] = useState<SkillStatus | ''>('')
   const [filterCategory, setFilterCategory] = useState<SkillCategory | ''>('')
   const [stats, setStats] = useState<{ total_skills: number; total_usage: number; by_type?: Record<string, number>; by_status?: Record<string, number> } | null>(null)
+  const [mdStats, setMdStats] = useState<{ skills?: { total: number; by_category?: Record<string, number>; by_type?: Record<string, number> } } | null>(null)
+  const [syncingMd, setSyncingMd] = useState(false)
+  const [lastSyncResult, setLastSyncResult] = useState<string | null>(null)
   const [showTestModal, setShowTestModal] = useState(false)
   const [testParams, setTestParams] = useState('{}')
   const [testResult, setTestResult] = useState<SkillTestResult | null>(null)
@@ -165,6 +170,56 @@ export default function Skills() {
     }
   }, [filterType, filterStatus, filterCategory, searchQuery])
 
+  const loadMdStats = async () => {
+    try {
+      const data = await getSkillMdStats()
+      setMdStats(data)
+    } catch (error) {
+      console.error('Failed to load skill MD stats:', error)
+    }
+  }
+
+  const formatSyncSummary = (summary: { synced?: number; skipped?: number; errors?: number; error?: number; files?: Array<{ file_path?: string | null; status: string; message: string }> }) => {
+    const errorCount = summary.errors || summary.error || 0
+    const errorSamples = (summary.files || [])
+      .filter((file) => file.status === 'error')
+      .slice(0, 3)
+      .map((file) => `${file.file_path || '未知文件'}：${file.message}`)
+    if (errorCount > 0) {
+      return [
+        `同步存在错误：成功 ${summary.synced || 0}，跳过 ${summary.skipped || 0}，错误 ${errorCount}`,
+        ...errorSamples,
+      ].join('；')
+    }
+    return `同步完成：成功 ${summary.synced || 0}，跳过 ${summary.skipped || 0}`
+  }
+
+  const handleSyncMdFiles = async () => {
+    if (!confirm('将扫描 skills/ 目录下符合规范的 Markdown 文件，并同步到 Skill 数据库和适用 Agent 信息。是否继续？')) return
+    setSyncingMd(true)
+    setLastSyncResult(null)
+    try {
+      const result = await syncSkillMdFiles()
+      const summary = result.result || {}
+      setLastSyncResult(formatSyncSummary(summary))
+      await loadMdStats()
+      if (viewMode === 'all') {
+        await loadSkills()
+      } else if (selectedAgentType) {
+        await loadAgentSkills(selectedAgentType)
+      }
+    } catch (error) {
+      console.error('Failed to sync skill MD files:', error)
+      setLastSyncResult('同步失败，请查看后端日志或浏览器控制台。')
+    } finally {
+      setSyncingMd(false)
+    }
+  }
+
+  const inferSkillSourceLabel = (skill: Skill) => {
+    if (skill.is_system) return '系统 / md'
+    return 'DB 自定义'
+  }
   const loadAgentSkills = async (agentType: string, scenario: string = selectedScenario) => {
     setLoading(true)
     try {
@@ -184,6 +239,7 @@ export default function Skills() {
     } else if (selectedAgentType) {
       loadAgentSkills(selectedAgentType)
     }
+    loadMdStats()
   }, [viewMode, selectedAgentType, selectedScenario, loadSkills])
 
   const openCreateModal = () => {
@@ -343,6 +399,25 @@ export default function Skills() {
     >
       {/* 视图切换和筛选 */}
       <div className="mb-6 space-y-4">
+        <div className={`rounded-lg border p-4 ${isDark ? 'bg-gray-900 border-gray-700' : 'bg-blue-50 border-blue-200'}`}>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className={`font-medium ${isDark ? 'text-gray-100' : 'text-gray-800'}`}>Markdown Skill 同步</div>
+              <div className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>
+                已扫描 skills/ 目录 {mdStats?.skills?.total ?? 0} 个规范 Skill md；同步后可在本页、按 Agent 查看和 Agent Template Skill slot 中选择。
+              </div>
+              {lastSyncResult && (
+                <div className={`mt-1 text-sm ${lastSyncResult.includes('失败') || lastSyncResult.includes('存在错误') ? 'text-red-500' : isDark ? 'text-green-300' : 'text-green-700'}`}>
+                  {lastSyncResult}
+                </div>
+              )}
+            </div>
+            <Button variant="secondary" onClick={handleSyncMdFiles} disabled={syncingMd}>
+              {syncingMd ? '同步中...' : '同步 md 文件'}
+            </Button>
+          </div>
+        </div>
+
         {/* 视图模式切换 */}
         <div className="flex items-center gap-4">
           <div className={`flex rounded-lg p-1 ${isDark ? 'bg-gray-800' : 'bg-gray-100'}`}>
@@ -489,11 +564,9 @@ export default function Skills() {
                           </div>
                         </div>
                       </div>
-                      {skill.is_system && (
-                        <span className={`text-xs px-2 py-1 rounded ${isDark ? 'bg-purple-900 text-purple-300' : 'bg-purple-100 text-purple-700'}`}>
-                          系统
-                        </span>
-                      )}
+                      <span className={`text-xs px-2 py-1 rounded ${skill.is_system ? isDark ? 'bg-purple-900 text-purple-300' : 'bg-purple-100 text-purple-700' : isDark ? 'bg-gray-700 text-gray-300' : 'bg-gray-100 text-gray-600'}`}>
+                        {inferSkillSourceLabel(skill)}
+                      </span>
                     </div>
 
                     <p className={`text-sm line-clamp-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
@@ -553,6 +626,9 @@ export default function Skills() {
                         </span>
                         <span className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
                           {skillTypeLabels[selectedSkill.skill_type]}
+                        </span>
+                        <span className={`text-xs px-2 py-0.5 rounded ${selectedSkill.is_system ? isDark ? 'bg-purple-900 text-purple-300' : 'bg-purple-100 text-purple-700' : isDark ? 'bg-gray-700 text-gray-300' : 'bg-gray-100 text-gray-600'}`}>
+                          {inferSkillSourceLabel(selectedSkill)}
                         </span>
                       </div>
                     </div>

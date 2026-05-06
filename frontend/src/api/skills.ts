@@ -144,6 +144,36 @@ export interface SkillStats {
   by_status: Record<string, number>
 }
 
+export interface MdAssetStats {
+  total: number
+  by_category?: Record<string, number>
+  by_type?: Record<string, number>
+}
+
+export interface MdStatsResponse {
+  prompts?: MdAssetStats
+  skills?: MdAssetStats
+}
+
+export interface MdSyncFileResult {
+  file_path?: string | null
+  id?: string | null
+  status: 'synced' | 'skipped' | 'error' | string
+  message: string
+}
+
+export interface MdSyncResult {
+  success: boolean
+  message: string
+  result: {
+    synced?: number
+    skipped?: number
+    errors?: number
+    error?: number
+    files?: MdSyncFileResult[]
+  }
+}
+
 export interface CreateSkillDTO {
   name: string
   description?: string
@@ -379,6 +409,20 @@ export async function getAllLogs(
  */
 export async function getSkillsStats(): Promise<SkillStats> {
   return await api.get(`${API_BASE}/stats/overview`)
+}
+
+/**
+ * 同步 skills/ 目录下的 MD 文件到数据库
+ */
+export async function syncSkillMdFiles(): Promise<MdSyncResult> {
+  return await api.post(`${API_BASE}/sync-md-files`)
+}
+
+/**
+ * 获取 prompts/skills MD 文件统计
+ */
+export async function getSkillMdStats(): Promise<MdStatsResponse> {
+  return await api.get(`${API_BASE}/md-stats`)
 }
 
 /**

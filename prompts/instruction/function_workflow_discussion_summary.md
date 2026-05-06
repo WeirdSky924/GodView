@@ -53,13 +53,25 @@ JSON 结构：
 ```json
 {
   "discussion_assets": {
-    "plot_updates": [{"title": "剧情加码标题", "summary": "后续剧情要承接的变化", "source": "group_discussion"}],
-    "hooks": [{"title": "伏笔标题", "description": "伏笔说明", "status": "planted", "related_locations": []}],
-    "lore_candidates": [{"title": "设定标题", "content": "设定内容", "category": "world_rule", "priority": "standard"}],
-    "region_candidates": [{"name": "地点名称", "description": "地点说明", "region_type": "location", "terrain_type": "unknown", "landmarks": [], "connections": []}],
-    "character_candidates": [{"name": "角色名", "importance_tier": "supporting", "description": "角色定位", "appearance": "外貌", "personality": "性格", "background_story": "背景", "goals": []}]
+    "plot_updates": [{"title": "剧情加码标题", "summary": "后续剧情要承接的变化", "source": "group_discussion", "asset_status": "pending_confirmation", "requires_revision": false}],
+    "hooks": [{"title": "伏笔标题", "description": "伏笔说明", "status": "planted", "asset_status": "pending_confirmation", "related_locations": []}],
+    "lore_candidates": [{"title": "设定标题", "content": "设定内容", "category": "world_rule", "priority": "standard", "asset_status": "pending_confirmation"}],
+    "region_candidates": [{"name": "地点名称", "description": "地点说明", "region_type": "location", "terrain_type": "unknown", "asset_status": "pending_confirmation", "landmarks": [], "connections": []}],
+    "character_candidates": [{"name": "角色名", "importance_tier": "supporting", "description": "角色定位", "appearance": "外貌", "personality": "性格", "background_story": "背景", "goals": [], "asset_status": "pending_confirmation"}],
+    "character_location_updates": [{"character_name": "角色名", "location": "地点", "reason": "位置变化原因", "asset_status": "pending_confirmation"}],
+    "state_changes": [{"title": "状态变化标题", "summary": "剧情/关系/资源状态变化", "visibility": "public/writer_only", "asset_status": "pending_confirmation"}]
   }
 }
 ```
 
 没有内容的数组必须保留为空数组。
+
+## 代码解析边界
+
+运行时代码只会从上述 JSON 或兼容字段中解析候选资产，并写入待确认的 `discussion_assets` bundle：
+
+- `plot_updates`、`hooks`、`lore_candidates`、`region_candidates`、`character_candidates`、`character_location_updates`、`state_changes` 是允许的顶层类别。
+- 所有候选资产默认都是 `pending_confirmation`，不是已落库事实。
+- 任何会影响 approved outline 的内容必须带有 `requires_revision: true` 或在说明中标为 revision proposal。
+- 如果没有资产候选，也必须输出空数组，方便代码稳定解析。
+- 不要依赖自然语言让代码推断关键资产；需要进入后续确认流的内容必须放入 JSON。

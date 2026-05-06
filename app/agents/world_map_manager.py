@@ -101,6 +101,7 @@ class WorldMapManagerAgent(BaseAgent):
             "context_blocks": [],
             "fallbacks_used": ["world_map_manager_deprecated_minimal_system_prompt" if deprecated else "world_map_manager_md_prompt_fallback"],
             "deprecated_sources_used": ["WorldMapManagerAgent._build_system_prompt"] if deprecated else [],
+            "missing_prompt_ids": ["role_world_map_manager", "function_map_management"] if deprecated else [],
         }
 
     def _build_system_prompt(self) -> str:
@@ -270,28 +271,16 @@ class WorldMapManagerAgent(BaseAgent):
             map_instruction = self._load_md_prompt_content("function_map_management") or "请遵循地图管理原则，优先复用现有地点并维护空间连续性。"
             prompt = f"""{map_instruction}
 
-【当前子任务】
-请判断现有地图区域是否适合当前章节大纲的发展。
+【当前子任务参数】
+- task_mode: match_or_generate_regions
+- output_schema: WorldMapOverviewSchema
+- existing_region_count: {len(existing_regions)}
 
 【当前章节大纲】
 {outline_text}
 
 【现有地图区域】
-{chr(10).join(region_summaries)}
-
-要求输出 JSON：
-{{
-  "overview": "判断说明：哪些地点可用，是否需要补充新地点",
-  "regions": [
-    {{"region_name": "区域名称", "region_type": "existing/new", "description": "用途说明", "importance": "为什么适合当前章节"}}
-  ],
-  "suggested_starting_location": "最适合本章开场的地点"
-}}
-
-规则：
-1. 优先复用现有地图区域。
-2. 只有现有区域无法承载大纲里的关键场景时，才建议 new 区域。
-3. 地点必须服务当前章节，不要生成与当前大纲无关的大地图。"""
+{chr(10).join(region_summaries)}"""
             try:
                 parsed = await self._call_structured(
                     WorldMapOverviewSchema,
@@ -369,31 +358,16 @@ class WorldMapManagerAgent(BaseAgent):
         map_instruction = self._load_md_prompt_content("function_map_management") or "请遵循地图管理原则，生成与世界观和当前剧情匹配的区域概述。"
         prompt = f"""{map_instruction}
 
-【当前子任务】
-请基于当前项目世界观生成地图/区域概述。
+【当前子任务参数】
+- task_mode: map_overview_generation
+- output_schema: WorldMapOverviewSchema
+- requested_region_count: 3-5
 
 【世界信息】
 - 名称：{world_name}
 - 类型/风格：{world_type}
 - 当前剧情焦点：{chapter_outline_text}
-- 相关设定关键词：{', '.join(lore_titles) if lore_titles else '未提供'}
-
-要求：
-1. 区域设计必须服务当前世界观与剧情，不得默认转向奇幻地下城套路。
-2. 若世界观是赛博朋克/科幻/都市等，应体现对应空间形态、基础设施与社会氛围。
-3. 输出 3-5 个与当前项目匹配的主要区域，JSON 格式：
-{{
-    "overview": "地图概述",
-    "regions": [
-        {{
-            "region_name": "区域名称",
-            "region_type": "类型",
-            "description": "描述",
-            "importance": "重要性"
-        }}
-    ],
-    "suggested_starting_location": "建议的起始地点"
-}}"""
+- 相关设定关键词：{', '.join(lore_titles) if lore_titles else '未提供'}"""
 
         try:
             parsed = await self._call_structured(

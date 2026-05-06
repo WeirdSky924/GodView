@@ -72,7 +72,12 @@ class SummarizerAgent(BaseAgent):
         return ""
 
     def _build_md_summarizer_fallback_prompt(self) -> str:
-        prompt_ids = ["role_summarizer", "function_workflow_discussion_summary", "function_workflow_performance_summary"]
+        prompt_ids = [
+            "role_summarizer",
+            "function_workflow_discussion_summary",
+            "function_workflow_performance_summary",
+            "function_summarizer_runtime_context_packet",
+        ]
         parts = [content for prompt_id in prompt_ids if (content := self._load_md_prompt_content(prompt_id))]
         return "\n\n".join(parts).strip()
 
@@ -90,6 +95,12 @@ class SummarizerAgent(BaseAgent):
             "context_blocks": [],
             "fallbacks_used": ["summarizer_deprecated_minimal_system_prompt" if deprecated else "summarizer_md_prompt_fallback"],
             "deprecated_sources_used": ["SummarizerAgent._build_default_system_prompt"] if deprecated else [],
+            "missing_prompt_ids": [
+                "role_summarizer",
+                "function_workflow_discussion_summary",
+                "function_workflow_performance_summary",
+                "function_summarizer_runtime_context_packet",
+            ] if deprecated else [],
         }
 
     def _build_default_system_prompt(self) -> str:
@@ -97,7 +108,12 @@ class SummarizerAgent(BaseAgent):
         md_prompt = self._build_md_summarizer_fallback_prompt()
         if md_prompt:
             self._legacy_fallback_trace = self._summarizer_fallback_trace(
-                prompt_ids=["role_summarizer", "function_workflow_discussion_summary", "function_workflow_performance_summary"],
+                prompt_ids=[
+                    "role_summarizer",
+                    "function_workflow_discussion_summary",
+                    "function_workflow_performance_summary",
+                    "function_summarizer_runtime_context_packet",
+                ],
             )
             return md_prompt
 
@@ -159,7 +175,12 @@ class SummarizerAgent(BaseAgent):
             if md_prompt:
                 self.system_prompt = md_prompt
                 self._system_prompt_render_trace = self._summarizer_fallback_trace(
-                    prompt_ids=["role_summarizer", "function_workflow_discussion_summary", "function_workflow_performance_summary"],
+                    prompt_ids=[
+                        "role_summarizer",
+                        "function_workflow_discussion_summary",
+                        "function_workflow_performance_summary",
+                        "function_summarizer_runtime_context_packet",
+                    ],
                 )
             else:
                 self.system_prompt = self._build_default_system_prompt()
@@ -299,17 +320,12 @@ class SummarizerAgent(BaseAgent):
             task_instruction = self._build_setting_check_instruction(has_chapter_content=False)
             prompt = f"""{task_instruction}
 
-【待确认设定】
-{setting_info}
+【当前任务参数】
+- task_mode: setting_confirmation
+- output_schema: SummarizerSettingConfirmSchema
 
-请按 SummarizerSettingConfirmSchema 输出 JSON：
-{{
-    "status": "confirmed",
-    "world_name": "世界名称",
-    "key_settings": ["核心设定点1", "核心设定点2"],
-    "suggestions": ["设定管理建议"],
-    "consistency_check": "世界观设定已确认，等待内容生成后进行一致性检查"
-}}"""
+【待确认设定】
+{setting_info}"""
 
             try:
                 parsed = await self._call_structured(
@@ -345,34 +361,15 @@ class SummarizerAgent(BaseAgent):
         task_instruction = self._build_setting_check_instruction(has_chapter_content=True)
         prompt = f"""{task_instruction}
 
+【当前任务参数】
+- task_mode: setting_consistency_check
+- output_schema: SummarizerSettingCheckSchema
+
 【设定资料】
 {setting_info}
 
 【章节内容】
-{chapter_content}
-
-请重点检查：
-1. 角色能力使用是否符合设定
-2. 世界规则是否被遵守
-3. 是否有设定冲突或矛盾
-4. 是否有需要补充的设定
-
-请按 SummarizerSettingCheckSchema 输出 JSON：
-{{
-    "consistency_status": "consistent/inconsistent/partial",
-    "world_name": "世界名称",
-    "checked_items": ["检查项目1", "检查项目2"],
-    "issues": [
-        {{
-            "type": "设定冲突类型",
-            "description": "问题描述",
-            "location": "问题位置",
-            "suggestion": "修改建议"
-        }}
-    ],
-    "suggestions": ["改进建议"],
-    "lore_expansion_suggestions": ["可以扩展的设定点"]
-}}"""
+{chapter_content}"""
 
         try:
             parsed = await self._call_structured(
@@ -428,7 +425,12 @@ class SummarizerAgent(BaseAgent):
                 [f"- {h.get('id')}: {h.get('title', '无标题')}" for h in active_hooks]
             )
             message_parts.append(f"【活跃伏笔】\n{hooks_text}")
-            message_parts.append("如果对话触发了任何伏笔，请在 hook_triggers 中列出相关 ID。")
+            message_parts.append("【伏笔触发检查】\n" + "\n".join(
+                [
+                    "- 如对话触发任何已提供伏笔，在 hook_triggers 中返回相关 ID。",
+                    "- 不要用伏笔标题替代 ID。",
+                ]
+            ))
 
         # 场景演绎分层上下文
         scene_performance_context = scene_performance_context or {}
@@ -474,10 +476,15 @@ class SummarizerAgent(BaseAgent):
             warning_lines = [f"- {item}" for item in performance_warnings[:10]]
             message_parts.append("【演绎素材警告】\n" + "\n".join(warning_lines))
 
-        message_parts.append(
-            "\n请将以上对话压缩成事件摘要，识别潜台词，检测伏笔触发。"
-            "如果使用私有表演素材，必须标明它只是潜台词/写作参考，不得写成所有角色已知事实。"
-        )
+        message_parts.append("【运行时任务参数】\n" + "\n".join(
+            [
+                "- task_mode: summarize_dialogue",
+                "- output_schema: SummarizerSummarySchema",
+                "- active_hook_count: " + str(len(active_hooks or [])),
+                "- public_performance_count: " + str(len(public_performances or [])),
+                "- private_performance_count: " + str(len(private_performances or [])),
+            ]
+        ))
 
         return "\n\n".join(message_parts)
 

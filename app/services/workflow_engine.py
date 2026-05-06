@@ -6329,6 +6329,26 @@ class WorkflowEngine:
             "previous_node_output": previous_node_output,
         }
 
+    def _ensure_context_dict_list(self, value: Any) -> List[Dict[str, Any]]:
+        """将运行期上下文字段归一化为 dict 列表，支持 JSON 字符串。"""
+        if value in (None, ""):
+            return []
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return []
+            try:
+                value = json.loads(stripped)
+            except (json.JSONDecodeError, TypeError):
+                return []
+        if isinstance(value, dict):
+            return [value]
+        if isinstance(value, tuple):
+            value = list(value)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+        return []
+
     def _build_character_performance_packet(
         self,
         performance: Dict[str, Any],
@@ -6353,8 +6373,8 @@ class WorkflowEngine:
             "perceived_facts": self._ensure_context_list(performance.get("perceived_facts")),
             "misinterpretations": self._ensure_context_list(performance.get("misinterpretations")),
             "withheld_information": self._ensure_context_list(performance.get("withheld_information")),
-            "relationship_delta": self._ensure_context_list(performance.get("relationship_delta")),
-            "state_delta": self._ensure_context_list(performance.get("state_delta")),
+            "relationship_delta": self._ensure_context_dict_list(performance.get("relationship_delta")),
+            "state_delta": self._ensure_context_dict_list(performance.get("state_delta")),
             "continuity_notes": self._ensure_context_list(performance.get("continuity_notes")),
             "warnings": self._ensure_context_list(performance.get("warnings")),
             "visibility": {
@@ -8644,6 +8664,7 @@ class WorkflowEngine:
         written_content: str,
         plot_outline: List,
         evaluation_result: Dict,
+        context: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """编剧 Agent 开场发言（要有实质内容，引导讨论方向）"""
         try:
@@ -8654,54 +8675,35 @@ class WorkflowEngine:
                     '- ' + (str(i) if isinstance(i, str) else i.get('issue', i.get('description', str(i))))
                     for i in issues_raw
                 ])
-                issues_section = f"\n问题点：\n{issues_formatted}"
             else:
-                issues_section = ''
+                issues_formatted = "无明显问题"
 
-            # 构建开场提示
-            prompt = f"""你是总编剧，现在召开《{chapter_title}》创作讨论会。
-
-【重要】作为讨论主持者，你的开场发言必须：
-- **有实质内容**：不要说空话套话，要有具体的分析和判断
-- **引导讨论**：提出需要讨论的具体问题
-- **明确方向**：让其他Agent知道该关注什么
-
-【当前章节】{chapter_title}
-
-【已写内容】
-{written_content if written_content else "暂无"}
-
-【剧情规划进度】
-{len(plot_outline)} 个情节点已规划
-{f"当前进度：{plot_outline}" if plot_outline else "暂无详细规划"}
-
-【评估反馈】
-评分: {evaluation_result.get('score', 'N/A')}/10
-{'✅ 通过' if evaluation_result.get('quality_passed', True) else '⚠️ 需要改进'}{issues_section}
-
-请输出你的开场发言，必须包含：
-
-## 章节创作总结
-[本章的核心创作意图、主要情节、想达到的效果]
-
-## 创作完成度评估
-[自我评价：哪些达到了预期，哪些还有差距]
-
-## 需要讨论的问题
-[列出具体需要各位Agent讨论的问题，比如：
-- 角色表现是否到位？
-- 节奏是否合适？
-- 有没有世界观冲突？
-- 伏笔埋设是否自然？
-- 文字表达有什么问题？]
-
-## 后续规划重点
-[接下来要关注什么，剧情要往哪个方向发展]
-
-## 对各位的期待
-[希望各位Agent重点关注什么方面]
-
-请以总编剧的身份发言，直接输出内容，不要有任何格式标记或解释。"""
+            config_prompt_data = await self._build_workflow_config_prompt_with_trace(
+                AgentType.MASTER_PLOTTER,
+                (context or {}).get("project_id") if isinstance(context, dict) else None,
+                "workflow_discussion_opening",
+                {"scenario": "workflow_discussion_opening", "chapter_title": chapter_title},
+            )
+            config_prompt = config_prompt_data.get("content", "")
+            prompt_render_trace = config_prompt_data.get("trace", {}) or {}
+            config_prompt_source = config_prompt_data.get("source", "missing")
+            sections = [
+                self._format_workflow_prompt_block("Master Plotter 配置规则", config_prompt),
+                self._format_workflow_prompt_block("章节", chapter_title),
+                self._format_workflow_prompt_block("已写内容", written_content or "暂无"),
+                self._format_workflow_prompt_block("当前剧情摘要", plot_summary or "暂无"),
+                self._format_workflow_prompt_block("剧情规划进度", {
+                    "planned_plot_points": len(plot_outline),
+                    "plot_outline": plot_outline or [],
+                }),
+                self._format_workflow_prompt_block("评估反馈", {
+                    "score": evaluation_result.get('score', 'N/A'),
+                    "quality_passed": bool(evaluation_result.get('quality_passed', True)),
+                    "issues": issues_formatted,
+                    "summary": evaluation_result.get('summary', ''),
+                }),
+            ]
+            prompt = "\n\n".join(section for section in sections if section)
 
             if hasattr(agent, 'model') and agent.model:
                 content = await self._get_model_response_text(agent.model, prompt)
@@ -8711,6 +8713,8 @@ class WorkflowEngine:
                     "type": "plotter",
                     "content": content,
                     "is_llm_generated": True,
+                    "config_prompt_source": config_prompt_source,
+                    "prompt_render_trace": prompt_render_trace,
                 }
         except Exception as e:
             logger.error(f"编剧开场生成失败: {e}")
@@ -8721,6 +8725,8 @@ class WorkflowEngine:
             "type": "plotter",
             "content": f"【开场】{chapter_title}的创作已完成，请各位从各自专业角度进行分析讨论。",
             "is_llm_generated": False,
+            "config_prompt_source": "missing",
+            "prompt_render_trace": None,
         }
 
     def _format_workflow_prompt_block(self, title: str, value: Any) -> str:
@@ -8944,7 +8950,10 @@ class WorkflowEngine:
             sections = [
                 self._format_workflow_prompt_block("Master Plotter 配置规则", config_prompt),
                 self._format_workflow_prompt_block("讨论记录", "\n".join(messages_summary)),
-                self._format_workflow_prompt_block("工作流角色/设定约束", self._format_agent_constraint_context(context)),
+                self._format_workflow_prompt_block(
+                    "工作流角色/设定约束",
+                    self._format_agent_constraint_context(context) or "当前未形成额外角色出场约束。",
+                ),
             ]
             prompt = "\n\n".join(section for section in sections if section)
 
@@ -8971,6 +8980,8 @@ class WorkflowEngine:
             "is_llm_generated": False,
             "is_leader_action": True,
             "action": "request_confirmation",
+            "config_prompt_source": "missing",
+            "prompt_render_trace": None,
         }
 
     async def _generate_leader_closing(
@@ -9193,7 +9204,7 @@ class WorkflowEngine:
 
             result = json.loads(json_str)
             if isinstance(result, dict):
-                result["config_prompt_source"] = "agent_template_runtime" if config_prompt else "missing"
+                result["config_prompt_source"] = config_prompt_source
                 result["prompt_render_trace"] = prompt_render_trace
             logger.info(f"编剧生成场景方向: {result.get('scene_type')} - {result.get('main_scene')}")
             return result
@@ -9227,7 +9238,7 @@ class WorkflowEngine:
             character_type = char_data.get("character_type", "supporting")
             is_protagonist = char_data.get("is_protagonist", False)
             is_antagonist = char_data.get("is_antagonist", False)
-            tier_description = self._get_character_tier_description(
+            tier_context = self._get_character_tier_context(
                 importance_tier, character_type, is_protagonist, is_antagonist
             )
             known_info = self._get_character_known_info(char_data, scene_directions, world_info)
@@ -9260,7 +9271,7 @@ class WorkflowEngine:
                     "name": char_name,
                     "type": character_type,
                     "importance_tier": importance_tier,
-                    "tier_description": tier_description,
+                    "tier_context": tier_context,
                     "personality": personality or '根据剧情需要表现',
                     "background": background or '普通背景',
                     "speech_pattern": speech_pattern or '自然随意',
@@ -9277,16 +9288,58 @@ class WorkflowEngine:
                     "main_action": char_role.get('main_action', '自然互动'),
                     "hidden_motivation": char_role.get('secret_motivation') or char_role.get('hidden_motivation') or '',
                 }),
+                self._format_workflow_prompt_block("角色可知上下文包", {
+                    "visible_scene": scene_directions.get('main_scene', '未设定'),
+                    "public_history": history_lines,
+                    "known_info": known_info,
+                    "boundary_source": "function_workflow_character_performance",
+                    "delta_semantics": "relationship_delta/state_delta are proposals, not persisted facts",
+                }),
                 self._format_workflow_prompt_block("当前场景中你能听到/看到的对话", "\n".join(history_lines)),
             ]
             prompt = "\n\n".join(section for section in sections if section)
 
             content = await self._get_model_response_text(agent.model, prompt)
+            public_content = str(content or "").strip()
+            performance_packet = self._build_character_performance_packet({
+                "agent": char_name,
+                "character": char_name,
+                "public_content": public_content,
+                "content": public_content,
+                "dialogue": public_content,
+                "action": "",
+                "private_thought": "",
+                "emotion": char_role.get('emotional_state', ''),
+                "intent": char_role.get('main_action', ''),
+                "perceived_facts": known_info,
+                "misinterpretations": [],
+                "withheld_information": [],
+                "relationship_delta": [],
+                "state_delta": [],
+                "continuity_notes": [],
+                "warnings": [],
+                "round": turn_number,
+            }, source_character=char_name)
 
             return {
                 "agent": char_name,
                 "type": "character_performance",
-                "content": content,
+                "content": public_content,
+                "public_content": public_content,
+                "dialogue": public_content,
+                "action": "",
+                "private_thought": "",
+                "inner_thought": "",
+                "emotion": char_role.get('emotional_state', ''),
+                "intent": char_role.get('main_action', ''),
+                "perceived_facts": known_info,
+                "misinterpretations": [],
+                "withheld_information": [],
+                "relationship_delta": [],
+                "state_delta": [],
+                "continuity_notes": [],
+                "warnings": [],
+                "character_performance_packet": performance_packet,
                 "is_llm_generated": True,
                 "turn_number": turn_number,
                 "total_characters": total_characters,
@@ -9308,6 +9361,35 @@ class WorkflowEngine:
             }
 
 
+    def _get_character_tier_context(
+        self,
+        importance_tier: int,
+        character_type: str,
+        is_protagonist: bool,
+        is_antagonist: bool,
+    ) -> Dict[str, Any]:
+        """返回角色层级的结构化运行时上下文；稳定表演规则由 prompt/skill 资产提供。"""
+        if is_protagonist:
+            role_type = "protagonist"
+        elif is_antagonist:
+            role_type = "antagonist"
+        elif importance_tier == 1:
+            role_type = "core"
+        elif importance_tier == 2:
+            role_type = "major"
+        elif importance_tier == 3:
+            role_type = "regular"
+        else:
+            role_type = "minor_or_background"
+
+        return {
+            "role_type": role_type,
+            "importance_tier": importance_tier,
+            "character_type": character_type,
+            "is_protagonist": bool(is_protagonist),
+            "is_antagonist": bool(is_antagonist),
+        }
+
     def _get_character_tier_description(
         self,
         importance_tier: int,
@@ -9315,88 +9397,16 @@ class WorkflowEngine:
         is_protagonist: bool,
         is_antagonist: bool,
     ) -> str:
-        """根据角色重要性层级返回定位说明"""
-        if is_protagonist:
-            return """【你是主角】
-你的职责：
-- 推动主线剧情发展
-- 展现角色的成长和变化
-- 面对挑战，做出关键抉择
-- 你的行动直接影响故事走向
-- 让读者能够代入你的视角
-
-注意事项：
-- 不要太过完美，要有弱点和成长空间
-- 你的每个决定都应该有后果
-- 展现真实的情感和挣扎"""
-
-        if is_antagonist:
-            return """【你是反派/对立角色】
-你的职责：
-- 制造冲突和阻碍
-- 对主角形成真正的威胁
-- 展现你的动机和逻辑（你觉得自己是对的）
-- 推动剧情走向高潮
-
-注意事项：
-- 你不是单纯的坏人，你有自己的目标和理由
-- 你的行为要有威胁感，但也要合理
-- 你的存在是为了让主角成长，不是为了送死
-- 要有作为反派的气场和压迫感"""
-
-        if importance_tier == 1:
-            return """【你是核心角色】
-你的职责：
-- 参与主线剧情的关键节点
-- 你的行动和选择影响故事走向
-- 展现丰富的性格和成长弧线
-- 与主角有重要互动
-
-注意事项：
-- 你的出场要有分量
-- 你的行为要有前后一致性
-- 要让观众记住你"""
-
-        if importance_tier == 2:
-            return """【你是重要角色】
-你的职责：
-- 辅助主线剧情
-- 丰富故事世界
-- 在关键时刻提供帮助或制造变数
-- 展现独特的个性
-
-注意事项：
-- 不要抢主角的风头
-- 但也要有存在感
-- 你的行为要符合你的定位"""
-
-        if importance_tier == 3:
-            return """【你是普通角色】
-你的职责：
-- 丰富故事的背景和世界
-- 在特定场景发挥作用
-- 展现普通人/普通角色的视角
-- 烘托氛围和情境
-
-注意事项：
-- 你的行为要自然、真实
-- 不要过度介入主线
-- 但也要有合理的作用"""
-
-        if importance_tier >= 4:
-            return """【你是配角/路人】
-你的职责：
-- 填充世界，让故事更真实
-- 对剧情做自然的反应
-- 烘托主角和重要角色的存在
-- 展现世界观的一个侧面
-
-注意事项：
-- 不要干扰主线
-- 要有真实自然的反应
-- 可以用简短的台词或行为表达"""
-
-        return ""
+        """兼容旧调用：返回结构化层级上下文的紧凑文本表示。"""
+        return json.dumps(
+            self._get_character_tier_context(
+                importance_tier,
+                character_type,
+                is_protagonist,
+                is_antagonist,
+            ),
+            ensure_ascii=False,
+        )
 
     def _get_character_known_info(
         self,

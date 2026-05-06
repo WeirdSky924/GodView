@@ -91,7 +91,8 @@ coverage.xml
 .hypothesis/
 
 # 测试和脚本目录
-tests/
+tests/*
+!tests/test_runtime_prompt_trace_standardization.py
 scripts/
 
 # ======================== 模型缓存 ========================
@@ -150,6 +151,10 @@ dmypy.json
 
 # Claude Code 本地设置
 .claude/
+
+# Agent handoff local development docs
+AGENT_HANDOFF.md
+AGENT_SESSION_PROMPTS.md
 
 # Playwright MCP 临时快照
 .playwright-mcp/

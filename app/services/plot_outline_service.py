@@ -2421,6 +2421,7 @@ class PlotOutlineService:
                     "context_blocks": [],
                     "fallbacks_used": ["plot_outline_md_prompt_fallback"],
                     "deprecated_sources_used": [],
+                    "missing_prompt_ids": [],
                 },
             }
 
@@ -2446,6 +2447,11 @@ class PlotOutlineService:
                 "context_blocks": [],
                 "fallbacks_used": ["plot_outline_deprecated_minimal_system_prompt"],
                 "deprecated_sources_used": ["PlotOutlineService._build_fallback_prompt_with_trace"],
+                "missing_prompt_ids": [
+                    "role_plot_outline",
+                    "function_plot_outline",
+                    "plot_outline_output",
+                ],
             },
         }
 

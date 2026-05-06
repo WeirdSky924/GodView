@@ -96,6 +96,7 @@ class HookManagerAgent(BaseAgent):
             "context_blocks": [],
             "fallbacks_used": ["hook_manager_deprecated_minimal_system_prompt" if deprecated else "hook_manager_md_prompt_fallback"],
             "deprecated_sources_used": ["HookManagerAgent._build_default_system_prompt"] if deprecated else [],
+            "missing_prompt_ids": ["role_hook_manager", "function_hook_management"] if deprecated else [],
         }
 
     def _build_default_system_prompt(self) -> str:
@@ -379,8 +380,12 @@ class HookManagerAgent(BaseAgent):
                     hooks_text.append(f"  描述: {desc}...")
 
             message_parts.append(f"【现有伏笔 ({len(existing_hooks)}个)】\n{chr(10).join(hooks_text)}")
-            message_parts.append("⚠️ 回收或更新现有伏笔时，hooks_to_resolve.id 和 hooks_status_updates.id 必须逐字使用上方 ID 字段；不要填写伏笔标题、名称或描述。")
-            message_parts.append("⚠️ 以上是数据库中已存在的伏笔，请优先考虑如何利用和管理这些伏笔。")
+            message_parts.append("【伏笔 ID 约束】\n" + "\n".join(
+                [
+                    "- hooks_to_resolve.id 与 hooks_status_updates.id 只能使用上方 ID 字段。",
+                    "- 现有伏笔是数据库中已存在的伏笔；优先考虑复用、推进、触发或回收。",
+                ]
+            ))
         else:
             message_parts.append("【现有伏笔】\n暂无已存储的伏笔。")
 
@@ -390,27 +395,15 @@ class HookManagerAgent(BaseAgent):
         if resolved_in_chapter:
             message_parts.append(f"【本章节已回收】\n{chr(10).join(f'- {h}' for h in resolved_in_chapter)}")
 
-        # 决策引导
-        message_parts.append("""
-【决策要点】
-
-1. **伏笔回收优先**: 检查现有伏笔是否可以在当前场景回收
-   - 回收时机是否合适？
-   - 回收方式是否能产生"原来如此"的效果？
-
-2. **伏笔状态更新**: 对于不能立即回收的伏笔
-   - 是否已触发（开始显现）？
-   - 是否需要调整优先级？
-
-3. **新伏笔创建**: 需要同时从两个角度判断
-   - 现有伏笔：是否已有伏笔可复用、推进、触发或回收？
-   - 本章大纲：是否明确要求埋设新的伏笔？如有，应给出自然埋设方案
-   - 新伏笔是否有明确的回收计划？
-   - 是否与现有伏笔重复？
-   - 是否对未来剧情有重要价值？
-
-请输出 JSON 格式的决策。
-""")
+        # 运行时任务参数；稳定决策规则由 function_hook_management md 资产提供
+        message_parts.append("【运行时任务参数】\n" + "\n".join(
+            [
+                "- output_schema: HookManagerDecisionSchema",
+                "- existing_hook_count: " + str(len(existing_hooks)),
+                "- planted_in_chapter_count: " + str(len(planted_in_chapter or [])),
+                "- resolved_in_chapter_count: " + str(len(resolved_in_chapter or [])),
+            ]
+        ))
 
         return "\n\n".join(message_parts)
 
@@ -434,8 +427,9 @@ class HookManagerAgent(BaseAgent):
         hook_instruction = self._load_md_prompt_content("function_hook_management") or "请遵循伏笔管理原则，优先复用现有伏笔并保持埋设自然。"
         prompt = f"""{hook_instruction}
 
-【当前子任务】
-请为以下伏笔设计一个自然的埋设方式。
+【当前子任务参数】
+- task_mode: hook_planting_suggestion
+- output_schema: HookPlantSuggestionSchema
 
 【伏笔信息】
 - ID: {hook.get('id')}
@@ -447,15 +441,7 @@ class HookManagerAgent(BaseAgent):
 {scene_context}
 
 【在场角色】
-{', '.join(character_ids)}
-
-请按 HookPlantSuggestionSchema 输出 JSON：
-{{
-    "method": "埋设方式（如：对话暗示/物品发现/行为异常）",
-    "context": "具体情境描述",
-    "dialogue_hint": "暗示性台词（如有）",
-    "attention_level": "low/medium/high"
-}}"""
+{', '.join(character_ids)}"""
 
         try:
             parsed = await self._call_structured(
@@ -491,8 +477,9 @@ class HookManagerAgent(BaseAgent):
         hook_instruction = self._load_md_prompt_content("function_hook_management") or "请遵循伏笔管理原则，确保回收自然、有因果支撑，并优先处理已存在伏笔。"
         prompt = f"""{hook_instruction}
 
-【当前子任务】
-请为以下伏笔设计一个令人满意的回收方式。
+【当前子任务参数】
+- task_mode: hook_resolution_suggestion
+- output_schema: HookResolutionSuggestionSchema
 
 【伏笔信息】
 - ID: {hook.get('id')}
@@ -501,15 +488,7 @@ class HookManagerAgent(BaseAgent):
 - 埋设时的情境：{hook.get('plant_context', '未知')}
 
 【当前上下文】
-{current_context}
-
-请按 HookResolutionSuggestionSchema 输出 JSON：
-{{
-    "resolution": "回收方式描述",
-    "emotional_impact": "low/medium/high",
-    "ties_to_other_hooks": ["关联的其他伏笔 ID"],
-    "suggested_dialogue": "揭示真相时的台词（如有）"
-}}"""
+{current_context}"""
 
         try:
             parsed = await self._call_structured(

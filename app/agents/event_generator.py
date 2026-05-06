@@ -100,6 +100,7 @@ class EventGeneratorAgent(BaseAgent):
             "context_blocks": [],
             "fallbacks_used": ["event_generator_deprecated_minimal_system_prompt" if deprecated else "event_generator_md_prompt_fallback"],
             "deprecated_sources_used": ["EventGeneratorAgent._build_system_prompt"] if deprecated else [],
+            "missing_prompt_ids": ["role_event_generator", "function_event_generation"] if deprecated else [],
         }
 
     def _build_system_prompt(self) -> str:
@@ -292,8 +293,10 @@ class EventGeneratorAgent(BaseAgent):
         event_instruction = self._load_md_prompt_content("function_event_generation") or "请生成符合世界观、章节目标和因果链的事件。"
         prompt = f"""{event_instruction}
 
-【当前子任务】
-请基于当前项目上下文生成一个服务于当前章节的事件。
+【当前子任务参数】
+- task_mode: current_chapter_event_generation
+- event_type: {event_type}
+- output_schema: EventGeneratorEventSchema
 
 【当前章节】
 - 章节号：{chapter_num or '未提供'}
@@ -316,14 +319,6 @@ class EventGeneratorAgent(BaseAgent):
 {', '.join(lore_titles) if lore_titles else '未提供'}
 
 【补充上下文】
-{context.get('situation', '无特定情境')}
-
-要求：
-1. 事件必须严格贴合当前章节大纲与章节目标，只能服务当前章节写作。
-2. 不要生成跨到后续章节的重大新主线；如果字段需要 suggested_chapter，必须填写当前章节号或当前章节标题。
-3. 不得把中后期高潮事件提前到当前章节；不得覆盖大纲中的既定事件。
-4. 参与者、触发条件、后果要优先引用大纲中的角色、场景、关键事件和计划伏笔。
-5. 如果当前章节只是铺垫/觉醒/初遇，事件也应保持相同叙事阶段，不要升级为最终阴谋揭示。
-6. 输出 JSON 格式。"""
+{context.get('situation', '无特定情境')}"""
 
         return prompt

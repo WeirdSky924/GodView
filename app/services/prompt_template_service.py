@@ -183,6 +183,49 @@ class PromptTemplateService:
             logger.debug(f"从 MD 文件加载失败 {prompt_id}: {e}")
             return None
 
+    def _try_load_md_template(self, prompt_id: str) -> Optional[PromptTemplate]:
+        """尝试从 MD prompt 资产构建 PromptTemplate。"""
+        try:
+            from app.services.md_file_service import get_md_file_service
+
+            md_service = get_md_file_service()
+            prompt = md_service.get_prompt(prompt_id)
+            if not prompt:
+                return None
+
+            category_value = prompt.get("category") or "function"
+            category_mapping = {
+                "identity": PromptCategory.ROLE,
+                "instruction": PromptCategory.FUNCTION,
+                "constraint": PromptCategory.CONSTRAINT,
+                "output": PromptCategory.OUTPUT,
+                "base": PromptCategory.BASE,
+                "role": PromptCategory.ROLE,
+                "function": PromptCategory.FUNCTION,
+                "value": PromptCategory.VALUE,
+            }
+            variables = prompt.get("variables") or []
+            default_values = {
+                item.get("name"): item.get("default")
+                for item in variables
+                if isinstance(item, dict) and "name" in item and "default" in item
+            }
+            return PromptTemplate(
+                id=prompt_id,
+                name=prompt.get("name") or prompt_id,
+                description=prompt.get("description", ""),
+                category=category_mapping.get(str(category_value), PromptCategory.FUNCTION),
+                tags=prompt.get("tags") or [],
+                content=prompt.get("content") or "",
+                variables=variables,
+                default_values=default_values,
+                priority=prompt.get("priority", 50),
+                is_system=prompt.get("is_system", True),
+            )
+        except Exception as e:
+            logger.debug(f"从 MD prompt 资产构建模板失败 {prompt_id}: {e}")
+            return None
+
     def _template_to_db_dict(self, template: PromptTemplate) -> Dict:
         """将 PromptTemplate 对象转换为数据库字典"""
         return {
@@ -245,9 +288,18 @@ class PromptTemplateService:
         return template
 
     async def get_template(self, template_id: str) -> Optional[PromptTemplate]:
-        """获取单个 Prompt 模板"""
+        """获取单个 Prompt 模板，DB 缓存优先，缺失时按需加载 md-only prompt。"""
         await self._ensure_cache()
-        return self._templates.get(template_id)
+        template = self._templates.get(template_id)
+        if template:
+            return template
+
+        md_template = self._try_load_md_template(template_id)
+        if md_template:
+            self._templates[template_id] = md_template
+            return md_template
+
+        return None
 
     async def list_templates(self, filters: PromptFilter) -> List[PromptTemplate]:
         """获取 Prompt 模板列表（支持过滤）"""
@@ -430,7 +482,7 @@ class PromptTemplateService:
 
     async def render_template(self, request: PromptRenderRequest) -> PromptRenderResult:
         """渲染 Prompt 模板（变量插值）"""
-        template = self._templates.get(request.template_id)
+        template = await self.get_template(request.template_id)
         if not template:
             raise ValueError(f"模板不存在: {request.template_id}")
 
@@ -450,7 +502,8 @@ class PromptTemplateService:
         for var in template_variables:
             if var in variables:
                 value = str(variables[var])
-                rendered_content = rendered_content.replace(f"{{{var}}}", value)
+                for placeholder in (f"{{{{{var}}}}}", f"{{{var}}}"):
+                    rendered_content = rendered_content.replace(placeholder, value)
                 used_variables[var] = variables[var]
             else:
                 missing_variables.append(var)
@@ -479,7 +532,8 @@ class PromptTemplateService:
         for var in template_variables:
             if var in variables:
                 value = str(variables[var])
-                rendered_content = rendered_content.replace(f"{{{var}}}", value)
+                for placeholder in (f"{{{{{var}}}}}", f"{{{var}}}"):
+                    rendered_content = rendered_content.replace(placeholder, value)
             else:
                 # 保留变量占位符
                 rendered_content = rendered_content.replace(f"{{{var}}}", f"{{{var}}}")
@@ -618,7 +672,46 @@ class PromptTemplateService:
 
     # ==================== MD 文件同步 ====================
 
-    async def sync_md_files_to_db(self) -> Dict[str, int]:
+    @staticmethod
+    def _new_md_sync_result() -> Dict[str, Any]:
+        return {"synced": 0, "skipped": 0, "errors": 0, "files": []}
+
+    @staticmethod
+    def _add_md_sync_file_result(
+        result: Dict[str, Any],
+        *,
+        file_path: str,
+        asset_id: Optional[str],
+        status: str,
+        message: str,
+    ):
+        result["files"].append({
+            "file_path": file_path,
+            "id": asset_id,
+            "status": status,
+            "message": message,
+        })
+
+    async def _delete_stale_md_templates(self, synced_ids: set[str]):
+        """Remove database Prompt rows that originated from md files but no longer exist."""
+        try:
+            rows = await self._db.execute_query(
+                "SELECT id FROM prompt_templates WHERE content IS NOT NULL"
+                " AND content <> ''"
+            )
+            stale_ids = [row['id'] for row in rows if row.get('id') not in synced_ids]
+            for template_id in stale_ids:
+                await self._db.execute_write(
+                    "DELETE FROM prompt_templates WHERE id = :id AND content IS NOT NULL AND content <> ''",
+                    {'id': template_id},
+                )
+                self._templates.pop(template_id, None)
+            if stale_ids:
+                logger.info(f"清理已删除的 MD Prompt 模板: {len(stale_ids)} 个")
+        except Exception as e:
+            logger.warning(f"清理已删除的 MD Prompt 模板失败: {e}")
+
+    async def sync_md_files_to_db(self) -> Dict[str, Any]:
         """
         将 MD 文件同步到数据库
 
@@ -632,7 +725,10 @@ class PromptTemplateService:
         """
         if not self._db:
             logger.warning("数据库未连接，无法同步 MD 文件")
-            return {"error": 1, "synced": 0, "skipped": 0}
+            return {"error": 1, "synced": 0, "skipped": 0, "errors": 1, "files": []}
+
+        result = self._new_md_sync_result()
+        synced_ids = set()
 
         try:
             from app.services.md_file_service import get_md_file_service
@@ -642,12 +738,20 @@ class PromptTemplateService:
             # 获取所有 MD 文件中的 Prompts
             md_prompts = md_service.list_prompts()
 
-            synced = 0
-            skipped = 0
-            errors = 0
+            for scan_error in md_service.get_scan_errors():
+                if str(scan_error.get('file_path', '')).startswith('prompts/'):
+                    result["errors"] += 1
+                    self._add_md_sync_file_result(
+                        result,
+                        file_path=scan_error.get('file_path', ''),
+                        asset_id=None,
+                        status="error",
+                        message=scan_error.get('error', 'Invalid markdown frontmatter'),
+                    )
 
             for md_prompt in md_prompts:
                 prompt_id = md_prompt['id']
+                file_path = md_prompt.get('file_path', '')
 
                 try:
                     # 解析 category，支持映射转换
@@ -707,23 +811,48 @@ class PromptTemplateService:
                         data
                     )
 
-                    synced += 1
+                    result["synced"] += 1
+                    synced_ids.add(prompt_id)
+                    self._add_md_sync_file_result(
+                        result,
+                        file_path=file_path,
+                        asset_id=prompt_id,
+                        status="synced",
+                        message="Prompt synced to database",
+                    )
                     logger.debug(f"同步 Prompt 到数据库: {prompt_id}")
 
                 except Exception as e:
-                    errors += 1
+                    result["errors"] += 1
+                    self._add_md_sync_file_result(
+                        result,
+                        file_path=file_path,
+                        asset_id=prompt_id,
+                        status="error",
+                        message=str(e),
+                    )
                     logger.error(f"同步 Prompt {prompt_id} 失败: {e}")
+
+            await self._delete_stale_md_templates(synced_ids)
 
             # 刷新缓存，并立即重新加载同步后的 DB 数据，确保启动阶段后续服务可直接解析新增 md prompt。
             self.invalidate_cache()
             await self._ensure_cache()
 
-            logger.info(f"MD 文件同步完成: {synced} 个成功, {skipped} 个跳过, {errors} 个错误")
-            return {"synced": synced, "skipped": skipped, "errors": errors}
+            logger.info(
+                "MD 文件同步完成: %s 个成功, %s 个跳过, %s 个错误",
+                result["synced"],
+                result["skipped"],
+                result["errors"],
+            )
+            return result
 
         except Exception as e:
             logger.error(f"同步 MD 文件失败: {e}")
-            return {"error": 1, "synced": 0, "skipped": 0}
+            result["errors"] += 1
+            result["error"] = 1
+            result["files"].append({"file_path": None, "id": None, "status": "error", "message": str(e)})
+            return result
 
 # 全局单例
 _prompt_template_service: Optional[PromptTemplateService] = None

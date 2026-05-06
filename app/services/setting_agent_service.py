@@ -9,6 +9,7 @@ import logging
 import re
 import uuid
 from datetime import datetime
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import settings
@@ -37,6 +38,47 @@ from app.services.token_tracker import token_tracker
 from app.services.trace_service import TraceService, get_trace_service
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SegmentedContextSynthesis:
+    """设定助手长上下文分段综合结果。"""
+
+    full_context: str
+    key_info_index: str
+    key_points: List[Dict[str, Any]] = field(default_factory=list)
+    cross_segment_links: List[Dict[str, Any]] = field(default_factory=list)
+    potential_conflicts: List[Dict[str, Any]] = field(default_factory=list)
+    resource_requirements: List[Dict[str, Any]] = field(default_factory=list)
+    parse_warnings: List[Dict[str, Any]] = field(default_factory=list)
+
+    def as_prompt_block(self) -> str:
+        lines = [self.key_info_index.strip() or "（无关键信息点）"]
+        if self.cross_segment_links:
+            lines.append("\n### 跨段关联提示")
+            for link in self.cross_segment_links[:12]:
+                entities = " / ".join(str(item) for item in link.get("entities", []) if item)
+                note = str(link.get("note") or link.get("reason") or "").strip()
+                relation_type = str(link.get("relation_type") or link.get("type") or "关联").strip()
+                lines.append(f"- [{relation_type}] {entities}: {note}" if entities else f"- [{relation_type}] {note}")
+        if self.potential_conflicts:
+            lines.append("\n### 潜在冲突提示")
+            for conflict in self.potential_conflicts[:8]:
+                entities = " / ".join(str(item) for item in conflict.get("entities", []) if item)
+                note = str(conflict.get("note") or conflict.get("description") or "").strip()
+                lines.append(f"- {entities}: {note}" if entities else f"- {note}")
+        if self.resource_requirements:
+            lines.append("\n### 资源补全提示")
+            for req in self.resource_requirements[:10]:
+                req_type = str(req.get("requirement_type") or req.get("type") or "lore")
+                name = str(req.get("resource_name") or req.get("name") or "未命名资源")
+                reason = str(req.get("reason") or req.get("usage_guidance") or "需要补全后再作为关键设定使用")
+                lines.append(f"- [{req_type}] {name}: {reason}")
+        if self.parse_warnings:
+            lines.append("\n### 分段解析警告")
+            for warning in self.parse_warnings[:6]:
+                lines.append(f"- {warning.get('section', '未知分段')}: {warning.get('error', '解析失败，已保留原文上下文')}")
+        return "\n".join(line for line in lines if line is not None)
 
 
 class SettingAgentService:
@@ -110,8 +152,15 @@ class SettingAgentService:
             "writing_rule_ids": [],
             "writing_rules": None,
             "context_blocks": [],
-            "fallbacks_used": [fallback] if fallback else [],
-            "deprecated_sources_used": [deprecated_source] if deprecated_source else [],
+            "fallbacks_used": [fallback] if fallback else ["setting_missing_config_prompt"],
+            "deprecated_sources_used": [deprecated_source] if deprecated_source else ([] if fallback else ["SettingAgentService._build_md_setting_fallback_prompt"]),
+            "missing_prompt_ids": [] if fallback else [
+                "role_setting",
+                "function_setting_resource_management",
+                "function_setting_segmented_context_synthesis",
+                "function_setting_lore_interconnection",
+                "function_setting_requirement_resolution",
+            ],
         }
 
     async def _get_setting_config_prompt_with_trace(
@@ -158,7 +207,6 @@ class SettingAgentService:
                 project_id,
                 scenario,
                 fallback="setting_md_prompt_fallback",
-                deprecated_source="SettingAgentService._build_md_setting_fallback_prompt",
             )
             self._setting_config_prompt_cache[cache_key] = fallback
             self._setting_config_prompt_source_cache[cache_key] = "md_prompt_fallback"
@@ -1086,19 +1134,28 @@ class SettingAgentService:
 
         if use_segmented_analysis:
             try:
-                # 分段分析返回：完整原始上下文 + 关键信息索引
-                full_context, key_info_index = await self._analyze_with_segmented_context(
+                # 分段分析返回：完整原始上下文 + 综合索引 + 跨段关系/冲突/资源缺口
+                segmented_synthesis = await self._analyze_with_segmented_context(
                     project_id=project_id,
                     user_message=message,
                     sections=sections,
                     world_type=world_type,
                 )
-                logger.info(f"[SettingAgent] 分段分析完成: full_context长度={len(full_context)}, key_info_index长度={len(key_info_index)}")
+                full_context = segmented_synthesis.full_context
+                key_info_index = segmented_synthesis.as_prompt_block()
+                logger.info(
+                    "[SettingAgent] 分段分析完成: full_context长度=%s, key_info_index长度=%s, key_points=%s, conflicts=%s, requirements=%s",
+                    len(full_context),
+                    len(key_info_index),
+                    len(segmented_synthesis.key_points),
+                    len(segmented_synthesis.potential_conflicts),
+                    len(segmented_synthesis.resource_requirements),
+                )
             except Exception as e:
                 logger.error(f"[SettingAgent] 分段分析失败: {e}")
                 # 回退到常规方法
                 full_context = "\n\n".join([f"【{k}】\n{v}" for k, v in sections.items() if v and not k.startswith("_")])
-                key_info_index = "（分段分析失败，直接使用原始上下文）"
+                key_info_index = "（分段分析失败，直接使用原始上下文；生成设定时仍需综合全部项目信息并标注关联/冲突/资源缺口）"
 
             # 构建最终上下文：跨段综合要求 + 关键信息索引 + 完整原始上下文 + 最近对话
             context_str = f"""【设定生成综合要求】
@@ -1271,6 +1328,124 @@ class SettingAgentService:
         except Exception as e:
             logger.warning(f"同步 Setting Agent 记忆失败: {e}")
 
+    def _append_lore_interconnection_guidance(self, prompt: str) -> str:
+        """为设定抽取类 prompt 附加 Phase 4.5 互联字段要求。"""
+        guidance = """
+
+【设定互联字段要求】
+- 每个设定必须尽量填写 related_characters / related_locations / related_items；如果涉及势力或组织，填写 related_factions。
+- 如果该设定依赖既有设定、角色状态、地点、伏笔或章节大纲，填写 depends_on_lore，并在 usage_guidance 中说明使用边界。
+- 如果该设定会支撑后续设定、伏笔或章节推进，填写 supports_lore。
+- 如果发现与既有设定或大纲有潜在冲突，填写 potential_conflicts；不要直接覆盖既有设定。
+- 如果需要新角色、地点、势力、道具、能力或事件规则配合，填写 resource_requirements，而不是把缺失资源硬写成已存在事实。
+- resource_requirements 元素格式：{"requirement_type":"character|lore|faction|location|item|ability|relationship|event_rule|crisis_resolution","resource_name":"待补资源名","severity":"blocking|advisory|optional","reason":"为什么需要补全","suggested_payload":{}}。
+"""
+        return f"{prompt.rstrip()}\n{guidance}"
+
+    def _normalize_string_list(self, value: Any) -> List[str]:
+        """把 LLM/前端传入的列表字段规范为去重字符串列表。"""
+        if value is None:
+            return []
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return []
+            try:
+                value = json.loads(stripped)
+            except (json.JSONDecodeError, TypeError):
+                value = re.split(r"[，,\n;；]", stripped)
+        if isinstance(value, dict):
+            value = list(value.values())
+        if not isinstance(value, list):
+            value = [value]
+
+        result: List[str] = []
+        seen = set()
+        for item in value:
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            result.append(text)
+        return result
+
+    def _normalize_lore_resource_requirements(self, value: Any) -> List[Dict[str, Any]]:
+        """规范化待确认设定携带的资源补全需求。"""
+        if value is None:
+            return []
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return []
+            try:
+                value = json.loads(stripped)
+            except (json.JSONDecodeError, TypeError):
+                value = [{"requirement_type": "lore", "resource_name": stripped, "severity": "advisory", "reason": stripped}]
+        if isinstance(value, dict):
+            value = [value]
+        if not isinstance(value, list):
+            return []
+
+        normalized: List[Dict[str, Any]] = []
+        for item in value:
+            if not isinstance(item, dict):
+                name = str(item or "").strip()
+                if not name:
+                    continue
+                item = {"requirement_type": "lore", "resource_name": name, "reason": name}
+            req_type = str(item.get("requirement_type") or item.get("type") or "lore").strip() or "lore"
+            resource_name = str(item.get("resource_name") or item.get("name") or item.get("title") or "").strip()
+            reason = str(item.get("reason") or item.get("usage_guidance") or item.get("description") or "").strip()
+            if not resource_name and not reason:
+                continue
+            severity = str(item.get("severity") or "advisory").strip().lower()
+            if severity not in {"blocking", "advisory", "optional"}:
+                severity = "advisory"
+            normalized.append({
+                "requirement_type": req_type,
+                "resource_name": resource_name or reason[:80] or "未命名资源",
+                "severity": severity,
+                "reason": reason or "该设定依赖尚未补全的资源",
+                "suggested_payload": item.get("suggested_payload") if isinstance(item.get("suggested_payload"), dict) else {},
+            })
+        return normalized
+
+    def _normalize_lore_interconnection_payload(self, lore_data: Dict[str, Any]) -> Dict[str, Any]:
+        """规范化待确认设定的互联字段，避免保存或展示时丢失上下文。"""
+        normalized = dict(lore_data)
+        for field_name in [
+            "keywords",
+            "tags",
+            "constraints",
+            "related_characters",
+            "related_locations",
+            "related_items",
+            "related_factions",
+            "depends_on_lore",
+            "supports_lore",
+            "potential_conflicts",
+            "forbidden_actions",
+        ]:
+            normalized[field_name] = self._normalize_string_list(normalized.get(field_name))
+        normalized["usage_guidance"] = str(normalized.get("usage_guidance") or "").strip()
+        normalized["resource_requirements"] = self._normalize_lore_resource_requirements(normalized.get("resource_requirements"))
+        return normalized
+
+    def _build_lore_source_with_metadata(self, lore_data: Dict[str, Any]) -> str:
+        """在现有 source 文本字段中保留可审计的互联元数据，避免旧表结构丢失信息。"""
+        base_source = str(lore_data.get("source") or "setting_agent").strip() or "setting_agent"
+        metadata = {
+            "related_factions": lore_data.get("related_factions") or [],
+            "depends_on_lore": lore_data.get("depends_on_lore") or [],
+            "supports_lore": lore_data.get("supports_lore") or [],
+            "potential_conflicts": lore_data.get("potential_conflicts") or [],
+            "usage_guidance": lore_data.get("usage_guidance") or "",
+            "resource_requirements": lore_data.get("resource_requirements") or [],
+        }
+        if not any(metadata.values()):
+            return base_source
+        return f"{base_source}\n[setting_agent_interconnection_metadata]\n{json.dumps(metadata, ensure_ascii=False)}"
+
     async def _extract_lore_from_conversation(
         self,
         project_id: str,
@@ -1315,7 +1490,20 @@ class SettingAgentService:
     "priority": "constitutional|core|standard|flexible",
     "content": "设定详细内容",
     "summary": "简短摘要",
-    "keywords": ["关键词1", "关键词2"]
+    "keywords": ["关键词1", "关键词2"],
+    "tags": ["标签"],
+    "constraints": ["约束"],
+    "related_characters": ["相关角色名或ID"],
+    "related_locations": ["相关地点名或ID"],
+    "related_items": ["相关物品名或ID"],
+    "related_factions": ["相关势力/组织名"],
+    "depends_on_lore": ["依赖的既有设定/伏笔/章节大纲"],
+    "supports_lore": ["支撑的后续设定/伏笔/章节"],
+    "potential_conflicts": ["潜在冲突说明"],
+    "usage_guidance": "使用边界、可见层级、与既有资源的连接方式",
+    "resource_requirements": [
+      {{"requirement_type":"character|lore|faction|location|item|ability|relationship|event_rule|crisis_resolution","resource_name":"待补资源名","severity":"blocking|advisory|optional","reason":"为什么需要补全","suggested_payload":{{}}}}
+    ]
   }}
 ]
 ```
@@ -1329,6 +1517,8 @@ class SettingAgentService:
         try:
             from app.models.agent_output_schemas import SettingPendingLoresExtractionSchema
             from app.services.structured_llm import StructuredOutputError
+
+            extraction_prompt = self._append_lore_interconnection_guidance(extraction_prompt)
 
             try:
                 parsed = await self._call_structured(
@@ -1349,18 +1539,25 @@ class SettingAgentService:
             for lore_data in lores:
                 if not lore_data.get("title") or not lore_data.get("content"):
                     continue
+                normalized_lore = self._normalize_lore_interconnection_payload(lore_data)
                 valid_lores.append({
-                    "title": lore_data.get("title", ""),
-                    "category": normalize_lore_category(lore_data.get("category", "custom")).value,
-                    "priority": normalize_lore_priority(lore_data.get("priority", "standard")).value,
-                    "content": lore_data.get("content", ""),
-                    "summary": lore_data.get("summary", ""),
-                    "keywords": lore_data.get("keywords", []),
-                    "tags": lore_data.get("tags", []),
-                    "constraints": lore_data.get("constraints", []),
-                    "related_characters": lore_data.get("related_characters", []),
-                    "related_locations": lore_data.get("related_locations", []),
-                    "related_items": lore_data.get("related_items", []),
+                    "title": normalized_lore.get("title", ""),
+                    "category": normalize_lore_category(normalized_lore.get("category", "custom")).value,
+                    "priority": normalize_lore_priority(normalized_lore.get("priority", "standard")).value,
+                    "content": normalized_lore.get("content", ""),
+                    "summary": normalized_lore.get("summary", ""),
+                    "keywords": normalized_lore.get("keywords", []),
+                    "tags": normalized_lore.get("tags", []),
+                    "constraints": normalized_lore.get("constraints", []),
+                    "related_characters": normalized_lore.get("related_characters", []),
+                    "related_locations": normalized_lore.get("related_locations", []),
+                    "related_items": normalized_lore.get("related_items", []),
+                    "related_factions": normalized_lore.get("related_factions", []),
+                    "depends_on_lore": normalized_lore.get("depends_on_lore", []),
+                    "supports_lore": normalized_lore.get("supports_lore", []),
+                    "potential_conflicts": normalized_lore.get("potential_conflicts", []),
+                    "usage_guidance": normalized_lore.get("usage_guidance", ""),
+                    "resource_requirements": normalized_lore.get("resource_requirements", []),
                 })
 
             if valid_lores:
@@ -1628,6 +1825,7 @@ class SettingAgentService:
                 logger.info(f"跳过重复设定: {lore_data.get('title', '')} -> {duplicate.get('id')}")
                 continue
 
+            lore_data = self._normalize_lore_interconnection_payload(lore_data)
             lore_entry = {
                 "id": str(uuid.uuid4()),
                 "project_id": project_id,
@@ -1643,7 +1841,7 @@ class SettingAgentService:
                 "related_locations": json.dumps(lore_data.get("related_locations", [])),
                 "related_items": json.dumps(lore_data.get("related_items", [])),
                 "forbidden_actions": json.dumps(lore_data.get("forbidden_actions", [])),
-                "source": lore_data.get("source", ""),
+                "source": self._build_lore_source_with_metadata(lore_data),
                 "created_at": datetime.now(),
                 "updated_at": datetime.now(),
             }
@@ -1996,6 +2194,7 @@ class SettingAgentService:
                     logger.info(f"跳过重复设定: {modification.get('suggested_title', '新设定')} -> {duplicate.get('id')}")
                     return {"success": True, "message": f"设定已存在，复用现有条目: {duplicate.get('id')}"}
 
+                modification = self._normalize_lore_interconnection_payload(modification)
                 lore_entry = {
                     "id": str(uuid.uuid4()),
                     "project_id": project_id,
@@ -2011,7 +2210,7 @@ class SettingAgentService:
                     "related_locations": json.dumps(modification.get("related_locations", [])),
                     "related_items": json.dumps(modification.get("related_items", [])),
                     "forbidden_actions": json.dumps(modification.get("forbidden_actions", [])),
-                    "source": modification.get("source", ""),
+                    "source": self._build_lore_source_with_metadata(modification),
                     "created_at": datetime.now(),
                     "updated_at": datetime.now(),
                 }
@@ -3315,7 +3514,7 @@ class SettingAgentService:
         user_message: str,
         sections: Dict[str, str],
         world_type: Optional[str] = None,
-    ) -> tuple[str, str]:
+    ) -> SegmentedContextSynthesis:
         """
         使用分段分析处理大量上下文（混合策略）
 
@@ -3332,7 +3531,7 @@ class SettingAgentService:
             world_type: 世界类型
 
         Returns:
-            tuple[str, str]: (完整原始上下文, 关键信息索引)
+            SegmentedContextSynthesis: 完整原始上下文、关键信息索引、跨段关联、冲突、资源缺口和解析警告
         """
         logger.info(f"[分段分析] 开始: {len(sections)} 个段落")
 
@@ -3346,8 +3545,9 @@ class SettingAgentService:
         elif sections.get("_world_type"):
             world_type_hint = self._get_world_type_hint(sections["_world_type"])
 
-        # 存储所有段落的关键信息点
-        all_key_points = []
+        # 存储所有段落的关键信息点和非致命解析警告
+        all_key_points: List[Dict[str, Any]] = []
+        parse_warnings: List[Dict[str, Any]] = []
 
         # 按段落类型逐个处理
         section_order = ["世界管理", "设定库", "角色列表", "伏笔列表", "章节大纲"]
@@ -3389,6 +3589,10 @@ class SettingAgentService:
                     all_key_points.extend(key_points)
                     failed_segments = 0  # 重置连续失败计数
                 else:
+                    parse_warnings.append({
+                        "section": section_name,
+                        "error": "未能解析关键信息点，已保留原文上下文",
+                    })
                     failed_segments += 1
                     logger.warning(f"[分段分析] 段落【{section_name}】提取失败 ({failed_segments}/{max_failed_segments})")
             else:
@@ -3423,6 +3627,10 @@ class SettingAgentService:
                         all_key_points.extend(key_points)
                         failed_segments = 0  # 重置连续失败计数
                     else:
+                        parse_warnings.append({
+                            "section": segment_label,
+                            "error": "未能解析关键信息点，已保留原文上下文",
+                        })
                         failed_segments += 1
                         logger.warning(f"[分段分析] 段落【{segment_label}】提取失败 ({failed_segments}/{max_failed_segments})")
 
@@ -3442,10 +3650,22 @@ class SettingAgentService:
         # 构建完整原始上下文
         full_context = "\n\n".join([f"【{k}】\n{v}" for k, v in sorted_sections])
 
+        cross_segment_links = self._build_cross_segment_links(merged_key_points)
+        potential_conflicts = self._build_segment_potential_conflicts(merged_key_points)
+        resource_requirements = self._build_segment_resource_requirements(merged_key_points)
+
         # 构建关键信息索引
         key_info_index = self._format_key_points_index(merged_key_points)
 
-        return full_context, key_info_index
+        return SegmentedContextSynthesis(
+            full_context=full_context,
+            key_info_index=key_info_index,
+            key_points=merged_key_points,
+            cross_segment_links=cross_segment_links,
+            potential_conflicts=potential_conflicts,
+            resource_requirements=resource_requirements,
+            parse_warnings=parse_warnings,
+        )
 
     async def _extract_key_points(
         self,
@@ -3495,7 +3715,13 @@ class SettingAgentService:
     "category": "信息类型（如：世界观、角色、事件、规则、时间线等）",
     "entity": "实体名称（如：具体角色名、地点名、事件名）",
     "key_fact": "关键事实（一句话描述，保留具体细节）",
-    "relevance": "与用户问题的相关性（高/中/低）"
+    "relevance": "与用户问题的相关性（高/中/低）",
+    "related_entities": ["与该事实有关的其他角色/设定/势力/地点"],
+    "relation_type": "depends_on|supports|conflicts_with|mentions|requires_resource",
+    "potential_conflicts": ["如果该事实与其他段落可能冲突，写明冲突点"],
+    "resource_requirements": [
+      {{"requirement_type":"character|lore|faction|location|item|ability|relationship|event_rule|crisis_resolution","resource_name":"待补资源名","severity":"blocking|advisory|optional","reason":"为什么需要补全"}}
+    ]
   }}
 ]
 ```
@@ -3505,6 +3731,7 @@ class SettingAgentService:
 2. 如果有时间线信息，必须记录具体时间点
 3. 如果有数值信息（等级、数量等），必须记录具体数值
 4. 保持信息点的独立性，每个信息点只描述一个事实
+5. 如果不同片段之间存在依赖、支撑、冲突或资源缺口，必须通过 related_entities / relation_type / potential_conflicts / resource_requirements 标出
 
 只输出JSON数组，不要其他内容。"""
 
@@ -3611,6 +3838,10 @@ class SettingAgentService:
                     "entity": entity or "未命名实体",
                     "key_fact": key_fact or entity,
                     "relevance": relevance if relevance in {"高", "中", "低"} else "中",
+                    "related_entities": self._normalize_string_list(item.get("related_entities")),
+                    "relation_type": str(item.get("relation_type") or item.get("relationship") or "mentions").strip() or "mentions",
+                    "potential_conflicts": self._normalize_string_list(item.get("potential_conflicts") or item.get("conflicts")),
+                    "resource_requirements": self._normalize_lore_resource_requirements(item.get("resource_requirements") or item.get("requirements")),
                 })
             return key_points
 
@@ -3626,8 +3857,6 @@ class SettingAgentService:
         return (
             payload
             .replace("\ufeff", "")
-            .replace("，", ",")
-            .replace("：", ":")
             .replace("“", '"')
             .replace("”", '"')
             .replace("‘", "'")
@@ -3642,6 +3871,65 @@ class SettingAgentService:
         repaired = re.sub(r'("\s*)\n\s*(")', r"\1,\n\2", repaired)
         repaired = re.sub(r"'([^'\\]*(?:\\.[^'\\]*)*)'", lambda m: json.dumps(m.group(1), ensure_ascii=False), repaired)
         return repaired
+
+    def _build_cross_segment_links(self, key_points: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """从分段信息点中构造跨段关联提示，供最终设定生成综合使用。"""
+        links: List[Dict[str, Any]] = []
+        seen = set()
+        for point in key_points:
+            entity = str(point.get("entity") or "").strip()
+            related_entities = self._normalize_string_list(point.get("related_entities"))
+            if not entity or not related_entities:
+                continue
+            relation_type = str(point.get("relation_type") or "mentions").strip() or "mentions"
+            key = (entity, tuple(related_entities), relation_type)
+            if key in seen:
+                continue
+            seen.add(key)
+            links.append({
+                "entities": [entity, *related_entities],
+                "relation_type": relation_type,
+                "note": point.get("key_fact") or "跨段信息存在关联，需要综合判断",
+            })
+        return links
+
+    def _build_segment_potential_conflicts(self, key_points: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """汇总分段中显式暴露的潜在冲突。"""
+        conflicts: List[Dict[str, Any]] = []
+        seen = set()
+        for point in key_points:
+            conflict_notes = self._normalize_string_list(point.get("potential_conflicts"))
+            if not conflict_notes:
+                continue
+            entity = str(point.get("entity") or "").strip()
+            for note in conflict_notes:
+                key = (entity, note)
+                if key in seen:
+                    continue
+                seen.add(key)
+                conflicts.append({
+                    "entities": [entity] if entity else [],
+                    "note": note,
+                    "source_fact": point.get("key_fact") or "",
+                })
+        return conflicts
+
+    def _build_segment_resource_requirements(self, key_points: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """汇总分段中提出的资源补全需求。"""
+        requirements: List[Dict[str, Any]] = []
+        seen = set()
+        for point in key_points:
+            for requirement in self._normalize_lore_resource_requirements(point.get("resource_requirements")):
+                key = (requirement.get("requirement_type"), requirement.get("resource_name"), requirement.get("reason"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                requirements.append({
+                    **requirement,
+                    "source_entity": point.get("entity") or "",
+                    "source_fact": point.get("key_fact") or "",
+                })
+        return requirements
 
     def _merge_key_points(self, all_key_points: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
@@ -3709,6 +3997,18 @@ class SettingAgentService:
                     lines.append(f"  • {entity}：{key_fact} {relevance_mark}")
                 else:
                     lines.append(f"  • {key_fact} {relevance_mark}")
+                related_entities = self._normalize_string_list(point.get("related_entities"))
+                if related_entities:
+                    lines.append(f"    关联：{', '.join(related_entities[:6])}")
+                conflict_notes = self._normalize_string_list(point.get("potential_conflicts"))
+                if conflict_notes:
+                    lines.append(f"    潜在冲突：{'; '.join(conflict_notes[:2])}")
+                requirements = self._normalize_lore_resource_requirements(point.get("resource_requirements"))
+                if requirements:
+                    req_text = "; ".join(
+                        f"[{req.get('requirement_type')}] {req.get('resource_name')}" for req in requirements[:3]
+                    )
+                    lines.append(f"    资源缺口：{req_text}")
             lines.append("")
 
         return "\n".join(lines)

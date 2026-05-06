@@ -199,8 +199,8 @@ export default function AgentTemplates() {
       is_optional: false,
       is_enabled: true,
     })
-    setAvailableSkills([])
     setShowEditModal(true)
+    await loadSkillsForAgentType('character', 'default')
   }
 
   const handleEdit = async (template: AgentTemplate) => {
@@ -230,8 +230,18 @@ export default function AgentTemplates() {
   const loadSkillsForAgentType = async (agentType: AgentType, scenario?: string) => {
     setLoadingSkills(true)
     try {
-      const skills = await getAgentTypeSkills(agentType, scenario || formData.scenario || 'default')
-      setAvailableSkills(skills)
+      const resolvedScenario = scenario || formData.scenario || 'default'
+      const [assignedSkills, skillCatalog] = await Promise.all([
+        getAgentTypeSkills(agentType, resolvedScenario),
+        getSkills(undefined, undefined, undefined, undefined, undefined, undefined, 200),
+      ])
+      const applicableSkills = skillCatalog.filter((skill) =>
+        skill.applicable_agent_types.length === 0 || skill.applicable_agent_types.includes(agentType)
+      )
+      const skillMap = new Map<string, Skill>()
+      ;[...assignedSkills, ...applicableSkills].forEach((skill) => skillMap.set(skill.id, skill))
+      setAvailableSkills(Array.from(skillMap.values()).sort((a, b) => b.priority - a.priority))
+      setAllSkills(skillCatalog)
     } catch (error) {
       console.error('Failed to load skills:', error)
       setAvailableSkills([])
@@ -807,6 +817,7 @@ export default function AgentTemplates() {
                       </div>
                       <div>
                         <label className={`block text-xs mb-1 ${isDark ? 'text-gray-500' : 'text-gray-500'}`}>关联 Prompt 模板 / 动态规则</label>
+                        <p className={`mb-1 text-[11px] ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>Prompt 列表来自 /prompts 数据库；同步 md 文件后会出现在这里。</p>
                         <select
                           className={`w-full border rounded px-3 py-2 text-sm ${isDark ? 'bg-gray-700 border-gray-600 text-white' : 'bg-white border-gray-300 text-gray-800'}`}
                           value={slot.prompt_template_id || ''}
@@ -895,7 +906,7 @@ export default function AgentTemplates() {
             ) : availableSkills.length > 0 ? (
               <div className={`p-3 rounded-lg border max-h-48 overflow-y-auto ${isDark ? 'bg-gray-800 border-gray-700' : 'bg-white border-gray-200'}`}>
                 <p className={`text-xs mb-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
-                  可用 Skills（点击添加）
+                  可用 Skills（点击添加；包含本场景已分配 Skill 和 Skill 库中适用于该 Agent 的同步 md 资产）
                 </p>
                 <div className="space-y-1">
                   {availableSkills.map((skill) => {
@@ -926,7 +937,7 @@ export default function AgentTemplates() {
               </div>
             ) : (
               <div className={`text-center py-4 text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
-                该 Agent 类型暂无可用 Skills
+                该 Agent 类型暂无可用 Skills；如果刚复制了 md 文件，请先在 /skills 同步。
               </div>
             )}
           </div>
