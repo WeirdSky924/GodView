@@ -2,4 +2,4 @@
 Godview Application Package
 """
 
-__version__ = "1.3.70"
+__version__ = "1.3.72"

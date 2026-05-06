@@ -15,6 +15,7 @@ from app.agents.director.master_plotter import MasterPlotterAgent
 from app.agents.director.summarizer import SummarizerAgent
 from app.agents.director.writer import WriterAgent
 from app.agents.procgen import ProcGenAgent
+from app.services.md_file_service import get_md_file_service
 from app.services.workflow_engine import ChapterReadinessBlockedError, get_workflow_engine
 
 
@@ -65,6 +66,8 @@ class CharacterEvent:
 
 class DirectorSystem:
     """导演系统 - orchestrates all agents for novel generation"""
+
+    AUTO_WRITE_PROMPT_ID = "function_director_auto_write"
 
     def __init__(self, world_data: Dict[str, Any], config: Optional[Dict[str, Any]] = None, project_id: Optional[str] = None):
         self.world_id = world_data.get("id", str(uuid.uuid4()))
@@ -2061,16 +2064,26 @@ class DirectorSystem:
         if style_reference:
             prompt_parts.append(f"\n【风格参考】\n{style_reference[:500]}")
 
-        prompt_parts.append("""
-【写作要求】
-1. 展示而非告知 (Show, Don't Tell)
-2. 描写比例：动作 35% + 神态 35% + 对话 30%
-3. 段落简短有力，便于移动端阅读
-4. 使用生动的感官描写
-5. 对话要符合角色性格
-6. 安排适当的冲突和转折
-7. 结尾要有悬念或伏笔
-
-请生成完整的章节正文。""")
+        prompt_parts.append("\n【写作要求】")
+        prompt_parts.append(self._load_prompt_asset(self.AUTO_WRITE_PROMPT_ID))
 
         return "\n".join(prompt_parts)
+
+    def _load_prompt_asset(self, prompt_id: str) -> str:
+        """读取 md prompt 资产内容；失败时保留极简兼容降级。"""
+        try:
+            prompt = get_md_file_service().get_prompt(prompt_id)
+        except Exception as e:
+            logger.warning("读取 Prompt 资产失败 %s: %s", prompt_id, e)
+            prompt = None
+
+        content = (prompt or {}).get("content") or (prompt or {}).get("raw_content") or ""
+        content = str(content).strip()
+        if content:
+            return content
+
+        logger.warning("Director 自动写作 Prompt 资产缺失: %s", prompt_id)
+        return (
+            "请根据章节目标生成完整章节正文；遵守已提供角色、世界观、风格参考和章节目标，"
+            "不要编造关键资源，不要越过当前章节阶段。"
+        )

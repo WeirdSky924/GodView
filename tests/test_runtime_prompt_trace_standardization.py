@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.agents.base import AgentResponse, BaseAgent
 from app.models.agent_template import AgentType
 from app.services.plot_outline_service import PlotOutlineService
+from app.services.setting_agent import SettingAgent
 from app.services.setting_agent_service import SegmentedContextSynthesis, SettingAgentService
 from app.services.workflow_engine import WorkflowEngine
 
@@ -988,6 +989,79 @@ async def test_base_agent_prompt_load_failure_records_deprecated_trace(monkeypat
     assert result["trace"]["scenario"] == "resource_management"
     assert result["trace"]["prompt_ids"] == ["prompt-setting"]
     assert_render_trace_contract(result["trace"])
+
+
+def test_setting_bootstrap_collection_system_prompt_uses_md_asset(monkeypatch):
+    class FakeMdService:
+        def __init__(self):
+            self.requested_prompt_ids = []
+
+        def get_prompt(self, prompt_id):
+            self.requested_prompt_ids.append(prompt_id)
+            assert prompt_id == "function_setting_bootstrap_collection"
+            return {"content": "md bootstrap collection rules"}
+
+    md_service = FakeMdService()
+    monkeypatch.setattr(
+        "app.services.setting_agent.get_md_file_service",
+        lambda: md_service,
+    )
+
+    agent = SettingAgent()
+    prompt = agent._build_system_prompt(SimpleNamespace())
+
+    assert md_service.requested_prompt_ids == ["function_setting_bootstrap_collection"]
+    assert prompt == "md bootstrap collection rules"
+    assert "你是长篇网络小说设定专家（Setting Agent）。请通过多轮对话收集世界观" not in prompt
+    assert "主动追问缺口，并保持所有内容为待确认草案" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_setting_bootstrap_seed_extraction_uses_md_system_prompt_and_dynamic_history(monkeypatch):
+    class FakeMdService:
+        def __init__(self):
+            self.requested_prompt_ids = []
+
+        def get_prompt(self, prompt_id):
+            self.requested_prompt_ids.append(prompt_id)
+            assert prompt_id == "function_setting_bootstrap_seed_extraction"
+            return {"content": "md bootstrap seed extraction contract"}
+
+    md_service = FakeMdService()
+    monkeypatch.setattr(
+        "app.services.setting_agent.get_md_file_service",
+        lambda: md_service,
+    )
+
+    agent = SettingAgent()
+    captured = {}
+
+    async def fake_call_llm(system_prompt, user_message, context):
+        captured["system_prompt"] = system_prompt
+        captured["user_message"] = user_message
+        captured["context"] = context
+        return '{"world_setting":{"name":"青岚界"},"main_characters":[]}'
+
+    monkeypatch.setattr(agent, "_call_llm", fake_call_llm)
+    session = SimpleNamespace(
+        setting_agent_history=[
+            {"role": "user", "content": "世界叫青岚界，主角从旧城药铺起步。"},
+            {"role": "assistant", "content": "已记录为待确认草案。"},
+        ]
+    )
+
+    seed_data = await agent.extract_seed_from_history(session)
+
+    assert md_service.requested_prompt_ids == ["function_setting_bootstrap_seed_extraction"]
+    assert seed_data == {"world_setting": {"name": "青岚界"}, "main_characters": []}
+    assert captured["system_prompt"] == "md bootstrap seed extraction contract"
+    assert captured["user_message"].startswith("## 对话历史")
+    assert "user: 世界叫青岚界" in captured["user_message"]
+    assert "assistant: 已记录为待确认草案。" in captured["user_message"]
+    assert captured["context"] == ""
+    assert "你是一个结构化数据提取专家。请从对话中提取 JSON 数据。" not in captured["system_prompt"]
+    assert "请从对话历史中提取结构化项目 seed，只输出 JSON 对象" not in captured["system_prompt"]
+    assert "md bootstrap seed extraction contract" not in captured["user_message"]
 
 
 @pytest.mark.asyncio
@@ -2933,6 +3007,142 @@ async def test_system_agent_template_prompt_resolution_audit_reports_missing_and
     assert audit["templates"][0]["prompt_ids"] == ["prompt_existing"]
     assert audit["templates"][0]["missing_prompt_ids"] == ["prompt_missing"]
     assert audit["templates"][0]["fallbacks_used"] == ["missing_prompt_template:prompt_missing"]
+
+
+@pytest.mark.asyncio
+async def test_skill_orchestrator_decision_prompt_uses_md_asset(monkeypatch):
+    from app.models.skill import Skill, SkillCategory, SkillType
+    from app.services.skill_orchestrator import OrchestrationContext, SkillOrchestrator
+
+    class FakeMdService:
+        def get_prompt(self, prompt_id):
+            assert prompt_id == "function_skill_orchestration_decision"
+            return {"content": "md orchestration decision rules"}
+
+    monkeypatch.setattr(
+        "app.services.skill_orchestrator.get_md_file_service",
+        lambda: FakeMdService(),
+    )
+
+    orchestrator = SkillOrchestrator(llm_client=object())
+    context = OrchestrationContext(
+        agent_type="writer",
+        initial_goal="完成章节补写",
+        current_iteration=2,
+        max_iterations=5,
+        variables={"chapter_goal": "推进局部冲突"},
+    )
+    skills = [
+        Skill(
+            id="skill_continue_writing",
+            name="续写",
+            description="根据已有内容继续写作",
+            skill_type=SkillType.PROMPT,
+            category=SkillCategory.WRITING,
+        )
+    ]
+
+    captured = {}
+
+    async def fake_call_llm(prompt):
+        captured["prompt"] = prompt
+        return '{"action":"finish","reason":"已完成","should_continue":false}'
+
+    monkeypatch.setattr(orchestrator, "_call_llm", fake_call_llm)
+
+    decision = await orchestrator._get_llm_decision(context, skills)
+
+    assert decision.action == "finish"
+    assert "md orchestration decision rules" in captured["prompt"]
+    assert "## 任务目标\n完成章节补写" in captured["prompt"]
+    assert "## 可用技能" in captured["prompt"]
+    assert "根据当前任务状态，决定下一步应该调用哪个技能" not in captured["prompt"]
+
+
+def test_skill_retrieval_decision_prompt_uses_md_asset(monkeypatch):
+    from app.models.skill import Skill, SkillCategory, SkillType
+    from app.services.skill_retrieval import SkillCandidate, SkillRetrievalService
+
+    class FakeMdService:
+        def get_prompt(self, prompt_id):
+            assert prompt_id == "function_skill_retrieval_decision"
+            return {"content": "md retrieval decision rules"}
+
+    monkeypatch.setattr(
+        "app.services.skill_retrieval.get_md_file_service",
+        lambda: FakeMdService(),
+    )
+
+    service = SkillRetrievalService(llm_client=object())
+    skill = Skill(
+        id="skill_scene_dialogue",
+        name="场景对话",
+        description="生成角色对话",
+        skill_type=SkillType.PROMPT,
+        category=SkillCategory.DIALOGUE,
+    )
+
+    prompt = service._build_decision_prompt(
+        "需要增强角色对话",
+        [SkillCandidate(skill=skill, similarity_score=0.87)],
+    )
+
+    assert "md retrieval decision rules" in prompt
+    assert "## 用户场景描述\n需要增强角色对话" in prompt
+    assert "skill_scene_dialogue" in prompt
+    assert "根据用户的场景描述，从候选技能中选择最合适的技能" not in prompt
+
+
+def test_director_auto_write_prompt_uses_md_asset(monkeypatch):
+    from app.services.director import DirectorSystem
+
+    class FakeMdService:
+        def get_prompt(self, prompt_id):
+            assert prompt_id == "function_director_auto_write"
+            return {"content": "md director auto-write rules"}
+
+    monkeypatch.setattr(
+        "app.services.director.get_md_file_service",
+        lambda: FakeMdService(),
+    )
+
+    director = DirectorSystem({"id": "world-1", "name": "测试世界", "description": "世界说明"})
+    prompt = director._build_auto_write_prompt(
+        chapter_title="第一章",
+        chapter_goal="完成局部冲突",
+        characters_info=[{"name": "甲", "role": "主角", "description": "谨慎"}],
+        world_info={"name": "测试世界", "description": "世界说明"},
+        target_word_count=1200,
+        style_reference="简洁",
+    )
+
+    assert "md director auto-write rules" in prompt
+    assert "【章节标题】\n第一章" in prompt
+    assert "【主要角色】" in prompt
+    assert "展示而非告知 (Show, Don't Tell)" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_master_plotter_forced_event_failure_uses_deterministic_low_intrusion_fallback(monkeypatch):
+    from app.agents.director.master_plotter import MasterPlotterAgent
+
+    agent = MasterPlotterAgent(system_prompt="system")
+    async def fake_config_prompt(*args, **kwargs):
+        return "md forced event rules"
+
+    monkeypatch.setattr(agent, "_get_master_plotter_config_prompt", fake_config_prompt)
+
+    async def broken_call_llm(*args, **kwargs):
+        raise RuntimeError("llm down")
+
+    monkeypatch.setattr(agent, "_call_llm", broken_call_llm)
+
+    first = await agent._generate_forced_event([], [])
+    second = await agent._generate_forced_event(["旧事件"], [{"title": "伏笔"}])
+
+    assert first == "周围环境出现异常动静，迫使众人立刻确认情况"
+    assert second == first
+    assert "远处传来异常动静" != first
 
 
 @pytest.mark.asyncio

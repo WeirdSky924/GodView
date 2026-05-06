@@ -11,12 +11,16 @@ from typing import Any, Dict, List, Optional
 
 from app.config import settings
 from app.models.bootstrap import BootstrapSession, BootstrapStage, BootstrapMessage
+from app.services.md_file_service import get_md_file_service
 
 logger = logging.getLogger(__name__)
 
 
 class SettingAgent:
     """设定 Agent - 负责与用户沟通项目设定，提炼结构化 seed"""
+
+    BOOTSTRAP_COLLECTION_PROMPT_ID = "function_setting_bootstrap_collection"
+    BOOTSTRAP_SEED_EXTRACTION_PROMPT_ID = "function_setting_bootstrap_seed_extraction"
 
     def __init__(self):
         self.llm_provider = settings.llm_provider
@@ -104,56 +108,30 @@ class SettingAgent:
         }
 
     def _build_system_prompt(self, session: BootstrapSession) -> str:
-        """构建系统提示词"""
-        return """你是一个长篇网络小说设定专家（Setting Agent）。你的职责是：
+        """构建系统提示词（稳定 Bootstrap 规则来自 md prompt 资产）。"""
+        return self._load_prompt_asset(
+            self.BOOTSTRAP_COLLECTION_PROMPT_ID,
+            fallback=(
+                "你是长篇网络小说设定专家（Setting Agent）。请通过多轮对话收集世界观、"
+                "角色、主线、风格和关键设定；主动追问缺口，并保持所有内容为待确认草案。"
+            ),
+        )
 
-1. 与用户沟通，了解他们想要创作的长篇网络小说世界观、主线、风格、角色等设定
-2. 通过多轮对话发现信息缺口并追问用户
-3. 提炼出结构化的项目 seed，为后续 bootstrap 提供可靠输入
+    def _load_prompt_asset(self, prompt_id: str, fallback: str = "") -> str:
+        """读取 md prompt 资产内容；失败时返回调用方提供的极简兼容降级。"""
+        try:
+            prompt = get_md_file_service().get_prompt(prompt_id)
+        except Exception as e:
+            logger.warning("读取 Setting Prompt 资产失败 %s: %s", prompt_id, e)
+            prompt = None
 
-【重要：本项目定位为长篇网络小说】
-- 目标篇幅：百万字以上，多卷结构
-- 目标读者：网络小说读者，注重节奏感和爽点
-- 创作周期：长期连载，需要完善的设定支撑
+        content = (prompt or {}).get("content") or (prompt or {}).get("raw_content") or ""
+        content = str(content).strip()
+        if content:
+            return content
 
-请遵循以下原则：
-- 保持友好、耐心的态度
-- 每次回答后，主动追问用户尚未提供的关键信息
-- 使用清晰的结构化格式组织信息
-- 不要直接写入正式世界，而是形成"待确认草案"
-
-【长篇网文关键设定要素】
-
-一、世界设定
-- 世界名称、类型（玄幻/仙侠/都市/科幻等）
-- 世界规则与底层逻辑
-- 力量体系（等级划分、升级路径、境界设定）
-- 势力分布与格局
-
-二、主角设定（核心）
-- 主角姓名、背景、初始状态
-- 金手指/特殊能力/独特优势
-- 主角成长路线与目标
-- 性格特点与行事风格
-
-三、配角体系
-- 核心配角（3-5人，有完整成长线）
-- 重要配角（导师、对手、红颜/知己等）
-- 势力角色（宗门长老、家族成员等）
-
-四、剧情架构
-- 主线剧情（贯穿全书的终极目标）
-- 卷级剧情（每卷的主要冲突与高潮）
-- 前期爽点设计（前三章抓住读者）
-- 伏笔规划（重要伏笔埋设计划）
-
-五、节奏与风格
-- 整体基调（热血/轻松/黑暗/爽文等）
-- 章节节奏（爽点频率、高潮安排）
-- 叙事风格与语言特色
-
-当你认为已经收集到足够的信息时，可以请求用户确认设定的完整性。
-"""
+        logger.warning("Setting Prompt 资产缺失: %s", prompt_id)
+        return fallback
 
     def _build_conversation_context(self, session: BootstrapSession) -> str:
         """构建对话上下文"""
@@ -316,49 +294,14 @@ class SettingAgent:
             for msg in session.setting_agent_history
         ])
 
-        extraction_prompt = f"""请从以下对话中提取结构化的项目 seed。要求输出 JSON 格式：
-
-{{
-    "world_setting": {{
-        "name": "世界名称",
-        "description": "世界描述",
-        "world_type": "fantasy/scifi/wuxia/etc",
-        "tone": "serious/humorous/dark/etc"
-    }},
-    "world_rules": [],
-    "power_system": "力量体系描述",
-    "technology_level": "科技水平",
-    "main_characters": [
-        {{
-            "name": "角色名",
-            "role": "main/supporting",
-            "description": "角色描述",
-            "importance_score": 0.8,
-            "traits": ["特质1", "特质2"],
-            "background_story": "背景故事"
-        }}
-    ],
-    "regions": [
-        {{
-            "name": "区域名",
-            "region_type": "city/village/wilderness/etc",
-            "description": "区域描述"
-        }}
-    ],
-    "plot_hooks": [],
-    "narrative_tone": "叙事基调",
-    "writing_style": "写作风格"
-}}
-
-对话历史：
-{history_text}
-
-请只输出 JSON，不要其他内容。
-"""
+        extraction_prompt = f"## 对话历史\n{history_text}".strip()
 
         try:
             response = await self._call_llm(
-                system_prompt="你是一个结构化数据提取专家。请从对话中提取 JSON 数据。",
+                system_prompt=self._load_prompt_asset(
+                    self.BOOTSTRAP_SEED_EXTRACTION_PROMPT_ID,
+                    fallback="请从对话历史中提取结构化项目 seed，只输出 JSON 对象，不要输出其他内容。",
+                ),
                 user_message=extraction_prompt,
                 context="",
             )

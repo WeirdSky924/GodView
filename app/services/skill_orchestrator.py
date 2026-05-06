@@ -22,6 +22,7 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from app.models.skill import Skill, SkillType
+from app.services.md_file_service import get_md_file_service
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +119,8 @@ class SkillOrchestrator:
     3. 是否需要继续调用
     4. 如何处理结果
     """
+
+    DECISION_PROMPT_ID = "function_skill_orchestration_decision"
 
     def __init__(
         self,
@@ -236,44 +239,11 @@ class SkillOrchestrator:
         # 构建上下文描述
         context_desc = self._build_context_description(context)
 
-        # 构建 Prompt
-        prompt = f"""你是一个智能技能调度器。根据当前任务状态，决定下一步应该调用哪个技能，或者是否完成任务。
-
-## 任务目标
-{context.initial_goal}
-
-## 当前状态
-{context_desc}
-
-## 可用技能
-{skills_desc}
-
-## 你的任务
-分析当前状态，决定下一步行动：
-1. 如果需要调用技能，选择最合适的技能并提供参数
-2. 如果任务已完成，返回 finish
-3. 如果遇到无法解决的问题，返回 abort
-
-## 输出格式
-返回 JSON：
-```json
-{{
-  "action": "call_skill" | "finish" | "abort",
-  "skill_id": "技能ID（调用技能时必填）",
-  "skill_name": "技能名称",
-  "parameters": {{}},  // 调用参数
-  "reason": "决策理由",
-  "should_continue": true  // 是否继续编排
-}}
-```
-
-## 重要规则
-1. 优先使用已有结果，避免重复调用
-2. 参数中可以使用 ${{变量名}} 引用上下文变量
-3. 如果上一步的结果不理想，可以调整参数重试
-4. 注意迭代次数限制（当前 {context.current_iteration}/{context.max_iterations}）
-
-请直接输出 JSON："""
+        prompt = self._build_decision_prompt(
+            context=context,
+            skills_desc=skills_desc,
+            context_desc=context_desc,
+        )
 
         try:
             response = await self._call_llm(prompt)
@@ -286,6 +256,45 @@ class SkillOrchestrator:
                 reason=f"LLM 决策失败: {str(e)}",
                 should_continue=False,
             )
+
+    def _build_decision_prompt(
+        self,
+        context: OrchestrationContext,
+        skills_desc: str,
+        context_desc: str,
+    ) -> str:
+        """构建 LLM 决策 Prompt（稳定任务说明来自 md prompt 资产）。"""
+        content = self._load_prompt_asset(self.DECISION_PROMPT_ID)
+        if not content:
+            logger.warning("Skill 编排决策 Prompt 资产缺失: %s", self.DECISION_PROMPT_ID)
+            content = (
+                "# Skill 编排决策\n\n"
+                "根据任务目标、当前状态和可用技能决定下一步行动。"
+                "只能输出 JSON 对象，action 必须为 call_skill、finish 或 abort。"
+            )
+
+        return "\n\n".join([
+            content.strip(),
+            f"## 任务目标\n{context.initial_goal}",
+            f"## 当前状态\n{context_desc}",
+            f"## 可用技能\n{skills_desc}",
+            f"## 当前迭代\n{context.current_iteration}/{context.max_iterations}",
+        ]).strip()
+
+    def _load_prompt_asset(self, prompt_id: str) -> Optional[str]:
+        """读取 md prompt 资产内容；失败时返回 None，由调用方决定降级策略。"""
+        try:
+            prompt = get_md_file_service().get_prompt(prompt_id)
+        except Exception as e:
+            logger.warning("读取 Prompt 资产失败 %s: %s", prompt_id, e)
+            return None
+
+        if not prompt:
+            return None
+
+        content = prompt.get("content") or prompt.get("raw_content") or ""
+        content = str(content).strip()
+        return content or None
 
     def _build_skills_description(self, skills: List[Skill]) -> str:
         """构建 Skills 描述"""

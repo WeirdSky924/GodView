@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.models.skill import Skill, SkillLoadMode
+from app.services.md_file_service import get_md_file_service
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +227,8 @@ class SkillRetrievalService:
     2. LLM 精决：让 LLM 从候选中选择并提取参数
     """
 
+    DECISION_PROMPT_ID = "function_skill_retrieval_decision"
+
     def __init__(
         self,
         skill_service=None,
@@ -427,50 +430,35 @@ class SkillRetrievalService:
 {param_block}
 """)
 
-        prompt = f"""你是一个智能技能选择系统。根据用户的场景描述，从候选技能中选择最合适的技能并提取调用参数。
+        content = self._load_prompt_asset(self.DECISION_PROMPT_ID)
+        if not content:
+            logger.warning("Skill 检索决策 Prompt 资产缺失: %s", self.DECISION_PROMPT_ID)
+            content = (
+                "# Skill 检索决策\n\n"
+                "根据用户场景描述和候选技能列表判断是否激活技能并提取参数。"
+                "只能输出 JSON 数组。"
+            )
 
-## 用户场景描述
-{query}
+        return "\n\n".join([
+            content.strip(),
+            f"## 用户场景描述\n{query}",
+            f"## 候选技能列表\n{''.join(candidate_info)}",
+        ]).strip()
 
-## 候选技能列表
-{''.join(candidate_info)}
+    def _load_prompt_asset(self, prompt_id: str) -> Optional[str]:
+        """读取 md prompt 资产内容；失败时返回 None，由调用方决定降级策略。"""
+        try:
+            prompt = get_md_file_service().get_prompt(prompt_id)
+        except Exception as e:
+            logger.warning("读取 Prompt 资产失败 %s: %s", prompt_id, e)
+            return None
 
-## 你的任务
-1. 分析用户场景，判断哪些技能应该被激活
-2. 对于需要激活的技能，提取必要的调用参数
-3. 输出 JSON 格式的决策结果
+        if not prompt:
+            return None
 
-## 输出格式
-请输出一个 JSON 数组，每个元素包含：
-- skill_id: 技能ID
-- should_activate: 是否激活 (true/false)
-- confidence: 置信度 (0.0-1.0)
-- parameters: 调用参数对象 {{}}
-- reason: 决策理由（简短说明）
-
-## 输出示例
-```json
-[
-  {{
-    "skill_id": "skill_combat_scene",
-    "should_activate": true,
-    "confidence": 0.9,
-    "parameters": {{}},
-    "reason": "场景涉及战斗对抗"
-  }},
-  {{
-    "skill_id": "skill_romance_scene",
-    "should_activate": false,
-    "confidence": 0.3,
-    "parameters": {{}},
-    "reason": "场景中没有恋爱元素"
-  }}
-]
-```
-
-请直接输出 JSON，不要包含其他内容："""
-
-        return prompt
+        content = prompt.get("content") or prompt.get("raw_content") or ""
+        content = str(content).strip()
+        return content or None
 
     async def _call_llm(self, prompt: str) -> str:
         """调用 LLM"""

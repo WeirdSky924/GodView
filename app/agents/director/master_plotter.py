@@ -1014,15 +1014,8 @@ class MasterPlotterAgent(BaseAgent):
             )
             return response.strip()
         except Exception:
-            # Deprecated minimal fallback：正常路径应由 function_master_plotter_forced_event.md 控制事件风格。
-            fallback_events = [
-                "远处传来异常动静，迫使众人立刻确认情况",
-                "一条紧急消息送达，打断了当前停滞的局面",
-                "周围环境突然发生变化，暴露出新的线索",
-                "一名普通传讯者带来与当前目标相关的警示",
-            ]
-            import random
-            return random.choice(fallback_events)
+            logger.warning("MasterPlotter forced event LLM 调用失败，使用低侵入确定性 fallback")
+            return "周围环境出现异常动静，迫使众人立刻确认情况"
 
     async def set_next_milestone(
         self, current_progress: float, plot_goals: List[str]
