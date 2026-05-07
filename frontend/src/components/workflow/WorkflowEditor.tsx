@@ -28,6 +28,7 @@ import {
   executeWorkflow,
   extractChapterReadinessGateDetail,
   formatChapterReadinessGateMessage,
+  formatApiErrorMessage,
   type WorkflowNode as WfNode,
   type WorkflowEdge as WfEdge,
   type WorkflowDefinition,
@@ -240,9 +241,11 @@ export default function WorkflowEditor({
         setPrecheckError(`第 ${targetOutline.chapter_number} 章存在 unresolved blocking 资源需求：${formatRequirementList(blocking)}`)
       }
     } catch (err: any) {
-      const detail = err?.response?.data?.detail
+      const gateDetail = extractChapterReadinessGateDetail(err)
       setPrecheckError(
-        detail?.message || (typeof detail === 'string' ? detail : err?.message) || '启动前资源预检失败',
+        gateDetail
+          ? formatChapterReadinessGateMessage(gateDetail, requirements => formatRequirementList(requirements as OutlineResourceRequirement[]))
+          : formatApiErrorMessage(err, '启动前资源预检失败'),
       )
     } finally {
       setPrechecking(false)
@@ -584,9 +587,7 @@ export default function WorkflowEditor({
       if (gateDetail) {
         setError(formatChapterReadinessGateMessage(gateDetail, formatRequirementList))
       } else {
-        const detail = err?.response?.data?.detail
-        const message = detail?.message || (typeof detail === 'string' ? detail : err?.message) || '执行失败'
-        setError(message)
+        setError(formatApiErrorMessage(err, '执行失败'))
       }
       console.error(err)
     } finally {

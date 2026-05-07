@@ -95,7 +95,7 @@ export default function Dashboard() {
   const loadStats = async () => {
     setLoading(true)
     try {
-      const data = await getGlobalStats(currentProject?.id)
+      const data = await getGlobalStats(currentProject?.id, { forceRefresh: true })
       setStats(data)
     } catch (error) {
       console.error('Failed to load stats:', error)
@@ -106,7 +106,7 @@ export default function Dashboard() {
 
   const loadAgentStatus = async () => {
     try {
-      const templates = await getAgentTemplates(undefined, undefined, undefined, 100)
+      const templates = await getAgentTemplates(undefined, undefined, undefined, 100, 0, undefined, { forceRefresh: true })
 
       const systemAgents: AgentStatus[] = templates.map((template) => ({
         id: template.id,

@@ -257,6 +257,47 @@ class SkillOrchestrator:
                 should_continue=False,
             )
 
+    def _build_decision_prompt_trace(self, *, source: str, content: str) -> Dict[str, Any]:
+        trace = {
+            "source": source,
+            "prompt_ids": [self.DECISION_PROMPT_ID],
+            "fallbacks_used": [],
+            "deprecated_sources_used": [],
+            "missing_prompt_ids": [],
+        }
+        if source == "deprecated_minimal_fallback":
+            trace["fallbacks_used"].append(f"skill_orchestration_deprecated_minimal_fallback:{self.DECISION_PROMPT_ID}")
+            trace["deprecated_sources_used"].append("SkillOrchestrator._build_decision_prompt")
+            trace["missing_prompt_ids"].append(self.DECISION_PROMPT_ID)
+        return {"content": content, "trace": trace}
+
+    def _build_decision_prompt_with_trace(
+        self,
+        context: OrchestrationContext,
+        skills_desc: str,
+        context_desc: str,
+    ) -> Dict[str, Any]:
+        """构建 LLM 决策 Prompt，并返回非 AgentTemplate prompt source trace。"""
+        content = self._load_prompt_asset(self.DECISION_PROMPT_ID)
+        source = "md_prompt_asset"
+        if not content:
+            logger.warning("Skill 编排决策 Prompt 资产缺失: %s", self.DECISION_PROMPT_ID)
+            source = "deprecated_minimal_fallback"
+            content = (
+                "# Skill 编排决策\n\n"
+                "根据任务目标、当前状态和可用技能决定下一步行动。"
+                "只能输出 JSON 对象，action 必须为 call_skill、finish 或 abort。"
+            )
+
+        prompt = "\n\n".join([
+            content.strip(),
+            f"## 任务目标\n{context.initial_goal}",
+            f"## 当前状态\n{context_desc}",
+            f"## 可用技能\n{skills_desc}",
+            f"## 当前迭代\n{context.current_iteration}/{context.max_iterations}",
+        ]).strip()
+        return self._build_decision_prompt_trace(source=source, content=prompt)
+
     def _build_decision_prompt(
         self,
         context: OrchestrationContext,
@@ -264,22 +305,11 @@ class SkillOrchestrator:
         context_desc: str,
     ) -> str:
         """构建 LLM 决策 Prompt（稳定任务说明来自 md prompt 资产）。"""
-        content = self._load_prompt_asset(self.DECISION_PROMPT_ID)
-        if not content:
-            logger.warning("Skill 编排决策 Prompt 资产缺失: %s", self.DECISION_PROMPT_ID)
-            content = (
-                "# Skill 编排决策\n\n"
-                "根据任务目标、当前状态和可用技能决定下一步行动。"
-                "只能输出 JSON 对象，action 必须为 call_skill、finish 或 abort。"
-            )
-
-        return "\n\n".join([
-            content.strip(),
-            f"## 任务目标\n{context.initial_goal}",
-            f"## 当前状态\n{context_desc}",
-            f"## 可用技能\n{skills_desc}",
-            f"## 当前迭代\n{context.current_iteration}/{context.max_iterations}",
-        ]).strip()
+        return self._build_decision_prompt_with_trace(
+            context=context,
+            skills_desc=skills_desc,
+            context_desc=context_desc,
+        )["content"]
 
     def _load_prompt_asset(self, prompt_id: str) -> Optional[str]:
         """读取 md prompt 资产内容；失败时返回 None，由调用方决定降级策略。"""

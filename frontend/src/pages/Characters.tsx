@@ -36,6 +36,7 @@ import {
   updateOutlineResourceRequirementStatus,
   type OutlineResourceRequirement,
 } from '@/api/outlines'
+import { formatApiErrorMessage } from '@/api/workflows'
 
 function splitCsvInput(value: string) {
   return value
@@ -343,7 +344,7 @@ export default function Characters() {
       setShowModal(false)
     } catch (error) {
       console.error('Failed to save character:', error)
-      alert('保存失败，请重试')
+      alert(formatApiErrorMessage(error, '保存失败，请重试'))
     }
   }
 
@@ -557,6 +558,8 @@ export default function Characters() {
               }))}
             onBound={async () => {
               await loadCharacters()
+            }}
+            onRequirementChanged={() => {
               setRequirementRefreshKey(value => value + 1)
             }}
             refreshKey={requirementRefreshKey}

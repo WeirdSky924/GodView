@@ -1,4 +1,6 @@
 import { client } from './client'
+import { getCachedQuery, invalidateQueryCache, type QueryCacheOptions } from './queryCache'
+import { withStartupRetry } from './startupRetry'
 
 export interface Project {
   id: string
@@ -37,9 +39,16 @@ export interface ProjectSummary extends Project {
   chapter_count: number
 }
 
-export async function getProjects(status?: string): Promise<Project[]> {
+export async function getProjects(status?: string, options: QueryCacheOptions = {}): Promise<Project[]> {
   const params = status ? `?status=${status}` : ''
-  return client.get(`/projects${params}`)
+  return getCachedQuery(
+    `projects:list:${status || 'all'}`,
+    () => withStartupRetry(
+      () => client.get(`/projects${params}`),
+      { label: 'projects' }
+    ),
+    { ttlMs: 30 * 1000, ...options }
+  )
 }
 
 export async function getProjectSummaries(status?: string): Promise<ProjectSummary[]> {
@@ -56,13 +65,23 @@ export async function getProjectSummary(id: string): Promise<ProjectSummary> {
 }
 
 export async function createProject(data: CreateProjectRequest): Promise<Project> {
-  return client.post('/projects', data)
+  const project = await client.post<Project>('/projects', data)
+  invalidateProjectCaches()
+  return project
 }
 
 export async function updateProject(id: string, data: UpdateProjectRequest): Promise<Project> {
-  return client.put(`/projects/${id}`, data)
+  const project = await client.put<Project>(`/projects/${id}`, data)
+  invalidateProjectCaches()
+  return project
 }
 
 export async function deleteProject(id: string): Promise<void> {
-  return client.delete(`/projects/${id}`)
+  await client.delete(`/projects/${id}`)
+  invalidateProjectCaches()
+}
+
+export function invalidateProjectCaches(): void {
+  invalidateQueryCache('projects')
+  invalidateQueryCache('global-stats')
 }

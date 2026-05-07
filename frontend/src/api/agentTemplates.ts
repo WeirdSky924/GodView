@@ -4,6 +4,9 @@
  */
 
 import { api } from './client'
+import { getCachedQuery, invalidateQueryCache, type QueryCacheOptions } from './queryCache'
+import { invalidateAgentConfigCaches } from './agentConfigs'
+import { withStartupRetry } from './startupRetry'
 
 const API_BASE = '/agent-templates'
 
@@ -166,7 +169,8 @@ export async function getAgentTemplates(
   tags?: string[],
   limit: number = 50,
   offset: number = 0,
-  scenario?: string
+  scenario?: string,
+  options: QueryCacheOptions = {}
 ): Promise<AgentTemplate[]> {
   const params = new URLSearchParams()
   if (agentType) params.append('agent_type', agentType)
@@ -177,14 +181,23 @@ export async function getAgentTemplates(
   params.append('offset', String(offset))
 
   const query = params.toString()
-  return await api.get(`${API_BASE}${query ? `?${query}` : ''}`)
+  return await getCachedQuery(
+    `agent-templates:list:${query || 'default'}`,
+    () => withStartupRetry(
+      () => api.get(`${API_BASE}${query ? `?${query}` : ''}`),
+      { label: 'agent templates' }
+    ),
+    { ttlMs: 30 * 1000, ...options }
+  )
 }
 
 /**
  * 创建 Agent 模板
  */
 export async function createAgentTemplate(dto: CreateAgentTemplateDTO): Promise<{ success: boolean; message: string; template: AgentTemplate }> {
-  return await api.post(`${API_BASE}`, dto)
+  const result = await api.post<{ success: boolean; message: string; template: AgentTemplate }>(`${API_BASE}`, dto)
+  invalidateAgentTemplateCaches()
+  return result
 }
 
 /**
@@ -198,14 +211,18 @@ export async function getAgentTemplate(templateId: string): Promise<AgentTemplat
  * 更新 Agent 模板
  */
 export async function updateAgentTemplate(templateId: string, dto: UpdateAgentTemplateDTO): Promise<{ success: boolean; message: string; template: AgentTemplate }> {
-  return await api.put(`${API_BASE}/${templateId}`, dto)
+  const result = await api.put<{ success: boolean; message: string; template: AgentTemplate }>(`${API_BASE}/${templateId}`, dto)
+  invalidateAgentTemplateCaches()
+  return result
 }
 
 /**
  * 删除 Agent 模板
  */
 export async function deleteAgentTemplate(templateId: string): Promise<{ success: boolean; message: string }> {
-  return await api.delete(`${API_BASE}/${templateId}`)
+  const result = await api.delete<{ success: boolean; message: string }>(`${API_BASE}/${templateId}`)
+  invalidateAgentTemplateCaches()
+  return result
 }
 
 /**
@@ -246,7 +263,10 @@ export async function toggleAgentTemplate(
   const params = new URLSearchParams()
   params.append('enabled', String(enabled))
   if (projectId) params.append('project_id', projectId)
-  return await api.post(`${API_BASE}/${templateId}/toggle?${params.toString()}`)
+  const result = await api.post<{ success: boolean; message: string; template: AgentTemplate; project_config?: unknown }>(`${API_BASE}/${templateId}/toggle?${params.toString()}`)
+  invalidateAgentTemplateCaches()
+  if (projectId) invalidateAgentConfigCaches(projectId)
+  return result
 }
 
 /**
@@ -278,6 +298,17 @@ export interface AgentTypeMetadata {
 /**
  * 获取所有 Agent 类型的元数据（用于动态生成 UI）
  */
-export async function getAgentTypesMetadata(): Promise<AgentTypeMetadata[]> {
-  return await api.get(`${API_BASE}/types/metadata`)
+export async function getAgentTypesMetadata(options: QueryCacheOptions = {}): Promise<AgentTypeMetadata[]> {
+  return await getCachedQuery(
+    'agent-templates:type-metadata',
+    () => withStartupRetry(
+      () => api.get(`${API_BASE}/types/metadata`),
+      { label: 'agent type metadata' }
+    ),
+    { ttlMs: 5 * 60 * 1000, ...options }
+  )
+}
+
+export function invalidateAgentTemplateCaches(): void {
+  invalidateQueryCache('agent-templates')
 }

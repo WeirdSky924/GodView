@@ -7,6 +7,7 @@ import { getCharacters } from '@/api/characters'
 import {
   extractChapterReadinessGateDetail,
   formatChapterReadinessGateMessage,
+  formatApiErrorMessage,
   getActiveWorkflowExecution,
   getWorkflows,
   getExecution,
@@ -66,7 +67,8 @@ const OUTLINE_STATUS_CONFIG: Record<OutlineStatus, { label: string; className: s
   approved: { label: '已审批', className: 'bg-green-100 text-green-700' },
   in_writing: { label: '写作中', className: 'bg-blue-100 text-blue-700' },
   completed: { label: '已完成', className: 'bg-purple-100 text-purple-700' },
-  revision: { label: '需修改', className: 'bg-orange-100 text-orange-700' },
+  revision: { label: '修订提案', className: 'bg-orange-100 text-orange-700' },
+  rejected: { label: '已拒绝', className: 'bg-red-100 text-red-700' },
 }
 
 function isOutlineWritable(outline?: ChapterOutline | null) {
@@ -1040,6 +1042,17 @@ export default function Director() {
     applyWorkflowExecutionSnapshot(pendingSnapshot.execution, pendingSnapshot.workflow)
   }, [applyWorkflowExecutionSnapshot, selectedWorkflowId])
 
+  const getGatePayloadMessage = useCallback((payload?: any) => {
+    const detail = extractChapterReadinessGateDetail({ data: payload })
+    if (detail) {
+      return formatChapterReadinessGateMessage(
+        detail,
+        requirements => formatRequirementList(requirements as OutlineResourceRequirement[], 5),
+      )
+    }
+    return formatApiErrorMessage({ data: payload }, '')
+  }, [])
+
   const applyDirectorEvent = useCallback((payload: any) => {
     const eventType = payload?.type
     const eventData = payload?.data || payload
@@ -1076,7 +1089,7 @@ export default function Director() {
         return true
       }
       case 'workflow_failed': {
-        addLog(`❌ 工作流执行失败: ${eventData?.error || '未知错误'}`)
+        addLog(`❌ 工作流执行失败: ${getGatePayloadMessage(eventData) || eventData?.error || '未知错误'}`)
         setIsGenerating(false)
         return true
       }
@@ -1207,8 +1220,9 @@ export default function Director() {
         const outputText = extractNodeOutputText(eventData.output_data ?? eventData.output)
 
         if (eventData.status === 'failed' || eventData.error) {
-          addLog(`❌ ${displayName} 执行失败: ${eventData.error || '未知错误'}`)
-          updateAgentFromNode(eventData, { status: 'error', message: eventData.error || '执行失败' })
+          const message = getGatePayloadMessage(eventData) || eventData.error || '未知错误'
+          addLog(`❌ ${displayName} 执行失败: ${message}`)
+          updateAgentFromNode(eventData, { status: 'error', message })
         } else {
           addLog(`✅ ${displayName} 完成`)
           updateAgentFromNode(eventData, { status: 'completed', message: displayName || '完成' })
@@ -1304,6 +1318,7 @@ export default function Director() {
     appendAgentStreaming,
     applyWorkflowExecutionSnapshot,
     clearAgentStreaming,
+    getGatePayloadMessage,
     setAgentOutput,
     updateAgentFromNode,
     updateAgentStatus,
@@ -1386,16 +1401,16 @@ export default function Director() {
             break
           case 'auto_mode_blocked':
             setAutoModeRunning(false)
-            addLog(`⛔ 连续创作启动阻塞: ${formatGatePayloadMessage(data)}`)
+            addLog(`⛔ 连续创作启动阻塞: ${getGatePayloadMessage(data)}`)
             void loadChapterOutlines()
             break
           case 'auto_mode_error':
             setAutoModeRunning(false)
-            addLog(`❌ 错误: ${data.error}`)
+            addLog(`❌ 错误: ${getGatePayloadMessage(data) || data.error || '未知错误'}`)
             break
           case 'auto_mode_chapter_blocked':
             setAutoModeRunning(false)
-            addLog(`⛔ 第 ${data.chapter_num || data.data?.chapter_num || '?'} 章启动阻塞: ${formatGatePayloadMessage(data)}`)
+            addLog(`⛔ 第 ${data.chapter_num || data.data?.chapter_num || '?'} 章启动阻塞: ${getGatePayloadMessage(data)}`)
             void loadChapterOutlines()
             break
           case 'auto_write_chapter_started':
@@ -1417,10 +1432,10 @@ export default function Director() {
               loadRuntimePanels()
             } else if (data.status === 'blocked') {
               setIsGenerating(false)
-              addLog(`⛔ 章节启动阻塞: ${formatGatePayloadMessage(data)}`)
+              addLog(`⛔ 章节启动阻塞: ${getGatePayloadMessage(data)}`)
               void loadChapterOutlines()
             } else {
-              addLog(`❌ 章节生成失败: ${data.error}`)
+              addLog(`❌ 章节生成失败: ${getGatePayloadMessage(data) || data.error || '未知错误'}`)
             }
             break
           case 'character_added':
@@ -1455,7 +1470,7 @@ export default function Director() {
             addLog('📝 干预已记录')
             break
           case 'error':
-            addLog(`❌ ${data.message}`)
+            addLog(`❌ ${getGatePayloadMessage(data) || data.message || data.error || '未知错误'}`)
             break
           default:
             if (data.type !== 'heartbeat') {
@@ -1607,14 +1622,6 @@ export default function Director() {
       ? `第 ${outline.chapter_number} 章资源未就绪：${requirementText}`
       : `第 ${outline.chapter_number} 章资源未就绪，请先刷新资源 readiness。`
   }, [getOutlineBlockingRequirements, getOutlineReadiness])
-
-  const formatGatePayloadMessage = useCallback((payload?: any) => {
-    const detail = extractChapterReadinessGateDetail({ data: payload }) || payload?.detail || payload?.data || payload
-    return formatChapterReadinessGateMessage(
-      detail,
-      requirements => formatRequirementList(requirements as OutlineResourceRequirement[], 5),
-    )
-  }, [])
 
   const renderOutlineReadiness = useCallback((outline?: ChapterOutline | null, compact = false) => {
     if (!outline) return null

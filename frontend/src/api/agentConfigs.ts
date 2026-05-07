@@ -4,6 +4,7 @@
  */
 
 import { api } from './client'
+import { getCachedQuery, invalidateQueryCache, type QueryCacheOptions } from './queryCache'
 import type { PreviewRenderTrace } from './agentTemplates'
 
 const API_BASE = ''
@@ -92,7 +93,8 @@ export async function getAgentConfigs(
   isActive?: boolean,
   limit: number = 50,
   offset: number = 0,
-  scenario?: string
+  scenario?: string,
+  options: QueryCacheOptions = {}
 ): Promise<AgentConfig[]> {
   const params = new URLSearchParams()
   if (agentType) params.append('agent_type', agentType)
@@ -102,7 +104,11 @@ export async function getAgentConfigs(
   params.append('offset', String(offset))
 
   const query = params.toString()
-  return await api.get(`${API_BASE}/projects/${projectId}/agents${query ? `?${query}` : ''}`)
+  return await getCachedQuery(
+    `agent-configs:${projectId}:list:${query || 'default'}`,
+    () => api.get(`${API_BASE}/projects/${projectId}/agents${query ? `?${query}` : ''}`),
+    { ttlMs: 30 * 1000, ...options }
+  )
 }
 
 /**
@@ -131,7 +137,9 @@ export async function updateAgentConfig(
   const params = new URLSearchParams()
   if (scenario) params.append('scenario', scenario)
   const query = params.toString()
-  return await api.put(`${API_BASE}/projects/${projectId}/agents/${agentType}${query ? `?${query}` : ''}`, dto)
+  const result = await api.put<{ success: boolean; message: string; config: AgentConfig }>(`${API_BASE}/projects/${projectId}/agents/${agentType}${query ? `?${query}` : ''}`, dto)
+  invalidateAgentConfigCaches(projectId)
+  return result
 }
 
 /**
@@ -171,5 +179,21 @@ export async function resetAgentConfigs(
   if (agentType) params.append('agent_type', agentType)
   if (scenario) params.append('scenario', scenario)
 
-  return await api.post(`${API_BASE}/projects/${projectId}/agents/reset?${params.toString()}`)
+  const result = await api.post<{
+    success: boolean
+    message: string
+    results: Array<{
+      config_id: string
+      agent_type: string
+      scenario?: string
+      success: boolean
+      message: string
+    }>
+  }>(`${API_BASE}/projects/${projectId}/agents/reset?${params.toString()}`)
+  invalidateAgentConfigCaches(projectId)
+  return result
+}
+
+export function invalidateAgentConfigCaches(projectId?: string): void {
+  invalidateQueryCache(projectId ? `agent-configs:${projectId}` : 'agent-configs')
 }

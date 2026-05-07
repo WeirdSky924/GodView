@@ -1,4 +1,6 @@
 import { api } from './client'
+import { getCachedQuery, invalidateQueryCache, type QueryCacheOptions } from './queryCache'
+import { withStartupRetry } from './startupRetry'
 
 export interface EmbeddingProviderInfo {
   id: string
@@ -172,7 +174,18 @@ export interface GlobalStats {
   total_cost: number
 }
 
-export async function getGlobalStats(projectId?: string): Promise<GlobalStats> {
+export async function getGlobalStats(projectId?: string, options: QueryCacheOptions = {}): Promise<GlobalStats> {
   const params = projectId ? { project_id: projectId } : {}
-  return await api.get<GlobalStats>('/config/stats', { params })
+  return await getCachedQuery(
+    `global-stats:${projectId || 'all'}`,
+    () => withStartupRetry(
+      () => api.get<GlobalStats>('/config/stats', { params }),
+      { label: 'global stats' }
+    ),
+    { ttlMs: 30 * 1000, ...options }
+  )
+}
+
+export function invalidateGlobalStatsCache(projectId?: string): void {
+  invalidateQueryCache(projectId ? `global-stats:${projectId}` : 'global-stats')
 }

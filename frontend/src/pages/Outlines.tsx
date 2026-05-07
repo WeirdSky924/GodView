@@ -3,7 +3,7 @@
  * 与 Plot Outline Agent 协作管理章节大纲
  */
 
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Card, Button, Input } from '@/components/ui'
 import PageLayout from '@/components/PageLayout'
 import { getCharacters, type Character } from '@/api/characters'
@@ -14,8 +14,10 @@ import { useTheme } from '@/contexts/ThemeContext'
 import {
   getOutlines,
   getOutline,
-  updateOutline,
-  approveOutline,
+  getOutlineById,
+  getOutlineVersions,
+  approveOutlineById,
+  rejectOutlineRevisionById,
   chatWithAgent,
   deleteOutline,
   getOutlineResourceRequirements,
@@ -31,7 +33,9 @@ import {
   type ChapterResourceReadiness,
   type ResourceSupplementDraft,
   type ResourceRequirementStatus,
+  type OutlineVersionsResponse,
 } from '@/api/outlines'
+import { formatApiErrorMessage } from '@/api/workflows'
 import {
   formatRequirementResolutionResult,
   formatRequirementTypeFlow,
@@ -78,10 +82,17 @@ const STATUS_CONFIG: Record<OutlineStatus, { label: string; color: string }> = {
   approved: { label: '已审批', color: 'bg-green-100 text-green-700' },
   in_writing: { label: '写作中', color: 'bg-blue-100 text-blue-700' },
   completed: { label: '已完成', color: 'bg-purple-100 text-purple-700' },
-  revision: { label: '需修改', color: 'bg-orange-100 text-orange-700' },
+  revision: { label: '修订提案', color: 'bg-orange-100 text-orange-700' },
+  rejected: { label: '已拒绝', color: 'bg-red-100 text-red-700' },
 }
 
 type BindableResourceType = 'character' | 'lore' | 'location'
+
+type RevisionNotice = {
+  approvedOutlineId: string
+  revisionOutlineId: string
+  message: string
+}
 
 interface BindableResourceOption {
   id: string
@@ -123,6 +134,9 @@ export default function Outlines() {
   const [selectedBindableResourceId, setSelectedBindableResourceId] = useState('')
   const [loadingBindableResources, setLoadingBindableResources] = useState(false)
   const [bindingResource, setBindingResource] = useState(false)
+  const [revisionNotice, setRevisionNotice] = useState<RevisionNotice | null>(null)
+  const [outlineVersions, setOutlineVersions] = useState<OutlineVersionsResponse | null>(null)
+  const [loadingVersions, setLoadingVersions] = useState(false)
 
   const directlyCreatableResourceTypes = ['character', 'lore', 'location']
 
@@ -131,15 +145,45 @@ export default function Outlines() {
   const isDirectlyCreatableDraft = (draft: ResourceSupplementDraft) =>
     directlyCreatableResourceTypes.includes(draft.resource_type)
 
+  const statusPriority: Record<OutlineStatus, number> = {
+    approved: 0,
+    in_writing: 1,
+    completed: 2,
+    draft: 3,
+    revision: 4,
+    rejected: 5,
+  }
+
   const mergeOutlines = (current: ChapterOutline[], incoming: ChapterOutline[]) => {
-    const outlineMap = new Map(current.map(outline => [outline.chapter_number, outline]))
+    const outlineMap = new Map(current.map(outline => [outline.id, outline]))
 
     for (const outline of incoming) {
-      outlineMap.set(outline.chapter_number, outline)
+      outlineMap.set(outline.id, outline)
     }
 
-    return Array.from(outlineMap.values()).sort((a, b) => a.chapter_number - b.chapter_number)
+    return Array.from(outlineMap.values()).sort((a, b) => {
+      if (a.chapter_number !== b.chapter_number) return a.chapter_number - b.chapter_number
+      return statusPriority[a.status] - statusPriority[b.status] || a.id.localeCompare(b.id)
+    })
   }
+
+  const getChapterNavigationOutlines = (source: ChapterOutline[]) => {
+    const chapterMap = new Map<number, ChapterOutline>()
+
+    for (const outline of source) {
+      const current = chapterMap.get(outline.chapter_number)
+      if (!current || statusPriority[outline.status] < statusPriority[current.status]) {
+        chapterMap.set(outline.chapter_number, outline)
+      }
+    }
+
+    return Array.from(chapterMap.values()).sort((a, b) => a.chapter_number - b.chapter_number)
+  }
+
+  const chapterNavigationOutlines = useMemo(
+    () => getChapterNavigationOutlines(outlines),
+    [outlines]
+  )
 
   const upsertOutline = (outline: ChapterOutline) => {
     setOutlines(prev => mergeOutlines(prev, [outline]))
@@ -149,13 +193,46 @@ export default function Outlines() {
     setOutlines(prev => mergeOutlines(prev, incoming))
   }
 
-  const removeOutlineFromState = (chapterNumber: number) => {
-    const remaining = outlines.filter(outline => outline.chapter_number !== chapterNumber)
-    const fallbackOutline = remaining[0] ?? null
+  const loadOutlineVersions = async (chapterNumber: number) => {
+    if (!currentProject?.id) return
+    setLoadingVersions(true)
+    try {
+      const versions = await getOutlineVersions(currentProject.id, chapterNumber)
+      setOutlineVersions(versions)
+      upsertOutlines(versions.versions)
+    } catch (error) {
+      console.error('Failed to load outline versions:', error)
+      setOutlineVersions(null)
+    } finally {
+      setLoadingVersions(false)
+    }
+  }
 
-    setOutlines(remaining)
+  const selectOutlineVersion = async (outlineId: string) => {
+    if (!currentProject?.id) return
+    setLoading(true)
+    try {
+      const outline = await getOutlineById(currentProject.id, outlineId)
+      setCurrentOutline(outline)
+      setSelectedChapter(outline.chapter_number)
+      setRevisionNotice(null)
+      await loadResourceStatus(outline.chapter_number, outline.id)
+      await loadOutlineVersions(outline.chapter_number)
+    } catch (error) {
+      console.error('Failed to load outline version:', error)
+      alert('加载大纲版本失败')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const removeOutlineFromState = (chapterNumber: number) => {
+    setOutlines(prev => prev.filter(outline => outline.chapter_number !== chapterNumber))
+
+    const fallbackOutline = chapterNavigationOutlines.find(outline => outline.chapter_number !== chapterNumber) ?? null
     setSelectedChapter(fallbackOutline?.chapter_number ?? null)
     setCurrentOutline(fallbackOutline)
+    setOutlineVersions(null)
   }
 
   // 加载大纲列表
@@ -171,9 +248,9 @@ export default function Outlines() {
     try {
       const result = await getOutlines(currentProject.id)
       setOutlines(result.outlines)
-      // 默认选择第一章或最新的章节
-      if (result.outlines.length > 0 && !selectedChapter) {
-        selectChapter(result.outlines[0].chapter_number)
+      const navigationOutlines = getChapterNavigationOutlines(result.outlines)
+      if (navigationOutlines.length > 0 && !selectedChapter) {
+        selectChapter(navigationOutlines[0].chapter_number)
       }
     } catch (error) {
       console.error('Failed to load outlines:', error)
@@ -214,15 +291,18 @@ export default function Outlines() {
   const selectChapter = async (chapterNumber: number) => {
     if (!currentProject?.id) return
     setSelectedChapter(chapterNumber)
+    setRevisionNotice(null)
     setResourceDrafts([])
     setLoading(true)
     try {
       const outline = await getOutline(currentProject.id, chapterNumber)
       setCurrentOutline(outline)
       await loadResourceStatus(chapterNumber, outline.id)
+      await loadOutlineVersions(chapterNumber)
     } catch (error) {
       console.error('Failed to load outline:', error)
       setCurrentOutline(null)
+      setOutlineVersions(null)
       await loadResourceStatus(chapterNumber)
     } finally {
       setLoading(false)
@@ -250,7 +330,7 @@ export default function Outlines() {
       }
     } catch (error) {
       console.error('Failed to generate resource drafts:', error)
-      alert('生成资源补全草案失败')
+      alert(formatApiErrorMessage(error, '生成资源补全草案失败'))
     } finally {
       setGeneratingDrafts(false)
     }
@@ -279,7 +359,7 @@ export default function Outlines() {
       await refreshResourceStatus(true)
     } catch (error) {
       console.error('Failed to confirm resource drafts:', error)
-      alert('确认创建资源失败')
+      alert(formatApiErrorMessage(error, '确认创建资源失败'))
     } finally {
       setConfirmingDrafts(false)
     }
@@ -371,7 +451,7 @@ export default function Outlines() {
       await refreshResourceStatus(true)
     } catch (error) {
       console.error('Failed to update resource requirement:', error)
-      alert('更新资源需求状态失败')
+      alert(formatApiErrorMessage(error, '更新资源需求状态失败'))
     }
   }
 
@@ -394,20 +474,43 @@ export default function Outlines() {
       await refreshResourceStatus(true)
     } catch (error) {
       console.error('Failed to bind existing resource:', error)
-      alert('绑定已有资源失败')
+      alert(formatApiErrorMessage(error, '绑定已有资源失败'))
     } finally {
       setBindingResource(false)
     }
   }
 
   const handleApprove = async () => {
-    if (!currentProject?.id || !selectedChapter) return
+    if (!currentProject?.id || !currentOutline) return
     try {
-      const updated = await approveOutline(currentProject.id, selectedChapter, 'user')
+      const updated = await approveOutlineById(currentProject.id, currentOutline.id, 'user')
       setCurrentOutline(updated)
       upsertOutline(updated)
+      setRevisionNotice(null)
+      await loadOutlineVersions(updated.chapter_number)
+      await loadResourceStatus(updated.chapter_number, updated.id)
     } catch (error) {
       console.error('Failed to approve outline:', error)
+      alert(formatApiErrorMessage(error, '审批大纲失败'))
+    }
+  }
+
+  const handleRejectRevision = async () => {
+    if (!currentProject?.id || !currentOutline || currentOutline.status !== 'revision') return
+    if (!confirm('确认拒绝当前修订提案？原已审批大纲会保持不变。')) return
+
+    try {
+      const rejected = await rejectOutlineRevisionById(currentProject.id, currentOutline.id)
+      setCurrentOutline(rejected)
+      upsertOutline(rejected)
+      setRevisionNotice(null)
+      await loadOutlineVersions(rejected.chapter_number)
+      if (outlineVersions?.current_approved) {
+        await selectOutlineVersion(outlineVersions.current_approved.id)
+      }
+    } catch (error) {
+      console.error('Failed to reject outline revision:', error)
+      alert('拒绝修订失败')
     }
   }
 
@@ -527,6 +630,74 @@ export default function Outlines() {
   }
 
   const isRequirementActionable = (status: ResourceRequirementStatus) => ['pending', 'in_progress'].includes(status)
+
+  const renderOutlineVersionPanel = () => {
+    if (!currentOutline) return null
+
+    const versions = outlineVersions?.versions ?? [currentOutline]
+    const currentApproved = outlineVersions?.current_approved ?? null
+    const pendingCount = outlineVersions?.pending_revisions.length ?? 0
+
+    return (
+      <Card className="p-4 mb-6">
+        <div className="flex items-center justify-between mb-3">
+          <div>
+            <h3 className={`text-sm font-medium ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>版本与修订</h3>
+            <p className={`text-xs mt-1 ${isDark ? 'text-gray-500' : 'text-gray-500'}`}>
+              章节启动默认使用已审批版本；修订提案只有审批后才成为后续写作依据。
+            </p>
+          </div>
+          <Button size="sm" variant="secondary" onClick={() => loadOutlineVersions(currentOutline.chapter_number)} disabled={loadingVersions}>
+            {loadingVersions ? <Loader2 className="w-4 h-4 mr-1 animate-spin" /> : <RefreshCw className="w-4 h-4 mr-1" />}
+            刷新版本
+          </Button>
+        </div>
+
+        {pendingCount > 0 && currentOutline.status !== 'revision' && (
+          <p className={`text-xs mb-3 ${isDark ? 'text-orange-300' : 'text-orange-700'}`}>
+            当前章节有 {pendingCount} 个待处理修订。请点选修订提案审查，或继续使用当前已审批版本。
+          </p>
+        )}
+
+        <div className="space-y-2">
+          {versions.map(version => {
+            const status = STATUS_CONFIG[version.status]
+            const active = currentOutline.id === version.id
+            const isApprovedBaseline = currentApproved?.id === version.id
+            return (
+              <button
+                key={version.id}
+                onClick={() => selectOutlineVersion(version.id)}
+                className={`w-full text-left p-3 rounded border transition-colors ${
+                  active
+                    ? isDark ? 'border-blue-700 bg-blue-950/40' : 'border-blue-200 bg-blue-50'
+                    : isDark ? 'border-gray-700 bg-gray-800 hover:bg-gray-700' : 'border-gray-200 bg-white hover:bg-gray-50'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div className="min-w-0">
+                    <p className={`text-sm font-medium truncate ${isDark ? 'text-gray-100' : 'text-gray-800'}`}>{version.title}</p>
+                    <p className={`text-xs mt-1 ${isDark ? 'text-gray-500' : 'text-gray-500'}`}>ID: {version.id}</p>
+                  </div>
+                  <div className="flex items-center gap-2 flex-shrink-0">
+                    {isApprovedBaseline && (
+                      <span className="px-2 py-0.5 text-xs rounded bg-green-100 text-green-700">当前基准</span>
+                    )}
+                    <span className={`px-2 py-0.5 text-xs rounded ${status.color}`}>{status.label}</span>
+                  </div>
+                </div>
+                {version.previous_outline_id && (
+                  <p className={`text-xs mt-2 ${isDark ? 'text-orange-300' : 'text-orange-700'}`}>
+                    修订来源：{version.previous_outline_id}
+                  </p>
+                )}
+              </button>
+            )
+          })}
+        </div>
+      </Card>
+    )
+  }
 
   const renderResourceReadinessPanel = () => {
     const config = readinessConfig(resourceReadiness?.readiness_status)
@@ -743,12 +914,13 @@ export default function Outlines() {
                 章节大纲
               </h2>
               <Button size="sm" onClick={() => {
-                const newChapter = outlines.length > 0 ? Math.max(...outlines.map(o => o.chapter_number)) + 1 : 1
+                const newChapter = chapterNavigationOutlines.length > 0 ? Math.max(...chapterNavigationOutlines.map(o => o.chapter_number)) + 1 : 1
                 setSelectedChapter(newChapter)
                 setCurrentOutline(null)
                 setResourceRequirements([])
                 setResourceReadiness(null)
                 setResourceDrafts([])
+                setOutlineVersions(null)
               }}>
                 <Plus className="w-4 h-4" />
               </Button>
@@ -759,11 +931,11 @@ export default function Outlines() {
           </div>
 
           <div className="overflow-y-auto h-[calc(100vh-200px)]">
-            {loading && outlines.length === 0 ? (
+            {loading && chapterNavigationOutlines.length === 0 ? (
               <div className={`p-4 text-center ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
                 加载中...
               </div>
-            ) : outlines.length === 0 ? (
+            ) : chapterNavigationOutlines.length === 0 ? (
               <div className={`p-4 text-center ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
                 <BookOpen className="w-12 h-12 mx-auto mb-2 opacity-50" />
                 <p className="text-sm">暂无大纲</p>
@@ -773,7 +945,7 @@ export default function Outlines() {
               </div>
             ) : (
               <div className="p-2 space-y-1">
-                {outlines.map((outline) => {
+                {chapterNavigationOutlines.map((outline) => {
                   const status = STATUS_CONFIG[outline.status]
                   const isSelected = selectedChapter === outline.chapter_number
                   return (
@@ -825,10 +997,16 @@ export default function Outlines() {
                       <span className={`px-3 py-1 text-sm rounded-full ${STATUS_CONFIG[currentOutline.status].color}`}>
                         {STATUS_CONFIG[currentOutline.status].label}
                       </span>
-                      {currentOutline.status === 'draft' && (
+                      {['draft', 'revision'].includes(currentOutline.status) && (
                         <Button size="sm" onClick={handleApprove}>
                           <Check className="w-4 h-4 mr-1" />
-                          审批
+                          {currentOutline.status === 'revision' ? '审批修订' : '审批'}
+                        </Button>
+                      )}
+                      {currentOutline.status === 'revision' && (
+                        <Button size="sm" variant="secondary" onClick={handleRejectRevision}>
+                          <X className="w-4 h-4 mr-1" />
+                          拒绝修订
                         </Button>
                       )}
                       <Button size="sm" variant="secondary" onClick={handleDelete}>
@@ -840,7 +1018,30 @@ export default function Outlines() {
                   <p className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-600'}`}>
                     {currentOutline.summary}
                   </p>
+                  {currentOutline.previous_outline_id && (
+                    <p className={`text-xs mt-2 ${isDark ? 'text-orange-300' : 'text-orange-700'}`}>
+                      修订来源：{currentOutline.previous_outline_id}
+                    </p>
+                  )}
+                  {currentOutline.next_outline_id && (
+                    <p className={`text-xs mt-2 ${isDark ? 'text-green-300' : 'text-green-700'}`}>
+                      后续已审批修订：{currentOutline.next_outline_id}
+                    </p>
+                  )}
                 </div>
+
+                {revisionNotice && currentOutline.id === revisionNotice.revisionOutlineId && (
+                  <Card className={`p-4 mb-6 border ${isDark ? 'border-orange-800 bg-orange-950/30' : 'border-orange-200 bg-orange-50'}`}>
+                    <p className={`text-sm font-medium ${isDark ? 'text-orange-200' : 'text-orange-800'}`}>
+                      已创建修订提案
+                    </p>
+                    <p className={`text-xs mt-1 ${isDark ? 'text-orange-300' : 'text-orange-700'}`}>
+                      {revisionNotice.message} 原审批大纲：{revisionNotice.approvedOutlineId}；当前修订：{revisionNotice.revisionOutlineId}。
+                    </p>
+                  </Card>
+                )}
+
+                {renderOutlineVersionPanel()}
 
                 {renderResourceReadinessPanel()}
 

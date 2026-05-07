@@ -32,6 +32,41 @@ is_system: true
 - 与用户问题的相关性：高 / 中 / 低。
 - 跨段关系线索：该信息可能依赖、支持、冲突或呼应哪些其他资源。
 
+## 分段提取 JSON 合同
+
+片段级提取必须直接输出 JSON 数组，数组元素使用以下稳定字段：
+
+```json
+[
+  {
+    "category": "信息类型，如世界观、角色、事件、规则、时间线、资源缺口等",
+    "entity": "实体名称，如具体角色名、地点名、事件名、势力名或设定名",
+    "key_fact": "关键事实，一句话描述并保留具体细节",
+    "relevance": "高|中|低",
+    "related_entities": ["与该事实有关的其他角色、设定、势力或地点"],
+    "relation_type": "depends_on|supports|conflicts_with|mentions|requires_resource",
+    "potential_conflicts": ["该事实与其他段落可能冲突的具体点"],
+    "resource_requirements": [
+      {
+        "requirement_type": "character|lore|faction|location|item|ability|relationship|event_rule|crisis_resolution",
+        "resource_name": "待补资源名",
+        "severity": "blocking|advisory|optional",
+        "reason": "为什么需要补全"
+      }
+    ]
+  }
+]
+```
+
+## 片段提取规则
+
+1. `key_fact` 必须包含具体细节，不要泛泛而谈。
+2. 如果有时间线信息，必须记录具体时间点。
+3. 如果有数值信息，如等级、数量、年份、章节号，必须记录具体数值。
+4. 保持信息点独立，每个信息点只描述一个事实。
+5. 如果不同片段之间存在依赖、支撑、冲突或资源缺口，必须通过 `related_entities`、`relation_type`、`potential_conflicts`、`resource_requirements` 标出。
+6. 只输出 JSON 数组，不要输出解释文字或 markdown 代码块。
+
 ## JSON 容错原则
 
 分段提取输出应尽量是 JSON 数组。轻微格式错误不应导致整段信息丢失：

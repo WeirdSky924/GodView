@@ -16,6 +16,8 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, TYPE_CHECKING
 from dataclasses import dataclass
 
+from app.services.md_file_service import get_md_file_service
+
 if TYPE_CHECKING:
     from app.models.character import Character
 else:
@@ -257,6 +259,8 @@ class CharacterDetectionService:
 class CharacterPromotionManager:
     """角色晋升管理器 - 管理从检测到晋升的完整流程"""
 
+    CHARACTER_DETECTION_PROMPT_ID = "function_character_detection"
+
     # 晋升阈值
     PROMOTION_THRESHOLDS = {
         "importance_high": 1,      # 高重要性角色出现1次即晋升
@@ -360,6 +364,34 @@ class CharacterPromotionManager:
             "candidates": list(self._candidates.get(project_id, {}).values()),
         }
 
+    def _load_prompt_asset(self, prompt_id: str, fallback: str = "") -> str:
+        """读取 md prompt 资产内容；失败时返回调用方提供的极简兼容降级。"""
+        try:
+            prompt = get_md_file_service().get_prompt(prompt_id)
+        except Exception as e:
+            logger.warning("读取角色检测 Prompt 资产失败 %s: %s", prompt_id, e)
+            prompt = None
+
+        content = (prompt or {}).get("content") or (prompt or {}).get("raw_content") or ""
+        content = str(content).strip()
+        if content:
+            return content
+
+        logger.warning("角色检测 Prompt 资产缺失: %s", prompt_id)
+        return fallback
+
+    def _build_character_detection_prompt(self, content_to_analyze: str, existing_names_str: str) -> str:
+        """构建角色检测 prompt；稳定规则来自 md，动态章节内容和已有角色列表来自运行时。"""
+        prompt_asset = self._load_prompt_asset(
+            self.CHARACTER_DETECTION_PROMPT_ID,
+            fallback="请检测章节中的新角色，并只输出符合约定字段的 JSON 对象。",
+        )
+        return "\n\n".join([
+            prompt_asset,
+            f"## 章节内容\n{content_to_analyze}",
+            f"## 已有角色列表\n{existing_names_str}",
+        ]).strip()
+
     async def _detect_characters_with_llm(
         self,
         content: str,
@@ -395,47 +427,7 @@ class CharacterPromotionManager:
             content = _normalize_text_content(content)
             content_to_analyze = content[:3000] if len(content) > 3000 else content
 
-            prompt = f"""请从以下章节内容中检测和提取所有出现的角色。
-
-【章节内容】
-{content_to_analyze}
-
-【已有角色列表】
-{existing_names_str}
-
-【检测任务】
-1. 识别章节中所有出现的角色
-2. 对于新角色（不在已有角色列表中的），评估其重要性
-3. 提取角色的关键信息
-
-【角色识别标准】
-- 有名字的个体（如：张三、李四、王大锤）
-- 有独特称谓的个体（如：白衣少年、黑袍长老）
-- 有台词或行动描述的人物
-- 注意：不要把普通名词、地名、组织名、时间词、形容词等误认为角色名
-
-【重要性判断标准】
-- Tier 1-2：主角、核心配角、有多次对话或关键行动
-- Tier 3：有名字的配角、有一定剧情作用
-- Tier 4-5：路人、背景人物、仅提及一次
-
-请输出 JSON 格式：
-{{
-    "existing_characters_found": ["章节中出现的已有角色名"],
-    "new_characters": [
-        {{
-            "name": "角色名称",
-            "importance_tier": 1-5,
-            "first_appearance_context": "首次出现的上下文（50字内）",
-            "description": "基于内容推断的角色描述",
-            "dialogue_count": 对话次数,
-            "importance_reason": "判断重要性的理由"
-        }}
-    ],
-    "total_characters_in_chapter": 章节中出现的角色总数
-}}
-
-只输出 JSON，不要有其他内容。"""
+            prompt = self._build_character_detection_prompt(content_to_analyze, existing_names_str)
 
             response = await llm_model.ainvoke([HumanMessage(content=prompt)])
             response_text = _normalize_text_content(response.content)

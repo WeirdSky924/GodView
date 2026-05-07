@@ -4,6 +4,8 @@
  */
 
 import { api } from './client'
+import { getCachedQuery, invalidateQueryCache } from './queryCache'
+import { withStartupRetry } from './startupRetry'
 
 export interface SystemConfig {
   app_name: string
@@ -59,10 +61,17 @@ export async function getSystemConfig(): Promise<SystemConfig> {
   }
 
   try {
-    cachedConfig = await api.get<SystemConfig>('/config/system')
+    cachedConfig = await getCachedQuery(
+      'system-config',
+      () => withStartupRetry(
+        () => api.get<SystemConfig>('/config/system'),
+        { label: 'system config' }
+      ),
+      { ttlMs: 5 * 60 * 1000 }
+    )
     return cachedConfig
   } catch (error) {
-    console.error('Failed to fetch system config, using defaults:', error)
+    console.error('Failed to fetch system config after startup retries, using defaults:', error)
     // 返回默认配置
     const defaultConfig: SystemConfig = {
       app_name: 'Godview',
@@ -96,4 +105,5 @@ export async function getApiBaseUrl(): Promise<string> {
  */
 export function clearConfigCache(): void {
   cachedConfig = null
+  invalidateQueryCache('system-config')
 }

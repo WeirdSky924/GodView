@@ -38,6 +38,9 @@ logger = logging.getLogger(__name__)
 class PlotOutlineService:
     """章节大纲服务"""
 
+    OUTLINE_CONSISTENCY_REPAIR_PROMPT_ID = "function_plot_outline_consistency_repair"
+    OUTLINE_GENERATION_OUTPUT_PROMPT_ID = "plot_outline_output"
+
     def __init__(self, db=None, skill_service=None, prompt_service=None):
         """
         初始化章节大纲服务
@@ -111,6 +114,20 @@ class PlotOutlineService:
     def _build_outline_list_cache(self, outlines: List[ChapterOutline]):
         self._outlines_cache = {outline.id: outline for outline in outlines}
         self._loaded_outline_projects = {outline.project_id for outline in outlines}
+
+    def _clone_outline_as_revision(self, outline: ChapterOutline) -> ChapterOutline:
+        data = outline.model_dump()
+        data.update({
+            "id": f"outline_{uuid.uuid4().hex[:8]}",
+            "status": ChapterOutlineStatus.REVISION,
+            "approved_at": None,
+            "approved_by": None,
+            "previous_outline_id": outline.id,
+            "next_outline_id": None,
+            "created_at": datetime.now(),
+            "updated_at": datetime.now(),
+        })
+        return ChapterOutline(**data)
 
     def _get_context_cache_key(self, project_id: str, chapter_number: int) -> str:
         return f"{project_id}:context:{chapter_number}"
@@ -259,16 +276,27 @@ class PlotOutlineService:
 """.strip()
 
     async def _get_cached_output_format_prompt(self) -> str:
-        cache_key = "plot_outline_output"
+        cache_key = self.OUTLINE_GENERATION_OUTPUT_PROMPT_ID
         cached = self._get_cached_value(self._output_format_cache, cache_key)
         if cached is not None:
             return cached
 
-        content = self._load_md_prompt_content("plot_outline_output")
+        content = self._load_md_prompt_content(self.OUTLINE_GENERATION_OUTPUT_PROMPT_ID)
         if content:
             return self._cache_entry(self._output_format_cache, cache_key, content)
 
-        return self._cache_entry(self._output_format_cache, cache_key, self._get_simple_output_format())
+        return self._cache_entry(cache=self._output_format_cache, key=cache_key, value=self._get_simple_output_format())
+
+    def _get_output_format_prompt(self) -> str:
+        cached = self._get_cached_value(self._output_format_cache, self.OUTLINE_GENERATION_OUTPUT_PROMPT_ID)
+        if cached is not None:
+            return cached
+
+        content = self._load_md_prompt_content(self.OUTLINE_GENERATION_OUTPUT_PROMPT_ID)
+        if not content:
+            logger.warning("Plot Outline 输出格式 Prompt 资产缺失: %s", self.OUTLINE_GENERATION_OUTPUT_PROMPT_ID)
+            content = self._get_simple_output_format()
+        return self._cache_entry(self._output_format_cache, self.OUTLINE_GENERATION_OUTPUT_PROMPT_ID, content)
 
     def _load_md_prompt_content(self, prompt_id: str) -> str:
         try:
@@ -408,6 +436,31 @@ class PlotOutlineService:
             logger.warning(f"[PlotOutline] 执行设定一致性检测失败: {e}")
             return {"conflicts": [], "setting_gaps": [], "risk_areas": [], "consistency_score": 100}
 
+    def _build_outline_consistency_repair_message(
+        self,
+        original_message: str,
+        consistency: Dict[str, Any],
+    ) -> str:
+        prompt_asset = self._load_md_prompt_content(
+            self.OUTLINE_CONSISTENCY_REPAIR_PROMPT_ID,
+        ) or (
+            "你刚生成的大纲存在设定一致性风险。请基于原任务修正后重新输出完整 JSON，"
+            "并优先服从宪法级设定和核心设定。"
+        )
+        conflicts = consistency.get("conflicts", [])
+        risk_areas = consistency.get("risk_areas", [])
+        setting_gaps = consistency.get("setting_gaps", [])
+
+        feedback_blocks = [prompt_asset]
+        if conflicts:
+            feedback_blocks.append("## 冲突列表\n" + "\n".join([f"- {item}" for item in conflicts]))
+        if risk_areas:
+            feedback_blocks.append("## 风险区域\n" + "\n".join([f"- {item}" for item in risk_areas]))
+        if setting_gaps:
+            feedback_blocks.append("## 设定缺口\n" + "\n".join([f"- {item}" for item in setting_gaps]))
+
+        return f"{original_message}\n\n" + "\n\n".join(feedback_blocks)
+
     async def _repair_outline_with_consistency_feedback(
         self,
         project_id: str,
@@ -421,28 +474,13 @@ class PlotOutlineService:
     ) -> Optional[Dict[str, Any]]:
         conflicts = consistency.get("conflicts", [])
         risk_areas = consistency.get("risk_areas", [])
-        setting_gaps = consistency.get("setting_gaps", [])
 
         if not conflicts and not risk_areas:
             return None
 
-        repair_feedback = [
-            "你刚生成的大纲存在设定一致性风险，请基于原任务立即修正后重新输出完整 JSON。",
-            "修正时必须优先服从宪法级设定和核心设定，不要输出解释，不要省略字段。",
-        ]
-        if conflicts:
-            repair_feedback.append("冲突列表：")
-            repair_feedback.extend([f"- {item}" for item in conflicts])
-        if risk_areas:
-            repair_feedback.append("风险区域：")
-            repair_feedback.extend([f"- {item}" for item in risk_areas])
-        if setting_gaps:
-            repair_feedback.append("设定缺口：")
-            repair_feedback.extend([f"- {item}" for item in setting_gaps])
-
         repaired_response = await self._call_llm_for_chat(
             system_prompt=system_prompt,
-            user_message=f"{message}\n\n" + "\n".join(repair_feedback),
+            user_message=self._build_outline_consistency_repair_message(message, consistency),
             context=combined_context,
             llm_config=llm_config,
         )
@@ -908,11 +946,6 @@ class PlotOutlineService:
                     outline_id=outline.id,
                     chapter_num=outline.chapter_number,
                 )
-                await self._db.update_chapter_resource_readiness(
-                    outline.project_id,
-                    outline_id=None,
-                    chapter_num=outline.chapter_number,
-                )
         except Exception as e:
             logger.warning(f"[PlotOutline] 大纲资源自动审计失败: {e}")
 
@@ -1273,22 +1306,65 @@ class PlotOutlineService:
 
     async def get_outline(self, project_id: str, chapter_number: int) -> Optional[ChapterOutline]:
         """
-        获取指定章节的大纲
+        获取指定章节的大纲。
 
-        Args:
-            project_id: 项目ID
-            chapter_number: 章节号
-
-        Returns:
-            ChapterOutline 或 None
+        章节号路由只返回可作为当前章节基准的版本，避免 approved 和 revision
+        同章共存时误把修订提案当成当前可写作版本。
         """
         await self._ensure_cache(project_id)
 
-        for outline in self._outlines_cache.values():
-            if outline.project_id == project_id and outline.chapter_number == chapter_number:
-                return outline
+        chapter_outlines = [
+            outline for outline in self._outlines_cache.values()
+            if outline.project_id == project_id and outline.chapter_number == chapter_number
+        ]
+        if not chapter_outlines:
+            return None
 
-        return None
+        status_priority = {
+            ChapterOutlineStatus.APPROVED: 0,
+            ChapterOutlineStatus.IN_WRITING: 1,
+            ChapterOutlineStatus.COMPLETED: 2,
+            ChapterOutlineStatus.DRAFT: 3,
+            ChapterOutlineStatus.REVISION: 4,
+            ChapterOutlineStatus.REJECTED: 5,
+        }
+        return sorted(
+            chapter_outlines,
+            key=lambda outline: (status_priority.get(outline.status, 99), outline.updated_at),
+        )[0]
+
+    async def get_outline_by_id(self, project_id: str, outline_id: str) -> Optional[ChapterOutline]:
+        """按 outline ID 精确获取大纲版本。"""
+        await self._ensure_cache(project_id)
+        outline = self._outlines_cache.get(outline_id)
+        if not outline or outline.project_id != project_id:
+            return None
+        return outline
+
+    async def get_outline_versions(self, project_id: str, chapter_number: int) -> Dict[str, Any]:
+        """获取某章节的所有大纲版本和当前版本摘要。"""
+        await self._ensure_cache(project_id)
+        versions = sorted(
+            [
+                outline for outline in self._outlines_cache.values()
+                if outline.project_id == project_id and outline.chapter_number == chapter_number
+            ],
+            key=lambda outline: (outline.created_at, outline.updated_at),
+        )
+        current_approved = next(
+            (outline for outline in reversed(versions) if outline.status == ChapterOutlineStatus.APPROVED),
+            None,
+        )
+        pending_revisions = [outline for outline in versions if outline.status == ChapterOutlineStatus.REVISION]
+        rejected_revisions = [outline for outline in versions if outline.status == ChapterOutlineStatus.REJECTED]
+        return {
+            "chapter_number": chapter_number,
+            "current_approved": current_approved,
+            "pending_revisions": pending_revisions,
+            "rejected_revisions": rejected_revisions,
+            "versions": versions,
+            "total": len(versions),
+        }
 
     async def get_outlines_by_project(self, project_id: str) -> List[ChapterOutline]:
         """
@@ -1322,6 +1398,54 @@ class PlotOutlineService:
         outline = self._outlines_cache.get(outline_id)
         if not outline:
             return None
+
+        if outline.status == ChapterOutlineStatus.APPROVED:
+            revision = self._clone_outline_as_revision(outline)
+            for key in dto.model_fields_set:
+                value = getattr(dto, key)
+                if value is not None:
+                    setattr(revision, key, value)
+            revision.updated_at = datetime.now()
+
+            if self._db:
+                try:
+                    await self._db.execute_write(
+                        """
+                        INSERT INTO chapter_outlines
+                        (id, project_id, chapter_number, title, summary, scenes, emotion_curve, chapter_goals,
+                         status, hooks_planted, hooks_resolved, target_word_count, created_at, updated_at,
+                         previous_outline_id)
+                        VALUES (:id, :project_id, :chapter_number, :title, :summary, :scenes, :emotion_curve,
+                         :chapter_goals, :status, :hooks_planted, :hooks_resolved, :target_word_count,
+                         :created_at, :updated_at, :previous_outline_id)
+                        """,
+                        {
+                            "id": revision.id,
+                            "project_id": revision.project_id,
+                            "chapter_number": revision.chapter_number,
+                            "title": revision.title,
+                            "summary": revision.summary,
+                            "scenes": json.dumps(self._to_plain_data(revision.scenes)),
+                            "emotion_curve": json.dumps(self._to_plain_data(revision.emotion_curve)) if revision.emotion_curve else None,
+                            "chapter_goals": json.dumps(revision.chapter_goals),
+                            "status": revision.status.value,
+                            "hooks_planted": json.dumps(revision.hooks_planted),
+                            "hooks_resolved": json.dumps(revision.hooks_resolved),
+                            "target_word_count": revision.target_word_count,
+                            "created_at": revision.created_at,
+                            "updated_at": revision.updated_at,
+                            "previous_outline_id": revision.previous_outline_id,
+                        },
+                    )
+                    logger.info(f"为已审批大纲创建修订提案: {outline_id} -> {revision.id}")
+                except Exception as e:
+                    logger.error(f"创建章节大纲修订提案失败: {e}")
+                    return None
+
+            self._merge_outline_into_list(revision)
+            self._mark_outline_project_dirty(revision.project_id, revision.chapter_number)
+            await self._persist_outline_resource_audit(revision)
+            return revision
 
         for key in dto.model_fields_set:
             value = getattr(dto, key)
@@ -1475,7 +1599,8 @@ class PlotOutlineService:
         existing_hooks: Optional[List[Dict]],
         full_context: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """构建大纲生成 Prompt"""
+        """构建大纲生成 Prompt，稳定输出合同来自 md prompt 资产。"""
+        output_format_prompt = self._get_output_format_prompt()
         prompt_parts = [
             f"请为第 {chapter_number} 章生成详细的章节大纲。",
             "",
@@ -1544,42 +1669,8 @@ class PlotOutlineService:
             prompt_parts.append(context)
             prompt_parts.append("")
 
-        prompt_parts.append("""
-【输出格式要求】
-请输出 JSON 格式：
-{
-    "title": "章节标题",
-    "summary": "章节摘要（100-200字）",
-    "scenes": [
-        {
-            "scene_number": 1,
-            "title": "场景标题",
-            "scene_type": "dialogue/action/description/climax",
-            "summary": "场景摘要",
-            "participating_characters": ["角色名"],
-            "location": "地点",
-            "emotion_start": "neutral/joy/fear/tension等",
-            "emotion_end": "neutral/joy/fear/tension等",
-            "conflict_level": "low/medium/high/critical",
-            "estimated_words": 800,
-            "key_events": ["关键事件1", "关键事件2"]
-        }
-    ],
-    "emotion_curve": {
-        "points": [
-            {"position": 0.0, "emotion": "neutral", "intensity": 0.3},
-            {"position": 0.5, "emotion": "tension", "intensity": 0.8},
-            {"position": 1.0, "emotion": "relief", "intensity": 0.5}
-        ],
-        "dominant_emotion": "tension"
-    },
-    "chapter_goals": ["目标1", "目标2"],
-    "hooks_to_plant": ["建议埋设的伏笔"],
-    "hooks_to_resolve": ["建议回收的伏笔ID"],
-    "suggestions": ["写作建议"],
-    "warnings": ["注意事项"]
-}
-""")
+        prompt_parts.append("【输出格式要求】")
+        prompt_parts.append(output_format_prompt)
         return "\n".join(prompt_parts)
 
     def _parse_generated_outline(
@@ -1887,7 +1978,10 @@ class PlotOutlineService:
         outline = self._outlines_cache.get(outline_id)
         if not outline:
             return None
+        if outline.status == ChapterOutlineStatus.REJECTED:
+            return None
 
+        previous_outline_id = outline.previous_outline_id
         outline.status = ChapterOutlineStatus.APPROVED
         outline.approved_at = datetime.now()
         outline.approved_by = approved_by
@@ -1910,9 +2004,60 @@ class PlotOutlineService:
                         "id": outline_id,
                     }
                 )
+                if previous_outline_id:
+                    await self._db.execute_write(
+                        """
+                        UPDATE chapter_outlines
+                        SET next_outline_id = :next_outline_id, updated_at = :updated_at
+                        WHERE id = :id
+                        """,
+                        {
+                            "next_outline_id": outline.id,
+                            "updated_at": outline.updated_at,
+                            "id": previous_outline_id,
+                        },
+                    )
                 logger.info(f"审批章节大纲: {outline_id}")
             except Exception as e:
                 logger.error(f"审批章节大纲失败: {e}")
+                return None
+
+        if previous_outline_id and previous_outline_id in self._outlines_cache:
+            previous_outline = self._outlines_cache[previous_outline_id]
+            previous_outline.next_outline_id = outline.id
+            previous_outline.updated_at = outline.updated_at
+
+        self._mark_outline_project_dirty(outline.project_id, outline.chapter_number)
+        await self._persist_outline_resource_audit(outline)
+        return outline
+
+    async def reject_outline_revision(self, outline_id: str) -> Optional[ChapterOutline]:
+        """拒绝修订提案，保留原 approved 版本不变。"""
+        outline = self._outlines_cache.get(outline_id)
+        if not outline or outline.status != ChapterOutlineStatus.REVISION:
+            return None
+
+        outline.status = ChapterOutlineStatus.REJECTED
+        outline.updated_at = datetime.now()
+
+        if self._db:
+            try:
+                await self._db.execute_write(
+                    """
+                    UPDATE chapter_outlines
+                    SET status = :status, updated_at = :updated_at
+                    WHERE id = :id
+                    """,
+                    {
+                        "status": outline.status.value,
+                        "updated_at": outline.updated_at,
+                        "id": outline_id,
+                    },
+                )
+                logger.info(f"拒绝章节大纲修订提案: {outline_id}")
+            except Exception as e:
+                logger.error(f"拒绝章节大纲修订提案失败: {e}")
+                return None
 
         self._mark_outline_project_dirty(outline.project_id, outline.chapter_number)
         return outline

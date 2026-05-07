@@ -112,7 +112,7 @@ class SettingAgent:
         return self._load_prompt_asset(
             self.BOOTSTRAP_COLLECTION_PROMPT_ID,
             fallback=(
-                "你是长篇网络小说设定专家（Setting Agent）。请通过多轮对话收集世界观、"
+                "【DEPRECATED 最小 fallback】你是长篇网络小说设定专家（Setting Agent）。请通过多轮对话收集世界观、"
                 "角色、主线、风格和关键设定；主动追问缺口，并保持所有内容为待确认草案。"
             ),
         )
@@ -300,7 +300,7 @@ class SettingAgent:
             response = await self._call_llm(
                 system_prompt=self._load_prompt_asset(
                     self.BOOTSTRAP_SEED_EXTRACTION_PROMPT_ID,
-                    fallback="请从对话历史中提取结构化项目 seed，只输出 JSON 对象，不要输出其他内容。",
+                    fallback="【DEPRECATED 最小 fallback】请从对话历史中提取结构化项目 seed，只输出 JSON 对象，不要输出其他内容。",
                 ),
                 user_message=extraction_prompt,
                 context="",

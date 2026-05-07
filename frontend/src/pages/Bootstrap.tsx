@@ -53,7 +53,7 @@ export default function BootstrapPage() {
 
   const loadProjects = async () => {
     try {
-      const result = await getProjects()
+      const result = await getProjects(undefined, { forceRefresh: true })
       setProjects(result)
     } catch (err) {
       console.error('Failed to load projects:', err)
@@ -234,6 +234,13 @@ export default function BootstrapPage() {
     })
   }
 
+  const refreshSessionFromServer = async (id: string) => {
+    const refreshedSession = await getBootstrapSession(id)
+    setSession(refreshedSession)
+    updateStageFromSession(refreshedSession)
+    return refreshedSession
+  }
+
   const handleConfirmSeed = async (confirmedSeed: SeedData) => {
     if (!session) return
 
@@ -250,6 +257,7 @@ export default function BootstrapPage() {
       const runRequestId = localStorage.getItem(runRequestKey) || createRequestId('bootstrap_run')
       localStorage.setItem(runRequestKey, runRequestId)
       await runBootstrap(session.id, { requestId: runRequestId })
+      await refreshSessionFromServer(session.id)
     } catch (err) {
       console.error('Failed to confirm seed:', err)
       setError('确认种子数据失败')
@@ -266,8 +274,9 @@ export default function BootstrapPage() {
       const runRequestKey = bootstrapRunRequestStorageKey(session.id)
       const runRequestId = localStorage.getItem(runRequestKey) || createRequestId('bootstrap_run')
       localStorage.setItem(runRequestKey, runRequestId)
-      await runBootstrap(session.id, { requestId: runRequestId })
       setStage('running')
+      await runBootstrap(session.id, { requestId: runRequestId })
+      await refreshSessionFromServer(session.id)
     } catch (err) {
       console.error('Failed to run bootstrap:', err)
       setError('运行引导失败')

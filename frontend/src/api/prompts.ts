@@ -4,6 +4,7 @@
  */
 
 import { api } from './client'
+import { getCachedQuery, invalidateQueryCache, type QueryCacheOptions } from './queryCache'
 
 const API_BASE = '/prompts'
 
@@ -80,6 +81,7 @@ export interface PromptFilter {
   search?: string
   limit?: number
   offset?: number
+  cache?: QueryCacheOptions
 }
 
 export interface CreatePromptDTO {
@@ -124,14 +126,21 @@ export async function getPrompts(filters?: PromptFilter): Promise<PromptTemplate
   params.append('limit', String(filters?.limit || 50))
   params.append('offset', String(filters?.offset || 0))
 
-  return await api.get(`${API_BASE}?${params.toString()}`)
+  const query = params.toString()
+  return await getCachedQuery(
+    `prompts:list:${query}`,
+    () => api.get(`${API_BASE}?${query}`),
+    { ttlMs: 30 * 1000, ...filters?.cache }
+  )
 }
 
 /**
  * 创建 Prompt
  */
 export async function createPrompt(dto: CreatePromptDTO): Promise<{ success: boolean; message: string; template: PromptTemplate }> {
-  return await api.post(`${API_BASE}`, dto)
+  const result = await api.post<{ success: boolean; message: string; template: PromptTemplate }>(`${API_BASE}`, dto)
+  invalidatePromptCaches()
+  return result
 }
 
 /**
@@ -145,14 +154,18 @@ export async function getPrompt(promptId: string): Promise<PromptTemplate> {
  * 更新 Prompt
  */
 export async function updatePrompt(promptId: string, dto: UpdatePromptDTO): Promise<{ success: boolean; message: string; template: PromptTemplate }> {
-  return await api.put(`${API_BASE}/${promptId}`, dto)
+  const result = await api.put<{ success: boolean; message: string; template: PromptTemplate }>(`${API_BASE}/${promptId}`, dto)
+  invalidatePromptCaches()
+  return result
 }
 
 /**
  * 删除 Prompt
  */
 export async function deletePrompt(promptId: string): Promise<{ success: boolean; message: string }> {
-  return await api.delete(`${API_BASE}/${promptId}`)
+  const result = await api.delete<{ success: boolean; message: string }>(`${API_BASE}/${promptId}`)
+  invalidatePromptCaches()
+  return result
 }
 
 /**
@@ -170,22 +183,36 @@ export async function searchPrompts(query: string, category?: PromptCategory, li
 /**
  * 获取分类列表
  */
-export async function getCategories(): Promise<Record<string, number>> {
-  return await api.get(`${API_BASE}/categories-list`)
+export async function getCategories(options: QueryCacheOptions = {}): Promise<Record<string, number>> {
+  return await getCachedQuery(
+    'prompts:categories',
+    () => api.get(`${API_BASE}/categories-list`),
+    { ttlMs: 5 * 60 * 1000, ...options }
+  )
 }
 
 /**
  * 同步 prompts/ 目录下的 MD 文件到数据库
  */
 export async function syncPromptMdFiles(): Promise<MdSyncResult> {
-  return await api.post(`${API_BASE}/sync-md-files`)
+  const result = await api.post<MdSyncResult>(`${API_BASE}/sync-md-files`)
+  invalidatePromptCaches()
+  return result
 }
 
 /**
  * 获取 prompts/skills MD 文件统计
  */
-export async function getPromptMdStats(): Promise<MdStatsResponse> {
-  return await api.get(`${API_BASE}/md-stats`)
+export async function getPromptMdStats(options: QueryCacheOptions = {}): Promise<MdStatsResponse> {
+  return await getCachedQuery(
+    'prompts:md-stats',
+    () => api.get(`${API_BASE}/md-stats`),
+    { ttlMs: 5 * 60 * 1000, ...options }
+  )
+}
+
+export function invalidatePromptCaches(): void {
+  invalidateQueryCache('prompts')
 }
 
 /**

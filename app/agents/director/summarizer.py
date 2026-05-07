@@ -26,6 +26,7 @@ class SummarizerAgent(BaseAgent):
 
     AGENT_TYPE = AgentType.SUMMARIZER
     DEFAULT_SCENARIO = "workflow_summary"
+    SETTING_CHECK_PROMPT_ID = "function_summarizer_setting_check"
 
     def __init__(
         self,
@@ -74,9 +75,11 @@ class SummarizerAgent(BaseAgent):
     def _build_md_summarizer_fallback_prompt(self) -> str:
         prompt_ids = [
             "role_summarizer",
+            "function_summarize",
             "function_workflow_discussion_summary",
             "function_workflow_performance_summary",
             "function_summarizer_runtime_context_packet",
+            self.SETTING_CHECK_PROMPT_ID,
         ]
         parts = [content for prompt_id in prompt_ids if (content := self._load_md_prompt_content(prompt_id))]
         return "\n\n".join(parts).strip()
@@ -97,9 +100,11 @@ class SummarizerAgent(BaseAgent):
             "deprecated_sources_used": ["SummarizerAgent._build_default_system_prompt"] if deprecated else [],
             "missing_prompt_ids": [
                 "role_summarizer",
+                "function_summarize",
                 "function_workflow_discussion_summary",
                 "function_workflow_performance_summary",
                 "function_summarizer_runtime_context_packet",
+                self.SETTING_CHECK_PROMPT_ID,
             ] if deprecated else [],
         }
 
@@ -110,9 +115,11 @@ class SummarizerAgent(BaseAgent):
             self._legacy_fallback_trace = self._summarizer_fallback_trace(
                 prompt_ids=[
                     "role_summarizer",
+                    "function_summarize",
                     "function_workflow_discussion_summary",
                     "function_workflow_performance_summary",
                     "function_summarizer_runtime_context_packet",
+                    self.SETTING_CHECK_PROMPT_ID,
                 ],
             )
             return md_prompt
@@ -180,6 +187,7 @@ class SummarizerAgent(BaseAgent):
                         "function_workflow_discussion_summary",
                         "function_workflow_performance_summary",
                         "function_summarizer_runtime_context_packet",
+                        self.SETTING_CHECK_PROMPT_ID,
                     ],
                 )
             else:
@@ -270,6 +278,7 @@ class SummarizerAgent(BaseAgent):
     def _build_setting_check_instruction(self, *, has_chapter_content: bool) -> str:
         """从 md 资产构建设定检查任务说明，保留 schema 字段约束在代码侧。"""
         prompt_ids = [
+            self.SETTING_CHECK_PROMPT_ID,
             "role_setting",
             "function_setting_resource_management",
             "function_setting_lore_interconnection",
@@ -387,6 +396,17 @@ class SummarizerAgent(BaseAgent):
             logger.error(f"设定检查失败：{e}")
             return AgentResponse(success=False, error=str(e))
 
+    def _build_summary_runtime_instruction(self) -> str:
+        prompt_ids = [
+            "function_summarize",
+            "function_summarizer_runtime_context_packet",
+        ]
+        parts = [content for prompt_id in prompt_ids if (content := self._load_md_prompt_content(prompt_id))]
+        if parts:
+            return "\n\n".join(parts).strip()
+        logger.warning("Summarizer summary md prompt 资产不可用，使用最小运行时任务说明")
+        return "请总结对话，识别潜台词、伏笔触发和信息增量，并只输出符合 SummarizerSummarySchema 的结果。"
+
     def _build_user_message(
         self,
         dialogue_history: List[Dict[str, str]],
@@ -402,6 +422,9 @@ class SummarizerAgent(BaseAgent):
     ) -> str:
         """构建用户消息"""
         message_parts = []
+        summary_instruction = self._build_summary_runtime_instruction()
+        if summary_instruction:
+            message_parts.append("【Summarizer 配置规则】\n" + summary_instruction)
 
         # 情境
         if context:
@@ -458,7 +481,7 @@ class SummarizerAgent(BaseAgent):
                 private_lines.append(f"- {item.get('agent', '未知角色')} 隐瞒信息：{hidden}")
         if private_lines:
             message_parts.append(
-                "【私有表演素材（仅供 Writer/Evaluator 参考，不得总结成场内公开事实）】\n"
+                "【私有表演素材】\n"
                 + "\n".join(private_lines)
             )
 

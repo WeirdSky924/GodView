@@ -670,6 +670,22 @@ class WriterAgent(BaseAgent):
         parts.append(f"【输出 JSON Schema】\n{output_schema}")
         return "\n\n".join(part for part in parts if part)
 
+    def _build_writer_segment_task_notes(
+        self,
+        task_kind: str,
+        runtime_notes: Optional[List[str]] = None,
+    ) -> List[str]:
+        """构建 Writer 分段/续写/补写任务补充要求。"""
+        prompt_asset = self._load_md_prompt_content("function_writer_segment_generation")
+        notes = [
+            "稳定分段规划、分段写作、续写和补写规则以 md prompt 资产 function_writer_segment_generation 为准。"
+        ]
+        if prompt_asset:
+            notes.append(prompt_asset)
+        notes.append(f"当前子任务类型：{task_kind}")
+        notes.extend(note for note in (runtime_notes or []) if note)
+        return notes
+
     async def _execute_single(
         self,
         input_data: Dict[str, Any],
@@ -1098,11 +1114,12 @@ class WriterAgent(BaseAgent):
                 ("已确认讨论资产", discussion_asset_digest),
                 ("世界观参考", world_info),
             ],
-            task_notes=[
-                "把绑定章节大纲、章节目标、修订要求中的关键剧情点分配到具体段落，不能用通用桥段替代。",
-                "每段必须有明确叙事焦点、关键元素和因果推进。",
-                "不得规划未授权角色、组织、能力、地点或专有概念。",
-            ],
+            task_notes=self._build_writer_segment_task_notes(
+                "segment_plan",
+                [
+                    "当前运行时目标：把本章动态输入拆成具体段落，并输出 WriterSegmentPlanSchema。",
+                ],
+            ),
             output_schema=self._writer_segment_plan_output_schema(),
             config_prompt=config_prompt,
         )
@@ -1175,11 +1192,13 @@ class WriterAgent(BaseAgent):
                 ("前一段落结尾", previous_content),
                 ("前文风格样本", previous_style if segment_num == 1 else ""),
             ],
-            task_notes=[
-                f"本段字数控制在 {min_words}-{max_words} 字范围内，接近目标 {target_words} 字。",
-                "与前文自然衔接，突出本段叙事焦点并覆盖关键元素。",
-                "严格遵守工作流绑定上下文；具体分段、续写、补写规则以 Writer 配置规则中的 md 资产为准。",
-            ],
+            task_notes=self._build_writer_segment_task_notes(
+                "segment_generation",
+                [
+                    f"当前运行时字数范围：{min_words}-{max_words} 字，接近目标 {target_words} 字。",
+                    "当前运行时目标：写作当前段落，并输出 WriterSegmentSchema。",
+                ],
+            ),
             output_schema=self._writer_segment_output_schema(),
             config_prompt=config_prompt,
         )
@@ -1203,10 +1222,12 @@ class WriterAgent(BaseAgent):
                 ("工作流绑定上下文", workflow_binding_block),
                 ("当前相关写作规则", writing_rules_guidance),
             ],
-            task_notes=[
-                "补写只能扩展已有合法场景中的前因、行动、阻力、线索或后果，不能开启新剧情线。",
-                "不得新增未授权角色、组织、能力、地点或专有概念。",
-            ],
+            task_notes=self._build_writer_segment_task_notes(
+                "supplement",
+                [
+                    f"当前运行时目标：为已有章节补写约 {shortage} 字，并输出 WriterSupplementSchema。",
+                ],
+            ),
             output_schema=self._writer_supplement_output_schema(),
             config_prompt=config_prompt,
         )
@@ -1234,11 +1255,12 @@ class WriterAgent(BaseAgent):
                 ("工作流绑定上下文", workflow_binding_block),
                 ("当前相关写作规则", writing_rules_guidance),
             ],
-            task_notes=[
-                "续写必须与上文自然衔接，只用于补足字数或补足未覆盖的大纲节点。",
-                "优先写前因、角色行动、外部阻力、线索发现、环境变化或上一段行动后果。",
-                "不得开启新剧情线，不得新增未授权角色、组织、能力、地点或专有概念。",
-            ],
+            task_notes=self._build_writer_segment_task_notes(
+                "continue",
+                [
+                    f"当前运行时目标：在已有内容后自然续写约 {shortage} 字，并输出 WriterContinueSchema。",
+                ],
+            ),
             output_schema=self._writer_continue_output_schema(),
             config_prompt=config_prompt,
         )

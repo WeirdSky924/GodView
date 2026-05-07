@@ -399,12 +399,26 @@ class SkillRetrievalService:
             logger.error(f"LLM 决策失败: {e}，回退到简单规则")
             return self._simple_decision(query, candidates)
 
-    def _build_decision_prompt(
+    def _build_decision_prompt_trace(self, *, source: str, content: str) -> Dict[str, Any]:
+        trace = {
+            "source": source,
+            "prompt_ids": [self.DECISION_PROMPT_ID],
+            "fallbacks_used": [],
+            "deprecated_sources_used": [],
+            "missing_prompt_ids": [],
+        }
+        if source == "deprecated_minimal_fallback":
+            trace["fallbacks_used"].append(f"skill_retrieval_deprecated_minimal_fallback:{self.DECISION_PROMPT_ID}")
+            trace["deprecated_sources_used"].append("SkillRetrievalService._build_decision_prompt")
+            trace["missing_prompt_ids"].append(self.DECISION_PROMPT_ID)
+        return {"content": content, "trace": trace}
+
+    def _build_decision_prompt_with_trace(
         self,
         query: str,
         candidates: List[SkillCandidate],
-    ) -> str:
-        """构建 LLM 决策 Prompt"""
+    ) -> Dict[str, Any]:
+        """构建 LLM 决策 Prompt，并返回非 AgentTemplate prompt source trace。"""
         candidate_info = []
         for i, c in enumerate(candidates):
             skill = c.skill
@@ -431,19 +445,30 @@ class SkillRetrievalService:
 """)
 
         content = self._load_prompt_asset(self.DECISION_PROMPT_ID)
+        source = "md_prompt_asset"
         if not content:
             logger.warning("Skill 检索决策 Prompt 资产缺失: %s", self.DECISION_PROMPT_ID)
+            source = "deprecated_minimal_fallback"
             content = (
                 "# Skill 检索决策\n\n"
                 "根据用户场景描述和候选技能列表判断是否激活技能并提取参数。"
                 "只能输出 JSON 数组。"
             )
 
-        return "\n\n".join([
+        prompt = "\n\n".join([
             content.strip(),
             f"## 用户场景描述\n{query}",
             f"## 候选技能列表\n{''.join(candidate_info)}",
         ]).strip()
+        return self._build_decision_prompt_trace(source=source, content=prompt)
+
+    def _build_decision_prompt(
+        self,
+        query: str,
+        candidates: List[SkillCandidate],
+    ) -> str:
+        """构建 LLM 决策 Prompt"""
+        return self._build_decision_prompt_with_trace(query, candidates)["content"]
 
     def _load_prompt_asset(self, prompt_id: str) -> Optional[str]:
         """读取 md prompt 资产内容；失败时返回 None，由调用方决定降级策略。"""

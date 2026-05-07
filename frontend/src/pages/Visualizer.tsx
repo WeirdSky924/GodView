@@ -39,6 +39,7 @@ import {
   executeWorkflow,
   extractChapterReadinessGateDetail,
   formatChapterReadinessGateMessage,
+  formatApiErrorMessage,
   getActiveWorkflowExecution,
   getExecution,
   pauseExecution,
@@ -1132,9 +1133,11 @@ export default function Visualizer() {
 
       return targetOutline
     } catch (error: any) {
-      const detail = error?.response?.data?.detail
+      const gateDetail = extractChapterReadinessGateDetail(error)
       setStartPrecheckError(
-        detail?.message || (typeof detail === 'string' ? detail : error?.message) || '启动前资源预检失败',
+        gateDetail
+          ? formatChapterReadinessGateMessage(gateDetail, requirements => formatRequirementList(requirements as OutlineResourceRequirement[]))
+          : formatApiErrorMessage(error, '启动前资源预检失败'),
       )
       return null
     } finally {
@@ -1193,9 +1196,7 @@ export default function Visualizer() {
       if (gateDetail) {
         alert(formatChapterReadinessGateMessage(gateDetail, formatRequirementList))
       } else {
-        const detail = error?.response?.data?.detail
-        const message = detail?.message || (typeof detail === 'string' ? detail : error?.message) || '执行失败'
-        alert(message)
+        alert(formatApiErrorMessage(error, '执行失败'))
       }
       console.error('Failed to execute workflow:', error)
     } finally {

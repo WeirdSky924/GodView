@@ -78,6 +78,8 @@ class ChapterReadinessBlockedError(ValueError):
 class WorkflowEngine:
     """工作流执行引擎"""
 
+    WORKFLOW_RUNTIME_CONSTRAINTS_PROMPT_ID = "function_workflow_runtime_constraints"
+
     def __init__(self):
         # 执行中的工作流实例
         self._executions: Dict[str, WorkflowExecution] = {}
@@ -1058,77 +1060,7 @@ class WorkflowEngine:
 
         # ========== 自动加载章节大纲 ==========
         if db:
-            if context.get("chapter_outline"):
-                explicit_outline = self._ensure_context_dict(context.get("chapter_outline"))
-                outline_status = str(explicit_outline.get("status") or "").lower()
-                if outline_status and outline_status not in {"approved", "completed"}:
-                    raise ChapterReadinessBlockedError({
-                        "readiness_status": "blocked",
-                        "block_reason": "outline_not_approved",
-                        "message": f"第 {context.get('chapter_num') or '未知'} 章大纲尚未审批，不能启动章节生成工作流。",
-                        "chapter_num": context.get("chapter_num"),
-                        "chapter_outline_id": explicit_outline.get("id"),
-                        "outline_status": outline_status,
-                        "blocking_requirements": [],
-                        "advisory_requirements": [],
-                    })
-                if explicit_outline.get("id") and not context.get("chapter_outline_id"):
-                    context["chapter_outline_id"] = str(explicit_outline.get("id"))
-                context.setdefault("chapter_title", explicit_outline.get("title", f"第{context.get('chapter_num')}章"))
-                context.setdefault("chapter_summary", explicit_outline.get("summary", ""))
-                outline_target_word_count = explicit_outline.get("target_word_count")
-                if outline_target_word_count and not context.get("target_word_count"):
-                    context["target_word_count"] = outline_target_word_count
-                if outline_target_word_count and not context.get("chapter_target_word_count"):
-                    context["chapter_target_word_count"] = outline_target_word_count
-                context.setdefault("chapter_outline_source", "selected_outline")
-                logger.info(f"使用显式传入的第 {context.get('chapter_num')} 章大纲: {context.get('chapter_title')}")
-            else:
-                try:
-                    from app.services.plot_outline_service import get_plot_outline_service
-                    plot_service = get_plot_outline_service()
-                    outline = await plot_service.get_chapter_outline_for_workflow(
-                        project_id=project_id,
-                        chapter_number=context.get("chapter_num")
-                    )
-                    if outline:
-                        context["chapter_outline"] = outline
-                        if outline.get("id") and not context.get("chapter_outline_id"):
-                            context["chapter_outline_id"] = str(outline.get("id"))
-                        context["chapter_title"] = outline.get("title", f"第{context.get('chapter_num')}章")
-                        context["chapter_summary"] = outline.get("summary", "")
-                        outline_target_word_count = outline.get("target_word_count")
-                        if outline_target_word_count and not context.get("target_word_count"):
-                            context["target_word_count"] = outline_target_word_count
-                        if outline_target_word_count and not context.get("chapter_target_word_count"):
-                            context["chapter_target_word_count"] = outline_target_word_count
-                        context.setdefault("chapter_outline_source", "auto_loaded")
-                        logger.info(f"自动加载第 {context.get('chapter_num')} 章大纲: {outline.get('title')}")
-                    else:
-                        raise ChapterReadinessBlockedError({
-                            "readiness_status": "blocked",
-                            "block_reason": "approved_outline_missing",
-                            "message": f"第 {context.get('chapter_num') or '未知'} 章没有已审批大纲，不能启动章节生成工作流。",
-                            "chapter_num": context.get("chapter_num"),
-                            "chapter_outline_id": context.get("chapter_outline_id"),
-                            "outline_status": None,
-                            "blocking_requirements": [],
-                            "advisory_requirements": [],
-                        })
-                except ChapterReadinessBlockedError:
-                    raise
-                except Exception as e:
-                    logger.warning(f"加载章节大纲失败: {e}")
-                    raise ChapterReadinessBlockedError({
-                        "readiness_status": "blocked",
-                        "block_reason": "outline_load_failed",
-                        "message": f"第 {context.get('chapter_num') or '未知'} 章大纲加载失败，不能启动章节生成工作流。",
-                        "chapter_num": context.get("chapter_num"),
-                        "chapter_outline_id": context.get("chapter_outline_id"),
-                        "outline_status": None,
-                        "blocking_requirements": [],
-                        "advisory_requirements": [],
-                    })
+            await self._resolve_approved_outline_for_chapter_start(project_id, context)
 
         try:
             readiness_context = await self.check_chapter_resource_readiness(project_id, context, db)
@@ -6769,10 +6701,7 @@ class WorkflowEngine:
                 "target_word_count": target_word_count,
                 "reference_mode": True,
                 "material_role": "reference_only",
-                "usage_instruction": (
-                    "场景演绎结果是供 Writer / Master Plotter 参考的素材索引，"
-                    "不是必须逐字照抄的章节正文；若与章节大纲、固定设定或角色硬约束冲突，必须跳过或改写。"
-                ),
+                "usage_instruction": self._build_workflow_reference_material_instruction(),
                 "plot_intents": plot_intents,
                 "chapter_word_count": chapter_word_count,
             }
@@ -6806,10 +6735,7 @@ class WorkflowEngine:
                 "messages": performance_messages,
                 "material_role": "reference_only",
                 "reference_mode": True,
-                "usage_instruction": (
-                    "场景演绎结果是供后续节点参考的素材索引，不是必须逐字照抄的章节正文；"
-                    "若与章节大纲、固定设定或角色硬约束冲突，必须跳过或改写。"
-                ),
+                "usage_instruction": self._build_workflow_reference_material_instruction(),
                 "performers": scene_directions.get("performers", []),
                 "mentioned_characters": scene_directions.get("mentioned_characters", []),
                 "background_characters": scene_directions.get("background_characters", []),
@@ -6935,7 +6861,131 @@ class WorkflowEngine:
         db,
     ) -> Dict[str, Any]:
         """检查章节资源 readiness，供 workflow 与直连章节生成入口复用。"""
+        if db and not context.get("_chapter_outline_resolved_for_start"):
+            await self._resolve_approved_outline_for_chapter_start(project_id, context)
         return await self._check_chapter_resource_readiness(project_id, context, db)
+
+    async def _resolve_approved_outline_for_chapter_start(
+        self,
+        project_id: str,
+        context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """解析并校验章节启动所绑定的已审批大纲版本。"""
+        from app.services.plot_outline_service import get_plot_outline_service
+
+        plot_service = get_plot_outline_service()
+        chapter_num = self._parse_chapter_number(context.get("chapter_num") or context.get("chapter_number"))
+        chapter_outline = self._ensure_context_dict(context.get("chapter_outline"))
+        requested_outline_id = context.get("chapter_outline_id") or context.get("outline_id") or chapter_outline.get("id")
+        requested_outline_id = str(requested_outline_id) if requested_outline_id else None
+
+        try:
+            outline = None
+            if requested_outline_id and hasattr(plot_service, "get_outline_by_id"):
+                outline = await plot_service.get_outline_by_id(str(project_id), requested_outline_id)
+                if not outline:
+                    raise ChapterReadinessBlockedError({
+                        "readiness_status": "blocked",
+                        "block_reason": "outline_not_found",
+                        "message": "选中的章节大纲不存在，不能启动章节生成工作流。",
+                        "chapter_num": chapter_num,
+                        "chapter_outline_id": requested_outline_id,
+                        "outline_status": None,
+                        "blocking_requirements": [],
+                        "advisory_requirements": [],
+                    })
+            elif chapter_num is not None:
+                outline = await plot_service.get_outline(str(project_id), chapter_num)
+
+            if not outline:
+                raise ChapterReadinessBlockedError({
+                    "readiness_status": "blocked",
+                    "block_reason": "approved_outline_missing",
+                    "message": f"第 {chapter_num or '未知'} 章没有已审批大纲，不能启动章节生成工作流。",
+                    "chapter_num": chapter_num,
+                    "chapter_outline_id": requested_outline_id,
+                    "outline_status": None,
+                    "blocking_requirements": [],
+                    "advisory_requirements": [],
+                })
+
+            outline_payload = self._outline_to_runtime_dict(outline)
+            resolved_chapter_num = self._parse_chapter_number(
+                outline_payload.get("chapter_number") or outline_payload.get("chapter_num")
+            )
+            if chapter_num is not None and resolved_chapter_num is not None and chapter_num != resolved_chapter_num:
+                raise ChapterReadinessBlockedError({
+                    "readiness_status": "blocked",
+                    "block_reason": "outline_chapter_mismatch",
+                    "message": "选中的章节大纲与请求章节号不一致，不能启动章节生成工作流。",
+                    "chapter_num": chapter_num,
+                    "chapter_outline_id": outline_payload.get("id") or requested_outline_id,
+                    "outline_status": str(outline_payload.get("status") or "").lower() or None,
+                    "blocking_requirements": [],
+                    "advisory_requirements": [],
+                })
+
+            outline_status = str(outline_payload.get("status") or "").lower()
+            if outline_status != "approved" or outline_payload.get("next_outline_id"):
+                raise ChapterReadinessBlockedError({
+                    "readiness_status": "blocked",
+                    "block_reason": "outline_not_current_approved",
+                    "message": f"第 {resolved_chapter_num or chapter_num or '未知'} 章大纲不是当前已审批版本，不能启动章节生成工作流。",
+                    "chapter_num": resolved_chapter_num or chapter_num,
+                    "chapter_outline_id": outline_payload.get("id") or requested_outline_id,
+                    "outline_status": outline_status,
+                    "blocking_requirements": [],
+                    "advisory_requirements": [],
+                })
+
+            context["chapter_num"] = resolved_chapter_num or chapter_num
+            context["chapter_outline_id"] = str(outline_payload.get("id"))
+            context["chapter_outline"] = outline_payload
+            context.setdefault("chapter_title", outline_payload.get("title", f"第{context.get('chapter_num')}章"))
+            context.setdefault("chapter_summary", outline_payload.get("summary", ""))
+            outline_target_word_count = outline_payload.get("target_word_count")
+            if outline_target_word_count and not context.get("target_word_count"):
+                context["target_word_count"] = outline_target_word_count
+            if outline_target_word_count and not context.get("chapter_target_word_count"):
+                context["chapter_target_word_count"] = outline_target_word_count
+            context.setdefault(
+                "chapter_outline_source",
+                "selected_outline" if requested_outline_id else "auto_loaded",
+            )
+            context["_chapter_outline_resolved_for_start"] = True
+            logger.info("章节启动绑定已审批大纲版本: %s", context["chapter_outline_id"])
+            return outline_payload
+        except ChapterReadinessBlockedError:
+            raise
+        except Exception as exc:
+            logger.warning("加载章节大纲失败: %s", exc)
+            raise ChapterReadinessBlockedError({
+                "readiness_status": "blocked",
+                "block_reason": "outline_load_failed",
+                "message": f"第 {chapter_num or '未知'} 章大纲加载失败，不能启动章节生成工作流。",
+                "chapter_num": chapter_num,
+                "chapter_outline_id": requested_outline_id,
+                "outline_status": None,
+                "blocking_requirements": [],
+                "advisory_requirements": [],
+            })
+
+    def _outline_to_runtime_dict(self, outline: Any) -> Dict[str, Any]:
+        """将 ChapterOutline / dict / ORM row 转为运行期大纲字典。"""
+        if isinstance(outline, dict):
+            return dict(outline)
+        if hasattr(outline, "model_dump"):
+            return outline.model_dump(mode="json")
+        if hasattr(outline, "dict"):
+            return outline.dict()
+        payload: Dict[str, Any] = {}
+        for key in [
+            "id", "project_id", "chapter_number", "chapter_num", "title", "summary",
+            "status", "chapter_goals", "target_word_count", "previous_outline_id", "next_outline_id",
+        ]:
+            if hasattr(outline, key):
+                payload[key] = getattr(outline, key)
+        return payload
 
     async def _check_chapter_resource_readiness(
         self,
@@ -6954,16 +7004,19 @@ class WorkflowEngine:
         if chapter_num is None and not outline_id:
             return {}
 
-        if chapter_num is not None:
+        if outline_id:
+            raw_requirements = await db.get_outline_resource_requirements(
+                project_id=project_id,
+                outline_id=outline_id,
+                chapter_num=chapter_num,
+            )
+        elif chapter_num is not None:
             raw_requirements = await db.get_outline_resource_requirements(
                 project_id=project_id,
                 chapter_num=chapter_num,
             )
         else:
-            raw_requirements = await db.get_outline_resource_requirements(
-                project_id=project_id,
-                outline_id=outline_id,
-            )
+            raw_requirements = []
 
         requirements: List[Dict[str, Any]] = []
         for item in raw_requirements or []:
@@ -8039,6 +8092,56 @@ class WorkflowEngine:
                 names.add(str(name))
         return names
 
+    def _load_prompt_asset_content(self, prompt_id: str) -> str:
+        """加载 md prompt 资产内容，失败时返回空字符串。"""
+        try:
+            from app.services.md_file_service import get_md_file_service
+
+            md_service = get_md_file_service()
+            prompt_data = md_service.get_prompt(prompt_id)
+            if isinstance(prompt_data, dict):
+                return (prompt_data.get("content") or prompt_data.get("raw_content") or "").strip()
+            return (md_service.get_prompt_content(prompt_id) or "").strip()
+        except Exception as e:
+            logger.warning("加载 workflow prompt 资产失败: prompt_id=%s, error=%s", prompt_id, e)
+            return ""
+
+    def _build_workflow_runtime_constraints_prompt(self, context: Dict[str, Any]) -> str:
+        """构建工作流共享运行期约束块。"""
+        prompt_asset = self._load_prompt_asset_content(
+            self.WORKFLOW_RUNTIME_CONSTRAINTS_PROMPT_ID,
+        ) or (
+            "Workflow runtime constraints: respect present/mentioned/forbidden character boundaries, "
+            "treat scene performance as reference material only, and keep asset changes pending confirmation."
+        )
+        constraints = self._build_character_constraint_state(context)
+        selected_lore = self._ensure_context_list(context.get("selected_lore_entries") or context.get("dynamic_lore_entries") or [])
+        character_setting_lore = [
+            entry for entry in selected_lore
+            if isinstance(entry, dict) and str(entry.get("category") or "").lower() == "character_setting"
+        ]
+        sections: List[str] = [prompt_asset]
+        if any(constraints.get(key) for key in ("present_character_names", "mentioned_only_names", "forbidden_direct_appearance_names")):
+            sections.append("【角色出场运行期数据】\n" + self._format_context_for_prompt(constraints, max_chars=3500))
+        if character_setting_lore:
+            sections.append("【角色设定库条目（来源/历史/身份必须遵守）】\n" + self._format_context_for_prompt(character_setting_lore, max_chars=3000))
+        return "\n\n".join(section for section in sections if section).strip()
+
+    def _build_workflow_reference_material_instruction(self) -> str:
+        """构建场景演绎素材使用边界说明。"""
+        prompt_asset = self._load_prompt_asset_content(
+            self.WORKFLOW_RUNTIME_CONSTRAINTS_PROMPT_ID,
+        )
+        if prompt_asset:
+            return (
+                "参见 prompt 资产 function_workflow_runtime_constraints：场景演绎结果是供后续节点参考的素材索引，"
+                "不是必须逐字照抄的章节正文；若与章节大纲、固定设定、角色硬约束或已确认资产冲突，必须跳过、改写或标记为风险。"
+            )
+        return (
+            "场景演绎结果是供后续节点参考的素材索引，不是必须逐字照抄的章节正文；"
+            "若与章节大纲、固定设定或角色硬约束冲突，必须跳过或改写。"
+        )
+
     def _build_character_constraint_state(self, context: Dict[str, Any]) -> Dict[str, Any]:
         """构建下游 Agent 共享的角色出场硬约束。"""
         scene_directions = self._ensure_context_dict(context.get("scene_directions"))
@@ -8065,13 +8168,7 @@ class WorkflowEngine:
             "forbidden_direct_appearance_names": hard_blocked_names,
             "participation_trace": trace,
             "participation_warnings": warnings,
-            "rules": [
-                "只有 present_character_names 中的角色可以在当前正面场景中说话、行动或直接参与互动。",
-                "mentioned_only_names 只能作为传闻、回忆、姓名、势力、影响或背景信息被提及，不能直接出场、发言或行动。",
-                "forbidden_direct_appearance_names 包含死亡、未激活、退场、章节外或不可用角色；这些角色不得被写成当前场景中的活人参与者。",
-                "如果讨论素材、场景演绎或写作计划引入未授权角色，必须视为未确认素材并跳过或改写。",
-                "角色来源、历史、身份和背景必须服从 selected_lore_entries 中 category=character_setting 的设定。",
-            ],
+            "rules_prompt_id": self.WORKFLOW_RUNTIME_CONSTRAINTS_PROMPT_ID,
         }
 
     def _inject_character_constraints(self, context: Dict[str, Any]) -> None:
@@ -8120,18 +8217,10 @@ class WorkflowEngine:
         return text
 
     def _format_agent_constraint_context(self, context: Dict[str, Any]) -> str:
-        constraints = self._build_character_constraint_state(context)
-        selected_lore = self._ensure_context_list(context.get("selected_lore_entries") or context.get("dynamic_lore_entries") or [])
-        character_setting_lore = [
-            entry for entry in selected_lore
-            if isinstance(entry, dict) and str(entry.get("category") or "").lower() == "character_setting"
-        ]
-        sections: List[str] = []
-        if any(constraints.get(key) for key in ("present_character_names", "mentioned_only_names", "forbidden_direct_appearance_names")):
-            sections.append("【角色出场硬约束】\n" + self._format_context_for_prompt(constraints, max_chars=3500))
-        if character_setting_lore:
-            sections.append("【角色设定库条目（来源/历史/身份必须遵守）】\n" + self._format_context_for_prompt(character_setting_lore, max_chars=3000))
-        return "\n\n".join(sections)
+        constraints_prompt = self._build_workflow_runtime_constraints_prompt(context)
+        if constraints_prompt:
+            return "【工作流角色/设定约束】\n" + constraints_prompt
+        return ""
 
     async def _execute_group_discussion_node(
         self,

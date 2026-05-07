@@ -3,12 +3,15 @@ Agent 通信服务
 v8 Agent协作可视化工作台
 """
 
+import json
 import logging
+import re
 import time
 from datetime import datetime
 from typing import Any, Callable, Dict, Optional
 
 from app.models.intervention import InterventionLog, InterventionType
+from app.services.md_file_service import get_md_file_service
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +26,8 @@ INTERVENTION_TYPE_DESCRIPTIONS = {
 
 class AgentCommunicationService:
     """Agent通信服务 - 处理与Agent的交互和干预"""
+
+    INTERVENTION_CLASSIFICATION_PROMPT_ID = "function_agent_intervention_classification"
 
     def __init__(self):
         # Agent 工厂回调
@@ -70,38 +75,17 @@ class AgentCommunicationService:
                 logger.warning("无法获取编剧Agent，使用默认干预类型")
                 return InterventionType.GUIDANCE
 
-            # 构建分类提示
-            type_descriptions = "\n".join([
-                f"- {t.value}: {desc}"
-                for t, desc in INTERVENTION_TYPE_DESCRIPTIONS.items()
-            ])
+            classification_prompt = self._build_intervention_classification_prompt(
+                message=message,
+                target_agent_type=target_agent_type,
+                context=context,
+            )
 
-            classification_prompt = f"""分析以下用户对 {self._get_agent_name(target_agent_type)} 的干预消息，判断属于哪种干预类型。
-
-干预类型定义：
-{type_descriptions}
-
-用户干预消息：
-"{message}"
-
-上下文信息：
-{context or '无'}
-
-请只回答干预类型的英文名称（guidance/correction/direction/override），不要有其他内容。"""
-
-            # 调用编剧进行分类
-            from app.agents.base import AgentResult
             result = await plotter._call_llm(classification_prompt)
-
-            if result:
-                # 解析结果
-                result_lower = result.strip().lower()
-
-                # 尝试匹配干预类型
-                for int_type in InterventionType:
-                    if int_type.value in result_lower:
-                        logger.info(f"干预类型分类: {message[:30]}... -> {int_type.value}")
-                        return int_type
+            intervention_type = self._normalize_intervention_type_result(result or "")
+            if intervention_type:
+                logger.info(f"干预类型分类: {message[:30]}... -> {intervention_type.value}")
+                return intervention_type
 
             # 默认返回指导性干预
             logger.info(f"干预类型分类失败，使用默认值: guidance")
@@ -110,6 +94,59 @@ class AgentCommunicationService:
         except Exception as e:
             logger.warning(f"干预类型分类异常: {e}，使用默认值")
             return InterventionType.GUIDANCE
+
+    def _load_prompt_asset(self, prompt_id: str) -> str:
+        """读取 md prompt 资产内容；失败时返回空字符串，由调用方决定降级策略。"""
+        try:
+            prompt = get_md_file_service().get_prompt(prompt_id)
+        except Exception as e:
+            logger.warning("读取 Agent 通信 Prompt 资产失败 %s: %s", prompt_id, e)
+            return ""
+
+        content = (prompt or {}).get("content") or (prompt or {}).get("raw_content") or ""
+        return str(content).strip()
+
+    def _build_intervention_classification_prompt(
+        self,
+        *,
+        message: str,
+        target_agent_type: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        prompt_asset = self._load_prompt_asset(self.INTERVENTION_CLASSIFICATION_PROMPT_ID)
+        if not prompt_asset:
+            logger.warning("Agent 干预分类 Prompt 资产缺失: %s", self.INTERVENTION_CLASSIFICATION_PROMPT_ID)
+            prompt_asset = (
+                "【DEPRECATED 最小 fallback】判断用户对 Agent 的干预类型；"
+                "只能输出 guidance、correction、direction 或 override 中的一个英文枚举。"
+            )
+
+        type_descriptions = "\n".join([
+            f"- {t.value}: {desc}"
+            for t, desc in INTERVENTION_TYPE_DESCRIPTIONS.items()
+        ])
+        context_text = json.dumps(context, ensure_ascii=False, indent=2, default=str) if context else "无"
+
+        return "\n\n".join([
+            prompt_asset,
+            f"## 目标 Agent\n{self._get_agent_name(target_agent_type)} ({target_agent_type})",
+            f"## 干预类型定义\n{type_descriptions}",
+            f"## 用户干预消息\n{message}",
+            f"## 上下文信息\n{context_text}",
+        ]).strip()
+
+    def _normalize_intervention_type_result(self, result: str) -> Optional[InterventionType]:
+        result_text = str(result or "").strip().lower()
+        if not result_text:
+            return None
+
+        cleaned = re.sub(r"[^a-z_\-]+", " ", result_text)
+        tokens = {token.replace("-", "_") for token in cleaned.split() if token}
+        for int_type in InterventionType:
+            if int_type.value in tokens:
+                return int_type
+
+        return None
 
     async def send_agent_message(
         self,

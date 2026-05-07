@@ -354,10 +354,41 @@ export function formatChapterReadinessGateMessage(
 ): string {
   if (!detail) return '章节资源未就绪，不能启动生成工作流。'
   const message = detail.message || detail.block_reason || '章节资源未就绪，不能启动生成工作流。'
+  const contextParts = [
+    detail.chapter_num !== undefined && detail.chapter_num !== null ? `章节：${detail.chapter_num}` : '',
+    detail.chapter_outline_id ? `大纲版本：${detail.chapter_outline_id}` : '',
+    detail.outline_status ? `大纲状态：${detail.outline_status}` : '',
+    detail.readiness_status ? `readiness：${detail.readiness_status}` : '',
+  ].filter(Boolean)
   const blockingRequirements = Array.isArray(detail.blocking_requirements) ? detail.blocking_requirements : []
-  if (!blockingRequirements.length) return message
-  const requirementText = formatRequirements ? formatRequirements(blockingRequirements) : ''
-  return requirementText ? `${message} 阻塞资源：${requirementText}` : message
+  const advisoryRequirements = Array.isArray(detail.advisory_requirements) ? detail.advisory_requirements : []
+  const requirementParts = [
+    blockingRequirements.length
+      ? `阻塞资源：${formatRequirements ? formatRequirements(blockingRequirements) : `${blockingRequirements.length} 项`}`
+      : '',
+    advisoryRequirements.length
+      ? `建议资源：${formatRequirements ? formatRequirements(advisoryRequirements) : `${advisoryRequirements.length} 项`}`
+      : '',
+  ].filter(Boolean)
+  return [message, ...contextParts, ...requirementParts].join('；')
+}
+
+export function formatApiErrorMessage(error: any, fallback = '操作失败'): string {
+  const gateDetail = extractChapterReadinessGateDetail(error)
+  if (gateDetail) return formatChapterReadinessGateMessage(gateDetail)
+  const detail = error?.response?.data?.detail || error?.detail || error?.data
+  if (typeof detail === 'string') return detail
+  if (Array.isArray(detail?.results)) {
+    const failed = detail.results.filter((item: any) => item?.status === 'failed')
+    const failureDetails = failed
+      .map((item: any) => `第${item.chapter_number ?? '?'}章：${item.error || item.error_type || '保存失败'}`)
+      .join('\n')
+    return failureDetails ? `${detail.message || fallback}\n${failureDetails}` : (detail.message || fallback)
+  }
+  if (detail?.message) return detail.message
+  if (detail?.error) return detail.error
+  if (error?.message) return error.message
+  return fallback
 }
 
 /**

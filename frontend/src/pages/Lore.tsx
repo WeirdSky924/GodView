@@ -33,6 +33,7 @@ import {
   updateOutlineResourceRequirementStatus,
   type OutlineResourceRequirement,
 } from '@/api/outlines'
+import { formatApiErrorMessage } from '@/api/workflows'
 
 const categoryIcons: Record<LoreCategory, React.ReactNode> = {
   world_rule: <Shield size={18} />,
@@ -327,7 +328,7 @@ export default function Lore() {
       console.error('Lore save response data JSON:', serializedResponseData)
       console.error('Lore save validation detail:', validationDetail)
       console.error('Lore save validation detail JSON:', serializedValidationDetail)
-      alert(serializedValidationDetail || '保存失败，请重试')
+      alert(serializedValidationDetail || formatApiErrorMessage(error, '保存失败，请重试'))
     }
   }
 
@@ -413,6 +414,8 @@ export default function Lore() {
                 }))}
                 onBound={async () => {
                   await loadLore()
+                }}
+                onRequirementChanged={() => {
                   setRequirementRefreshKey(value => value + 1)
                 }}
                 refreshKey={requirementRefreshKey}

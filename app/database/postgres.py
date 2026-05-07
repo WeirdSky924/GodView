@@ -2195,13 +2195,20 @@ class PostgresDatabase:
         """根据未完成资源需求刷新章节 readiness 汇总。"""
         if chapter_num is None:
             return None
+        if not outline_id:
+            logger.warning(
+                "拒绝在缺少 outline_id 时刷新章节资源 readiness: project_id=%s chapter_num=%s",
+                project_id,
+                chapter_num,
+            )
+            return None
         params = {
             "project_id": project_id,
             "outline_id": outline_id,
             "chapter_num": chapter_num,
             "updated_at": datetime.now(),
         }
-        outline_filter = "outline_id = :outline_id" if outline_id else "TRUE"
+        outline_filter = "outline_id = :outline_id"
         query = f"""
         WITH stats AS (
             SELECT
@@ -3120,6 +3127,22 @@ class PostgresDatabase:
                         await session.execute(text(statement))
                     except Exception as e:
                         logger.warning(f"更新章节表软删除结构时出错: {str(e)[:100]}")
+
+            chapter_outline_schema_updates = [
+                "ALTER TABLE chapter_outlines ADD COLUMN IF NOT EXISTS previous_outline_id VARCHAR(64)",
+                "ALTER TABLE chapter_outlines ADD COLUMN IF NOT EXISTS next_outline_id VARCHAR(64)",
+                "ALTER TABLE chapter_outlines DROP CONSTRAINT IF EXISTS chapter_outlines_project_id_chapter_number_key",
+                "DROP INDEX IF EXISTS chapter_outlines_project_id_chapter_number_key",
+                "CREATE INDEX IF NOT EXISTS idx_chapter_outlines_project_chapter ON chapter_outlines(project_id, chapter_number)",
+                "CREATE INDEX IF NOT EXISTS idx_chapter_outlines_previous ON chapter_outlines(previous_outline_id)",
+                "CREATE INDEX IF NOT EXISTS idx_chapter_outlines_next ON chapter_outlines(next_outline_id)",
+            ]
+            if 'chapter_outlines' in existing_tables:
+                for statement in chapter_outline_schema_updates:
+                    try:
+                        await session.execute(text(statement))
+                    except Exception as e:
+                        logger.warning(f"更新章节大纲版本结构时出错: {str(e)[:100]}")
 
             project_schema_updates = [
                 "ALTER TABLE projects ADD COLUMN IF NOT EXISTS user_id TEXT",

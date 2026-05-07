@@ -8,7 +8,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from app.models.chapter_outline import (
     ChapterOutline,
@@ -75,6 +75,16 @@ class OutlineStatisticsResponse(BaseModel):
     hooks_resolved: int
 
 
+class OutlineVersionsResponse(BaseModel):
+    """章节大纲版本列表响应"""
+    chapter_number: int
+    current_approved: Optional[ChapterOutline] = None
+    pending_revisions: List[ChapterOutline] = Field(default_factory=list)
+    rejected_revisions: List[ChapterOutline] = Field(default_factory=list)
+    versions: List[ChapterOutline] = Field(default_factory=list)
+    total: int
+
+
 class ApproveOutlineRequest(BaseModel):
     """审批大纲请求"""
     approved_by: str
@@ -116,11 +126,23 @@ class SavePendingOutlinesRequest(BaseModel):
     outlines: List[PendingOutline]
 
 
+class SavePendingOutlineResult(BaseModel):
+    """单个待确认大纲保存结果"""
+    chapter_number: Optional[int] = None
+    status: str = Field(..., description="saved/failed")
+    action: Optional[str] = Field(None, description="created/updated")
+    outline_id: Optional[str] = None
+    error_type: Optional[str] = None
+    error: Optional[str] = None
+
+
 class SavePendingOutlinesResponse(BaseModel):
     """保存待确认大纲响应"""
     success: bool
     saved_count: int
     message: str
+    failed_count: int = 0
+    results: List[SavePendingOutlineResult] = Field(default_factory=list)
 
 
 class UpdateResourceRequirementStatusRequest(BaseModel):
@@ -678,24 +700,30 @@ async def save_pending_outlines(
         return SavePendingOutlinesResponse(
             success=True,
             saved_count=0,
-            message="没有需要保存的大纲"
+            failed_count=0,
+            results=[],
+            message="没有需要保存的大纲",
         )
 
     service = get_plot_outline_service()
-    saved_count = 0
+    results: List[SavePendingOutlineResult] = []
 
     for pending in request.outlines:
+        chapter_number = pending.chapter_number
         try:
+            scenes = [SceneOutline(**s) for s in pending.scenes] if pending.scenes else []
+            emotion_curve = EmotionCurve(**pending.emotion_curve) if pending.emotion_curve else None
+
             # 检查是否已存在该章节大纲
-            existing = await service.get_outline(project_id, pending.chapter_number)
+            existing = await service.get_outline(project_id, chapter_number)
 
             if existing:
                 # 更新现有大纲
                 update_data = {
                     "title": pending.title,
                     "summary": pending.summary,
-                    "scenes": [SceneOutline(**s) for s in pending.scenes] if pending.scenes else [],
-                    "emotion_curve": EmotionCurve(**pending.emotion_curve) if pending.emotion_curve else None,
+                    "scenes": scenes,
+                    "emotion_curve": emotion_curve,
                     "chapter_goals": pending.chapter_goals or [],
                     "hooks_planted": pending.hooks_planted or [],
                     "hooks_resolved": pending.hooks_resolved or [],
@@ -703,17 +731,25 @@ async def save_pending_outlines(
                     "status": ChapterOutlineStatus.DRAFT,
                 }
                 updated_outline = await service.update_outline(existing.id, UpdateChapterOutlineDTO(**update_data))
-                if pending.character_arcs and updated_outline:
+                if not updated_outline:
+                    raise RuntimeError("大纲更新失败，未返回更新后的大纲")
+                if pending.character_arcs:
                     updated_outline.character_arcs = pending.character_arcs
                     await service.persist_outline_resource_audit(updated_outline)
+                results.append(SavePendingOutlineResult(
+                    chapter_number=chapter_number,
+                    status="saved",
+                    action="updated",
+                    outline_id=updated_outline.id,
+                ))
             else:
                 # 创建新大纲
                 create_dto = CreateChapterOutlineDTO(
                     project_id=project_id,
-                    chapter_number=pending.chapter_number,
+                    chapter_number=chapter_number,
                     title=pending.title,
                     summary=pending.summary,
-                    scenes=[SceneOutline(**s) for s in pending.scenes] if pending.scenes else [],
+                    scenes=scenes,
                     chapter_goals=pending.chapter_goals or [],
                     hooks_planted=pending.hooks_planted or [],
                     hooks_resolved=pending.hooks_resolved or [],
@@ -723,15 +759,59 @@ async def save_pending_outlines(
                 if pending.character_arcs:
                     created.character_arcs = pending.character_arcs
                     await service.persist_outline_resource_audit(created)
-            saved_count += 1
+                results.append(SavePendingOutlineResult(
+                    chapter_number=chapter_number,
+                    status="saved",
+                    action="created",
+                    outline_id=created.id,
+                ))
+        except ValidationError as e:
+            logger.warning("保存大纲校验失败 (章节 %s): %s", chapter_number, e)
+            results.append(SavePendingOutlineResult(
+                chapter_number=chapter_number,
+                status="failed",
+                error_type="validation_error",
+                error=str(e),
+            ))
         except Exception as e:
-            logger.error(f"保存大纲失败 (章节 {pending.chapter_number}): {e}")
+            logger.exception("保存大纲失败 (章节 %s)", chapter_number)
+            results.append(SavePendingOutlineResult(
+                chapter_number=chapter_number,
+                status="failed",
+                error_type="save_error",
+                error=str(e),
+            ))
 
-    return SavePendingOutlinesResponse(
-        success=True,
-        saved_count=saved_count,
-        message=f"成功保存 {saved_count} 个大纲" if saved_count > 0 else "没有保存任何大纲"
-    )
+    saved_count = sum(1 for result in results if result.status == "saved")
+    failed_count = sum(1 for result in results if result.status == "failed")
+
+    if failed_count == 0:
+        response = SavePendingOutlinesResponse(
+            success=True,
+            saved_count=saved_count,
+            failed_count=0,
+            results=results,
+            message=f"成功保存 {saved_count} 个大纲",
+        )
+    elif saved_count == 0:
+        response = SavePendingOutlinesResponse(
+            success=False,
+            saved_count=0,
+            failed_count=failed_count,
+            results=results,
+            message=f"{failed_count} 个大纲保存失败，请根据 results 查看具体原因",
+        )
+        raise HTTPException(status_code=422, detail=response.model_dump(mode="json"))
+    else:
+        response = SavePendingOutlinesResponse(
+            success=False,
+            saved_count=saved_count,
+            failed_count=failed_count,
+            results=results,
+            message=f"已保存 {saved_count} 个大纲，{failed_count} 个大纲保存失败，请检查失败项",
+        )
+
+    return response
 
 
 @router.get("", response_model=OutlineListResponse)
@@ -759,6 +839,54 @@ async def get_statistics(project_id: str):
     service = get_plot_outline_service()
     stats = await service.get_outline_statistics(project_id)
     return OutlineStatisticsResponse(**stats)
+
+
+@router.get("/by-id/{outline_id}", response_model=ChapterOutline)
+async def get_outline_by_id(project_id: str, outline_id: str):
+    """按 outline ID 精确获取大纲版本。"""
+    service = get_plot_outline_service()
+    outline = await service.get_outline_by_id(project_id, outline_id)
+    if not outline:
+        raise HTTPException(status_code=404, detail="章节大纲版本不存在")
+    return outline
+
+
+@router.get("/{chapter_number}/versions", response_model=OutlineVersionsResponse)
+async def get_outline_versions(project_id: str, chapter_number: int):
+    """获取某章节的所有大纲版本。"""
+    service = get_plot_outline_service()
+    versions = await service.get_outline_versions(project_id, chapter_number)
+    if versions["total"] == 0:
+        raise HTTPException(status_code=404, detail="章节大纲不存在")
+    return OutlineVersionsResponse(**versions)
+
+
+@router.post("/by-id/{outline_id}/approve", response_model=ChapterOutline)
+async def approve_outline_by_id(project_id: str, outline_id: str, request: ApproveOutlineRequest):
+    """按 outline ID 审批指定大纲版本，避免同章多版本误审批。"""
+    service = get_plot_outline_service()
+    outline = await service.get_outline_by_id(project_id, outline_id)
+    if not outline:
+        raise HTTPException(status_code=404, detail="章节大纲版本不存在")
+
+    updated = await service.approve_outline(outline.id, request.approved_by)
+    if not updated:
+        raise HTTPException(status_code=400, detail="该大纲版本无法审批")
+    return updated
+
+
+@router.post("/by-id/{outline_id}/reject", response_model=ChapterOutline)
+async def reject_outline_revision_by_id(project_id: str, outline_id: str):
+    """拒绝指定修订提案，保留原 approved 版本不变。"""
+    service = get_plot_outline_service()
+    outline = await service.get_outline_by_id(project_id, outline_id)
+    if not outline:
+        raise HTTPException(status_code=404, detail="章节大纲版本不存在")
+
+    rejected = await service.reject_outline_revision(outline.id)
+    if not rejected:
+        raise HTTPException(status_code=400, detail="只有 revision 状态的大纲可以被拒绝")
+    return rejected
 
 
 @router.get("/{chapter_number}")
@@ -851,6 +979,15 @@ async def update_outline(project_id: str, chapter_number: int, request: UpdateOu
         update_dto.target_word_count = request.target_word_count
 
     updated = await service.update_outline(outline.id, update_dto)
+    if not updated:
+        raise HTTPException(status_code=500, detail="更新章节大纲失败")
+    if updated.id != outline.id and updated.previous_outline_id == outline.id:
+        return {
+            "outline": updated,
+            "revision_proposal": True,
+            "approved_outline_id": outline.id,
+            "message": "原已审批大纲保持不变，已创建修订提案。",
+        }
     return updated
 
 
@@ -876,7 +1013,8 @@ async def approve_outline(project_id: str, chapter_number: int, request: Approve
     """
     审批章节大纲
 
-    将大纲状态更新为已审批
+    兼容旧的章节号审批入口。若同章存在 revision，前端/新调用方应使用
+    /by-id/{outline_id}/approve，避免误审批。
     """
     service = get_plot_outline_service()
     outline = await service.get_outline(project_id, chapter_number)
@@ -884,7 +1022,22 @@ async def approve_outline(project_id: str, chapter_number: int, request: Approve
     if not outline:
         raise HTTPException(status_code=404, detail="章节大纲不存在")
 
+    versions = await service.get_outline_versions(project_id, chapter_number)
+    if versions["pending_revisions"]:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "outline_revision_selection_required",
+                "message": "该章节存在待审批修订，请按 outline_id 审批指定版本。",
+                "chapter_number": chapter_number,
+                "pending_revision_ids": [outline.id for outline in versions["pending_revisions"]],
+                "current_approved_id": versions["current_approved"].id if versions["current_approved"] else None,
+            },
+        )
+
     updated = await service.approve_outline(outline.id, request.approved_by)
+    if not updated:
+        raise HTTPException(status_code=400, detail="该大纲版本无法审批")
     return updated
 
 

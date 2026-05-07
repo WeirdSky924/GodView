@@ -84,14 +84,14 @@ export default function AgentConfigPanel({
     loadData()
   }, [projectId, refreshKey, agentTypeFilter])
 
-  const loadData = async () => {
+  const loadData = async (options: { forceRefresh?: boolean } = {}) => {
     setLoading(true)
     try {
       const filter = agentTypeFilter || undefined
       const [configsData, templatesData, promptsData] = await Promise.all([
-        getAgentConfigs(projectId, filter || undefined, undefined, 200),
-        getAgentTemplates(filter as AgentType | undefined, undefined, undefined, 200),
-        getPrompts({ limit: 100 }),
+        getAgentConfigs(projectId, filter || undefined, undefined, 200, 0, undefined, { forceRefresh: options.forceRefresh }),
+        getAgentTemplates(filter as AgentType | undefined, undefined, undefined, 200, 0, undefined, { forceRefresh: options.forceRefresh }),
+        getPrompts({ limit: 100, cache: { forceRefresh: options.forceRefresh } }),
       ])
       setConfigs(configsData)
       setTemplates(templatesData)
@@ -189,7 +189,7 @@ export default function AgentConfigPanel({
       setShowEditModal(true)
 
       if (wasLazyCreated) {
-        await loadData()
+        await loadData({ forceRefresh: true })
         onChanged?.()
       }
     } catch (error) {
@@ -202,7 +202,7 @@ export default function AgentConfigPanel({
     try {
       await updateAgentConfig(projectId, editingConfig.agent_type, formData, editingConfig.scenario)
       setShowEditModal(false)
-      await loadData()
+      await loadData({ forceRefresh: true })
       onChanged?.()
     } catch (error) {
       console.error('Failed to save config:', error)
@@ -221,7 +221,7 @@ export default function AgentConfigPanel({
       setPreviewTrace(result.render_trace || null)
 
       if (!row.config) {
-        await loadData()
+        await loadData({ forceRefresh: true })
         onChanged?.()
       }
     } catch (error) {
@@ -234,7 +234,7 @@ export default function AgentConfigPanel({
     if (!confirm('确定要重置配置为模板默认值吗？')) return
     try {
       await resetAgentConfigs(projectId, agentType, scenario)
-      await loadData()
+      await loadData({ forceRefresh: true })
       onChanged?.()
     } catch (error) {
       console.error('Failed to reset config:', error)

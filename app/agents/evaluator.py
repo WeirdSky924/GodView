@@ -32,6 +32,11 @@ class EvaluatorAgent(BaseAgent):
         "reader_simulate": "reader_simulation",
         "ooc_review": "ooc_information_gate",
     }
+    TASK_PROMPT_IDS = {
+        "chapter_end": "function_evaluator_chapter_quality_gate",
+        "reader_simulate": "function_evaluator_reader_simulation",
+        "ooc_review": "function_evaluator_ooc_review",
+    }
 
     def __init__(
         self,
@@ -278,17 +283,21 @@ class EvaluatorAgent(BaseAgent):
         }
         return titles.get(task_type, task_type)
 
-    def _evaluator_task_notes(self, task_type: str) -> List[str]:
-        notes = {
-            "chapter_end": [
-                "必须以 Agent Template / md prompt / writing-rules 中的门禁为准。",
-                "确定性角色约束预检问题必须作为阻断问题写入 character_participation_check。",
-                "确定性 role_performance_gate 问题必须写入 character_participation_check 或 upstream_context_usage_check；若正文采纳 blocker 指向素材，quality_passed=false。",
-            ],
-            "reader_simulate": [],
-            "ooc_review": [],
-        }
-        return notes.get(task_type, [])
+    def _evaluator_task_notes(
+        self,
+        task_type: str,
+        runtime_notes: Optional[List[str]] = None,
+    ) -> List[str]:
+        prompt_id = self.TASK_PROMPT_IDS.get(task_type, "")
+        notes: List[str] = []
+        if prompt_id:
+            notes.append(f"稳定评估规则以 md prompt 资产 {prompt_id} 为准。")
+            prompt_asset = self._load_md_prompt_content(prompt_id)
+            if prompt_asset:
+                notes.append(prompt_asset)
+        notes.append(f"当前子任务类型：{task_type}")
+        notes.extend(note for note in (runtime_notes or []) if note)
+        return notes
 
     def _evaluator_task_schema(self, task_type: str, **kwargs: Any) -> str:
         if task_type == "chapter_end":
@@ -651,7 +660,14 @@ class EvaluatorAgent(BaseAgent):
                 word_count=word_count,
                 target_word_count=target_word_count,
             ),
-            task_notes=self._evaluator_task_notes("chapter_end"),
+            task_notes=self._evaluator_task_notes(
+                "chapter_end",
+                [
+                    "当前运行时目标：评估本章是否可收尾，并输出 EvaluatorChapterEndSchema。",
+                    "确定性角色约束预检问题必须作为阻断问题写入 character_participation_check。",
+                    "确定性 role_performance_gate 问题必须写入 character_participation_check 或 upstream_context_usage_check；若正文采纳 blocker 指向素材，quality_passed=false。",
+                ],
+            ),
             config_prompt=evaluator_config_prompt,
         )
 
@@ -774,7 +790,10 @@ class EvaluatorAgent(BaseAgent):
                 ("章节内容", chapter_content),
             ],
             output_schema=self._evaluator_task_schema("reader_simulate"),
-            task_notes=self._evaluator_task_notes("reader_simulate"),
+            task_notes=self._evaluator_task_notes(
+                "reader_simulate",
+                ["当前运行时目标：模拟首次阅读体验，并输出 EvaluatorReaderSimulateSchema。"],
+            ),
             config_prompt=evaluator_config_prompt,
         )
 
@@ -843,6 +862,10 @@ class EvaluatorAgent(BaseAgent):
                 ("待审查台词", dialogue),
             ],
             output_schema=self._evaluator_task_schema("ooc_review"),
+            task_notes=self._evaluator_task_notes(
+                "ooc_review",
+                ["当前运行时目标：审查单句台词是否 OOC，并输出 EvaluatorOOCSchema。"],
+            ),
             config_prompt=await self._get_evaluator_config_prompt({"task_type": "ooc_review"}),
         )
 

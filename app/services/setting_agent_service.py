@@ -84,6 +84,17 @@ class SegmentedContextSynthesis:
 class SettingAgentService:
     """设定 Agent 服务 - 持续的设定管理者"""
 
+    SETTING_IMPROVEMENT_ANALYSIS_PROMPT_ID = "function_setting_improvement_analysis"
+    SETTING_MANAGEMENT_SYSTEM_PROMPT_ID = "function_setting_management_system_prompt"
+    SETTING_LORE_EXTRACTION_PROMPT_ID = "function_setting_lore_extraction_confirmation"
+    SETTING_HOOK_EXTRACTION_PROMPT_ID = "function_setting_hook_extraction_confirmation"
+    SETTING_CHARACTER_EXTRACTION_PROMPT_ID = "function_setting_character_extraction_confirmation"
+    SETTING_BOOTSTRAP_COLLECTION_PROMPT_ID = "function_setting_bootstrap_collection"
+    SETTING_BOOTSTRAP_SEED_EXTRACTION_PROMPT_ID = "function_setting_bootstrap_seed_extraction"
+    SETTING_PERSONALITY_GENERATION_PROMPT_ID = "function_setting_personality_generation"
+    SETTING_WORLD_TYPE_INFERENCE_PROMPT_ID = "function_setting_world_type_inference"
+    SETTING_TONE_INFERENCE_PROMPT_ID = "function_setting_tone_inference"
+
     def __init__(self):
         self.llm_provider = settings.llm_provider
         # 获取当前 provider 的配置
@@ -772,12 +783,21 @@ class SettingAgentService:
             result["error"] = error
         return result
 
+    def _build_world_description_analysis_prompt(self, description: str) -> str:
+        prompt_asset = self._load_md_prompt_content("function_setting_world_description_analysis")
+        if not prompt_asset:
+            prompt_asset = "【DEPRECATED 最小 fallback】请分析以下世界观描述，并提取结构化信息，只输出 JSON 对象。"
+        return "\n\n".join([
+            prompt_asset,
+            f"## 世界观描述\n{description}",
+        ]).strip()
+
     async def _analyze_world_description(
         self,
         project_id: str,
         description: str,
     ) -> Dict[str, Any]:
-        prompt = f"""请分析以下世界观描述，并提取结构化信息。\n\n世界观描述：\n{description}\n\n请输出 JSON 对象，字段固定为：\n{{\n  \"power_system\": \"力量体系描述\",\n  \"technology_level\": \"科技水平描述\",\n  \"history\": \"世界历史概述\",\n  \"geography\": \"地理环境描述\"\n}}\n\n要求：\n- 只输出 JSON 对象\n- 不要输出 markdown 代码块\n- 没有明确信息时填空字符串\n"""
+        prompt = self._build_world_description_analysis_prompt(description)
 
         response = await self._call_llm_simple(prompt, project_id=project_id)
         payload = response.strip()
@@ -836,6 +856,18 @@ class SettingAgentService:
             return int(match.group(1)) - 1
         return None
 
+    def _build_negotiation_response_prompt(self, conflict: SettingConflict, user_response: str) -> str:
+        prompt_asset = self._load_md_prompt_content("function_setting_negotiation_response")
+        if not prompt_asset:
+            prompt_asset = "【DEPRECATED 最小 fallback】请生成一个有帮助的设定协商回复，帮助用户做出决定。"
+        return "\n\n".join([
+            prompt_asset,
+            f"## 冲突描述\n{conflict.description}",
+            f"## 严重程度\n{conflict.severity.value}",
+            "## 现有建议\n" + "\n".join(f"{i+1}. {s}" for i, s in enumerate(conflict.resolution_suggestions)),
+            f"## 用户回复\n{user_response}",
+        ]).strip()
+
     async def _generate_negotiation_response(
         self,
         session: SettingAgentSession,
@@ -844,17 +876,7 @@ class SettingAgentService:
     ) -> Dict[str, Any]:
         """生成协商回复"""
         # 构建协商提示
-        prompt = f"""用户正在就设定冲突进行协商。
-
-冲突描述：{conflict.description}
-严重程度：{conflict.severity.value}
-
-现有建议：
-{chr(10).join(f'{i+1}. {s}' for i, s in enumerate(conflict.resolution_suggestions))}
-
-用户回复：{user_response}
-
-请生成一个有帮助的回复，帮助用户做出决定。"""
+        prompt = self._build_negotiation_response_prompt(conflict, user_response)
 
         # 调用 LLM 生成回复
         assistant_response = await self._call_llm_simple(prompt)
@@ -1446,6 +1468,69 @@ class SettingAgentService:
             return base_source
         return f"{base_source}\n[setting_agent_interconnection_metadata]\n{json.dumps(metadata, ensure_ascii=False)}"
 
+    def _build_lore_extraction_prompt(self, history_text: str) -> str:
+        prompt_asset = self._load_md_prompt_content(self.SETTING_LORE_EXTRACTION_PROMPT_ID)
+        if not prompt_asset:
+            prompt_asset = (
+                "【DEPRECATED 最小 fallback】分析以下对话，判断用户是否明确确认了新的世界观设定；"
+                "只在用户明确确认后才提取，并只输出 JSON 数组。"
+            )
+        return "\n\n".join([
+            prompt_asset,
+            f"## 对话内容\n{history_text}",
+        ]).strip()
+
+    def _build_hook_extraction_prompt(self, history_text: str) -> str:
+        prompt_asset = self._load_md_prompt_content(self.SETTING_HOOK_EXTRACTION_PROMPT_ID)
+        if not prompt_asset:
+            prompt_asset = (
+                "【DEPRECATED 最小 fallback】分析以下对话，判断用户是否明确确认了值得记录的伏笔；"
+                "只在用户明确确认后才提取，并只输出 JSON 数组。"
+            )
+        return "\n\n".join([
+            prompt_asset,
+            f"## 对话内容\n{history_text}",
+        ]).strip()
+
+    def _build_character_extraction_prompt(self, history_text: str) -> str:
+        prompt_asset = self._load_md_prompt_content(self.SETTING_CHARACTER_EXTRACTION_PROMPT_ID)
+        if not prompt_asset:
+            prompt_asset = (
+                "【DEPRECATED 最小 fallback】分析以下对话，判断用户是否明确确认了新的角色设定；"
+                "只在用户明确确认后才提取，并只输出 JSON 数组。"
+            )
+        return "\n\n".join([
+            prompt_asset,
+            f"## 对话内容\n{history_text}",
+        ]).strip()
+
+    def _build_personality_generation_prompt_from_context(
+        self,
+        *,
+        name: str,
+        role: str,
+        description: str,
+        background: str,
+        existing_personalities: str,
+        project_context: str,
+        role_descriptions: Dict[str, str],
+    ) -> str:
+        prompt_asset = self._load_md_prompt_content(self.SETTING_PERSONALITY_GENERATION_PROMPT_ID)
+        if not prompt_asset:
+            prompt_asset = (
+                "【DEPRECATED 最小 fallback】你是一个专业的小说角色设定专家。请为以下角色生成性格设定，并只输出 JSON。"
+            )
+        return "\n\n".join([
+            prompt_asset,
+            f"【项目背景】\n{project_context if project_context else '通用小说设定'}",
+            "【角色信息】",
+            f"- 姓名：{name}",
+            f"- 定位：{role_descriptions.get(role, role)}",
+            f"- 描述：{description}",
+            f"- 背景：{background if background else '暂无详细背景'}",
+            existing_personalities,
+        ]).strip()
+
     async def _extract_lore_from_conversation(
         self,
         project_id: str,
@@ -1472,47 +1557,7 @@ class SettingAgentService:
             for msg in recent_messages
         ])
 
-        extraction_prompt = f"""分析以下对话，判断用户是否明确要求保存或确认了新的世界观设定。
-
-重要规则：
-- 只有当用户在对话中明确说"保存"、"确认"、"好的"、"可以"等确认性语言时，才提取设定
-- 如果只是讨论或询问，不要提取
-- 如果只是建议或候选方案，用户还没有确认，不要提取
-
-如果有用户明确确认的新设定，请提取为 JSON 数组。如果没有，返回空数组 []。
-
-输出格式：
-```json
-[
-  {{
-    "title": "设定标题",
-    "category": "world_rule|geography|history|faction|culture|race|profession|item|skill|custom",
-    "priority": "constitutional|core|standard|flexible",
-    "content": "设定详细内容",
-    "summary": "简短摘要",
-    "keywords": ["关键词1", "关键词2"],
-    "tags": ["标签"],
-    "constraints": ["约束"],
-    "related_characters": ["相关角色名或ID"],
-    "related_locations": ["相关地点名或ID"],
-    "related_items": ["相关物品名或ID"],
-    "related_factions": ["相关势力/组织名"],
-    "depends_on_lore": ["依赖的既有设定/伏笔/章节大纲"],
-    "supports_lore": ["支撑的后续设定/伏笔/章节"],
-    "potential_conflicts": ["潜在冲突说明"],
-    "usage_guidance": "使用边界、可见层级、与既有资源的连接方式",
-    "resource_requirements": [
-      {{"requirement_type":"character|lore|faction|location|item|ability|relationship|event_rule|crisis_resolution","resource_name":"待补资源名","severity":"blocking|advisory|optional","reason":"为什么需要补全","suggested_payload":{{}}}}
-    ]
-  }}
-]
-```
-
-对话内容：
-{history_text}
-
-只输出 JSON 数组，不要其他内容。如果没有用户明确确认的新设定，输出 []。
-"""
+        extraction_prompt = self._build_lore_extraction_prompt(history_text)
 
         try:
             from app.models.agent_output_schemas import SettingPendingLoresExtractionSchema
@@ -1621,41 +1666,7 @@ class SettingAgentService:
             for msg in recent_messages
         ])
 
-        extraction_prompt = f"""分析以下对话，判断用户是否明确确认了值得记录为“伏笔（hook）”的内容。
-
-重要规则：
-- 只有当用户明确表示要保存、确认、加入设定库，或者 assistant 已经形成明确可保存设定时，才提取
-- 只有那些适合后续统一追踪、回收、管理的伏笔才提取
-- 普通背景设定、泛泛讨论、尚未确认的猜想不要提取
-- 如果没有明确可保存的伏笔，返回 []
-
-请输出 JSON 数组，每个对象字段必须为：
-```json
-[
-  {{
-    "title": "伏笔标题",
-    "description": "伏笔描述",
-    "hook_type": "mystery|object|character|event|location|relationship|custom",
-    "status": "planted",
-    "related_characters": ["角色名或ID"],
-    "related_locations": ["地点名或ID"],
-    "related_objects": ["物品名或ID"],
-    "plant_context": "这个伏笔在设定中的埋设情境",
-    "resolution_hint": "后续可如何回收或揭示",
-    "priority": 3
-  }}
-]
-```
-
-约束：
-- hook_type 必须使用给定枚举之一
-- status 固定为 planted
-- priority 为 1-5 的整数
-- 只输出 JSON 数组，不要输出解释文字
-
-对话内容：
-{history_text}
-"""
+        extraction_prompt = self._build_hook_extraction_prompt(history_text)
 
         try:
             from app.models.agent_output_schemas import SettingPendingHooksExtractionSchema
@@ -2003,6 +2014,31 @@ class SettingAgentService:
 
         return saved_count
 
+    def _build_deprecated_minimal_setting_improvement_analysis_prompt(self) -> str:
+        logger.warning("[SettingAgent] 使用 deprecated 最小 fallback 生成设定改进分析 prompt")
+        return (
+            "【DEPRECATED 最小 fallback】请分析现有世界观设定，识别真正有价值的冲突、缺失、优先级、优化或关联改进建议，"
+            "并只输出符合结构化契约的结果。"
+        )
+
+    def _build_setting_improvement_analysis_prompt(
+        self,
+        world_type_hint: str,
+        lores_summary: str,
+        conversation_context: str,
+    ) -> str:
+        prompt_asset = self._load_md_prompt_content(
+            self.SETTING_IMPROVEMENT_ANALYSIS_PROMPT_ID,
+        )
+        if not prompt_asset:
+            prompt_asset = self._build_deprecated_minimal_setting_improvement_analysis_prompt()
+        return "\n\n".join([
+            prompt_asset,
+            f"## 世界类型\n{world_type_hint if world_type_hint else '未指定'}",
+            f"## 现有设定列表\n{lores_summary}",
+            f"## 最近对话上下文\n{conversation_context or '无'}",
+        ]).strip()
+
     async def analyze_existing_lores(
         self,
         project_id: str,
@@ -2045,49 +2081,11 @@ class SettingAgentService:
 
             world_type_hint = self._get_world_type_hint(world_type) if world_type else ""
 
-            analysis_prompt = f"""你是一个专业的小说设定审核专家。请分析以下世界观设定，识别可能的改进点。
-
-## 世界类型
-{world_type_hint if world_type_hint else "未指定"}
-
-## 现有设定列表
-{lores_summary}
-
-## 最近对话上下文
-{conversation_context}
-
-## 分析任务
-请识别以下类型的改进机会：
-1. **冲突检测**：设定之间是否存在矛盾或不一致？
-2. **缺失补充**：是否有重要设定缺失或不够完整？
-3. **优先级调整**：优先级是否合理？核心规则是否标记为 constitutional？
-4. **内容优化**：设定描述是否清晰、具体、可操作？
-5. **关联增强**：设定之间的关联是否需要补充？
-
-## 输出格式
-返回 JSON 数组，每个改进建议包含：
-```json
-[
-  {{
-    "type": "conflict|missing|priority|optimize|relation",
-    "target_lore_id": "目标设定ID（如适用）",
-    "target_lore_title": "目标设定标题",
-    "issue": "发现的问题描述",
-    "suggestion": "具体的改进建议",
-    "suggested_content": "建议的新内容或修改内容（如适用）",
-    "priority": "low|medium|high",
-    "reason": "为什么需要这个改进"
-  }}
-]
-```
-
-## 重要规则
-- 只返回真正有价值的改进建议，不要为了建议而建议
-- 如果没有明显的改进点，返回空数组 []
-- 建议要具体、可操作，不要泛泛而谈
-- 最多返回 3 个最关键的改进建议
-
-只输出 JSON 数组，不要其他内容。"""
+            analysis_prompt = self._build_setting_improvement_analysis_prompt(
+                world_type_hint=world_type_hint,
+                lores_summary=lores_summary,
+                conversation_context=conversation_context,
+            )
 
             from app.models.agent_output_schemas import SettingImprovementSuggestionsSchema
             from app.services.structured_llm import StructuredOutputError
@@ -2366,64 +2364,7 @@ class SettingAgentService:
             for msg in recent_messages
         ])
 
-        extraction_prompt = f"""分析以下对话，判断用户是否明确要求保存或确认了新的角色设定。
-
-重要规则：
-- 只有当用户在对话中明确说"保存角色"、"确认角色"、"添加角色"等确认性语言时，才提取角色
-- 如果只是讨论或询问某个角色，不要提取
-- 提取的角色信息要完整，包括基本信息、外貌、性格等
-
-如果有用户明确确认的新角色，请提取为 JSON 数组。如果没有，返回空数组 []。
-
-输出格式：
-```json
-[
-  {{
-    "name": "角色名称",
-    "importance_tier": "protagonist|co_protagonist|deuteragonist|mentor|love_interest|best_friend|archenemy|major_ally|major_antagonist|rival|family_member|guardian|arc_antagonist|arc_ally|recurring|catalyst|mystery_figure|minion|informant|mentor_figure|comic_relief|victim|npc|background|cameo",
-    "description": "角色描述（一句话概括）",
-    "appearance": "外貌描述",
-    "personality": "性格特点",
-    "background_story": "背景故事",
-    "speech_pattern": "说话风格",
-    "age": 年龄数字或null,
-    "gender": "性别",
-    "goals": ["目标1", "目标2"],
-    "relationships": ["与其他角色的关系概述"],
-    "key_relationships": {{"角色名": "关系说明"}},
-    "lexicon": ["标志性用词"],
-    "forbidden_words": ["不会说的词"],
-    "voice_samples": ["代表性台词"],
-    "attributes": {{"身份": "值"}},
-    "inventory": ["随身物品"],
-    "narrative_weight": "full_focus|major_focus|moderate|minimal|background",
-    "story_arc_role": "hero|guide|helper|protector|mentor_role|villain|obstacle|betrayer|corruptor|neutral|wild_card|double_agent|sacrifice|redeemed|tragic|herald",
-    "plot_priority": 0,
-    "has_agent": true,
-    "agent_enabled": true,
-    "agent_goals": ["角色Agent目标"],
-    "agent_memory": ["角色关键记忆"]
-  }}
-]
-```
-
-重要性层级说明：
-- protagonist: 主角，故事核心
-- co_protagonist: 双主角
-- deuteragonist: 第二主角
-- mentor: 导师/引路人
-- love_interest: 恋爱对象
-- best_friend: 挚友
-- archenemy: 宿敌/主要反派
-- major_ally: 重要盟友
-- major_antagonist: 重要反派
-- npc: 普通NPC
-
-对话内容：
-{history_text}
-
-只输出 JSON 数组，不要其他内容。如果没有用户明确确认的新角色，输出 []。
-"""
+        extraction_prompt = self._build_character_extraction_prompt(history_text)
 
         try:
             from app.models.agent_output_schemas import SettingPendingCharactersExtractionSchema
@@ -2579,6 +2520,30 @@ class SettingAgentService:
 
     # ==================== 智能推断方法 ====================
 
+    def _build_world_type_inference_prompt(self, history_text: str) -> str:
+        prompt_asset = self._load_md_prompt_content(self.SETTING_WORLD_TYPE_INFERENCE_PROMPT_ID)
+        if not prompt_asset:
+            prompt_asset = (
+                "【DEPRECATED 最小 fallback】请从对话中推断故事世界类型；"
+                "仅返回 fantasy、scifi、modern、historical、wuxia 或 unknown。"
+            )
+        return "\n\n".join([
+            prompt_asset,
+            f"## 对话内容\n{history_text}",
+        ]).strip()
+
+    def _build_tone_inference_prompt(self, history_text: str) -> str:
+        prompt_asset = self._load_md_prompt_content(self.SETTING_TONE_INFERENCE_PROMPT_ID)
+        if not prompt_asset:
+            prompt_asset = (
+                "【DEPRECATED 最小 fallback】请从对话中推断故事叙事基调；"
+                "仅返回 serious、lighthearted、dark、comedic、adventurous 或 unknown。"
+            )
+        return "\n\n".join([
+            prompt_asset,
+            f"## 对话内容\n{history_text}",
+        ]).strip()
+
     async def infer_world_type(self, conversation_history: List[Dict[str, Any]]) -> Optional[str]:
         """
         从对话历史中推断世界类型
@@ -2599,20 +2564,7 @@ class SettingAgentService:
             for msg in recent_messages
         ])
 
-        prompt = f"""请从以下对话中推断故事的世界类型。
-
-可能的类型：
-- fantasy (奇幻): 魔法、精灵、怪物、异世界
-- scifi (科幻): 太空、未来科技、外星人、赛博朋克
-- modern (现代): 当代社会、都市、现实题材
-- historical (历史): 古代/近代历史背景
-- wuxia (武侠): 江湖、武功、门派、恩怨
-
-对话内容：
-{history_text}
-
-请直接返回世界类型名称（如 fantasy），如果没有足够信息推断则返回 "unknown"。
-"""
+        prompt = self._build_world_type_inference_prompt(history_text)
 
         try:
             result = await self._call_llm_simple(prompt)
@@ -2647,20 +2599,7 @@ class SettingAgentService:
             for msg in recent_messages
         ])
 
-        prompt = f"""请从以下对话中推断故事的叙事基调。
-
-可能的基调：
-- serious (严肃): 正剧、深刻主题、命运沉重
-- lighthearted (轻松): 轻松幽默、日常甜蜜
-- dark (暗黑): 悲剧、虐心、压抑
-- comedic (喜剧): 搞笑、荒诞、无厘头
-- adventurous (冒险): 热血、成长、挑战
-
-对话内容：
-{history_text}
-
-请直接返回基调名称（如 serious），如果没有足够信息推断则返回 "unknown"。
-"""
+        prompt = self._build_tone_inference_prompt(history_text)
 
         try:
             result = await self._call_llm_simple(prompt)
@@ -2957,49 +2896,15 @@ class SettingAgentService:
             if personalities:
                 existing_personalities = f"\n\n现有角色性格（避免过于相似）：\n" + "\n".join(personalities)
 
-        prompt = f"""你是一个专业的小说角色设定专家。请为以下角色生成性格设定。
-
-【项目背景】
-{project_context if project_context else "通用小说设定"}
-
-【角色信息】
-- 姓名：{name}
-- 定位：{role_descriptions.get(role, role)}
-- 描述：{description}
-- 背景：{background if background else "暂无详细背景"}
-{existing_personalities}
-
-【输出要求】
-请生成以下内容，以 JSON 格式输出：
-
-1. **appearance**: 外貌描述（2-3句话，描述外貌特征、穿着打扮、气质等）
-2. **personality**: 性格描述（2-3句话，描述核心性格特点）
-3. **speech_pattern**: 说话风格（如：简短凌厉、幽默风趣、文绉绉等）
-4. **personality_traits**: 性格特质列表（3-5个，如["勇敢", "冲动", "正义感强"]）
-5. **agent_goals**: 作为角色 Agent 的目标（2-3个，用于驱动角色行为）
-6. **agent_memory**: 角色应记住的关键信息（1-2条，如重要经历、关系等）
-
-【输出格式】
-```json
-{{
-  "appearance": "外貌描述",
-  "personality": "性格描述",
-  "speech_pattern": "说话风格",
-  "personality_traits": ["特质1", "特质2", "特质3"],
-  "agent_goals": ["目标1", "目标2"],
-  "agent_memory": ["记忆1"]
-}}
-```
-
-请确保：
-- 外貌描述要有辨识度，符合角色身份和世界设定
-- 性格与角色定位相符
-- 与现有角色有区分度
-- 性格要有优缺点，避免脸谱化
-- 说话风格要与身份背景匹配
-
-只输出 JSON，不要其他内容。
-"""
+        prompt = self._build_personality_generation_prompt_from_context(
+            name=name,
+            role=role,
+            description=description,
+            background=background,
+            existing_personalities=existing_personalities,
+            project_context=project_context,
+            role_descriptions=role_descriptions,
+        )
         return prompt
 
     async def _build_management_system_prompt(self, session: SettingAgentSession) -> str:
@@ -3032,47 +2937,17 @@ class SettingAgentService:
             except Exception:
                 pass  # 忽略错误，使用默认提示
 
-        base_prompt = f"""你是一个专业的长篇网络小说设定管理者（Setting Agent）。你的职责是：
-
-1. 维护项目的世界观设定，确保长篇连载中设定的一致性
-2. 管理项目中的角色信息，帮助用户添加、修改角色设定
-3. 帮助用户添加、修改、删除世界观设定
-4. 检测和处理设定冲突
-5. 提供设定建议和优化方案
-
-【核心原则】
-- 严格遵循项目的世界类型设定，不要生成与项目类型不符的设定
-- 保持设定的内在一致性，这对长篇连载尤为重要
-- 注意宪法级规则，任何新设定都不能违反它们
-- 当发现潜在冲突时，及时提醒用户并提供解决方案
-- 用清晰、结构化的方式组织信息
-- 考虑长篇创作的可持续性和扩展性
-
-【重要规则 - 必须遵守】
-- 永远不要自动保存设定或角色到数据库！
-- 当需要保存新设定、新角色或确认修改时，你只能建议用户保存，并说明保存了什么内容
-- 等待用户明确说"保存"、"确认"、"好的"等确认性语言后，才将内容标记为待保存
-- 在用户确认之前，只将设定或角色以建议的形式展示给用户看
-
-【关键要求】
-- 你必须仔细阅读并使用【项目综合信息】中提供的上下文来回答用户的问题
-- 如果用户询问项目信息，你必须基于提供的世界管理、角色列表、章节大纲等上下文来回答
-- 不要声称"没有设定"或"没有角色"，如果上下文中已经有项目信息，你必须告诉用户这些信息的内容
-- 优先使用用户提供的信息，而不是说"还没有设定"
-
-{world_type_hint}
-
-你可以帮助用户：
-- 添加新设定（根据项目类型添加相应的设定）
-- 修改现有设定（注意影响范围和连带修改）
-- 添加新角色（包括姓名、外貌、性格、背景、重要性层级等）
-- 修改现有角色信息
-- 解决设定冲突（提供多种解决方案）
-- 查询和检索设定与角色
-- 分析设定的一致性
-- 规划伏笔和剧情线
-"""
-        return base_prompt
+        prompt_asset = self._load_md_prompt_content(self.SETTING_MANAGEMENT_SYSTEM_PROMPT_ID)
+        if not prompt_asset:
+            prompt_asset = (
+                "【DEPRECATED 最小 fallback】你是一个专业的长篇网络小说设定管理者（Setting Agent）。"
+                "请维护世界观、角色和设定冲突，并只提供待确认建议。"
+            )
+        return "\n\n".join([
+            prompt_asset,
+            f"【世界类型提示】\n{world_type_hint or '未指定'}",
+            f"【叙事基调提示】\n{tone_hint or '未指定'}",
+        ]).strip()
 
     async def _extract_keywords_from_message(self, message: str) -> List[str]:
         """
@@ -3667,6 +3542,28 @@ class SettingAgentService:
             parse_warnings=parse_warnings,
         )
 
+    def _build_segment_key_point_extraction_prompt(
+        self,
+        *,
+        section_name: str,
+        segment_content: str,
+        user_question: str,
+        world_type_hint: str,
+    ) -> str:
+        prompt_asset = self._load_md_prompt_content("function_setting_segmented_context_synthesis")
+        if not prompt_asset:
+            prompt_asset = (
+                "【DEPRECATED 最小 fallback】分析项目上下文片段，提取关键信息点；"
+                "只输出 JSON 数组。"
+            )
+        return "\n\n".join([
+            prompt_asset,
+            f"## 世界类型\n{world_type_hint if world_type_hint else '未指定'}",
+            f"## 片段来源\n{section_name}",
+            f"## 片段内容\n{segment_content}",
+            f"## 用户问题\n{user_question}",
+        ]).strip()
+
     async def _extract_key_points(
         self,
         section_name: str,
@@ -3693,47 +3590,12 @@ class SettingAgentService:
         Returns:
             List[Dict]: 关键信息点列表
         """
-        prompt = f"""分析以下项目上下文片段，提取关键信息点（信息索引）。
-
-## 世界类型
-{world_type_hint if world_type_hint else "未指定"}
-
-## 片段来源
-{section_name}
-
-## 片段内容
-{segment_content}
-
-## 用户问题
-{user_question}
-
-## 任务
-提取关键信息点，格式如下（JSON数组）：
-```json
-[
-  {{
-    "category": "信息类型（如：世界观、角色、事件、规则、时间线等）",
-    "entity": "实体名称（如：具体角色名、地点名、事件名）",
-    "key_fact": "关键事实（一句话描述，保留具体细节）",
-    "relevance": "与用户问题的相关性（高/中/低）",
-    "related_entities": ["与该事实有关的其他角色/设定/势力/地点"],
-    "relation_type": "depends_on|supports|conflicts_with|mentions|requires_resource",
-    "potential_conflicts": ["如果该事实与其他段落可能冲突，写明冲突点"],
-    "resource_requirements": [
-      {{"requirement_type":"character|lore|faction|location|item|ability|relationship|event_rule|crisis_resolution","resource_name":"待补资源名","severity":"blocking|advisory|optional","reason":"为什么需要补全"}}
-    ]
-  }}
-]
-```
-
-## 重要规则
-1. key_fact 必须包含具体细节，不要泛泛而谈
-2. 如果有时间线信息，必须记录具体时间点
-3. 如果有数值信息（等级、数量等），必须记录具体数值
-4. 保持信息点的独立性，每个信息点只描述一个事实
-5. 如果不同片段之间存在依赖、支撑、冲突或资源缺口，必须通过 related_entities / relation_type / potential_conflicts / resource_requirements 标出
-
-只输出JSON数组，不要其他内容。"""
+        prompt = self._build_segment_key_point_extraction_prompt(
+            section_name=section_name,
+            segment_content=segment_content,
+            user_question=user_question,
+            world_type_hint=world_type_hint,
+        )
 
         try:
             result = await self._call_llm_simple(prompt)
@@ -4420,38 +4282,14 @@ class SettingAgentService:
         }
 
     def _build_bootstrap_prompt(self, session: BootstrapSession) -> str:
-        """构建 Bootstrap 提示"""
-        return """你是一个长篇网络小说设定专家（Setting Agent）。你的职责是：
-
-1. 与用户沟通，了解他们想要创作的长篇网络小说世界观、主线、风格、角色等设定
-2. 通过多轮对话发现信息缺口并追问用户
-3. 提炼出结构化的项目 seed，为后续 bootstrap 提供可靠输入
-
-【重要：本项目定位为长篇网络小说】
-- 目标篇幅：百万字以上，多卷结构
-- 目标读者：网络小说读者，注重节奏感和爽点
-- 创作周期：长期连载，需要完善的设定支撑
-
-请遵循以下原则：
-- 严格根据用户描述的世界类型（科幻/奇幻/现代/历史/武侠/其他）来设定，不要混入其他类型的内容
-- 保持友好、耐心的态度
-- 每次回答后，主动追问用户尚未提供的关键信息
-- 使用清晰的结构化格式组织信息
-
-【世界类型区分参考】
-- 科幻：高科技、太空探索、人工智能、基因工程等，遵守科学逻辑
-- 奇幻：魔法、精灵、怪物、异世界等
-- 现代：当代都市、社会题材
-- 历史：古代/近代历史背景
-- 武侠：江湖、武功、门派、恩怨
-
-【长篇网文核心设定要素】
-1. 世界观：类型、规则、力量体系、势力格局（必须符合用户指定的世界类型）
-2. 主角：背景、金手指、成长路线、性格
-3. 配角体系：核心配角、重要NPC、对手反派
-4. 剧情架构：主线、分卷规划、爽点设计、伏笔计划
-5. 风格基调：热血/轻松/黑暗/爽文等
-"""
+        """构建 Bootstrap 提示（稳定 Bootstrap 规则来自 md prompt 资产）。"""
+        prompt_asset = self._load_md_prompt_content(self.SETTING_BOOTSTRAP_COLLECTION_PROMPT_ID)
+        if not prompt_asset:
+            prompt_asset = (
+                "【DEPRECATED 最小 fallback】你是长篇网络小说设定专家（Setting Agent）。请通过多轮对话收集世界观、"
+                "角色、主线、风格和关键设定；主动追问缺口，并保持所有内容为待确认草案。"
+            )
+        return prompt_asset
 
     def _build_conversation_context(self, session: BootstrapSession) -> str:
         """构建对话上下文"""
@@ -4481,6 +4319,18 @@ class SettingAgentService:
 
         return False
 
+    def _build_bootstrap_seed_extraction_prompt(self, history_text: str) -> str:
+        prompt_asset = self._load_md_prompt_content(self.SETTING_BOOTSTRAP_SEED_EXTRACTION_PROMPT_ID)
+        if not prompt_asset:
+            prompt_asset = (
+                "【DEPRECATED 最小 fallback】请从对话历史中提取结构化项目 seed；"
+                "只输出 JSON 对象，缺失字段使用空字符串或空数组。"
+            )
+        return "\n\n".join([
+            prompt_asset,
+            f"## 对话历史\n{history_text}",
+        ]).strip()
+
     async def _extract_seed_from_history(self, session: BootstrapSession) -> Optional[Dict[str, Any]]:
         """从历史提取 seed"""
         history_text = "\n".join([
@@ -4488,22 +4338,7 @@ class SettingAgentService:
             for msg in session.setting_agent_history
         ])
 
-        extraction_prompt = f"""请从以下对话中提取结构化的项目 seed。输出 JSON 格式：
-{{
-    "world_setting": {{"name": "", "description": "", "world_type": "", "tone": ""}},
-    "world_rules": [],
-    "power_system": "",
-    "main_characters": [],
-    "regions": [],
-    "plot_hooks": [],
-    "narrative_tone": ""
-}}
-
-对话历史：
-{history_text}
-
-只输出 JSON。
-"""
+        extraction_prompt = self._build_bootstrap_seed_extraction_prompt(history_text)
         try:
             from app.models.agent_output_schemas import BootstrapSeedExtractionSchema
 

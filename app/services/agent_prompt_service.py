@@ -136,8 +136,8 @@ class AgentPromptService:
         scenario_value = (scenario or "default").strip()
         return scenario_value or "default"
 
-    def _build_prompt_id_trace(self, template: Optional[AgentTemplate]) -> List[str]:
-        """按模板启用插槽顺序提取 PromptTemplate ID。"""
+    def _ordered_prompt_slots(self, template: Optional[AgentTemplate]) -> List[PromptSlot]:
+        """按运行时模板顺序返回启用的 PromptSlot。"""
         if not template:
             return []
 
@@ -157,10 +157,13 @@ class AgentPromptService:
         ]
         remaining_slots.sort(key=lambda slot: -slot.priority)
         ordered_slots.extend(remaining_slots)
+        return ordered_slots
 
+    def _build_prompt_id_trace(self, template: Optional[AgentTemplate]) -> List[str]:
+        """按模板启用插槽顺序提取 PromptTemplate ID。"""
         prompt_ids: List[str] = []
         seen_ids: Set[str] = set()
-        for slot in ordered_slots:
+        for slot in self._ordered_prompt_slots(template):
             if slot.slot_name in {"writing_rules", "character_hierarchy"}:
                 continue
             if not slot.prompt_template_id or slot.prompt_template_id in seen_ids:
@@ -540,8 +543,8 @@ class AgentPromptService:
             logger.debug(f"从 MD prompt 资产构建模板失败: {template_id}, error={e}")
             return None
 
-    async def get_prompt_template(self, template_id: str) -> Optional[PromptTemplate]:
-        """获取 Prompt 模板，统一走 PromptTemplateService resolver，随后兼容系统缓存。"""
+    async def _resolve_prompt_template_with_source(self, template_id: str) -> Dict[str, Any]:
+        """解析 PromptTemplate，并标记来源以便审计 seed/md/db fallback。"""
         prompt_service = self._prompt_template_service
         if not prompt_service:
             try:
@@ -556,15 +559,45 @@ class AgentPromptService:
                 template = await prompt_service.get_template(template_id)
                 if template:
                     self._prompt_cache[template_id] = template
-                    return template
+                    if self._is_system_seed_prompt(template_id):
+                        md_template = self._build_prompt_template_from_md(template_id)
+                        if md_template:
+                            return {"template": md_template, "source": "md_asset"}
+                        return {"template": template, "source": "system_seed"}
+                    return {"template": template, "source": "prompt_template_service"}
             except Exception as e:
                 logger.debug(f"从 PromptTemplateService 获取模板失败: {template_id}, error={e}")
 
         cached_template = self._prompt_cache.get(template_id)
         if cached_template:
-            return cached_template
+            if self._is_system_seed_prompt(template_id):
+                md_template = self._build_prompt_template_from_md(template_id)
+                if md_template:
+                    return {"template": md_template, "source": "md_asset"}
+                return {"template": cached_template, "source": "system_seed"}
+            return {"template": cached_template, "source": "runtime_cache"}
 
+        md_template = self._build_prompt_template_from_md(template_id)
+        if md_template:
+            return {"template": md_template, "source": "md_asset"}
+
+        return {"template": None, "source": "missing"}
+
+    def _is_system_seed_prompt(self, template_id: str) -> bool:
+        return any(prompt.id == template_id for prompt in SYSTEM_PROMPTS)
+
+    @staticmethod
+    def _prompt_resolution_fallback_marker(prompt_id: str, source: str) -> Optional[str]:
+        if source == "md_asset":
+            return f"prompt_template_md_asset:{prompt_id}"
+        if source == "system_seed":
+            return f"prompt_template_system_seed:{prompt_id}"
         return None
+
+    async def get_prompt_template(self, template_id: str) -> Optional[PromptTemplate]:
+        """获取 Prompt 模板，统一走 PromptTemplateService resolver，随后兼容系统缓存。"""
+        resolution = await self._resolve_prompt_template_with_source(template_id)
+        return resolution.get("template")
 
     def get_agent_template(self, agent_type: str) -> Optional[AgentTemplate]:
         """获取 Agent 模板"""
@@ -1519,10 +1552,18 @@ class AgentPromptService:
             "slot_count": 0,
             "resolved_prompt_ids": [],
             "missing_prompt_ids": [],
+            "md_asset_prompt_ids": [],
+            "system_seed_prompt_ids": [],
+            "deprecated_prompt_ids": [],
+            "unresolved_md_asset_prompt_ids": [],
             "templates": [],
         }
         seen_resolved: Set[str] = set()
         seen_missing: Set[str] = set()
+        seen_md_asset: Set[str] = set()
+        seen_system_seed: Set[str] = set()
+        seen_deprecated: Set[str] = set()
+        seen_unresolved_md_asset: Set[str] = set()
 
         for template in SYSTEM_AGENT_TEMPLATES:
             template_result: Dict[str, Any] = {
@@ -1531,25 +1572,59 @@ class AgentPromptService:
                 "scenario": template.scenario,
                 "prompt_ids": [],
                 "missing_prompt_ids": [],
+                "md_asset_prompt_ids": [],
+                "system_seed_prompt_ids": [],
+                "deprecated_prompt_ids": [],
+                "unresolved_md_asset_prompt_ids": [],
                 "fallbacks_used": [],
                 "deprecated_sources_used": [],
             }
 
-            for slot in sorted(template.prompt_slots, key=lambda item: -item.priority):
+            ordered_slots = self._ordered_prompt_slots(template)
+            for slot in ordered_slots:
                 if not slot.is_enabled or not slot.prompt_template_id:
                     continue
 
                 prompt_id = slot.prompt_template_id
                 audit["slot_count"] += 1
-                prompt_template = await self.get_prompt_template(prompt_id)
+                resolution = await self._resolve_prompt_template_with_source(prompt_id)
+                prompt_template = resolution.get("template")
+                source = resolution.get("source", "missing")
                 if prompt_template:
                     template_result["prompt_ids"].append(prompt_id)
+                    fallback_marker = self._prompt_resolution_fallback_marker(prompt_id, source)
+                    if fallback_marker:
+                        template_result["fallbacks_used"].append(fallback_marker)
+                    if source == "md_asset":
+                        template_result["md_asset_prompt_ids"].append(prompt_id)
+                        if prompt_id not in seen_md_asset:
+                            seen_md_asset.add(prompt_id)
+                            audit["md_asset_prompt_ids"].append(prompt_id)
+                    if source == "system_seed":
+                        template_result["system_seed_prompt_ids"].append(prompt_id)
+                        template_result["deprecated_sources_used"].append(f"system_prompt_seed:{prompt_id}")
+                        if prompt_id not in seen_system_seed:
+                            seen_system_seed.add(prompt_id)
+                            audit["system_seed_prompt_ids"].append(prompt_id)
+                        if prompt_id not in template_result["deprecated_prompt_ids"]:
+                            template_result["deprecated_prompt_ids"].append(prompt_id)
+                        if prompt_id not in seen_deprecated:
+                            seen_deprecated.add(prompt_id)
+                            audit["deprecated_prompt_ids"].append(prompt_id)
                     if prompt_id not in seen_resolved:
                         seen_resolved.add(prompt_id)
                         audit["resolved_prompt_ids"].append(prompt_id)
                 else:
                     template_result["missing_prompt_ids"].append(prompt_id)
-                    template_result["fallbacks_used"].append(f"missing_prompt_template:{prompt_id}")
+                    md_template = self._build_prompt_template_from_md(prompt_id)
+                    if md_template:
+                        template_result["unresolved_md_asset_prompt_ids"].append(prompt_id)
+                        template_result["fallbacks_used"].append(f"prompt_template_md_asset_unresolved:{prompt_id}")
+                        if prompt_id not in seen_unresolved_md_asset:
+                            seen_unresolved_md_asset.add(prompt_id)
+                            audit["unresolved_md_asset_prompt_ids"].append(prompt_id)
+                    else:
+                        template_result["fallbacks_used"].append(f"missing_prompt_template:{prompt_id}")
                     if prompt_id not in seen_missing:
                         seen_missing.add(prompt_id)
                         audit["missing_prompt_ids"].append(prompt_id)

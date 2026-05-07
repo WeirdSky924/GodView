@@ -4,6 +4,7 @@
  */
 
 import { api } from './client'
+import { getCachedQuery, invalidateQueryCache, type QueryCacheOptions } from './queryCache'
 
 const API_BASE = '/skills'
 
@@ -257,7 +258,8 @@ export async function getSkills(
   tags?: string[],
   search?: string,
   limit: number = 50,
-  offset: number = 0
+  offset: number = 0,
+  options: QueryCacheOptions = {}
 ): Promise<Skill[]> {
   const params = new URLSearchParams()
   if (skillType) params.append('skill_type', skillType)
@@ -269,14 +271,21 @@ export async function getSkills(
   params.append('limit', String(limit))
   params.append('offset', String(offset))
 
-  return await api.get(`${API_BASE}/?${params.toString()}`)
+  const query = params.toString()
+  return await getCachedQuery(
+    `skills:list:${query}`,
+    () => api.get(`${API_BASE}/?${query}`),
+    { ttlMs: 30 * 1000, ...options }
+  )
 }
 
 /**
  * 创建 Skill
  */
 export async function createSkill(dto: CreateSkillDTO): Promise<Skill> {
-  return await api.post(`${API_BASE}/`, dto)
+  const result = await api.post<Skill>(`${API_BASE}/`, dto)
+  invalidateSkillCaches()
+  return result
 }
 
 /**
@@ -290,14 +299,18 @@ export async function getSkill(skillId: string): Promise<Skill> {
  * 更新 Skill
  */
 export async function updateSkill(skillId: string, dto: UpdateSkillDTO): Promise<Skill> {
-  return await api.put(`${API_BASE}/${skillId}`, dto)
+  const result = await api.put<Skill>(`${API_BASE}/${skillId}`, dto)
+  invalidateSkillCaches()
+  return result
 }
 
 /**
  * 删除 Skill
  */
 export async function deleteSkill(skillId: string): Promise<{ success: boolean; message: string }> {
-  return await api.delete(`${API_BASE}/${skillId}`)
+  const result = await api.delete<{ success: boolean; message: string }>(`${API_BASE}/${skillId}`)
+  invalidateSkillCaches()
+  return result
 }
 
 /**
@@ -341,7 +354,9 @@ export async function executeSkill(
  * 分配 Skill 给 Agent 模板
  */
 export async function assignSkill(dto: AssignSkillDTO): Promise<SkillAssignment> {
-  return await api.post(`${API_BASE}/assign`, dto)
+  const result = await api.post<SkillAssignment>(`${API_BASE}/assign`, dto)
+  invalidateSkillCaches()
+  return result
 }
 
 /**
@@ -351,7 +366,9 @@ export async function unassignSkill(
   skillId: string,
   agentType: string
 ): Promise<{ success: boolean; message: string }> {
-  return await api.delete(`${API_BASE}/${skillId}/assign/${agentType}`)
+  const result = await api.delete<{ success: boolean; message: string }>(`${API_BASE}/${skillId}/assign/${agentType}`)
+  invalidateSkillCaches()
+  return result
 }
 
 /**
@@ -364,11 +381,15 @@ export async function getSkillAssignments(skillId: string): Promise<SkillAssignm
 /**
  * 获取 Agent 模板的 Skills
  */
-export async function getAgentTypeSkills(agentType: string, scenario?: string): Promise<Skill[]> {
+export async function getAgentTypeSkills(agentType: string, scenario?: string, options: QueryCacheOptions = {}): Promise<Skill[]> {
   const params = new URLSearchParams()
   if (scenario) params.append('scenario', scenario)
   const query = params.toString()
-  return await api.get(`${API_BASE}/agents/${agentType}/skills${query ? `?${query}` : ''}`)
+  return await getCachedQuery(
+    `skills:agent:${agentType}:${query || 'default'}`,
+    () => api.get(`${API_BASE}/agents/${agentType}/skills${query ? `?${query}` : ''}`),
+    { ttlMs: 30 * 1000, ...options }
+  )
 }
 
 /**
@@ -407,22 +428,32 @@ export async function getAllLogs(
 /**
  * 获取 Skill 统计
  */
-export async function getSkillsStats(): Promise<SkillStats> {
-  return await api.get(`${API_BASE}/stats/overview`)
+export async function getSkillsStats(options: QueryCacheOptions = {}): Promise<SkillStats> {
+  return await getCachedQuery(
+    'skills:stats',
+    () => api.get(`${API_BASE}/stats/overview`),
+    { ttlMs: 30 * 1000, ...options }
+  )
 }
 
 /**
  * 同步 skills/ 目录下的 MD 文件到数据库
  */
 export async function syncSkillMdFiles(): Promise<MdSyncResult> {
-  return await api.post(`${API_BASE}/sync-md-files`)
+  const result = await api.post<MdSyncResult>(`${API_BASE}/sync-md-files`)
+  invalidateSkillCaches()
+  return result
 }
 
 /**
  * 获取 prompts/skills MD 文件统计
  */
-export async function getSkillMdStats(): Promise<MdStatsResponse> {
-  return await api.get(`${API_BASE}/md-stats`)
+export async function getSkillMdStats(options: QueryCacheOptions = {}): Promise<MdStatsResponse> {
+  return await getCachedQuery(
+    'skills:md-stats',
+    () => api.get(`${API_BASE}/md-stats`),
+    { ttlMs: 5 * 60 * 1000, ...options }
+  )
 }
 
 /**
@@ -437,19 +468,41 @@ export async function initializeDefaultSkills(): Promise<{
     assignments_created: number
   }
 }> {
-  return await api.post(`${API_BASE}/initialize`)
+  const result = await api.post<{
+    success: boolean
+    message: string
+    result: {
+      skills_created: number
+      skills_skipped: number
+      assignments_created: number
+    }
+  }>(`${API_BASE}/initialize`)
+  invalidateSkillCaches()
+  return result
 }
 
 /**
  * 获取所有 Skill 类别
  */
-export async function getSkillCategories(): Promise<string[]> {
-  return await api.get(`${API_BASE}/categories`)
+export async function getSkillCategories(options: QueryCacheOptions = {}): Promise<string[]> {
+  return await getCachedQuery(
+    'skills:categories',
+    () => api.get(`${API_BASE}/categories`),
+    { ttlMs: 5 * 60 * 1000, ...options }
+  )
 }
 
 /**
  * 获取所有 Skill 类型
  */
-export async function getSkillTypes(): Promise<string[]> {
-  return await api.get(`${API_BASE}/types`)
+export async function getSkillTypes(options: QueryCacheOptions = {}): Promise<string[]> {
+  return await getCachedQuery(
+    'skills:types',
+    () => api.get(`${API_BASE}/types`),
+    { ttlMs: 5 * 60 * 1000, ...options }
+  )
+}
+
+export function invalidateSkillCaches(): void {
+  invalidateQueryCache('skills')
 }

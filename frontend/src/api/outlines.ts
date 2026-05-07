@@ -19,7 +19,7 @@ export type SceneType =
 
 export type ConflictLevel = 'low' | 'medium' | 'high' | 'critical'
 
-export type OutlineStatus = 'draft' | 'approved' | 'in_writing' | 'completed' | 'revision'
+export type OutlineStatus = 'draft' | 'approved' | 'in_writing' | 'completed' | 'revision' | 'rejected'
 
 export interface EmotionPoint {
   position: number
@@ -86,6 +86,30 @@ export interface ChapterOutline {
   next_outline_id?: string
 }
 
+export interface OutlineRevisionProposalResponse {
+  outline: ChapterOutline
+  revision_proposal: true
+  approved_outline_id: string
+  message: string
+}
+
+export interface OutlineVersionsResponse {
+  chapter_number: number
+  current_approved?: ChapterOutline | null
+  pending_revisions: ChapterOutline[]
+  rejected_revisions: ChapterOutline[]
+  versions: ChapterOutline[]
+  total: number
+}
+
+export type UpdateOutlineResponse = ChapterOutline | OutlineRevisionProposalResponse
+
+export function isOutlineRevisionProposalResponse(
+  response: UpdateOutlineResponse
+): response is OutlineRevisionProposalResponse {
+  return Boolean((response as OutlineRevisionProposalResponse).revision_proposal)
+}
+
 export interface OutlineStatistics {
   total_outlines: number
   total_target_words: number
@@ -140,6 +164,40 @@ export interface PendingOutline {
   hooks_resolved?: string[]
   target_word_count?: number
   character_arcs?: Record<string, string>
+}
+
+export interface SavePendingOutlineResult {
+  chapter_number?: number
+  status: 'saved' | 'failed'
+  action?: 'created' | 'updated'
+  outline_id?: string
+  error_type?: 'validation_error' | 'save_error' | string
+  error?: string
+}
+
+export interface SavePendingOutlinesResponse {
+  success: boolean
+  saved_count: number
+  failed_count: number
+  message: string
+  results: SavePendingOutlineResult[]
+}
+
+export function extractSavePendingOutlinesFailure(error: any): SavePendingOutlinesResponse | null {
+  const detail = error?.response?.data?.detail || error?.detail || error?.data
+  if (!detail || typeof detail !== 'object') return null
+  if (!Array.isArray(detail.results)) return null
+  if (typeof detail.saved_count !== 'number' || typeof detail.failed_count !== 'number') return null
+  return detail as SavePendingOutlinesResponse
+}
+
+export function formatSavePendingOutlinesFailure(result: SavePendingOutlinesResponse): string {
+  const failed = result.results.filter(item => item.status === 'failed')
+  if (failed.length === 0) return result.message
+  const details = failed
+    .map(item => `第${item.chapter_number ?? '?'}章：${item.error || item.error_type || '保存失败'}`)
+    .join('\n')
+  return `${result.message}\n${details}`
 }
 
 export interface ChatResponse {
@@ -253,10 +311,24 @@ export async function getOutlineStatistics(projectId: string): Promise<OutlineSt
 }
 
 /**
- * 获取单章大纲
+ * 获取单章当前大纲
  */
 export async function getOutline(projectId: string, chapterNumber: number): Promise<ChapterOutline> {
   return await api.get(`${API_BASE}/${chapterNumber}?project_id=${projectId}`)
+}
+
+/**
+ * 按 ID 获取具体大纲版本
+ */
+export async function getOutlineById(projectId: string, outlineId: string): Promise<ChapterOutline> {
+  return await api.get(`${API_BASE}/by-id/${outlineId}?project_id=${projectId}`)
+}
+
+/**
+ * 获取单章所有大纲版本
+ */
+export async function getOutlineVersions(projectId: string, chapterNumber: number): Promise<OutlineVersionsResponse> {
+  return await api.get(`${API_BASE}/${chapterNumber}/versions?project_id=${projectId}`)
 }
 
 /**
@@ -293,7 +365,7 @@ export async function updateOutline(
   projectId: string,
   chapterNumber: number,
   data: Partial<ChapterOutline>
-): Promise<ChapterOutline> {
+): Promise<UpdateOutlineResponse> {
   return await api.put(`${API_BASE}/${chapterNumber}?project_id=${projectId}`, data)
 }
 
@@ -316,6 +388,27 @@ export async function approveOutline(
   approvedBy: string
 ): Promise<ChapterOutline> {
   return await api.post(`${API_BASE}/${chapterNumber}/approve?project_id=${projectId}`, { approved_by: approvedBy })
+}
+
+/**
+ * 按 ID 审批具体大纲版本
+ */
+export async function approveOutlineById(
+  projectId: string,
+  outlineId: string,
+  approvedBy: string
+): Promise<ChapterOutline> {
+  return await api.post(`${API_BASE}/by-id/${outlineId}/approve?project_id=${projectId}`, { approved_by: approvedBy })
+}
+
+/**
+ * 按 ID 拒绝修订提案
+ */
+export async function rejectOutlineRevisionById(
+  projectId: string,
+  outlineId: string
+): Promise<ChapterOutline> {
+  return await api.post(`${API_BASE}/by-id/${outlineId}/reject?project_id=${projectId}`, {})
 }
 
 /**
@@ -374,7 +467,7 @@ export async function batchGenerateOutlines(
 export async function savePendingOutlines(
   projectId: string,
   outlines: PendingOutline[]
-): Promise<{ success: boolean; saved_count: number; message: string }> {
+): Promise<SavePendingOutlinesResponse> {
   return await api.post(`${API_BASE}/save-outlines?project_id=${projectId}`, {
     outlines,
   })

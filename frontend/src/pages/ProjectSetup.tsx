@@ -31,7 +31,7 @@ export default function ProjectSetup() {
   const loadProjects = async () => {
     setLoading(true)
     try {
-      const result = await getProjects()
+      const result = await getProjects(undefined, { forceRefresh: true })
       setProjects(result)
     } catch (err) {
       console.error('Failed to load projects:', err)

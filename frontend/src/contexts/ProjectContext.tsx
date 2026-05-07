@@ -6,7 +6,7 @@ interface ProjectContextType {
   projects: Project[]
   setCurrentProject: (project: Project | null) => void
   loading: boolean
-  refreshProjects: () => Promise<void>
+  refreshProjects: (options?: { forceRefresh?: boolean }) => Promise<void>
 }
 
 const ProjectContext = createContext<ProjectContextType | null>(null)
@@ -16,16 +16,25 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
   const [currentProject, setCurrentProject] = useState<Project | null>(null)
   const [loading, setLoading] = useState(true)
 
-  const refreshProjects = async () => {
+  const refreshProjects = async (options: { forceRefresh?: boolean } = {}) => {
     try {
-      const data = await getProjects()
+      const data = await getProjects(undefined, { forceRefresh: options.forceRefresh })
       setProjects(data)
-      // 从 localStorage 恢复上次选择的项目
+
       const savedProjectId = localStorage.getItem('currentProjectId')
-      if (savedProjectId) {
-        const saved = data.find(p => p.id === savedProjectId)
-        if (saved) setCurrentProject(saved)
-      }
+      setCurrentProject((current) => {
+        const selectedId = savedProjectId || current?.id
+        if (!selectedId) return null
+
+        const selected = data.find(p => p.id === selectedId)
+        if (selected) {
+          localStorage.setItem('currentProjectId', selected.id)
+          return selected
+        }
+
+        localStorage.removeItem('currentProjectId')
+        return null
+      })
     } catch (error) {
       console.error('Failed to load projects:', error)
     } finally {

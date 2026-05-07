@@ -82,12 +82,12 @@ export default function AgentTemplates() {
     loadAllSkills()
   }, [selectedType, currentProject?.id])
 
-  const loadTemplates = async () => {
+  const loadTemplates = async (options: { forceRefresh?: boolean } = {}) => {
     setLoading(true)
     try {
-      const data = await getAgentTemplates(selectedType || undefined)
+      const data = await getAgentTemplates(selectedType || undefined, undefined, undefined, 50, 0, undefined, { forceRefresh: options.forceRefresh })
       const projectConfigs = currentProject?.id
-        ? await getAgentConfigs(currentProject.id, undefined, undefined, 200)
+        ? await getAgentConfigs(currentProject.id, undefined, undefined, 200, 0, undefined, { forceRefresh: options.forceRefresh })
         : []
       const projectConfigMap = new Map(projectConfigs.map((config) => [`${config.agent_type}:${config.scenario || 'default'}`, config]))
 
@@ -254,7 +254,7 @@ export default function AgentTemplates() {
     if (!confirm('确定要删除此 Agent 模板吗？')) return
     try {
       await deleteAgentTemplate(templateId)
-      await loadTemplates()
+      await loadTemplates({ forceRefresh: true })
       bumpConfigRefreshKey()
     } catch (error) {
       console.error('Failed to delete template:', error)
@@ -275,7 +275,7 @@ export default function AgentTemplates() {
   const handleToggle = async (template: AgentTemplate) => {
     try {
       await toggleAgentTemplate(template.id, !template.is_enabled, currentProject?.id)
-      await loadTemplates()
+      await loadTemplates({ forceRefresh: true })
       bumpConfigRefreshKey()
     } catch (error) {
       console.error('Failed to toggle template:', error)
@@ -283,7 +283,7 @@ export default function AgentTemplates() {
   }
 
   const handleConfigChanged = async () => {
-    await loadTemplates()
+    await loadTemplates({ forceRefresh: true })
     bumpConfigRefreshKey()
   }
 
@@ -309,7 +309,7 @@ export default function AgentTemplates() {
         await createAgentTemplate(payload)
       }
       setShowEditModal(false)
-      await loadTemplates()
+      await loadTemplates({ forceRefresh: true })
       bumpConfigRefreshKey()
     } catch (error) {
       console.error('Failed to save template:', error)

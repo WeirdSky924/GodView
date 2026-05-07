@@ -14,6 +14,7 @@ from app.models.character import Character
 from app.services.model_router import create_llm
 from app.services.token_tracker import token_tracker
 from app.models.token_usage import UsageCategory
+from app.services.md_file_service import get_md_file_service
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,8 @@ class CollaborationRequest:
 class CollaboratorSystem:
     """AI 协作者系统"""
 
+    COLLABORATOR_ROLE_ADVICE_PROMPT_ID = "function_collaborator_role_advice"
+
     def __init__(self, model_factory: Optional[Callable] = None):
         self.model_factory = model_factory or create_llm
         self.collaboration_history: List[Dict[str, Any]] = []
@@ -67,49 +70,31 @@ class CollaboratorSystem:
             CollaborationRole.IDEA_GENERATOR: {
                 "name": "创意生成者",
                 "description": "擅长提出新颖创意和故事点子",
-                "system_prompt": """你是一个创意生成者，擅长提出新颖、有趣的故事创意。
-                你的任务是基于给定的上下文，提出有创意、可执行的故事点子。
-                请提供具体、详细、有启发性的建议。""",
                 "strengths": ["创意发散", "联想能力", "创新思维"],
             },
             CollaborationRole.CRITIC: {
                 "name": "批评家",
                 "description": "擅长发现问题和提出改进建议",
-                "system_prompt": """你是一个严谨的批评家，擅长分析故事中的问题并提出改进建议。
-                你的任务是客观分析故事的质量，指出优缺点，并提出具体的改进方案。
-                请保持建设性、具体的批评态度。""",
                 "strengths": ["分析能力", "问题识别", "改进建议"],
             },
             CollaborationRole.PLOT_ADVISOR: {
                 "name": "剧情顾问",
                 "description": "擅长设计剧情结构和节奏",
-                "system_prompt": """你是一个经验丰富的剧情顾问，擅长设计剧情结构和节奏。
-                你的任务是分析剧情发展，提出结构优化建议，确保故事有良好的起承转合。
-                请关注剧情的连贯性、张力和节奏感。""",
                 "strengths": ["结构设计", "节奏控制", "张力构建"],
             },
             CollaborationRole.CHARACTER_CONSULTANT: {
                 "name": "角色顾问",
                 "description": "擅长角色设计和成长弧线",
-                "system_prompt": """你是一个专业的角色顾问，擅长角色设计和成长弧线规划。
-                你的任务是分析角色设定，提出角色发展建议，确保角色行为一致且有深度。
-                请关注角色的动机、成长和内在一致性。""",
                 "strengths": ["角色设计", "动机分析", "成长规划"],
             },
             CollaborationRole.WORLD_BUILDER: {
                 "name": "世界构建者",
                 "description": "擅长世界观设定和规则设计",
-                "system_prompt": """你是一个世界构建专家，擅长世界观设定和规则设计。
-                你的任务是分析世界设定，提出完善建议，确保世界观自洽且有深度。
-                请关注世界的逻辑性、一致性和趣味性。""",
                 "strengths": ["世界观构建", "规则设计", "细节完善"],
             },
             CollaborationRole.DIALOGUE_WRITER: {
                 "name": "对话写手",
                 "description": "擅长编写符合角色特点的对话",
-                "system_prompt": """你是一个专业的对话写手，擅长编写符合角色特点的对话。
-                你的任务是分析角色设定，编写自然、生动、符合角色特点的对话。
-                请关注对话的口语化、角色特点和情感表达。""",
                 "strengths": ["对话创作", "角色声音", "情感表达"],
             },
         }
@@ -240,26 +225,61 @@ class CollaboratorSystem:
         except Exception as e:
             logger.warning(f"记录协作 token 使用失败: {e}")
 
+    def _load_prompt_asset(self, prompt_id: str, fallback: str = "") -> str:
+        """读取 md prompt 资产内容；失败时返回调用方提供的极简兼容降级。"""
+        try:
+            prompt = get_md_file_service().get_prompt(prompt_id)
+        except Exception as e:
+            logger.warning("读取协作者 Prompt 资产失败 %s: %s", prompt_id, e)
+            prompt = None
+
+        content = (prompt or {}).get("content") or (prompt or {}).get("raw_content") or ""
+        content = str(content).strip()
+        if content:
+            return content
+
+        logger.warning("协作者 Prompt 资产缺失: %s", prompt_id)
+        return fallback
+
+    def _build_collaborator_system_prompt(self, role_profile: Dict[str, Any]) -> str:
+        """构建协作者 system prompt；稳定协作规则来自 md，角色画像来自运行时。"""
+        prompt_asset = self._load_prompt_asset(
+            self.COLLABORATOR_ROLE_ADVICE_PROMPT_ID,
+            fallback="请作为 AI 协作者，基于运行时角色画像和创作上下文提供具体、可执行的建议。",
+        )
+        strengths = "、".join(role_profile.get("strengths", [])) or "未指定"
+        role_blocks = [
+            f"角色名称：{role_profile.get('name', '未命名协作者')}",
+            f"角色定位：{role_profile.get('description', '未指定')}",
+            f"角色优势：{strengths}",
+        ]
+        return "\n\n".join([
+            prompt_asset,
+            "## 当前协作角色\n" + "\n".join(role_blocks),
+        ]).strip()
+
+    def _build_collaborator_user_message(
+        self,
+        request: CollaborationRequest,
+        role_profile: Dict[str, Any],
+    ) -> str:
+        """构建协作者 user message；只包含运行时请求类型和创作上下文。"""
+        return "\n\n".join([
+            f"## 协作请求类型\n{request.request_type}",
+            f"## 上下文信息\n{self._format_context(request.context)}",
+            f"## 本次协作者\n{role_profile.get('name', '未命名协作者')}",
+        ]).strip()
+
     def _prepare_prompt(self, request: CollaborationRequest, role_profile: Dict[str, Any]) -> List[Dict[str, Any]]:
         """准备提示词"""
 
-        system_prompt = role_profile["system_prompt"]
-        context = request.context
-        request_type = request.request_type
-
-        # 构建用户消息
-        user_message = f"""协作请求类型：{request_type}
-
-上下文信息：
-{self._format_context(context)}
-
-请根据你的角色"{role_profile['name']}"的特点，提供专业的协作建议。"""
+        system_prompt = self._build_collaborator_system_prompt(role_profile)
+        user_message = self._build_collaborator_user_message(request, role_profile)
 
         return [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
         ]
-
     def _format_context(self, context: Dict[str, Any]) -> str:
         """格式化上下文信息"""
 

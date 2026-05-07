@@ -1248,15 +1248,10 @@ async def _resolve_message_outline(message: dict, project_id: Optional[str]) -> 
     plot_service = get_plot_outline_service()
     outline = None
 
-    if chapter_num:
+    if outline_id and hasattr(plot_service, "get_outline_by_id"):
+        outline = await plot_service.get_outline_by_id(str(project_id), str(outline_id))
+    elif chapter_num:
         outline = await plot_service.get_outline(str(project_id), int(chapter_num))
-
-    if not outline and outline_id:
-        outlines = await plot_service.get_outlines_by_project(str(project_id))
-        outline = next(
-            (item for item in outlines if str(_outline_value(item, "id")) == str(outline_id)),
-            None,
-        )
 
     return outline
 

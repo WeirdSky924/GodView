@@ -8,6 +8,7 @@ import {
   type OutlineResourceRequirement,
   type ResourceRequirementStatus,
 } from '@/api/outlines'
+import { formatApiErrorMessage } from '@/api/workflows'
 import { useTheme } from '@/contexts/ThemeContext'
 import {
   formatRequirementTypeFlow,
@@ -35,6 +36,7 @@ interface OutlineRequirementPanelProps {
   onCreate?: (requirement: OutlineResourceRequirement) => void
   bindableResources?: BindableRequirementResource[]
   onBound?: () => void
+  onRequirementChanged?: () => void
 }
 
 const severityLabels: Record<string, string> = {
@@ -86,6 +88,7 @@ export default function OutlineRequirementPanel({
   onCreate,
   bindableResources = [],
   onBound,
+  onRequirementChanged,
 }: OutlineRequirementPanelProps) {
   const { theme } = useTheme()
   const isDark = theme === 'dark'
@@ -148,9 +151,10 @@ export default function OutlineRequirementPanel({
         ...(status === 'ignored' ? { resolution_method: 'ignored' as const } : {}),
       })
       await loadRequirements()
+      onRequirementChanged?.()
     } catch (error) {
       console.error('Failed to update outline resource requirement:', error)
-      alert('更新资源需求状态失败')
+      alert(formatApiErrorMessage(error, '更新资源需求状态失败'))
     } finally {
       setUpdatingId(null)
     }
@@ -179,9 +183,10 @@ export default function OutlineRequirementPanel({
       })
       await loadRequirements()
       onBound?.()
+      onRequirementChanged?.()
     } catch (error) {
       console.error('Failed to bind outline resource requirement:', error)
-      alert('绑定资源需求失败')
+      alert(formatApiErrorMessage(error, '绑定资源需求失败'))
     } finally {
       setUpdatingId(null)
     }

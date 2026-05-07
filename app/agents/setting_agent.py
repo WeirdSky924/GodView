@@ -28,28 +28,8 @@ class SettingAgent(BaseAgent):
 
     AGENT_TYPE = "setting"
     DEFAULT_SCENARIO = "workflow_context"
-    AGENT_PROMPT = """你是一个专业的长篇网络小说设定管理者（Setting Agent）。
-
-【核心职责】
-1. 维护项目的世界观设定，确保长篇连载中设定的一致性
-2. 帮助用户添加、修改、删除设定
-3. 检测和处理设定冲突
-4. 提供设定建议和优化方案
-
-【核心原则】
-- 严格遵循项目的世界类型设定（科幻/奇幻/现代/历史/武侠），不要生成与项目类型不符的设定
-- 保持设定的内在一致性，这对长篇连载尤为重要
-- 注意宪法级规则，任何新设定都不能违反它们
-- 当发现潜在冲突时，及时提醒并提供解决方案
-- 用清晰、结构化的方式组织信息
-- 考虑长篇创作的可持续性和扩展性
-
-【世界类型区分】
-- 科幻：高科技、太空、外星人、赛博朋克、基因工程等，遵守科学逻辑
-- 奇幻：魔法、精灵、怪物、异世界等，可以有魔法但要保持内在逻辑
-- 现代：当代社会、都市、职场等现实题材
-- 历史：古代/近代背景，需要有历史依据
-- 武侠：江湖、武功、门派、恩怨，内功招式等"""
+    CHAPTER_CONSISTENCY_PROMPT_ID = "function_setting_chapter_consistency"
+    WORKFLOW_CONTEXT_ANALYSIS_PROMPT_ID = "function_setting_workflow_context_analysis"
 
     def __init__(self, model=None, project_id: str = None, agent_id: str = None):
         super().__init__(
@@ -202,6 +182,61 @@ class SettingAgent(BaseAgent):
                 data={"message": f"设定管理任务执行失败: {str(e)}"},
             )
 
+    def _load_md_prompt_content(self, prompt_id: str) -> str:
+        try:
+            from app.services.md_file_service import get_md_file_service
+
+            md_service = get_md_file_service()
+            prompt = md_service.get_prompt(prompt_id)
+            if prompt:
+                content = prompt.get("content") or prompt.get("raw_content") or ""
+                if content:
+                    return content.strip()
+        except Exception as e:
+            logger.warning("加载 SettingAgent md prompt 失败: prompt_id=%s, error=%s", prompt_id, e)
+        return ""
+
+    def _build_chapter_consistency_prompt(self, chapter_content: str) -> str:
+        prompt_asset = self._load_md_prompt_content(self.CHAPTER_CONSISTENCY_PROMPT_ID) or (
+            "【DEPRECATED 最小 fallback】请检查章节内容与世界设定的一致性；如无问题，简要说明检查通过；"
+            "如有问题，列出具体冲突和修改建议。"
+        )
+        return f"""{prompt_asset}
+
+【章节内容】
+{chapter_content}"""
+
+    def _build_workflow_context_analysis_prompt(
+        self,
+        *,
+        chapter_num: Any,
+        goal_text: str,
+        outline_text: str,
+        world_name: str,
+        world_type: str,
+        world_rules_text: str,
+        lore_summaries: List[str],
+    ) -> str:
+        prompt_asset = self._load_md_prompt_content(self.WORKFLOW_CONTEXT_ANALYSIS_PROMPT_ID) or (
+            "【DEPRECATED 最小 fallback】请基于当前项目上下文提取本章写作必须遵守的设定约束、可用素材、"
+            "潜在冲突和对后续节点的建议。"
+        )
+        lore_text = chr(10).join(lore_summaries) if lore_summaries else "未提供相关设定"
+        return f"""{prompt_asset}
+
+【当前章节】
+- 章节号：{chapter_num or '未提供'}
+- 章节目标：{goal_text}
+- 当前大纲/焦点：{outline_text}
+
+【世界信息】
+- 世界名：{world_name}
+- 类型/风格：{world_type}
+- 核心规则：{world_rules_text}
+
+【相关设定】
+{lore_text}"""
+
     async def _check_chapter_consistency(
         self,
         chapter_content: str,
@@ -217,20 +252,8 @@ class SettingAgent(BaseAgent):
         Returns:
             str: 检查结果描述
         """
-        # 构建检查提示
-        prompt = f"""请检查以下章节内容与世界设定的一致性。
-
-【章节内容】
-{chapter_content}
-
-请检查：
-1. 力量体系使用是否一致（等级、境界、能力名称）
-2. 角色行为是否符合设定
-3. 地理、势力信息是否正确
-4. 是否有违反核心规则的情节
-
-如果没有发现问题，简要说明"章节设定一致性检查通过"。
-如果发现问题，列出具体问题并建议修改方案。"""
+        # 构建检查提示：稳定检查规则来自 md prompt，章节正文保持运行时输入
+        prompt = self._build_chapter_consistency_prompt(chapter_content)
 
         result = await self._setting_service.chat(
             project_id=self.project_id,
@@ -299,34 +322,15 @@ class SettingAgent(BaseAgent):
         else:
             world_rules_text = str(world_rules) if world_rules else "未提供"
 
-        prompt = f"""请基于当前项目上下文，提取本章写作必须遵守的设定约束，并检查潜在冲突。
-
-【任务目标】
-你不是在泛泛整理世界观，而是要服务当前章节/当前工作流，输出对这一章真正有用的设定结论。
-
-【当前章节】
-- 章节号：{chapter_num or '未提供'}
-- 章节目标：{goal_text}
-- 当前大纲/焦点：{outline_text}
-
-【世界信息】
-- 世界名：{world_name}
-- 类型/风格：{world_type}
-- 核心规则：{world_rules_text}
-
-【相关设定】
-{chr(10).join(lore_summaries) if lore_summaries else '未提供相关设定'}
-
-要求：
-1. 只提取与当前章节直接相关的设定约束、禁忌、风险点、可用素材。
-2. 若发现上下文不足，请明确指出缺失点，不要自行脑补默认奇幻/冒险设定。
-3. 如果设定之间存在冲突，指出冲突来源、影响范围、建议处理方式。
-4. 输出尽量结构化，至少包含：
-   - 本章关键设定约束
-   - 允许使用的设定素材
-   - 潜在冲突/风险
-   - 对写作或后续节点的建议
-"""
+        prompt = self._build_workflow_context_analysis_prompt(
+            chapter_num=chapter_num,
+            goal_text=goal_text,
+            outline_text=outline_text,
+            world_name=world_name,
+            world_type=world_type,
+            world_rules_text=world_rules_text,
+            lore_summaries=lore_summaries,
+        )
         result = await self._setting_service.chat(
             project_id=self.project_id,
             message=prompt,

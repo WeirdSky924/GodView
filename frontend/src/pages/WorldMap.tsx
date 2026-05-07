@@ -19,6 +19,7 @@ import {
   updateOutlineResourceRequirementStatus,
   type OutlineResourceRequirement,
 } from '@/api/outlines'
+import { formatApiErrorMessage } from '@/api/workflows'
 
 const REGION_TYPES = [
   { value: 'custom', label: '自定义' },
@@ -316,7 +317,7 @@ export default function WorldMap() {
       await loadRegions()
     } catch (error) {
       console.error('Failed to save region:', error)
-      alert('保存区域失败，请查看控制台日志')
+      alert(formatApiErrorMessage(error, '保存区域失败，请查看控制台日志'))
     }
   }
 
@@ -370,6 +371,8 @@ export default function WorldMap() {
               }))}
             onBound={async () => {
               await loadRegions()
+            }}
+            onRequirementChanged={() => {
               setRequirementRefreshKey(value => value + 1)
             }}
             refreshKey={requirementRefreshKey}

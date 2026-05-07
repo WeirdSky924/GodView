@@ -1,14 +1,20 @@
+import asyncio
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
+from unittest.mock import AsyncMock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.agents.base import AgentResponse, BaseAgent
 from app.models.agent_template import AgentType
+from app.models.intervention import InterventionType
+from app.services.agent_communication import AgentCommunicationService
+from app.services.character_detection import CharacterPromotionManager
+from app.services.collaborator import CollaborationRequest, CollaborationRole, CollaboratorSystem
 from app.services.plot_outline_service import PlotOutlineService
 from app.services.setting_agent import SettingAgent
 from app.services.setting_agent_service import SegmentedContextSynthesis, SettingAgentService
@@ -65,6 +71,224 @@ async def test_plot_outline_cached_system_prompt_preserves_render_trace(monkeypa
     assert "plot outline prompt" in result["content"]
     assert result["trace"]["scenario"] == "generate_chapter_outline"
     assert result["trace"]["template_id"] == "plot_outline-template"
+
+
+@pytest.mark.asyncio
+async def test_plot_outline_approved_update_creates_revision_proposal(monkeypatch):
+    from app.models.chapter_outline import ChapterOutline, ChapterOutlineStatus, UpdateChapterOutlineDTO
+
+    service = PlotOutlineService()
+    approved = ChapterOutline(
+        id="outline-approved",
+        project_id="project-1",
+        chapter_number=3,
+        title="原审批标题",
+        summary="原审批摘要",
+        status=ChapterOutlineStatus.APPROVED,
+        chapter_goals=["原目标"],
+    )
+    service._outlines_cache[approved.id] = approved
+    writes = []
+
+    class FakeDB:
+        async def execute_write(self, query, params=None):
+            writes.append((query, dict(params or {})))
+            return 1
+
+    service._db = FakeDB()
+    monkeypatch.setattr(service, "_persist_outline_resource_audit", AsyncMock())
+
+    revision = await service.update_outline(
+        approved.id,
+        UpdateChapterOutlineDTO(title="修订标题", summary="修订摘要"),
+    )
+
+    assert revision is not None
+    assert revision.id != approved.id
+    assert revision.previous_outline_id == approved.id
+    assert revision.status == ChapterOutlineStatus.REVISION
+    assert revision.approved_at is None
+    assert revision.approved_by is None
+    assert revision.title == "修订标题"
+    assert revision.summary == "修订摘要"
+    assert approved.title == "原审批标题"
+    assert approved.summary == "原审批摘要"
+    assert service._outlines_cache[approved.id] is approved
+    assert service._outlines_cache[revision.id] is revision
+    assert writes[0][1]["status"] == "revision"
+    assert writes[0][1]["previous_outline_id"] == approved.id
+    service._persist_outline_resource_audit.assert_awaited_once_with(revision)
+
+
+@pytest.mark.asyncio
+async def test_plot_outline_revision_update_does_not_mutate_approved(monkeypatch):
+    from app.models.chapter_outline import ChapterOutline, ChapterOutlineStatus, UpdateChapterOutlineDTO
+
+    service = PlotOutlineService()
+    approved = ChapterOutline(
+        id="outline-approved",
+        project_id="project-1",
+        chapter_number=3,
+        title="原审批标题",
+        summary="原审批摘要",
+        status=ChapterOutlineStatus.APPROVED,
+    )
+    revision = ChapterOutline(
+        id="outline-revision",
+        project_id="project-1",
+        chapter_number=3,
+        title="修订标题",
+        summary="修订摘要",
+        status=ChapterOutlineStatus.REVISION,
+        previous_outline_id=approved.id,
+    )
+    service._outlines_cache[approved.id] = approved
+    service._outlines_cache[revision.id] = revision
+    writes = []
+
+    class FakeDB:
+        async def execute_write(self, query, params=None):
+            writes.append((query, dict(params or {})))
+            return 1
+
+    service._db = FakeDB()
+    monkeypatch.setattr(service, "_persist_outline_resource_audit", AsyncMock())
+
+    result = await service.update_outline(
+        revision.id,
+        UpdateChapterOutlineDTO(title="二次修订标题"),
+    )
+
+    assert result is revision
+    assert revision.title == "二次修订标题"
+    assert revision.previous_outline_id == approved.id
+    assert approved.title == "原审批标题"
+    assert writes[0][1]["id"] == revision.id
+    service._persist_outline_resource_audit.assert_awaited_once_with(revision)
+
+
+@pytest.mark.asyncio
+async def test_plot_outline_approving_revision_links_previous_outline(monkeypatch):
+    from app.models.chapter_outline import ChapterOutline, ChapterOutlineStatus
+
+    service = PlotOutlineService()
+    approved = ChapterOutline(
+        id="outline-approved",
+        project_id="project-1",
+        chapter_number=3,
+        title="原审批标题",
+        summary="原审批摘要",
+        status=ChapterOutlineStatus.APPROVED,
+    )
+    revision = ChapterOutline(
+        id="outline-revision",
+        project_id="project-1",
+        chapter_number=3,
+        title="修订标题",
+        summary="修订摘要",
+        status=ChapterOutlineStatus.REVISION,
+        previous_outline_id=approved.id,
+    )
+    service._outlines_cache[approved.id] = approved
+    service._outlines_cache[revision.id] = revision
+    writes = []
+
+    class FakeDB:
+        async def execute_write(self, query, params=None):
+            writes.append((query, dict(params or {})))
+            return 1
+
+    service._db = FakeDB()
+    monkeypatch.setattr(service, "_persist_outline_resource_audit", AsyncMock())
+
+    result = await service.approve_outline(revision.id, "reviewer")
+
+    assert result is revision
+    assert revision.status == ChapterOutlineStatus.APPROVED
+    assert revision.approved_by == "reviewer"
+    assert approved.next_outline_id == revision.id
+    assert writes[0][1]["id"] == revision.id
+    assert writes[0][1]["status"] == "approved"
+    assert writes[1][1]["id"] == approved.id
+    assert writes[1][1]["next_outline_id"] == revision.id
+    service._persist_outline_resource_audit.assert_awaited_once_with(revision)
+
+
+@pytest.mark.asyncio
+async def test_plot_outline_rejecting_revision_preserves_approved_outline():
+    from app.models.chapter_outline import ChapterOutline, ChapterOutlineStatus
+
+    service = PlotOutlineService()
+    approved = ChapterOutline(
+        id="outline-approved",
+        project_id="project-1",
+        chapter_number=3,
+        title="原审批标题",
+        summary="原审批摘要",
+        status=ChapterOutlineStatus.APPROVED,
+    )
+    revision = ChapterOutline(
+        id="outline-revision",
+        project_id="project-1",
+        chapter_number=3,
+        title="修订标题",
+        summary="修订摘要",
+        status=ChapterOutlineStatus.REVISION,
+        previous_outline_id=approved.id,
+    )
+    service._outlines_cache[approved.id] = approved
+    service._outlines_cache[revision.id] = revision
+    writes = []
+
+    class FakeDB:
+        async def execute_write(self, query, params=None):
+            writes.append((query, dict(params or {})))
+            return 1
+
+    service._db = FakeDB()
+
+    result = await service.reject_outline_revision(revision.id)
+
+    assert result is revision
+    assert revision.status == ChapterOutlineStatus.REJECTED
+    assert revision.previous_outline_id == approved.id
+    assert approved.status == ChapterOutlineStatus.APPROVED
+    assert approved.next_outline_id is None
+    assert writes[0][1]["id"] == revision.id
+    assert writes[0][1]["status"] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_plot_outline_chapter_lookup_prefers_approved_when_revision_exists():
+    from app.models.chapter_outline import ChapterOutline, ChapterOutlineStatus
+
+    service = PlotOutlineService()
+    approved = ChapterOutline(
+        id="outline-approved",
+        project_id="project-1",
+        chapter_number=3,
+        title="原审批标题",
+        summary="原审批摘要",
+        status=ChapterOutlineStatus.APPROVED,
+    )
+    revision = ChapterOutline(
+        id="outline-revision",
+        project_id="project-1",
+        chapter_number=3,
+        title="修订标题",
+        summary="修订摘要",
+        status=ChapterOutlineStatus.REVISION,
+        previous_outline_id=approved.id,
+    )
+    service._outlines_cache[revision.id] = revision
+    service._outlines_cache[approved.id] = approved
+    service._loaded_outline_projects.add("project-1")
+
+    assert await service.get_outline("project-1", 3) is approved
+    assert await service.get_outline_by_id("project-1", revision.id) is revision
+    versions = await service.get_outline_versions("project-1", 3)
+    assert versions["current_approved"] is approved
+    assert versions["pending_revisions"] == [revision]
 
 
 @pytest.mark.asyncio
@@ -157,6 +381,96 @@ def test_plot_outline_direct_fallback_trace_distinguishes_md_and_deprecated_mini
         "plot_outline_output",
     ]
     assert_render_trace_contract(minimal_result["trace"])
+
+
+
+def test_plot_outline_generation_prompt_uses_md_output_contract(monkeypatch):
+    service = PlotOutlineService()
+    loaded_prompt_ids = []
+
+    monkeypatch.setattr(
+        service,
+        "_load_md_prompt_content",
+        lambda prompt_id: loaded_prompt_ids.append(prompt_id) or "md plot outline output contract",
+    )
+
+    prompt = service._build_generation_prompt(
+        chapter_number=7,
+        context="需要在结尾制造危机",
+        previous_events="主角刚获得青铜书签",
+        characters=[{"name": "林澈", "role": "主角"}],
+        world_info={
+            "name": "青岚界",
+            "world_type": "wuxia",
+            "description": "旧城与灵压并存",
+            "settings": [{"priority": "constitutional", "title": "灵压守恒", "summary": "灵压不可凭空产生"}],
+        },
+        existing_hooks=[{"title": "青铜书签", "description": "接近真相时发热"}],
+        full_context=None,
+    )
+
+    assert loaded_prompt_ids == ["plot_outline_output"]
+    assert "请为第 7 章生成详细的章节大纲。" in prompt
+    assert "【输出格式要求】\nmd plot outline output contract" in prompt
+    assert "主角刚获得青铜书签" in prompt
+    assert "- 林澈 (主角)" in prompt
+    assert "请输出 JSON 格式：" not in prompt
+    assert "\"emotion_curve\"" not in prompt
+    assert "\"hooks_to_plant\"" not in prompt
+
+
+def test_plot_outline_generation_prompt_uses_deprecated_minimal_output_fallback(monkeypatch):
+    service = PlotOutlineService()
+    loaded_prompt_ids = []
+
+    monkeypatch.setattr(
+        service,
+        "_load_md_prompt_content",
+        lambda prompt_id: loaded_prompt_ids.append(prompt_id) or "",
+    )
+
+    prompt = service._build_generation_prompt(
+        chapter_number=1,
+        context=None,
+        previous_events=None,
+        characters=None,
+        world_info=None,
+        existing_hooks=None,
+        full_context=None,
+    )
+
+    assert loaded_prompt_ids == ["plot_outline_output"]
+    assert "【输出格式要求】" in prompt
+    assert "deprecated 最小输出格式 fallback" in prompt
+    assert "必须输出完整 JSON" in prompt
+
+
+def test_plot_outline_consistency_repair_uses_md_asset_and_runtime_feedback(monkeypatch):
+    service = PlotOutlineService()
+    loaded_prompt_ids = []
+
+    def fake_load(prompt_id):
+        loaded_prompt_ids.append(prompt_id)
+        return "MD consistency repair rules: output complete JSON only"
+
+    monkeypatch.setattr(service, "_load_md_prompt_content", fake_load)
+
+    message = "请生成第 3 章大纲"
+    consistency = {
+        "conflicts": ["主角在未获得能力前使用能力"],
+        "risk_areas": ["时间线: 第三章早于觉醒事件"],
+        "setting_gaps": ["需要明确青铜书签能力边界"],
+    }
+
+    repair_message = service._build_outline_consistency_repair_message(message, consistency)
+
+    assert loaded_prompt_ids == ["function_plot_outline_consistency_repair"]
+    assert repair_message.startswith(message)
+    assert "MD consistency repair rules: output complete JSON only" in repair_message
+    assert "主角在未获得能力前使用能力" in repair_message
+    assert "时间线: 第三章早于觉醒事件" in repair_message
+    assert "需要明确青铜书签能力边界" in repair_message
+    assert "你刚生成的大纲存在设定一致性风险，请基于原任务立即修正后重新输出完整 JSON" not in repair_message
 
 
 def test_writer_legacy_fallback_loads_auxiliary_md_prompt_assets(monkeypatch):
@@ -343,7 +657,78 @@ async def test_writer_segmented_generation_accepts_discussion_asset_digest(monke
     assert result["segments"][0]["focus"] == "承接大纲"
 
 
-def test_character_legacy_fallback_loads_role_performance_md_prompt_assets(monkeypatch):
+def test_writer_segment_task_prompts_use_md_asset_for_stable_rules(monkeypatch):
+    from app.agents.director.writer import WriterAgent
+
+    writer = WriterAgent(project_id="project-1")
+    loaded_prompt_ids = []
+
+    def fake_load(prompt_id):
+        loaded_prompt_ids.append(prompt_id)
+        assert prompt_id == "function_writer_segment_generation"
+        return "md writer segment generation rules"
+
+    monkeypatch.setattr(writer, "_load_md_prompt_content", fake_load)
+
+    plan_notes = writer._build_writer_segment_task_notes(
+        "segment_plan",
+        ["当前运行时目标：输出 WriterSegmentPlanSchema。"],
+    )
+    segment_prompt = writer._build_segment_prompt(
+        segment_info={"focus": "追踪旧城线索", "key_elements": ["线索", "阻力"], "tone": "紧张"},
+        previous_content="上一段结尾",
+        segment_num=1,
+        total_segments=2,
+        target_words=800,
+        min_words=680,
+        max_words=1000,
+        world_info={"name": "云岫洲"},
+        previous_style="冷峻克制",
+        writing_rules_guidance="写作规则：移动端可读",
+        discussion_asset_digest="已确认线索：青铜书签",
+        workflow_binding_block="绑定大纲：旧城追踪",
+        config_prompt="Writer runtime prompt",
+    )
+    supplement_prompt = writer._build_supplement_prompt(
+        existing_content="已有正文",
+        shortage=300,
+        chapter_num=2,
+        total_chapters=100,
+        writing_rules_guidance="写作规则",
+        workflow_binding_block="绑定大纲",
+        config_prompt="Writer runtime prompt",
+    )
+    continue_prompt = writer._build_continue_prompt(
+        existing_content="已有正文",
+        shortage=250,
+        intents=["推进追踪"],
+        character_moods={"沈砚": "警惕"},
+        chapter_num=2,
+        total_chapters=100,
+        writing_rules_guidance="写作规则",
+        workflow_binding_block="绑定大纲",
+        config_prompt="Writer runtime prompt",
+    )
+
+    assert loaded_prompt_ids == [
+        "function_writer_segment_generation",
+        "function_writer_segment_generation",
+        "function_writer_segment_generation",
+        "function_writer_segment_generation",
+    ]
+    assert "md writer segment generation rules" in "\n".join(plan_notes)
+    assert "当前运行时目标：输出 WriterSegmentPlanSchema。" in "\n".join(plan_notes)
+    for prompt in (segment_prompt, supplement_prompt, continue_prompt):
+        assert "md writer segment generation rules" in prompt
+        assert "Writer runtime prompt" in prompt
+        assert "【输出 JSON Schema】" in prompt
+    assert "当前运行时字数范围：680-1000 字" in segment_prompt
+    assert "绑定大纲：旧城追踪" in segment_prompt
+    assert "已确认线索：青铜书签" in segment_prompt
+    assert "把绑定章节大纲、章节目标、修订要求中的关键剧情点分配到具体段落" not in segment_prompt
+    assert "续写必须与上文自然衔接，只用于补足字数或补足未覆盖的大纲节点" not in continue_prompt
+    assert "补写只能扩展已有合法场景中的前因、行动、阻力、线索或后果" not in supplement_prompt
+
     from app.agents.character_agent import CharacterAgent
     from app.models.character import Character
 
@@ -427,13 +812,17 @@ def test_summarizer_legacy_fallback_loads_performance_summary_md_prompt_assets(m
     trace = agent.get_system_prompt_render_trace()
 
     assert "content:role_summarizer" in prompt
+    assert "content:function_summarize" in prompt
     assert "content:function_workflow_performance_summary" in prompt
     assert "content:function_summarizer_runtime_context_packet" in prompt
+    assert "content:function_summarizer_setting_check" in prompt
     assert loaded_prompt_ids == [
         "role_summarizer",
+        "function_summarize",
         "function_workflow_discussion_summary",
         "function_workflow_performance_summary",
         "function_summarizer_runtime_context_packet",
+        "function_summarizer_setting_check",
     ]
     assert trace["fallbacks_used"] == ["summarizer_md_prompt_fallback"]
     assert trace["deprecated_sources_used"] == []
@@ -671,12 +1060,145 @@ async def test_auxiliary_runtime_prompts_keep_stable_hook_rules_in_md(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_setting_service_bootstrap_seed_extraction_uses_md_prompt_asset(monkeypatch):
+    from app.models.agent_output_schemas import BootstrapSeedExtractionSchema
+
+    service = SettingAgentService()
+    captured = {}
+
+    monkeypatch.setattr(
+        service,
+        "_load_md_prompt_content",
+        lambda prompt_id: captured.setdefault("loaded_prompt_ids", []).append(prompt_id) or "md bootstrap seed extraction contract",
+    )
+
+    async def fake_call_structured(schema, prompt, project_id=None):
+        captured["schema"] = schema
+        captured["prompt"] = prompt
+        captured["project_id"] = project_id
+        return SimpleNamespace(
+            model_dump=lambda: {
+                "world_setting": {"name": "青岚界", "description": "旧城与灵压并存", "world_type": "wuxia", "tone": "adventurous"},
+                "world_rules": ["灵压不可凭空产生"],
+                "power_system": "灵压修行",
+                "technology_level": "近代机关",
+                "main_characters": [],
+                "regions": [],
+                "plot_hooks": [],
+                "narrative_tone": "adventurous",
+                "writing_style": "长篇网文",
+            }
+        )
+
+    monkeypatch.setattr(service, "_call_structured", fake_call_structured)
+    session = SimpleNamespace(
+        project_id="project-1",
+        setting_agent_history=[
+            {"role": "user", "content": "世界叫青岚界，旧城与灵压并存。"},
+            {"role": "assistant", "content": "我会保留为 seed 草案。"},
+        ],
+    )
+
+    seed = await service._extract_seed_from_history(session)
+
+    assert captured["loaded_prompt_ids"] == [service.SETTING_BOOTSTRAP_SEED_EXTRACTION_PROMPT_ID]
+    assert captured["schema"] is BootstrapSeedExtractionSchema
+    assert captured["project_id"] == "project-1"
+    prompt = captured["prompt"]
+    assert prompt.startswith("md bootstrap seed extraction contract")
+    assert "## 对话历史" in prompt
+    assert "世界叫青岚界" in prompt
+    assert "md bootstrap seed extraction contract" not in prompt.split("## 对话历史", 1)[1]
+    assert "请从以下对话中提取结构化的项目 seed" not in prompt
+    assert '"world_setting": {"name": "", "description": "", "world_type": "", "tone": ""}' not in prompt
+    assert seed["world_setting"]["name"] == "青岚界"
+    assert seed["power_system"] == "灵压修行"
+
+
+@pytest.mark.asyncio
+async def test_setting_hook_extraction_uses_md_prompt_asset(monkeypatch):
+    service = SettingAgentService()
+    captured = {}
+
+    def fake_load_md(prompt_id):
+        captured.setdefault("loaded_prompt_ids", []).append(prompt_id)
+        assert prompt_id == service.SETTING_HOOK_EXTRACTION_PROMPT_ID
+        return "md hook extraction rules\noutput_schema: SettingPendingHooksExtractionSchema"
+
+    async def fake_call_structured(schema, prompt, project_id=None):
+        captured["schema"] = schema.__name__
+        captured["prompt"] = prompt
+        captured["project_id"] = project_id
+        hook = SimpleNamespace(
+            model_dump=lambda: {
+                "title": "青铜书签",
+                "description": "书签会在主角接近真相时发热",
+                "hook_type": "object",
+                "status": "planted",
+                "related_characters": ["主角"],
+                "related_locations": [],
+                "related_objects": ["青铜书签"],
+                "plant_context": "用户明确确认该物件作为长期伏笔",
+                "resolution_hint": "终局揭示其来源",
+                "priority": 7,
+            }
+        )
+        return SimpleNamespace(hooks=[hook])
+
+    monkeypatch.setattr(service, "_load_md_prompt_content", fake_load_md)
+    monkeypatch.setattr(service, "_call_structured", fake_call_structured)
+
+    session = SimpleNamespace(
+        conversation_history=[
+            {"role": "user", "content": "书签会发热，可以作为长期伏笔。"},
+            {"role": "assistant", "content": "我会把青铜书签作为待确认伏笔记录。"},
+        ]
+    )
+
+    hooks = await service._extract_hooks_from_conversation("project-1", session)
+
+    assert captured["loaded_prompt_ids"] == [service.SETTING_HOOK_EXTRACTION_PROMPT_ID]
+    assert captured["schema"] == "SettingPendingHooksExtractionSchema"
+    assert captured["project_id"] == "project-1"
+    prompt = captured["prompt"]
+    assert "md hook extraction rules" in prompt
+    assert "## 对话内容" in prompt
+    assert "书签会发热，可以作为长期伏笔" in prompt
+    assert "分析以下对话，判断用户是否明确确认了值得记录为“伏笔（hook）”的内容" not in prompt
+    assert "重要规则：" not in prompt
+    assert hooks == [
+        {
+            "title": "青铜书签",
+            "description": "书签会在主角接近真相时发热",
+            "hook_type": "object",
+            "status": "planted",
+            "related_characters": ["主角"],
+            "related_locations": [],
+            "related_objects": ["青铜书签"],
+            "plant_context": "用户明确确认该物件作为长期伏笔",
+            "resolution_hint": "终局揭示其来源",
+            "priority": 5,
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_auxiliary_runtime_prompts_keep_summarizer_rules_in_md(monkeypatch):
     from app.agents.director.summarizer import SummarizerAgent
     from app.models.agent_output_schemas import SummarizerSettingCheckSchema, SummarizerSummarySchema
 
     agent = SummarizerAgent(system_prompt="summarizer system")
     captured = {}
+
+    prompt_assets = {
+        "function_summarize": "md summarize rules",
+        "function_summarizer_runtime_context_packet": "md runtime context packet rules",
+    }
+
+    def fake_load(prompt_id):
+        return prompt_assets[prompt_id]
+
+    monkeypatch.setattr(agent, "_load_md_prompt_content", fake_load)
 
     async def fake_call_structured(schema, messages, temperature=0.0, category=None):
         captured[schema.__name__] = messages[0].content
@@ -709,6 +1231,8 @@ async def test_auxiliary_runtime_prompts_keep_summarizer_rules_in_md(monkeypatch
     assert summary.success is True
     assert setting_check.success is True
     summary_prompt = captured["SummarizerSummarySchema"]
+    assert "md summarize rules" in summary_prompt
+    assert "md runtime context packet rules" in summary_prompt
     assert "output_schema: SummarizerSummarySchema" in summary_prompt
     assert "请将以上对话压缩成事件摘要" not in summary_prompt
     assert "不得写成所有角色已知事实" not in summary_prompt
@@ -716,6 +1240,46 @@ async def test_auxiliary_runtime_prompts_keep_summarizer_rules_in_md(monkeypatch
     assert "output_schema: SummarizerSettingCheckSchema" in check_prompt
     assert "请重点检查" not in check_prompt
     assert "角色能力使用是否符合设定" not in check_prompt
+
+
+def test_summarizer_setting_check_instruction_uses_md_asset_for_stable_rules(monkeypatch):
+    from app.agents.director.summarizer import SummarizerAgent
+
+    agent = SummarizerAgent(system_prompt="summarizer system")
+    loaded_prompt_ids = []
+
+    prompt_assets = {
+        "function_summarizer_setting_check": "md summarizer setting check rules",
+        "role_setting": "md setting role rules",
+        "function_setting_resource_management": "md setting resource rules",
+        "function_setting_lore_interconnection": "md setting interconnection rules",
+    }
+
+    def fake_load(prompt_id):
+        loaded_prompt_ids.append(prompt_id)
+        return prompt_assets[prompt_id]
+
+    monkeypatch.setattr(agent, "_load_md_prompt_content", fake_load)
+
+    confirmation_instruction = agent._build_setting_check_instruction(has_chapter_content=False)
+    consistency_instruction = agent._build_setting_check_instruction(has_chapter_content=True)
+
+    assert loaded_prompt_ids == [
+        "function_summarizer_setting_check",
+        "role_setting",
+        "function_setting_resource_management",
+        "function_setting_lore_interconnection",
+        "function_summarizer_setting_check",
+        "role_setting",
+        "function_setting_resource_management",
+        "function_setting_lore_interconnection",
+    ]
+    assert "md summarizer setting check rules" in confirmation_instruction
+    assert "md summarizer setting check rules" in consistency_instruction
+    assert "md setting resource rules" in consistency_instruction
+    assert "【当前任务模式】\n世界观设定确认" in confirmation_instruction
+    assert "【当前任务模式】\n章节内容一致性检查" in consistency_instruction
+    assert "你是世界观设定管理员，负责确认世界观设定并检查章节内容与设定的一致性" not in confirmation_instruction
 
 
 @pytest.mark.asyncio
@@ -861,9 +1425,11 @@ async def test_auxiliary_runtime_prompts_keep_event_procgen_map_rules_in_md(monk
             "SummarizerAgent._build_default_system_prompt",
             [
                 "role_summarizer",
+                "function_summarize",
                 "function_workflow_discussion_summary",
                 "function_workflow_performance_summary",
                 "function_summarizer_runtime_context_packet",
+                "function_summarizer_setting_check",
             ],
         ),
         (
@@ -1016,6 +1582,580 @@ def test_setting_bootstrap_collection_system_prompt_uses_md_asset(monkeypatch):
     assert "主动追问缺口，并保持所有内容为待确认草案" not in prompt
 
 
+def test_setting_bootstrap_collection_system_prompt_uses_deprecated_minimal_fallback(monkeypatch):
+    class EmptyMdService:
+        def get_prompt(self, prompt_id):
+            return None
+
+    monkeypatch.setattr(
+        "app.services.setting_agent.get_md_file_service",
+        lambda: EmptyMdService(),
+    )
+
+    agent = SettingAgent()
+    prompt = agent._build_system_prompt(SimpleNamespace())
+
+    assert prompt.startswith("【DEPRECATED 最小 fallback】")
+    assert "Setting Prompt 资产缺失" not in prompt
+
+
+def test_setting_agent_service_bootstrap_prompt_uses_md_asset(monkeypatch):
+    service = SettingAgentService()
+    loaded_prompt_ids = []
+
+    monkeypatch.setattr(
+        service,
+        "_load_md_prompt_content",
+        lambda prompt_id: loaded_prompt_ids.append(prompt_id) or "md bootstrap collection rules",
+    )
+
+    prompt = service._build_bootstrap_prompt(SimpleNamespace())
+
+    assert loaded_prompt_ids == ["function_setting_bootstrap_collection"]
+    assert prompt == "md bootstrap collection rules"
+    assert "你是一个长篇网络小说设定专家（Setting Agent）。你的职责是" not in prompt
+    assert "【长篇网文核心设定要素】" not in prompt
+
+
+def test_setting_agent_service_bootstrap_prompt_uses_deprecated_minimal_fallback(monkeypatch):
+    service = SettingAgentService()
+    loaded_prompt_ids = []
+
+    monkeypatch.setattr(
+        service,
+        "_load_md_prompt_content",
+        lambda prompt_id: loaded_prompt_ids.append(prompt_id) or "",
+    )
+
+    prompt = service._build_bootstrap_prompt(SimpleNamespace())
+
+    assert loaded_prompt_ids == ["function_setting_bootstrap_collection"]
+    assert prompt.startswith("【DEPRECATED 最小 fallback】")
+    assert "主动追问缺口" in prompt
+    assert "【长篇网文核心设定要素】" not in prompt
+
+
+def test_agent_communication_intervention_classification_prompt_uses_md_asset(monkeypatch):
+    service = AgentCommunicationService()
+    loaded_prompt_ids = []
+
+    monkeypatch.setattr(
+        service,
+        "_load_prompt_asset",
+        lambda prompt_id: loaded_prompt_ids.append(prompt_id) or "md intervention classification rules",
+    )
+
+    prompt = service._build_intervention_classification_prompt(
+        message="这里人物动机错了，请修正",
+        target_agent_type="writer",
+        context={"chapter": 3, "node_id": "writer-1"},
+    )
+
+    assert loaded_prompt_ids == ["function_agent_intervention_classification"]
+    assert prompt.startswith("md intervention classification rules")
+    assert "## 目标 Agent\n作家 Agent (writer)" in prompt
+    assert "## 干预类型定义" in prompt
+    assert "- correction:" in prompt
+    assert "## 用户干预消息\n这里人物动机错了，请修正" in prompt
+    assert '"chapter": 3' in prompt
+    assert "分析以下用户对" not in prompt
+    assert "请只回答干预类型的英文名称" not in prompt
+
+
+def test_agent_communication_intervention_classification_prompt_uses_deprecated_minimal_fallback(monkeypatch):
+    service = AgentCommunicationService()
+    loaded_prompt_ids = []
+
+    monkeypatch.setattr(
+        service,
+        "_load_prompt_asset",
+        lambda prompt_id: loaded_prompt_ids.append(prompt_id) or "",
+    )
+
+    prompt = service._build_intervention_classification_prompt(
+        message="直接把结局改成主角失败",
+        target_agent_type="master_plotter",
+        context=None,
+    )
+
+    assert loaded_prompt_ids == ["function_agent_intervention_classification"]
+    assert prompt.startswith("【DEPRECATED 最小 fallback】")
+    assert "## 目标 Agent\n总编剧 Agent (master_plotter)" in prompt
+    assert "## 上下文信息\n无" in prompt
+    assert "分析以下用户对" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_agent_communication_classification_uses_md_prompt_and_normalizes_llm_output(monkeypatch):
+    service = AgentCommunicationService()
+    captured = {}
+
+    class FakePlotter:
+        async def _call_llm(self, prompt):
+            captured["prompt"] = prompt
+            return "Correction."
+
+    async def fake_factory(agent_type, project_id):
+        captured["agent_type"] = agent_type
+        captured["project_id"] = project_id
+        return FakePlotter()
+
+    service.set_agent_factory(fake_factory)
+    monkeypatch.setattr(
+        service,
+        "_load_prompt_asset",
+        lambda prompt_id: captured.setdefault("loaded_prompt_ids", []).append(prompt_id) or "md intervention classification rules",
+    )
+
+    intervention_type = await service.classify_intervention_type(
+        message="主角这里不该知道秘密，请修正逻辑",
+        target_agent_type="writer",
+        project_id="project-1",
+        context={"node_id": "writer-1"},
+    )
+
+    assert captured["agent_type"] == "master_plotter"
+    assert captured["project_id"] == "project-1"
+    assert captured["loaded_prompt_ids"] == ["function_agent_intervention_classification"]
+    assert captured["prompt"].startswith("md intervention classification rules")
+    assert intervention_type is InterventionType.CORRECTION
+
+
+@pytest.mark.asyncio
+async def test_agent_communication_classification_defaults_invalid_llm_output_to_guidance(monkeypatch):
+    service = AgentCommunicationService()
+
+    class FakePlotter:
+        async def _call_llm(self, prompt):
+            return "这需要更多上下文"
+
+    async def fake_factory(agent_type, project_id):
+        return FakePlotter()
+
+    service.set_agent_factory(fake_factory)
+    monkeypatch.setattr(
+        service,
+        "_load_prompt_asset",
+        lambda prompt_id: "md intervention classification rules",
+    )
+
+    intervention_type = await service.classify_intervention_type(
+        message="看看这里是否需要调整",
+        target_agent_type="writer",
+        project_id="project-1",
+        context=None,
+    )
+
+    assert intervention_type is InterventionType.GUIDANCE
+
+
+def test_agent_intervention_classification_prompt_asset_defines_enum_contract():
+    content = Path("prompts/instruction/function_agent_intervention_classification.md").read_text(encoding="utf-8")
+
+    assert "id: function_agent_intervention_classification" in content
+    assert "只能输出以下英文枚举之一" in content
+    for value in ["guidance", "correction", "direction", "override"]:
+        assert f"`{value}`" in content
+    assert "不要输出解释、Markdown、JSON、标点、前后缀或额外文本" in content
+
+
+def test_setting_world_description_analysis_prompt_uses_md_asset(monkeypatch):
+    service = SettingAgentService()
+    loaded_prompt_ids = []
+
+    monkeypatch.setattr(
+        service,
+        "_load_md_prompt_content",
+        lambda prompt_id: loaded_prompt_ids.append(prompt_id) or "md world description analysis rules",
+    )
+
+    prompt = service._build_world_description_analysis_prompt("青岚界由灵压和旧城遗迹构成")
+
+    assert loaded_prompt_ids == ["function_setting_world_description_analysis"]
+    assert prompt.startswith("md world description analysis rules")
+    assert "## 世界观描述\n青岚界由灵压和旧城遗迹构成" in prompt
+    assert "请分析以下世界观描述，并提取结构化信息" not in prompt
+
+
+def test_setting_negotiation_response_prompt_uses_md_asset(monkeypatch):
+    service = SettingAgentService()
+    loaded_prompt_ids = []
+    conflict = SimpleNamespace(
+        description="青铜书签是否可直接攻击",
+        severity=SimpleNamespace(value="high"),
+        resolution_suggestions=["保留限制", "改为回放回声"],
+    )
+
+    monkeypatch.setattr(
+        service,
+        "_load_md_prompt_content",
+        lambda prompt_id: loaded_prompt_ids.append(prompt_id) or "md negotiation response rules",
+    )
+
+    prompt = service._build_negotiation_response_prompt(conflict, "用户倾向保留限制")
+
+    assert loaded_prompt_ids == ["function_setting_negotiation_response"]
+    assert prompt.startswith("md negotiation response rules")
+    assert "## 冲突描述\n青铜书签是否可直接攻击" in prompt
+    assert "## 严重程度\nhigh" in prompt
+    assert "1. 保留限制" in prompt
+    assert "## 用户回复\n用户倾向保留限制" in prompt
+    assert "请生成一个有帮助的回复，帮助用户做出决定" not in prompt
+
+
+
+def test_setting_lore_extraction_prompt_uses_md_asset(monkeypatch):
+    service = SettingAgentService()
+    loaded_prompt_ids = []
+
+    monkeypatch.setattr(
+        service,
+        "_load_md_prompt_content",
+        lambda prompt_id: loaded_prompt_ids.append(prompt_id) or "md lore extraction rules",
+    )
+
+    prompt = service._build_lore_extraction_prompt("user: 用户确认保存青铜书签")
+
+    assert loaded_prompt_ids == ["function_setting_lore_extraction_confirmation"]
+    assert prompt.startswith("md lore extraction rules")
+    assert "## 对话内容\nuser: 用户确认保存青铜书签" in prompt
+    assert "请只在用户明确确认后才提取" not in prompt
+
+
+
+def test_setting_hook_extraction_prompt_uses_md_asset(monkeypatch):
+    service = SettingAgentService()
+    loaded_prompt_ids = []
+
+    monkeypatch.setattr(
+        service,
+        "_load_md_prompt_content",
+        lambda prompt_id: loaded_prompt_ids.append(prompt_id) or "md hook extraction rules",
+    )
+
+    prompt = service._build_hook_extraction_prompt("user: 用户确认这个伏笔要保留")
+
+    assert loaded_prompt_ids == ["function_setting_hook_extraction_confirmation"]
+    assert prompt.startswith("md hook extraction rules")
+    assert "## 对话内容\nuser: 用户确认这个伏笔要保留" in prompt
+
+
+
+def test_setting_character_extraction_prompt_uses_md_asset(monkeypatch):
+    service = SettingAgentService()
+    loaded_prompt_ids = []
+
+    monkeypatch.setattr(
+        service,
+        "_load_md_prompt_content",
+        lambda prompt_id: loaded_prompt_ids.append(prompt_id) or "md character extraction rules",
+    )
+
+    prompt = service._build_character_extraction_prompt("user: 请保存这个角色")
+
+    assert loaded_prompt_ids == ["function_setting_character_extraction_confirmation"]
+    assert prompt.startswith("md character extraction rules")
+    assert "## 对话内容\nuser: 请保存这个角色" in prompt
+
+
+
+def test_setting_world_type_and_tone_inference_prompts_use_md_assets(monkeypatch):
+    service = SettingAgentService()
+    loaded_prompt_ids = []
+
+    def fake_load(prompt_id):
+        loaded_prompt_ids.append(prompt_id)
+        return f"md rules for {prompt_id}"
+
+    monkeypatch.setattr(service, "_load_md_prompt_content", fake_load)
+
+    world_type_prompt = service._build_world_type_inference_prompt("user: 这个世界有门派和江湖恩怨")
+    tone_prompt = service._build_tone_inference_prompt("user: 故事整体是热血成长冒险")
+
+    assert loaded_prompt_ids == [
+        "function_setting_world_type_inference",
+        "function_setting_tone_inference",
+    ]
+    assert world_type_prompt.startswith("md rules for function_setting_world_type_inference")
+    assert "## 对话内容\nuser: 这个世界有门派和江湖恩怨" in world_type_prompt
+    assert "请从以下对话中推断故事的世界类型" not in world_type_prompt
+    assert "可能的类型：" not in world_type_prompt
+    assert tone_prompt.startswith("md rules for function_setting_tone_inference")
+    assert "## 对话内容\nuser: 故事整体是热血成长冒险" in tone_prompt
+    assert "请从以下对话中推断故事的叙事基调" not in tone_prompt
+    assert "可能的基调：" not in tone_prompt
+
+
+@pytest.mark.asyncio
+async def test_setting_world_type_and_tone_inference_paths_use_md_prompt_builders(monkeypatch):
+    service = SettingAgentService()
+    captured_prompts = []
+
+    monkeypatch.setattr(
+        service,
+        "_load_md_prompt_content",
+        lambda prompt_id: f"md inference rules for {prompt_id}",
+    )
+
+    async def fake_call_llm_simple(prompt):
+        captured_prompts.append(prompt)
+        if "function_setting_world_type_inference" in prompt:
+            return "wuxia"
+        if "function_setting_tone_inference" in prompt:
+            return "adventurous"
+        raise AssertionError(prompt)
+
+    monkeypatch.setattr(service, "_call_llm_simple", fake_call_llm_simple)
+
+    history = [
+        {"role": "user", "content": "故事发生在江湖门派之间。"},
+        {"role": "assistant", "content": "这是武侠底色。"},
+        {"role": "user", "content": "整体要热血成长、持续冒险。"},
+    ]
+
+    assert await service.infer_world_type(history) == "wuxia"
+    assert await service.infer_tone(history) == "adventurous"
+
+    assert len(captured_prompts) == 2
+    assert "md inference rules for function_setting_world_type_inference" in captured_prompts[0]
+    assert "## 对话内容" in captured_prompts[0]
+    assert "故事发生在江湖门派之间" in captured_prompts[0]
+    assert "请从以下对话中推断故事的世界类型" not in captured_prompts[0]
+    assert "md inference rules for function_setting_tone_inference" in captured_prompts[1]
+    assert "整体要热血成长、持续冒险" in captured_prompts[1]
+    assert "请从以下对话中推断故事的叙事基调" not in captured_prompts[1]
+
+
+@pytest.mark.parametrize(
+    ("prompt_id", "expected_terms"),
+    [
+        ("function_setting_world_type_inference", ["fantasy", "scifi", "modern", "historical", "wuxia", "unknown"]),
+        ("function_setting_tone_inference", ["serious", "lighthearted", "dark", "comedic", "adventurous", "unknown"]),
+    ],
+)
+def test_setting_inference_prompt_assets_define_stable_enum_contract(prompt_id, expected_terms):
+    prompt_path = Path("prompts/instruction") / f"{prompt_id}.md"
+    content = prompt_path.read_text(encoding="utf-8")
+
+    assert f"id: {prompt_id}" in content
+    assert "不要输出解释文字" in content
+    for term in expected_terms:
+        assert term in content
+
+
+def test_setting_personality_generation_prompt_uses_md_asset(monkeypatch):
+    service = SettingAgentService()
+    loaded_prompt_ids = []
+
+    monkeypatch.setattr(
+        service,
+        "_load_md_prompt_content",
+        lambda prompt_id: loaded_prompt_ids.append(prompt_id) or "md personality generation rules",
+    )
+
+    prompt = service._build_personality_generation_prompt_from_context(
+        name="陆青",
+        role="main",
+        description="旧城药铺出身的少年",
+        background="懂得隐藏力量",
+        existing_personalities="\n\n现有角色性格（避免过于相似）：\n- 林掌柜：沉稳",
+        project_context="青岚界",
+        role_descriptions={"main": "主角 - 故事的核心人物，需要鲜明的性格和成长空间"},
+    )
+
+    assert loaded_prompt_ids == ["function_setting_personality_generation"]
+    assert prompt.startswith("md personality generation rules")
+    assert "【项目背景】\n青岚界" in prompt
+    assert "【角色信息】" in prompt
+    assert "- 姓名：陆青" in prompt
+    assert "- 定位：主角 - 故事的核心人物，需要鲜明的性格和成长空间" in prompt
+
+
+
+def test_setting_management_system_prompt_uses_md_asset(monkeypatch):
+    service = SettingAgentService()
+    loaded_prompt_ids = []
+
+    monkeypatch.setattr(
+        service,
+        "_load_md_prompt_content",
+        lambda prompt_id: loaded_prompt_ids.append(prompt_id) or "md management system rules",
+    )
+
+    class FakeSession:
+        project_id = "project-1"
+
+    prompt = asyncio.run(service._build_management_system_prompt(FakeSession()))
+
+    assert loaded_prompt_ids == ["function_setting_management_system_prompt"]
+    assert prompt.startswith("md management system rules")
+    assert "【世界类型提示】" in prompt
+    assert "【叙事基调提示】" in prompt
+
+
+
+def test_character_detection_prompt_uses_md_asset_and_runtime_blocks(monkeypatch):
+    class FakeMdService:
+        def __init__(self):
+            self.requested_prompt_ids = []
+
+        def get_prompt(self, prompt_id):
+            self.requested_prompt_ids.append(prompt_id)
+            assert prompt_id == "function_character_detection"
+            return {"content": "md character detection rules and JSON contract"}
+
+    md_service = FakeMdService()
+    monkeypatch.setattr(
+        "app.services.character_detection.get_md_file_service",
+        lambda: md_service,
+    )
+
+    manager = CharacterPromotionManager()
+    prompt = manager._build_character_detection_prompt(
+        "青岚界旧城药铺中，白衣少年第一次开口。",
+        "陆青, 林掌柜",
+    )
+
+    assert md_service.requested_prompt_ids == ["function_character_detection"]
+    assert prompt.startswith("md character detection rules and JSON contract")
+    assert "## 章节内容\n青岚界旧城药铺中，白衣少年第一次开口。" in prompt
+    assert "## 已有角色列表\n陆青, 林掌柜" in prompt
+    assert "请从以下章节内容中检测和提取所有出现的角色" not in prompt
+    assert "【检测任务】" not in prompt
+    assert "【重要性判断标准】" not in prompt
+    assert "只输出 JSON，不要有其他内容。" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_character_detection_llm_path_parses_json_and_filters_existing_characters(monkeypatch):
+    class FakeMdService:
+        def __init__(self):
+            self.requested_prompt_ids = []
+
+        def get_prompt(self, prompt_id):
+            self.requested_prompt_ids.append(prompt_id)
+            assert prompt_id == "function_character_detection"
+            return {"content": "md character detection rules"}
+
+    class FakeResponse:
+        content = """
+        {
+          "existing_characters_found": ["陆青"],
+          "new_characters": [
+            {
+              "name": "陆青",
+              "importance_tier": 1,
+              "first_appearance_context": "陆青回到药铺",
+              "description": "已有角色",
+              "dialogue_count": 1,
+              "importance_reason": "已有主角"
+            },
+            {
+              "name": "白衣少年",
+              "importance_tier": 3,
+              "first_appearance_context": "白衣少年推门而入",
+              "description": "带来线索的新角色",
+              "dialogue_count": 2,
+              "importance_reason": "有台词并推动情节"
+            }
+          ],
+          "total_characters_in_chapter": 2
+        }
+        """
+
+    class FakeLlm:
+        def __init__(self):
+            self.messages = []
+
+        async def ainvoke(self, messages):
+            self.messages = messages
+            return FakeResponse()
+
+    md_service = FakeMdService()
+    monkeypatch.setattr(
+        "app.services.character_detection.get_md_file_service",
+        lambda: md_service,
+    )
+
+    manager = CharacterPromotionManager()
+    llm = FakeLlm()
+    detected = await manager._detect_characters_with_llm(
+        content="陆青回到药铺。白衣少年推门而入：我知道青岚界旧城的秘密。",
+        project_id="project-1",
+        existing_characters=[{"name": "陆青"}],
+        llm_model=llm,
+    )
+
+    assert md_service.requested_prompt_ids == ["function_character_detection"]
+    assert detected == [
+        {
+            "name": "白衣少年",
+            "importance_tier": 3,
+            "first_appearance_context": "白衣少年推门而入",
+            "description": "带来线索的新角色",
+            "dialogue_count": 2,
+            "importance_reason": "有台词并推动情节",
+        }
+    ]
+    assert len(llm.messages) == 1
+    prompt = llm.messages[0].content
+    assert prompt.startswith("md character detection rules")
+    assert "## 章节内容\n陆青回到药铺。白衣少年推门而入" in prompt
+    assert "## 已有角色列表\n陆青" in prompt
+    assert "请从以下章节内容中检测和提取所有出现的角色" not in prompt
+
+def test_collaborator_prompt_uses_md_asset_and_runtime_role_context(monkeypatch):
+    class FakeMdService:
+        def __init__(self):
+            self.requested_prompt_ids = []
+
+        def get_prompt(self, prompt_id):
+            self.requested_prompt_ids.append(prompt_id)
+            assert prompt_id == "function_collaborator_role_advice"
+            return {"content": "md collaborator advice rules"}
+
+    md_service = FakeMdService()
+    monkeypatch.setattr(
+        "app.services.collaborator.get_md_file_service",
+        lambda: md_service,
+    )
+
+    system = CollaboratorSystem()
+    role_profile = system.role_profiles[CollaborationRole.PLOT_ADVISOR]
+    request = CollaborationRequest(
+        request_type="plot_gap_review",
+        context={
+            "world": {"name": "云岫洲", "description": "慢热玄幻世界"},
+            "characters": [{"name": "沈砚", "role": "main"}],
+            "plot": "主角获得青铜书签后需要承接古碑回声线索。",
+            "current_issue": "第二章缺少明确事件推进。",
+            "specific_question": "如何避免只有对话？",
+        },
+        role=CollaborationRole.PLOT_ADVISOR,
+    )
+
+    prompt = system._prepare_prompt(request, role_profile)
+
+    assert md_service.requested_prompt_ids == ["function_collaborator_role_advice"]
+    assert prompt[0]["role"] == "system"
+    assert prompt[0]["content"].startswith("md collaborator advice rules")
+    assert "## 当前协作角色" in prompt[0]["content"]
+    assert "角色名称：剧情顾问" in prompt[0]["content"]
+    assert "角色优势：结构设计、节奏控制、张力构建" in prompt[0]["content"]
+    assert "你是一个经验丰富的剧情顾问" not in prompt[0]["content"]
+    assert "请关注剧情的连贯性、张力和节奏感" not in prompt[0]["content"]
+
+    assert prompt[1]["role"] == "user"
+    user_message = prompt[1]["content"]
+    assert "## 协作请求类型\nplot_gap_review" in user_message
+    assert "世界：云岫洲" in user_message
+    assert "角色列表：" in user_message
+    assert "沈砚 - main" in user_message
+    assert "当前问题：第二章缺少明确事件推进。" in user_message
+    assert "具体问题：如何避免只有对话？" in user_message
+    assert "请根据你的角色" not in user_message
+
+
 @pytest.mark.asyncio
 async def test_setting_bootstrap_seed_extraction_uses_md_system_prompt_and_dynamic_history(monkeypatch):
     class FakeMdService:
@@ -1062,6 +2202,251 @@ async def test_setting_bootstrap_seed_extraction_uses_md_system_prompt_and_dynam
     assert "你是一个结构化数据提取专家。请从对话中提取 JSON 数据。" not in captured["system_prompt"]
     assert "请从对话历史中提取结构化项目 seed，只输出 JSON 对象" not in captured["system_prompt"]
     assert "md bootstrap seed extraction contract" not in captured["user_message"]
+
+
+def test_workflow_setting_agent_chapter_consistency_prompt_uses_md_asset(monkeypatch):
+    from app.agents.setting_agent import SettingAgent as WorkflowSettingAgent
+
+    agent = WorkflowSettingAgent(project_id="project-1")
+    loaded_prompt_ids = []
+
+    def fake_load(prompt_id):
+        loaded_prompt_ids.append(prompt_id)
+        assert prompt_id == "function_setting_chapter_consistency"
+        return "md setting chapter consistency rules"
+
+    monkeypatch.setattr(agent, "_load_md_prompt_content", fake_load)
+
+    prompt = agent._build_chapter_consistency_prompt(
+        "陆青在旧城灵压下用青铜书签直接击溃敌人。"
+    )
+
+    assert loaded_prompt_ids == ["function_setting_chapter_consistency"]
+    assert prompt.startswith("md setting chapter consistency rules")
+    assert "【章节内容】\n陆青在旧城灵压下用青铜书签直接击溃敌人。" in prompt
+    assert "请检查以下章节内容与世界设定的一致性" not in prompt
+    assert "力量体系使用是否一致" not in prompt
+    assert "如果发现问题，列出具体问题并建议修改方案" not in prompt
+
+
+def test_workflow_setting_agent_context_analysis_prompt_uses_md_asset_and_runtime_blocks(monkeypatch):
+    from app.agents.setting_agent import SettingAgent as WorkflowSettingAgent
+
+    agent = WorkflowSettingAgent(project_id="project-1")
+    loaded_prompt_ids = []
+
+    def fake_load(prompt_id):
+        loaded_prompt_ids.append(prompt_id)
+        assert prompt_id == "function_setting_workflow_context_analysis"
+        return "md setting workflow context analysis rules"
+
+    monkeypatch.setattr(agent, "_load_md_prompt_content", fake_load)
+
+    prompt = agent._build_workflow_context_analysis_prompt(
+        chapter_num=3,
+        goal_text="揭示青铜书签只能回放古碑回声",
+        outline_text="陆青在旧城药铺发现书签限制",
+        world_name="青岚界",
+        world_type="fantasy",
+        world_rules_text="灵气不能凭空转化为神识",
+        lore_summaries=["- 青铜书签: 只能回放古碑回声，不能直接攻击"],
+    )
+
+    assert loaded_prompt_ids == ["function_setting_workflow_context_analysis"]
+    assert prompt.startswith("md setting workflow context analysis rules")
+    assert "- 章节号：3" in prompt
+    assert "- 章节目标：揭示青铜书签只能回放古碑回声" in prompt
+    assert "- 当前大纲/焦点：陆青在旧城药铺发现书签限制" in prompt
+    assert "- 世界名：青岚界" in prompt
+    assert "- 类型/风格：fantasy" in prompt
+    assert "- 核心规则：灵气不能凭空转化为神识" in prompt
+    assert "- 青铜书签: 只能回放古碑回声，不能直接攻击" in prompt
+    assert "你不是在泛泛整理世界观" not in prompt
+    assert "不要自行脑补默认奇幻/冒险设定" not in prompt
+    assert "输出尽量结构化" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_workflow_setting_agent_methods_send_md_backed_prompts_to_chat(monkeypatch):
+    from app.agents.setting_agent import SettingAgent as WorkflowSettingAgent
+
+    agent = WorkflowSettingAgent(project_id="project-1")
+    loaded_prompt_ids = []
+    captured_calls = []
+
+    def fake_load(prompt_id):
+        loaded_prompt_ids.append(prompt_id)
+        return f"md rules for {prompt_id}"
+
+    class FakeSettingService:
+        async def chat(self, **kwargs):
+            captured_calls.append(kwargs)
+            return {"response": "ok"}
+
+    monkeypatch.setattr(agent, "_load_md_prompt_content", fake_load)
+    agent._setting_service = FakeSettingService()
+
+    chapter_result = await agent._check_chapter_consistency(
+        "陆青用青铜书签直接攻击敌人。",
+        {"world_info": {"name": "青岚界"}},
+    )
+    organize_result = await agent._organize_settings(
+        {
+            "chapter_num": 1,
+            "chapter_goals": [{"goal": "确认书签能力边界"}],
+            "chapter_outline": {"1": {"summary": "旧城药铺测试书签"}},
+            "world_info": {
+                "name": "青岚界",
+                "world_type": "fantasy",
+                "rules": ["书签只能回放回声"],
+            },
+            "lore_entries": [
+                {
+                    "title": "青铜书签",
+                    "summary": "只能回放古碑回声",
+                    "constraints": ["不能直接攻击"],
+                }
+            ],
+        }
+    )
+
+    assert chapter_result == "ok"
+    assert organize_result == "ok"
+    assert loaded_prompt_ids == [
+        "function_setting_chapter_consistency",
+        "function_setting_workflow_context_analysis",
+    ]
+
+    chapter_call = captured_calls[0]
+    assert chapter_call["project_id"] == "project-1"
+    assert chapter_call["message"].startswith("md rules for function_setting_chapter_consistency")
+    assert "【章节内容】\n陆青用青铜书签直接攻击敌人。" in chapter_call["message"]
+    assert chapter_call["context"]["chapter_check"] is True
+    assert chapter_call["context"]["world_info"] == {"name": "青岚界"}
+    assert "力量体系使用是否一致" not in chapter_call["message"]
+
+    organize_call = captured_calls[1]
+    assert organize_call["project_id"] == "project-1"
+    assert organize_call["message"].startswith("md rules for function_setting_workflow_context_analysis")
+    assert "- 章节号：1" in organize_call["message"]
+    assert "- 章节目标：确认书签能力边界" in organize_call["message"]
+    assert "- 当前大纲/焦点：旧城药铺测试书签" in organize_call["message"]
+    assert "- 世界名：青岚界" in organize_call["message"]
+    assert "- 青铜书签: 只能回放古碑回声；禁止/限制：不能直接攻击" in organize_call["message"]
+    assert organize_call["context"]["workflow_setting_analysis"] is True
+    assert "你不是在泛泛整理世界观" not in organize_call["message"]
+
+
+def test_setting_improvement_analysis_prompt_uses_md_asset_and_runtime_blocks(monkeypatch):
+    service = SettingAgentService()
+    loaded_prompt_ids = []
+
+    def fake_load(prompt_id):
+        loaded_prompt_ids.append(prompt_id)
+        assert prompt_id == "function_setting_improvement_analysis"
+        return "md setting improvement analysis rules"
+
+    monkeypatch.setattr(service, "_load_md_prompt_content", fake_load)
+
+    prompt = service._build_setting_improvement_analysis_prompt(
+        world_type_hint="fantasy：魔法、异世界、宗门体系",
+        lores_summary="- [core] 青岚界灵气规则 (power): 灵气不能凭空转化为神识",
+        conversation_context="用户刚确认青铜书签只能回放古碑回声，不能直接攻击。",
+    )
+
+    assert loaded_prompt_ids == ["function_setting_improvement_analysis"]
+    assert prompt.startswith("md setting improvement analysis rules")
+    assert "## 世界类型\nfantasy：魔法、异世界、宗门体系" in prompt
+    assert "## 现有设定列表\n- [core] 青岚界灵气规则" in prompt
+    assert "## 最近对话上下文\n用户刚确认青铜书签只能回放古碑回声" in prompt
+    assert "你是一个专业的小说设定审核专家。请分析以下世界观设定" not in prompt
+    assert "请识别以下类型的改进机会" not in prompt
+    assert "只输出 JSON 数组，不要其他内容" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_setting_improvement_analysis_path_uses_structured_schema_and_filters_results(monkeypatch):
+    from app.models.agent_output_schemas import SettingImprovementSuggestionsSchema
+
+    service = SettingAgentService()
+    monkeypatch.setattr(
+        service,
+        "_load_md_prompt_content",
+        lambda prompt_id: "md setting improvement analysis rules",
+    )
+
+    class FakeDb:
+        async def execute_query(self, query, params):
+            assert params == {"project_id": "project-1"}
+            return [
+                {
+                    "id": "lore-1",
+                    "title": "青铜书签",
+                    "category": "artifact",
+                    "priority": "core",
+                    "content": "只能回放古碑回声，不能直接攻击。",
+                    "summary": "回放古碑回声",
+                    "keywords": [],
+                },
+                {
+                    "id": "lore-2",
+                    "title": "旧城灵压",
+                    "category": "power_system",
+                    "priority": "standard",
+                    "content": "旧城灵压会压制初学者施法。",
+                    "summary": "旧城灵压限制",
+                    "keywords": [],
+                },
+            ]
+
+    captured = {}
+
+    async def fake_call_structured(schema, prompt, *, project_id=None, **kwargs):
+        captured["schema"] = schema
+        captured["prompt"] = prompt
+        captured["project_id"] = project_id
+        return SimpleNamespace(
+            suggestions=[
+                SimpleNamespace(model_dump=lambda: {
+                    "type": "relation",
+                    "target_lore_id": "lore-1",
+                    "target_lore_title": "青铜书签",
+                    "issue": "与旧城灵压的互动边界未说明",
+                    "suggestion": "补充书签回放能力在灵压环境下的限制",
+                    "suggested_content": "青铜书签在旧城灵压下只能回放短片段。",
+                    "priority": "high",
+                    "reason": "避免后续大纲误用能力",
+                }),
+                SimpleNamespace(model_dump=lambda: {
+                    "type": "missing",
+                    "issue": "缺少 suggestion 字段，应被过滤",
+                }),
+            ]
+        )
+
+    monkeypatch.setattr("app.api.app.postgres_db", FakeDb(), raising=False)
+    monkeypatch.setattr(service, "_call_structured", fake_call_structured)
+    monkeypatch.setattr(service, "_get_world_type_hint", lambda world_type: f"hint:{world_type}")
+
+    suggestions = await service.analyze_existing_lores(
+        project_id="project-1",
+        conversation_context="用户刚确认书签不能直接攻击。",
+        world_type="fantasy",
+    )
+
+    assert captured["schema"] is SettingImprovementSuggestionsSchema
+    assert captured["project_id"] == "project-1"
+    assert captured["prompt"].startswith("md setting improvement analysis rules")
+    assert "## 世界类型\nhint:fantasy" in captured["prompt"]
+    assert "青铜书签" in captured["prompt"]
+    assert "旧城灵压" in captured["prompt"]
+    assert "用户刚确认书签不能直接攻击" in captured["prompt"]
+    assert "你是一个专业的小说设定审核专家。请分析以下世界观设定" not in captured["prompt"]
+    assert len(suggestions) == 1
+    assert suggestions[0]["type"] == "relation"
+    assert suggestions[0]["target_lore_id"] == "lore-1"
+    assert suggestions[0]["priority"] == "high"
+    assert suggestions[0]["id"]
 
 
 @pytest.mark.asyncio
@@ -1120,6 +2505,117 @@ async def test_setting_missing_config_prompt_is_not_silent(monkeypatch):
     assert result["trace"]["deprecated_sources_used"] == ["SettingAgentService._build_md_setting_fallback_prompt"]
     assert "function_setting_resource_management" in result["trace"]["missing_prompt_ids"]
     assert_render_trace_contract(result["trace"])
+
+
+def test_setting_segment_key_point_extraction_prompt_uses_md_asset(monkeypatch):
+    service = SettingAgentService()
+    loaded_prompt_ids = []
+
+    monkeypatch.setattr(
+        service,
+        "_load_md_prompt_content",
+        lambda prompt_id: loaded_prompt_ids.append(prompt_id) or "md segmented synthesis rules",
+    )
+
+    prompt = service._build_segment_key_point_extraction_prompt(
+        section_name="设定库",
+        segment_content="青铜书签只能回放旧城短片段。",
+        user_question="如何补全书签限制？",
+        world_type_hint="武侠 / 灵压体系",
+    )
+
+    assert loaded_prompt_ids == ["function_setting_segmented_context_synthesis"]
+    assert prompt.startswith("md segmented synthesis rules")
+    assert "## 世界类型\n武侠 / 灵压体系" in prompt
+    assert "## 片段来源\n设定库" in prompt
+    assert "## 片段内容\n青铜书签只能回放旧城短片段。" in prompt
+    assert "## 用户问题\n如何补全书签限制？" in prompt
+    assert "分析以下项目上下文片段，提取关键信息点" not in prompt
+    assert "提取关键信息点，格式如下" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_setting_extract_key_points_uses_md_prompt_builder(monkeypatch):
+    service = SettingAgentService()
+    captured = {}
+
+    monkeypatch.setattr(
+        service,
+        "_load_md_prompt_content",
+        lambda prompt_id: captured.setdefault("loaded_prompt_ids", []).append(prompt_id) or "md segmented synthesis rules",
+    )
+
+    async def fake_call_llm_simple(prompt):
+        captured["prompt"] = prompt
+        return """
+        ```json
+        [
+          {
+            "category": "道具规则",
+            "entity": "青铜书签",
+            "key_fact": "青铜书签只能回放旧城短片段",
+            "relevance": "高",
+            "related_entities": ["旧城"],
+            "relation_type": "requires_resource",
+            "resource_requirements": [
+              {"requirement_type":"item","resource_name":"青铜书签","severity":"blocking","reason":"需要补全回放边界"}
+            ]
+          }
+        ]
+        ```
+        """
+
+    monkeypatch.setattr(service, "_call_llm_simple", fake_call_llm_simple)
+
+    key_points = await service._extract_key_points(
+        section_name="设定库",
+        segment_content="青铜书签只能回放旧城短片段。",
+        user_question="如何补全书签限制？",
+        world_type_hint="武侠 / 灵压体系",
+        project_id="project-1",
+    )
+
+    assert captured["loaded_prompt_ids"] == ["function_setting_segmented_context_synthesis"]
+    assert captured["prompt"].startswith("md segmented synthesis rules")
+    assert "## 片段内容\n青铜书签只能回放旧城短片段。" in captured["prompt"]
+    assert "分析以下项目上下文片段，提取关键信息点" not in captured["prompt"]
+    assert key_points == [
+        {
+            "category": "道具规则",
+            "entity": "青铜书签",
+            "key_fact": "青铜书签只能回放旧城短片段",
+            "relevance": "高",
+            "related_entities": ["旧城"],
+            "relation_type": "requires_resource",
+            "potential_conflicts": [],
+            "resource_requirements": [
+                {
+                    "requirement_type": "item",
+                    "resource_name": "青铜书签",
+                    "severity": "blocking",
+                    "reason": "需要补全回放边界",
+                    "suggested_payload": {},
+                }
+            ],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_setting_improvement_analysis_prompt_uses_deprecated_minimal_fallback_when_md_missing(monkeypatch):
+    service = SettingAgentService()
+    monkeypatch.setattr(service, "_load_md_prompt_content", lambda prompt_id: "")
+
+    prompt = service._build_setting_improvement_analysis_prompt(
+        world_type_hint="hint:fantasy",
+        lores_summary="- [core] 青铜书签",
+        conversation_context="用户刚确认书签不能直接攻击。",
+    )
+
+    assert prompt.startswith("【DEPRECATED 最小 fallback】请分析现有世界观设定")
+    assert "## 世界类型\nhint:fantasy" in prompt
+    assert "## 现有设定列表\n- [core] 青铜书签" in prompt
+    assert "## 最近对话上下文\n用户刚确认书签不能直接攻击。" in prompt
 
 
 def test_setting_segment_parser_preserves_interconnection_fields():
@@ -1425,6 +2921,72 @@ async def test_workflow_plotter_opening_uses_config_prompt_trace(monkeypatch):
     assert result["content"] == "开场发言"
     assert result["config_prompt_source"] == "md_prompt_fallback"
     assert result["prompt_render_trace"]["scenario"] == "workflow_discussion_opening"
+
+
+def test_workflow_runtime_constraints_use_md_asset_and_runtime_blocks(monkeypatch):
+    engine = WorkflowEngine()
+    loaded_prompt_ids = []
+
+    def fake_load(prompt_id):
+        loaded_prompt_ids.append(prompt_id)
+        assert prompt_id == "function_workflow_runtime_constraints"
+        return "md workflow runtime constraint rules"
+
+    monkeypatch.setattr(engine, "_load_prompt_asset_content", fake_load)
+
+    context = {
+        "scene_directions": {
+            "performers": [{"name": "沈砚"}],
+            "mentioned_characters": [{"name": "旧城守夜人"}],
+            "unavailable_characters": [{"name": "已故师父"}],
+            "background_characters": [{"name": "客栈伙计"}],
+        },
+        "selected_lore_entries": [
+            {
+                "id": "lore-char-1",
+                "category": "character_setting",
+                "title": "沈砚来源",
+                "content": "沈砚来自旧城书铺。",
+            }
+        ],
+    }
+
+    constraints = engine._build_character_constraint_state(context)
+    prompt = engine._format_agent_constraint_context(context)
+
+    assert constraints["rules_prompt_id"] == "function_workflow_runtime_constraints"
+    assert loaded_prompt_ids == ["function_workflow_runtime_constraints"]
+    assert prompt.startswith("【工作流角色/设定约束】\nmd workflow runtime constraint rules")
+    assert "【角色出场运行期数据】" in prompt
+    assert "present_character_names" in prompt
+    assert "沈砚" in prompt
+    assert "mentioned_only_names" in prompt
+    assert "旧城守夜人" in prompt
+    assert "forbidden_direct_appearance_names" in prompt
+    assert "已故师父" in prompt
+    assert "【角色设定库条目（来源/历史/身份必须遵守）】" in prompt
+    assert "沈砚来源" in prompt
+    assert "只有 present_character_names 中的角色可以在当前正面场景中说话" not in prompt
+    assert "mentioned_only_names 只能作为传闻" not in prompt
+    assert "角色来源、历史、身份和背景必须服从 selected_lore_entries" not in prompt
+
+
+def test_workflow_reference_material_instruction_uses_constraints_asset(monkeypatch):
+    engine = WorkflowEngine()
+    loaded_prompt_ids = []
+
+    def fake_load(prompt_id):
+        loaded_prompt_ids.append(prompt_id)
+        return "md workflow runtime constraint rules"
+
+    monkeypatch.setattr(engine, "_load_prompt_asset_content", fake_load)
+
+    instruction = engine._build_workflow_reference_material_instruction()
+
+    assert loaded_prompt_ids == ["function_workflow_runtime_constraints"]
+    assert "function_workflow_runtime_constraints" in instruction
+    assert "参考的素材索引" in instruction
+    assert "已确认资产冲突" in instruction
 
 
 @pytest.mark.asyncio
@@ -1837,7 +3399,7 @@ async def test_phase_4_6_character_context_packet_is_injected_and_list_fields_ar
     assert integrated["private_performances"][0]["intent"] == "先稳住局面再观察"
 
 
-def test_phase_4_6_scene_coordinator_builds_per_character_knowledge_packet():
+def test_phase_4_6_scene_coordinator_builds_per_character_knowledge_packet(monkeypatch):
     from app.agents.scene_coordinator import SceneCoordinatorAgent
 
     coordinator = SceneCoordinatorAgent(project_id="project-1")
@@ -1879,6 +3441,14 @@ def test_phase_4_6_scene_coordinator_builds_per_character_knowledge_packet():
     from app.agents.director.summarizer import SummarizerAgent
 
     summarizer = SummarizerAgent(project_id="project-1")
+
+    def fake_load(prompt_id):
+        return {
+            "function_summarize": "md summarize rules",
+            "function_summarizer_runtime_context_packet": "md runtime context packet rules",
+        }[prompt_id]
+
+    monkeypatch.setattr(summarizer, "_load_md_prompt_content", fake_load)
     user_message = summarizer._build_user_message(
         dialogue_history=[{"speaker": "角色甲", "content": "我们先离开这里。"}],
         participants=["角色甲", "角色乙"],
@@ -1901,7 +3471,10 @@ def test_phase_4_6_scene_coordinator_builds_per_character_knowledge_packet():
         },
     )
 
-    assert "【私有表演素材（仅供 Writer/Evaluator 参考，不得总结成场内公开事实）】" in user_message
+    assert "md summarize rules" in user_message
+    assert "md runtime context packet rules" in user_message
+    assert "【私有表演素材】" in user_message
+    assert "【私有表演素材（仅供 Writer/Evaluator 参考，不得总结成场内公开事实）】" not in user_message
     assert "角色甲 私有内心：不能让他们知道真正的计划。" in user_message
     assert "角色甲 下一步意图：先稳住局面再观察" in user_message
     assert "角色甲 隐瞒信息：隐藏的接头地点" in user_message
@@ -2033,6 +3606,48 @@ def test_authoritative_templates_include_long_novel_skills_and_writing_rules_slo
         assert prompt_slots["writing_rules"].prompt_template_id is None
         assert "writing_rules" in (template.default_prompt_order or []), template.id
         assert "skill_long_novel_awareness" in skill_ids, template.id
+
+
+def test_writer_style_consistency_template_is_scenario_specific():
+    from app.data.system_agent_templates import SYSTEM_AGENT_TEMPLATES, WRITER_STYLE_CONSISTENCY
+
+    prompt_ids = {slot.prompt_template_id for slot in WRITER_STYLE_CONSISTENCY.prompt_slots if slot.prompt_template_id}
+
+    assert WRITER_STYLE_CONSISTENCY in SYSTEM_AGENT_TEMPLATES
+    assert WRITER_STYLE_CONSISTENCY.id == "director_writer_style_consistency"
+    assert WRITER_STYLE_CONSISTENCY.agent_type.value == "writer"
+    assert WRITER_STYLE_CONSISTENCY.scenario == "style_consistency_check"
+    assert "function_writer_style_consistency" in prompt_ids
+    assert "function_writer_segment_generation" not in prompt_ids
+    assert "style_consistency" in WRITER_STYLE_CONSISTENCY.default_prompt_order
+    assert "writing_rules" in WRITER_STYLE_CONSISTENCY.default_prompt_order
+
+
+@pytest.mark.asyncio
+async def test_writer_style_consistency_runtime_trace_does_not_use_template_fallback():
+    from app.data.system_agent_templates import WRITER_STYLE_CONSISTENCY
+    from app.services.agent_prompt_service import AgentPromptService
+
+    service = AgentPromptService()
+    result = await service.build_agent_prompt_with_trace(
+        agent_type="writer",
+        project_id="project-1",
+        variables={"scenario": "style_consistency_check"},
+        scenario="style_consistency_check",
+        resolved_template=WRITER_STYLE_CONSISTENCY,
+        include_skills=False,
+        use_project_config=False,
+    )
+    trace = result["trace"]
+
+    assert "function_writer_style_consistency" in trace["prompt_ids"]
+    assert "function_writer_segment_generation" not in trace["prompt_ids"]
+    assert trace["template_id"] == "director_writer_style_consistency"
+    assert trace["template_scenario"] == "style_consistency_check"
+    assert trace["fallbacks_used"] == []
+    assert trace["deprecated_sources_used"] == []
+    assert trace["missing_prompt_ids"] == []
+    assert_render_trace_contract(trace)
 
 
 def test_auxiliary_templates_bind_authoritative_prompt_assets():
@@ -2567,12 +4182,20 @@ AUDIT_REQUIRED_KEYS = {
     "slot_count",
     "resolved_prompt_ids",
     "missing_prompt_ids",
+    "md_asset_prompt_ids",
+    "system_seed_prompt_ids",
+    "deprecated_prompt_ids",
+    "unresolved_md_asset_prompt_ids",
     "templates",
 }
 
 AUDIT_LIST_KEYS = (
     "resolved_prompt_ids",
     "missing_prompt_ids",
+    "md_asset_prompt_ids",
+    "system_seed_prompt_ids",
+    "deprecated_prompt_ids",
+    "unresolved_md_asset_prompt_ids",
     "templates",
 )
 
@@ -2582,6 +4205,10 @@ AUDIT_TEMPLATE_REQUIRED_KEYS = {
     "scenario",
     "prompt_ids",
     "missing_prompt_ids",
+    "md_asset_prompt_ids",
+    "system_seed_prompt_ids",
+    "deprecated_prompt_ids",
+    "unresolved_md_asset_prompt_ids",
     "fallbacks_used",
     "deprecated_sources_used",
 }
@@ -2589,6 +4216,10 @@ AUDIT_TEMPLATE_REQUIRED_KEYS = {
 AUDIT_TEMPLATE_LIST_KEYS = (
     "prompt_ids",
     "missing_prompt_ids",
+    "md_asset_prompt_ids",
+    "system_seed_prompt_ids",
+    "deprecated_prompt_ids",
+    "unresolved_md_asset_prompt_ids",
     "fallbacks_used",
     "deprecated_sources_used",
 )
@@ -2962,6 +4593,79 @@ async def test_evaluator_deterministic_role_performance_gate_survives_prompt_mig
     assert_render_trace_contract(result.metadata["prompt_render_trace"])
 
 
+def test_evaluator_task_prompts_use_md_assets_for_stable_rules(monkeypatch):
+    from app.agents.evaluator import EvaluatorAgent
+
+    evaluator = EvaluatorAgent(project_id="project-1")
+    loaded_prompt_ids = []
+
+    prompt_assets = {
+        "function_evaluator_chapter_quality_gate": "md evaluator chapter gate rules",
+        "function_evaluator_reader_simulation": "md evaluator reader simulation rules",
+        "function_evaluator_ooc_review": "md evaluator ooc review rules",
+    }
+
+    def fake_load(prompt_id):
+        loaded_prompt_ids.append(prompt_id)
+        return prompt_assets[prompt_id]
+
+    monkeypatch.setattr(evaluator, "_load_md_prompt_content", fake_load)
+
+    chapter_prompt = evaluator._format_evaluator_task_prompt(
+        evaluator._evaluator_task_title("chapter_end"),
+        [("当前章节数据", {"word_count": 1200, "chapter_content": "正文"})],
+        output_schema=evaluator._evaluator_task_schema(
+            "chapter_end",
+            word_count=1200,
+            target_word_count=1500,
+        ),
+        task_notes=evaluator._evaluator_task_notes(
+            "chapter_end",
+            ["当前运行时目标：输出 EvaluatorChapterEndSchema。"],
+        ),
+        config_prompt="Evaluator runtime prompt",
+    )
+    reader_prompt = evaluator._format_evaluator_task_prompt(
+        evaluator._evaluator_task_title("reader_simulate"),
+        [("章节内容", "正文")],
+        output_schema=evaluator._evaluator_task_schema("reader_simulate"),
+        task_notes=evaluator._evaluator_task_notes(
+            "reader_simulate",
+            ["当前运行时目标：输出 EvaluatorReaderSimulateSchema。"],
+        ),
+        config_prompt="Evaluator runtime prompt",
+    )
+    ooc_prompt = evaluator._format_evaluator_task_prompt(
+        evaluator._evaluator_task_title("ooc_review"),
+        [("待审查台词", "我必须守住秘密")],
+        output_schema=evaluator._evaluator_task_schema("ooc_review"),
+        task_notes=evaluator._evaluator_task_notes(
+            "ooc_review",
+            ["当前运行时目标：输出 EvaluatorOOCSchema。"],
+        ),
+        config_prompt="Evaluator runtime prompt",
+    )
+
+    assert loaded_prompt_ids == [
+        "function_evaluator_chapter_quality_gate",
+        "function_evaluator_reader_simulation",
+        "function_evaluator_ooc_review",
+    ]
+    assert "md evaluator chapter gate rules" in chapter_prompt
+    assert "md evaluator reader simulation rules" in reader_prompt
+    assert "md evaluator ooc review rules" in ooc_prompt
+    for prompt in (chapter_prompt, reader_prompt, ooc_prompt):
+        assert "Evaluator runtime prompt" in prompt
+        assert "【输出 JSON Schema】" in prompt
+    assert "当前运行时目标：输出 EvaluatorChapterEndSchema。" in chapter_prompt
+    assert "当前运行时目标：输出 EvaluatorReaderSimulateSchema。" in reader_prompt
+    assert "当前运行时目标：输出 EvaluatorOOCSchema。" in ooc_prompt
+    assert "稳定评估规则以 md prompt 资产 function_evaluator_chapter_quality_gate 为准。" in chapter_prompt
+    assert "必须以 Agent Template / md prompt / writing-rules 中的门禁为准。" not in chapter_prompt
+    assert "确定性 role_performance_gate 问题必须写入" not in reader_prompt
+    assert "确定性角色约束预检问题必须作为阻断问题写入" not in ooc_prompt
+
+
 @pytest.mark.asyncio
 async def test_system_agent_template_prompt_resolution_audit_reports_missing_and_resolved(monkeypatch):
     from app.models.agent_template import AgentTemplate, AgentType, PromptSlot
@@ -2989,13 +4693,13 @@ async def test_system_agent_template_prompt_resolution_audit_reports_missing_and
 
     service = AgentPromptService()
 
-    async def fake_get_prompt_template(prompt_id):
+    async def fake_resolve(prompt_id):
         if prompt_id == prompt_template.id:
-            return prompt_template
-        return None
+            return {"template": prompt_template, "source": "prompt_template_service"}
+        return {"template": None, "source": "missing"}
 
     monkeypatch.setattr(prompt_module, "SYSTEM_AGENT_TEMPLATES", [template])
-    monkeypatch.setattr(service, "get_prompt_template", fake_get_prompt_template)
+    monkeypatch.setattr(service, "_resolve_prompt_template_with_source", fake_resolve)
 
     audit = await service.audit_system_agent_template_prompt_resolution()
 
@@ -3004,9 +4708,115 @@ async def test_system_agent_template_prompt_resolution_audit_reports_missing_and
     assert audit["slot_count"] == 2
     assert audit["resolved_prompt_ids"] == ["prompt_existing"]
     assert audit["missing_prompt_ids"] == ["prompt_missing"]
+    assert audit["md_asset_prompt_ids"] == []
+    assert audit["system_seed_prompt_ids"] == []
+    assert audit["deprecated_prompt_ids"] == []
+    assert audit["unresolved_md_asset_prompt_ids"] == []
     assert audit["templates"][0]["prompt_ids"] == ["prompt_existing"]
     assert audit["templates"][0]["missing_prompt_ids"] == ["prompt_missing"]
+    assert audit["templates"][0]["md_asset_prompt_ids"] == []
+    assert audit["templates"][0]["system_seed_prompt_ids"] == []
+    assert audit["templates"][0]["deprecated_prompt_ids"] == []
+    assert audit["templates"][0]["unresolved_md_asset_prompt_ids"] == []
     assert audit["templates"][0]["fallbacks_used"] == ["missing_prompt_template:prompt_missing"]
+
+
+@pytest.mark.asyncio
+async def test_system_agent_template_prompt_resolution_audit_reports_md_and_seed_sources(monkeypatch):
+    from app.models.agent_template import AgentTemplate, AgentType, PromptSlot
+    from app.models.prompt_template import PromptCategory, PromptTemplate
+    from app.services.agent_prompt_service import AgentPromptService
+    import app.services.agent_prompt_service as prompt_module
+
+    template = AgentTemplate(
+        id="audit-source-template",
+        name="Audit Source Template",
+        agent_type=AgentType.SETTING,
+        scenario="resource_management",
+        prompt_slots=[
+            PromptSlot(slot_name="md", prompt_template_id="prompt_md", priority=100),
+            PromptSlot(slot_name="seed", prompt_template_id="prompt_seed", priority=90),
+        ],
+    )
+    md_prompt = PromptTemplate(id="prompt_md", name="MD Prompt", category=PromptCategory.FUNCTION, content="MD")
+    seed_prompt = PromptTemplate(id="prompt_seed", name="Seed Prompt", category=PromptCategory.FUNCTION, content="Seed")
+
+    service = AgentPromptService()
+
+    async def fake_resolve(prompt_id):
+        if prompt_id == "prompt_md":
+            return {"template": md_prompt, "source": "md_asset"}
+        if prompt_id == "prompt_seed":
+            return {"template": seed_prompt, "source": "system_seed"}
+        return {"template": None, "source": "missing"}
+
+    monkeypatch.setattr(prompt_module, "SYSTEM_AGENT_TEMPLATES", [template])
+    monkeypatch.setattr(service, "_resolve_prompt_template_with_source", fake_resolve)
+
+    audit = await service.audit_system_agent_template_prompt_resolution()
+
+    assert_prompt_resolution_audit_contract(audit)
+    assert audit["md_asset_prompt_ids"] == ["prompt_md"]
+    assert audit["system_seed_prompt_ids"] == ["prompt_seed"]
+    assert audit["deprecated_prompt_ids"] == ["prompt_seed"]
+    assert audit["unresolved_md_asset_prompt_ids"] == []
+    template_result = audit["templates"][0]
+    assert template_result["md_asset_prompt_ids"] == ["prompt_md"]
+    assert template_result["system_seed_prompt_ids"] == ["prompt_seed"]
+    assert template_result["deprecated_prompt_ids"] == ["prompt_seed"]
+    assert template_result["unresolved_md_asset_prompt_ids"] == []
+    assert template_result["fallbacks_used"] == [
+        "prompt_template_md_asset:prompt_md",
+        "prompt_template_system_seed:prompt_seed",
+    ]
+    assert template_result["deprecated_sources_used"] == ["system_prompt_seed:prompt_seed"]
+
+
+@pytest.mark.asyncio
+async def test_system_agent_template_prompt_resolution_audit_reports_unresolved_md_assets(monkeypatch):
+    from app.models.agent_template import AgentTemplate, AgentType, PromptSlot
+    from app.models.prompt_template import PromptCategory, PromptTemplate
+    from app.services.agent_prompt_service import AgentPromptService
+    import app.services.agent_prompt_service as prompt_module
+
+    template = AgentTemplate(
+        id="audit-unresolved-md-template",
+        name="Audit Unresolved MD Template",
+        agent_type=AgentType.MASTER_PLOTTER,
+        scenario="workflow_plot_planning",
+        prompt_slots=[
+            PromptSlot(slot_name="md-only", prompt_template_id="prompt_md_only", priority=100),
+            PromptSlot(slot_name="missing", prompt_template_id="prompt_missing", priority=90),
+        ],
+    )
+    md_prompt = PromptTemplate(id="prompt_md_only", name="MD Only", category=PromptCategory.FUNCTION, content="MD only")
+
+    service = AgentPromptService()
+
+    async def fake_resolve(prompt_id):
+        return {"template": None, "source": "missing"}
+
+    def fake_build_from_md(prompt_id):
+        if prompt_id == "prompt_md_only":
+            return md_prompt
+        return None
+
+    monkeypatch.setattr(prompt_module, "SYSTEM_AGENT_TEMPLATES", [template])
+    monkeypatch.setattr(service, "_resolve_prompt_template_with_source", fake_resolve)
+    monkeypatch.setattr(service, "_build_prompt_template_from_md", fake_build_from_md)
+
+    audit = await service.audit_system_agent_template_prompt_resolution()
+
+    assert_prompt_resolution_audit_contract(audit)
+    assert audit["missing_prompt_ids"] == ["prompt_md_only", "prompt_missing"]
+    assert audit["unresolved_md_asset_prompt_ids"] == ["prompt_md_only"]
+    template_result = audit["templates"][0]
+    assert template_result["missing_prompt_ids"] == ["prompt_md_only", "prompt_missing"]
+    assert template_result["unresolved_md_asset_prompt_ids"] == ["prompt_md_only"]
+    assert template_result["fallbacks_used"] == [
+        "prompt_template_md_asset_unresolved:prompt_md_only",
+        "missing_prompt_template:prompt_missing",
+    ]
 
 
 @pytest.mark.asyncio
@@ -3058,6 +4868,50 @@ async def test_skill_orchestrator_decision_prompt_uses_md_asset(monkeypatch):
     assert "## 可用技能" in captured["prompt"]
     assert "根据当前任务状态，决定下一步应该调用哪个技能" not in captured["prompt"]
 
+    prompt_result = orchestrator._build_decision_prompt_with_trace(
+        context=context,
+        skills_desc=orchestrator._build_skills_description(skills),
+        context_desc=orchestrator._build_context_description(context),
+    )
+    assert prompt_result["trace"] == {
+        "source": "md_prompt_asset",
+        "prompt_ids": ["function_skill_orchestration_decision"],
+        "fallbacks_used": [],
+        "deprecated_sources_used": [],
+        "missing_prompt_ids": [],
+    }
+
+
+def test_skill_orchestrator_decision_prompt_trace_reports_deprecated_fallback(monkeypatch):
+    from app.services.skill_orchestrator import OrchestrationContext, SkillOrchestrator
+
+    class EmptyMdService:
+        def get_prompt(self, prompt_id):
+            assert prompt_id == "function_skill_orchestration_decision"
+            return None
+
+    monkeypatch.setattr(
+        "app.services.skill_orchestrator.get_md_file_service",
+        lambda: EmptyMdService(),
+    )
+
+    orchestrator = SkillOrchestrator(llm_client=object())
+    context = OrchestrationContext(agent_type="writer", initial_goal="完成章节补写")
+    prompt_result = orchestrator._build_decision_prompt_with_trace(
+        context=context,
+        skills_desc="- skill",
+        context_desc="- state",
+    )
+
+    assert prompt_result["content"].startswith("# Skill 编排决策")
+    assert prompt_result["trace"] == {
+        "source": "deprecated_minimal_fallback",
+        "prompt_ids": ["function_skill_orchestration_decision"],
+        "fallbacks_used": ["skill_orchestration_deprecated_minimal_fallback:function_skill_orchestration_decision"],
+        "deprecated_sources_used": ["SkillOrchestrator._build_decision_prompt"],
+        "missing_prompt_ids": ["function_skill_orchestration_decision"],
+    }
+
 
 def test_skill_retrieval_decision_prompt_uses_md_asset(monkeypatch):
     from app.models.skill import Skill, SkillCategory, SkillType
@@ -3082,15 +4936,59 @@ def test_skill_retrieval_decision_prompt_uses_md_asset(monkeypatch):
         category=SkillCategory.DIALOGUE,
     )
 
-    prompt = service._build_decision_prompt(
-        "需要增强角色对话",
-        [SkillCandidate(skill=skill, similarity_score=0.87)],
-    )
+    candidates = [SkillCandidate(skill=skill, similarity_score=0.87)]
+    prompt = service._build_decision_prompt("需要增强角色对话", candidates)
 
     assert "md retrieval decision rules" in prompt
     assert "## 用户场景描述\n需要增强角色对话" in prompt
     assert "skill_scene_dialogue" in prompt
     assert "根据用户的场景描述，从候选技能中选择最合适的技能" not in prompt
+
+    prompt_result = service._build_decision_prompt_with_trace("需要增强角色对话", candidates)
+    assert prompt_result["trace"] == {
+        "source": "md_prompt_asset",
+        "prompt_ids": ["function_skill_retrieval_decision"],
+        "fallbacks_used": [],
+        "deprecated_sources_used": [],
+        "missing_prompt_ids": [],
+    }
+
+
+def test_skill_retrieval_decision_prompt_trace_reports_deprecated_fallback(monkeypatch):
+    from app.models.skill import Skill, SkillCategory, SkillType
+    from app.services.skill_retrieval import SkillCandidate, SkillRetrievalService
+
+    class EmptyMdService:
+        def get_prompt(self, prompt_id):
+            assert prompt_id == "function_skill_retrieval_decision"
+            return None
+
+    monkeypatch.setattr(
+        "app.services.skill_retrieval.get_md_file_service",
+        lambda: EmptyMdService(),
+    )
+
+    service = SkillRetrievalService(llm_client=object())
+    skill = Skill(
+        id="skill_scene_dialogue",
+        name="场景对话",
+        description="生成角色对话",
+        skill_type=SkillType.PROMPT,
+        category=SkillCategory.DIALOGUE,
+    )
+    prompt_result = service._build_decision_prompt_with_trace(
+        "需要增强角色对话",
+        [SkillCandidate(skill=skill, similarity_score=0.87)],
+    )
+
+    assert prompt_result["content"].startswith("# Skill 检索决策")
+    assert prompt_result["trace"] == {
+        "source": "deprecated_minimal_fallback",
+        "prompt_ids": ["function_skill_retrieval_decision"],
+        "fallbacks_used": ["skill_retrieval_deprecated_minimal_fallback:function_skill_retrieval_decision"],
+        "deprecated_sources_used": ["SkillRetrievalService._build_decision_prompt"],
+        "missing_prompt_ids": ["function_skill_retrieval_decision"],
+    }
 
 
 def test_director_auto_write_prompt_uses_md_asset(monkeypatch):
@@ -3156,6 +5054,10 @@ async def test_prompt_audit_route_uses_non_llm_agent_prompt_service(monkeypatch)
                 "slot_count": 1,
                 "resolved_prompt_ids": ["prompt_existing"],
                 "missing_prompt_ids": [],
+                "md_asset_prompt_ids": [],
+                "system_seed_prompt_ids": [],
+                "deprecated_prompt_ids": [],
+                "unresolved_md_asset_prompt_ids": [],
                 "templates": [],
             }
 
@@ -3171,6 +5073,274 @@ async def test_prompt_audit_route_uses_non_llm_agent_prompt_service(monkeypatch)
     assert result["resolved_prompt_ids"] == ["prompt_existing"]
 
 
+def test_outline_version_api_routes_require_explicit_revision_selection(monkeypatch):
+    from app.api.app import create_app
+    from app.models.chapter_outline import ChapterOutline, ChapterOutlineStatus
+    from app.services.plot_outline_service import PlotOutlineService, set_plot_outline_service
+
+    service = PlotOutlineService()
+    approved = ChapterOutline(
+        id="outline-approved",
+        project_id="project-1",
+        chapter_number=3,
+        title="原审批标题",
+        summary="原审批摘要",
+        status=ChapterOutlineStatus.APPROVED,
+    )
+    revision = ChapterOutline(
+        id="outline-revision",
+        project_id="project-1",
+        chapter_number=3,
+        title="修订标题",
+        summary="修订摘要",
+        status=ChapterOutlineStatus.REVISION,
+        previous_outline_id=approved.id,
+    )
+    service._outlines_cache[approved.id] = approved
+    service._outlines_cache[revision.id] = revision
+    service._loaded_outline_projects.add("project-1")
+    monkeypatch.setattr(service, "_persist_outline_resource_audit", AsyncMock())
+    set_plot_outline_service(service)
+
+    try:
+        client = TestClient(create_app())
+
+        exact_response = client.get("/api/outlines/by-id/outline-revision?project_id=project-1")
+        assert exact_response.status_code == 200
+        assert exact_response.json()["id"] == "outline-revision"
+        assert exact_response.json()["status"] == "revision"
+
+        versions_response = client.get("/api/outlines/3/versions?project_id=project-1")
+        assert versions_response.status_code == 200
+        versions = versions_response.json()
+        assert versions["current_approved"]["id"] == "outline-approved"
+        assert [outline["id"] for outline in versions["pending_revisions"]] == ["outline-revision"]
+        assert [outline["id"] for outline in versions["versions"]] == ["outline-approved", "outline-revision"]
+
+        legacy_approve_response = client.post(
+            "/api/outlines/3/approve?project_id=project-1",
+            json={"approved_by": "reviewer"},
+        )
+        assert legacy_approve_response.status_code == 409
+        legacy_detail = legacy_approve_response.json()["detail"]
+        assert legacy_detail["code"] == "outline_revision_selection_required"
+        assert legacy_detail["pending_revision_ids"] == ["outline-revision"]
+        assert legacy_detail["current_approved_id"] == "outline-approved"
+
+        reject_response = client.post("/api/outlines/by-id/outline-revision/reject?project_id=project-1", json={})
+        assert reject_response.status_code == 200
+        assert reject_response.json()["status"] == "rejected"
+        assert approved.status == ChapterOutlineStatus.APPROVED
+        assert revision.status == ChapterOutlineStatus.REJECTED
+
+        rejected_versions_response = client.get("/api/outlines/3/versions?project_id=project-1")
+        assert rejected_versions_response.status_code == 200
+        rejected_versions = rejected_versions_response.json()
+        assert rejected_versions["pending_revisions"] == []
+        assert [outline["id"] for outline in rejected_versions["rejected_revisions"]] == ["outline-revision"]
+    finally:
+        set_plot_outline_service(None)
+
+
+def test_outline_version_api_routes_approve_revision_by_id(monkeypatch):
+    from app.api.app import create_app
+    from app.models.chapter_outline import ChapterOutline, ChapterOutlineStatus
+    from app.services.plot_outline_service import PlotOutlineService, set_plot_outline_service
+
+    service = PlotOutlineService()
+    approved = ChapterOutline(
+        id="outline-approved",
+        project_id="project-1",
+        chapter_number=3,
+        title="原审批标题",
+        summary="原审批摘要",
+        status=ChapterOutlineStatus.APPROVED,
+    )
+    revision = ChapterOutline(
+        id="outline-revision",
+        project_id="project-1",
+        chapter_number=3,
+        title="修订标题",
+        summary="修订摘要",
+        status=ChapterOutlineStatus.REVISION,
+        previous_outline_id=approved.id,
+    )
+    service._outlines_cache[approved.id] = approved
+    service._outlines_cache[revision.id] = revision
+    service._loaded_outline_projects.add("project-1")
+    monkeypatch.setattr(service, "_persist_outline_resource_audit", AsyncMock())
+    set_plot_outline_service(service)
+
+    try:
+        client = TestClient(create_app())
+        approve_response = client.post(
+            "/api/outlines/by-id/outline-revision/approve?project_id=project-1",
+            json={"approved_by": "reviewer"},
+        )
+
+        assert approve_response.status_code == 200
+        approved_revision = approve_response.json()
+        assert approved_revision["id"] == "outline-revision"
+        assert approved_revision["status"] == "approved"
+        assert approved_revision["approved_by"] == "reviewer"
+        assert revision.status == ChapterOutlineStatus.APPROVED
+        assert approved.next_outline_id == revision.id
+        service._persist_outline_resource_audit.assert_awaited_once_with(revision)
+    finally:
+        set_plot_outline_service(None)
+
+
+@pytest.mark.asyncio
+async def test_plot_outline_resource_audit_refreshes_readiness_with_outline_id_only():
+    from app.models.chapter_outline import ChapterOutline, ChapterOutlineStatus
+    from app.services.plot_outline_service import PlotOutlineService
+
+    readiness_calls = []
+
+    class FakeDB:
+        async def save_outline_resource_requirements(self, requirements):
+            return None
+
+        async def update_chapter_resource_readiness(self, project_id, outline_id, chapter_num):
+            readiness_calls.append({
+                "project_id": project_id,
+                "outline_id": outline_id,
+                "chapter_num": chapter_num,
+            })
+            return {"outline_id": outline_id, "chapter_num": chapter_num}
+
+    service = PlotOutlineService(db=FakeDB())
+    outline = ChapterOutline(
+        id="outline-refresh",
+        project_id="00000000-0000-0000-0000-000000000001",
+        chapter_number=7,
+        title="资源审计刷新",
+        summary="用于证明 readiness 刷新不再发起缺少 outline_id 的噪声调用。",
+        status=ChapterOutlineStatus.DRAFT,
+    )
+
+    await service._persist_outline_resource_audit(outline)
+
+    assert readiness_calls == [
+        {
+            "project_id": "00000000-0000-0000-0000-000000000001",
+            "outline_id": "outline-refresh",
+            "chapter_num": 7,
+        }
+    ]
+
+
+def test_save_pending_outlines_reports_all_failed_validation_errors(monkeypatch):
+    import app.api.app as api_app
+    from app.api.app import create_app
+    from app.services.plot_outline_service import PlotOutlineService, set_plot_outline_service
+
+    service = PlotOutlineService()
+    service._loaded_outline_projects.add("project-save")
+    monkeypatch.setattr(service, "_persist_outline_resource_audit", AsyncMock())
+    monkeypatch.setattr(api_app, "postgres_db", object())
+    set_plot_outline_service(service)
+
+    try:
+        client = TestClient(create_app())
+        response = client.post(
+            "/api/outlines/save-outlines?project_id=project-save",
+            json={
+                "outlines": [
+                    {
+                        "chapter_number": 1,
+                        "title": "失效大纲",
+                        "summary": "场景缺少必填 title，应暴露为结构化保存失败。",
+                        "scenes": [
+                            {
+                                "scene_number": 1,
+                                "summary": "缺少场景标题",
+                                "participating_characters": ["林澈"],
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+
+        assert response.status_code == 422
+        detail = response.json()["detail"]
+        assert detail["success"] is False
+        assert detail["saved_count"] == 0
+        assert detail["failed_count"] == 1
+        assert detail["message"] == "1 个大纲保存失败，请根据 results 查看具体原因"
+        assert detail["results"][0]["chapter_number"] == 1
+        assert detail["results"][0]["status"] == "failed"
+        assert detail["results"][0]["error_type"] == "validation_error"
+        assert "title" in detail["results"][0]["error"]
+    finally:
+        set_plot_outline_service(None)
+        monkeypatch.setattr(api_app, "postgres_db", None)
+
+
+def test_save_pending_outlines_returns_partial_success_results(monkeypatch):
+    import app.api.app as api_app
+    from app.api.app import create_app
+    from app.services.plot_outline_service import PlotOutlineService, set_plot_outline_service
+
+    service = PlotOutlineService()
+    service._loaded_outline_projects.add("project-save")
+    monkeypatch.setattr(service, "_persist_outline_resource_audit", AsyncMock())
+    monkeypatch.setattr(api_app, "postgres_db", object())
+    set_plot_outline_service(service)
+
+    try:
+        client = TestClient(create_app())
+        response = client.post(
+            "/api/outlines/save-outlines?project_id=project-save",
+            json={
+                "outlines": [
+                    {
+                        "chapter_number": 1,
+                        "title": "有效大纲",
+                        "summary": "可保存的大纲。",
+                        "scenes": [
+                            {
+                                "scene_number": 1,
+                                "title": "有效场景",
+                                "summary": "字段完整。",
+                                "participating_characters": ["林澈"],
+                            }
+                        ],
+                    },
+                    {
+                        "chapter_number": 2,
+                        "title": "失效大纲",
+                        "summary": "场景缺少必填 title。",
+                        "scenes": [
+                            {
+                                "scene_number": 1,
+                                "summary": "缺少场景标题",
+                            }
+                        ],
+                    },
+                ]
+            },
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["success"] is False
+        assert body["saved_count"] == 1
+        assert body["failed_count"] == 1
+        assert body["message"] == "已保存 1 个大纲，1 个大纲保存失败，请检查失败项"
+        assert body["results"][0]["chapter_number"] == 1
+        assert body["results"][0]["status"] == "saved"
+        assert body["results"][0]["action"] == "created"
+        assert body["results"][0]["outline_id"].startswith("outline_")
+        assert body["results"][1]["chapter_number"] == 2
+        assert body["results"][1]["status"] == "failed"
+        assert body["results"][1]["error_type"] == "validation_error"
+    finally:
+        set_plot_outline_service(None)
+        monkeypatch.setattr(api_app, "postgres_db", None)
+
+
 def test_prompt_audit_api_route_smoke_uses_non_llm_agent_prompt_service(monkeypatch):
     from app.api.app import create_app
 
@@ -3181,6 +5351,10 @@ def test_prompt_audit_api_route_smoke_uses_non_llm_agent_prompt_service(monkeypa
                 "slot_count": 2,
                 "resolved_prompt_ids": ["prompt_existing"],
                 "missing_prompt_ids": ["prompt_missing"],
+                "md_asset_prompt_ids": ["prompt_existing"],
+                "system_seed_prompt_ids": [],
+                "deprecated_prompt_ids": [],
+                "unresolved_md_asset_prompt_ids": [],
                 "templates": [
                     {
                         "template_id": "template-writer",
@@ -3188,7 +5362,11 @@ def test_prompt_audit_api_route_smoke_uses_non_llm_agent_prompt_service(monkeypa
                         "scenario": "workflow_chapter_generation",
                         "prompt_ids": ["prompt_existing"],
                         "missing_prompt_ids": ["prompt_missing"],
-                        "fallbacks_used": ["missing_prompt_template:prompt_missing"],
+                        "md_asset_prompt_ids": ["prompt_existing"],
+                        "system_seed_prompt_ids": [],
+                        "deprecated_prompt_ids": [],
+                        "unresolved_md_asset_prompt_ids": [],
+                        "fallbacks_used": ["prompt_template_md_asset:prompt_existing", "missing_prompt_template:prompt_missing"],
                         "deprecated_sources_used": [],
                     }
                 ],
@@ -3209,4 +5387,7 @@ def test_prompt_audit_api_route_smoke_uses_non_llm_agent_prompt_service(monkeypa
     assert result["slot_count"] == 2
     assert result["resolved_prompt_ids"] == ["prompt_existing"]
     assert result["missing_prompt_ids"] == ["prompt_missing"]
-    assert result["templates"][0]["fallbacks_used"] == ["missing_prompt_template:prompt_missing"]
+    assert result["templates"][0]["fallbacks_used"] == [
+        "prompt_template_md_asset:prompt_existing",
+        "missing_prompt_template:prompt_missing",
+    ]
