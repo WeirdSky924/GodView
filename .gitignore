@@ -91,13 +91,29 @@ coverage.xml
 .hypothesis/
 
 # 测试和脚本目录
-tests/*
-!tests/test_runtime_prompt_trace_standardization.py
-scripts/
+# 注意：不要直接忽略目录，否则无法用 ! 取消忽略子文件
+# tests/ 目录本身需要被追踪
 
-# ======================== 模型缓存 ========================
-# HuggingFace 模型缓存
-models/
+# 忽略测试缓存和临时文件
+tests/__pycache__/
+tests/.pytest_cache/
+tests/.hypothesis/
+tests/*.pyc
+
+# 忽略脚本缓存
+scripts/__pycache__/
+
+# 忽略测试输出文件（可选）
+tests/test_*.png
+tests/test_*.json
+tests/test_*.txt
+tests/test_*.log
+tests/generated_*.txt
+tests/server*.log
+
+# HuggingFace 模型缓存（使用绝对路径避免误匹配）
+/models/
+!app/models/
 *.bin
 *.safetensors
 *.gguf
