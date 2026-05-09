@@ -121,7 +121,66 @@ export interface NodeExecutionState {
   output_schema_name?: string
   output_schema_version?: string
   error?: string
+  retry_count?: number
   duration_ms?: number
+}
+
+export interface WorkflowOperationCapability {
+  allowed: boolean
+  label: string
+  reason?: string | null
+  severity?: 'info' | 'warning' | 'blocking' | string
+  next_status?: WorkflowStatus | string | null
+}
+
+export interface WorkflowOperationEvent {
+  sequence_no?: number | null
+  event_type: string
+  created_at?: string | null
+  summary: string
+  node_id?: string | null
+  status?: string | null
+  severity: 'info' | 'warning' | 'error' | string
+  data: Record<string, any>
+}
+
+export interface WorkflowOperationSummary {
+  execution_id: string
+  workflow_id: string
+  project_id: string
+  status: WorkflowStatus
+  current_node?: string | null
+  active_task: boolean
+  terminal: boolean
+  capabilities: Record<'pause' | 'resume' | 'cancel' | 'recover' | 'remediate', WorkflowOperationCapability>
+  node_summary: {
+    total: number
+    counts: Record<string, number>
+    failed_node_id?: string | null
+    failed_node_error?: string | null
+    failed_nodes?: Array<Record<string, any>>
+  }
+  lease: {
+    lease_expires_at?: string | null
+    last_heartbeat_at?: string | null
+    expired: boolean
+    seconds_remaining?: number | null
+    cancel_requested?: boolean | null
+  }
+  recovery: {
+    count: number
+    latest?: WorkflowRecoveryHistoryEntry | null
+    resume_cursor?: Record<string, any> | null
+  }
+  remediation: {
+    count: number
+    latest?: Record<string, any> | null
+  }
+  stale: {
+    count: number
+    latest?: Record<string, any> | null
+  }
+  attention: Array<{ type: string; severity: string; message: string }>
 }
 
 export interface WorkflowExecution {
@@ -137,6 +196,7 @@ export interface WorkflowExecution {
   completed_at?: string
   total_duration_ms?: number
   error?: string
+  trace_id?: string
   request_id?: string
   request_hash?: string
   director_session_id?: string
@@ -146,6 +206,7 @@ export interface WorkflowExecution {
   last_heartbeat_at?: string
   resume_cursor?: Record<string, any>
   cancel_requested?: boolean
+  operation_summary?: WorkflowOperationSummary
 }
 
 export interface ExecutionTrace {
@@ -223,6 +284,101 @@ export interface WorkflowEventMessage {
   type: string
   execution_id: string
   data: Record<string, any>
+  sequence_no?: number
+  replayed?: boolean
+}
+
+export type WorkflowSseState = 'connecting' | 'connected' | 'degraded' | 'closed'
+export type WorkflowRecoveryMode = 'retry_failed' | 'retry_from_node'
+
+export interface WorkflowRecoveryHistoryEntry {
+  attempt?: number
+  mode?: WorkflowRecoveryMode | string
+  target_node_id?: string
+  reset_node_ids?: string[]
+  reason?: string
+  started_at?: string
+  previous_error?: string | null
+  previous_completed_at?: string | null
+  trace_id?: string | null
+  status_at_start?: string
+}
+
+export interface WorkflowExecutionHistoryRow {
+  id: string
+  workflow_id: string
+  project_id: string
+  status: WorkflowStatus
+  current_node?: string | null
+  started_at?: string | null
+  completed_at?: string | null
+  total_duration_ms?: number | null
+  trace_id?: string | null
+  error?: string | null
+  node_count?: number
+  completed_node_count?: number
+  failed_node_id?: string | null
+  recovery_count?: number
+  latest_recovery?: WorkflowRecoveryHistoryEntry | null
+  resume_cursor?: Record<string, any> | null
+}
+
+export interface WorkflowRecoveryRequest {
+  mode?: WorkflowRecoveryMode
+  node_id?: string
+  reason?: string
+  context_patch?: Record<string, any>
+  reset_downstream?: boolean
+}
+
+export interface WorkflowRecoveryResponse {
+  success: boolean
+  message: string
+  execution_id: string
+  status: WorkflowStatus
+  recovered_node_id?: string
+  reset_node_ids?: string[]
+  recovery_attempt?: number
+  trace_id?: string
+  recovery_entry?: WorkflowRecoveryHistoryEntry
+}
+
+export interface WorkflowFailureDiagnosis {
+  execution_id: string
+  workflow_id: string
+  failed_node_id: string
+  failed_node_label?: string
+  category: string
+  severity: string
+  recoverable: boolean
+  retry_without_fix_likely_to_fail: boolean
+  remediable: boolean
+  summary: string
+  evidence: string[]
+  current_agent_type?: string | null
+  current_scenario?: string | null
+  suggested_actions: Array<{ type: string; label: string; fields?: string[] }>
+}
+
+export interface WorkflowNodeRemediationPatch {
+  agent_type?: string
+  scenario?: string
+}
+
+export interface WorkflowRemediationRequest {
+  node_id?: string
+  reason?: string
+  patch: WorkflowNodeRemediationPatch
+  context_patch?: Record<string, any>
+  reset_downstream?: boolean
+}
+
+export interface WorkflowRemediationResponse {
+  success: boolean
+  message: string
+  diagnosis: WorkflowFailureDiagnosis
+  remediation_entry: Record<string, any>
+  recovery: WorkflowRecoveryResponse
 }
 
 // ==================== API 函数 ====================
@@ -348,6 +504,27 @@ export function isChapterReadinessGateError(error: any): boolean {
   return extractChapterReadinessGateDetail(error) !== null
 }
 
+export function isReadinessBlockedStatus(status?: string | null): boolean {
+  return status === 'blocked'
+}
+
+export function isReadinessWarningStatus(status?: string | null): boolean {
+  return status === 'ready_with_warnings'
+}
+
+export function isReadinessReadyStatus(status?: string | null): boolean {
+  return status === 'ready'
+}
+
+export function getReadinessStatusLabel(status?: string | null): string {
+  if (status === 'ready') return 'Ready'
+  if (status === 'ready_with_warnings') return 'Ready with warnings'
+  if (status === 'blocked') return 'Blocked'
+  if (status === 'stale') return 'Stale'
+  if (status === 'not_audited') return 'Not audited'
+  return 'Unknown'
+}
+
 export function formatChapterReadinessGateMessage(
   detail: ChapterReadinessGateDetail | null,
   formatRequirements?: (requirements: Array<Record<string, any>>) => string,
@@ -413,6 +590,21 @@ export async function getExecution(executionId: string): Promise<WorkflowExecuti
   return response.data
 }
 
+export async function getExecutionOperationSummary(executionId: string): Promise<WorkflowOperationSummary> {
+  const response = await axios.get(`${API_BASE}/workflows/executions/${executionId}/operation-summary`)
+  return response.data.summary
+}
+
+export async function getExecutionOperationEvents(
+  executionId: string,
+  limit: number = 50,
+): Promise<WorkflowOperationEvent[]> {
+  const response = await axios.get(`${API_BASE}/workflows/executions/${executionId}/operation-events`, {
+    params: { limit },
+  })
+  return response.data.events || []
+}
+
 /**
  * 创建工作流执行 SSE 连接
  */
@@ -468,9 +660,10 @@ export async function getExecutions(
   status?: WorkflowStatus,
   limit: number = 50,
   offset: number = 0,
-): Promise<WorkflowExecution[]> {
+  workflowId?: string,
+): Promise<WorkflowExecutionHistoryRow[]> {
   const response = await axios.get(`${API_BASE}/workflows/executions`, {
-    params: { project_id: projectId, status, limit, offset },
+    params: { project_id: projectId, status, limit, offset, workflow_id: workflowId },
   })
   return response.data
 }
@@ -480,7 +673,7 @@ export async function getExecutions(
  */
 export async function pauseExecution(
   executionId: string,
-): Promise<{ success: boolean; message: string }> {
+): Promise<{ success: boolean; message: string; execution?: WorkflowExecution | null }> {
   const response = await axios.post(`${API_BASE}/workflows/executions/${executionId}/pause`)
   return response.data
 }
@@ -490,8 +683,42 @@ export async function pauseExecution(
  */
 export async function resumeExecution(
   executionId: string,
-): Promise<{ success: boolean; message: string }> {
+): Promise<{ success: boolean; message: string; execution?: WorkflowExecution | null }> {
   const response = await axios.post(`${API_BASE}/workflows/executions/${executionId}/resume`)
+  return response.data
+}
+
+export async function recoverExecution(
+  executionId: string,
+  request: WorkflowRecoveryRequest = {},
+): Promise<WorkflowRecoveryResponse> {
+  const response = await axios.post(`${API_BASE}/workflows/executions/${executionId}/recover`, request)
+  return response.data
+}
+
+export async function getFailedNodeDiagnosis(
+  executionId: string,
+  nodeId?: string,
+): Promise<WorkflowFailureDiagnosis> {
+  const response = await axios.get(`${API_BASE}/workflows/executions/${executionId}/failed-node-diagnosis`, {
+    params: { node_id: nodeId },
+  })
+  return response.data
+}
+
+export async function validateRemediation(
+  executionId: string,
+  request: WorkflowRemediationRequest,
+): Promise<Record<string, any>> {
+  const response = await axios.post(`${API_BASE}/workflows/executions/${executionId}/remediations/validate`, request)
+  return response.data
+}
+
+export async function remediateAndRecoverExecution(
+  executionId: string,
+  request: WorkflowRemediationRequest,
+): Promise<WorkflowRemediationResponse> {
+  const response = await axios.post(`${API_BASE}/workflows/executions/${executionId}/remediate-and-recover`, request)
   return response.data
 }
 
@@ -511,7 +738,7 @@ export async function confirmDiscussion(
  */
 export async function cancelExecution(
   executionId: string,
-): Promise<{ success: boolean; message: string }> {
+): Promise<{ success: boolean; message: string; execution?: WorkflowExecution | null }> {
   const response = await axios.post(`${API_BASE}/workflows/executions/${executionId}/cancel`)
   return response.data
 }

@@ -6,6 +6,7 @@ GodView v9: PlotOutlineAgent 专用接口
 import json
 import logging
 from typing import Any, Dict, List, Optional
+from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field, ValidationError
@@ -27,6 +28,58 @@ from app.services.plot_outline_service import get_plot_outline_service, set_plot
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+_ALLOWED_RESOURCE_REQUIREMENT_STATUSES = {"pending", "in_progress", "resolved", "ignored", "superseded"}
+_ALLOWED_RESOURCE_REQUIREMENT_SEVERITIES = {"blocking", "advisory", "optional"}
+
+
+def _validate_uuid(value: Optional[str], field_name: str, *, required: bool = False) -> Optional[str]:
+    """Validate external ID parameters before they reach UUID-casting SQL paths."""
+    normalized = _validate_text_id(value, field_name, required=required)
+    if normalized is None:
+        return None
+    try:
+        UUID(normalized)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"{field_name} 不是有效 UUID")
+    return normalized
+
+
+def _validate_text_id(value: Optional[str], field_name: str, *, required: bool = False) -> Optional[str]:
+    if value is None:
+        if required:
+            raise HTTPException(status_code=400, detail=f"{field_name} 不能为空")
+        return None
+    normalized = str(value).strip()
+    if not normalized:
+        if required:
+            raise HTTPException(status_code=400, detail=f"{field_name} 不能为空")
+        return None
+    if any(char.isspace() for char in normalized):
+        raise HTTPException(status_code=400, detail=f"{field_name} 不能包含空白字符")
+    if len(normalized) > 128:
+        raise HTTPException(status_code=400, detail=f"{field_name} 过长")
+    return normalized
+
+
+def _validate_resource_requirement_status(status: Optional[str], *, required: bool = False) -> Optional[str]:
+    if status is None:
+        if required:
+            raise HTTPException(status_code=400, detail="资源需求状态不能为空")
+        return None
+    normalized = status.strip().lower()
+    if normalized not in _ALLOWED_RESOURCE_REQUIREMENT_STATUSES:
+        raise HTTPException(status_code=400, detail="无效的资源需求状态")
+    return normalized
+
+
+def _validate_resource_requirement_severity(severity: Optional[str], *, default: Optional[str] = None) -> Optional[str]:
+    if severity is None:
+        return default
+    normalized = severity.strip().lower()
+    if normalized not in _ALLOWED_RESOURCE_REQUIREMENT_SEVERITIES:
+        raise HTTPException(status_code=400, detail="无效的资源需求严重级别")
+    return normalized
 
 
 # ==================== 请求/响应模型 ====================
@@ -151,6 +204,23 @@ class UpdateResourceRequirementStatusRequest(BaseModel):
     matched_resource_id: Optional[str] = Field(None, description="绑定的资源 ID")
     matched_resource_type: Optional[str] = Field(None, description="绑定的资源类型")
     resolution_method: Optional[str] = Field(None, description="bind_existing/create_resource/manual_resolved/ignored")
+
+
+class CreateResourceRequirementRequest(BaseModel):
+    """创建大纲资源需求请求；用于开发/测试环境构造可复现 readiness 状态。"""
+    project_id: str = Field(..., description="项目ID")
+    outline_id: str = Field(..., description="大纲 ID")
+    chapter_num: int = Field(..., ge=1, description="章节号")
+    requirement_type: str = Field(..., description="character/lore/location 等资源类型")
+    resource_name: str = Field(..., min_length=1, description="资源名称")
+    severity: str = Field("blocking", description="blocking/advisory/optional")
+    status: str = Field("pending", description="pending/in_progress/resolved/ignored/superseded")
+    reason: Optional[str] = Field(None, description="需求原因")
+    suggested_payload: Dict[str, Any] = Field(default_factory=dict, description="建议创建资源 payload")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="附加元数据")
+    source_agent: Optional[str] = Field("readiness_smoke_fixture", description="来源 Agent/工具标识")
+    source_node_id: Optional[str] = Field(None, description="来源节点 ID")
+    source_execution_id: Optional[str] = Field(None, description="来源执行 ID")
 
 
 class GenerateResourceSupplementDraftsRequest(BaseModel):
@@ -593,6 +663,58 @@ async def confirm_resource_supplements(request: ConfirmResourceSupplementDraftsR
     }
 
 
+@router.post("/resource-requirements", response_model=Dict[str, Any])
+async def create_resource_requirement(request: CreateResourceRequirementRequest):
+    """创建单条大纲资源需求，并刷新对应章节 readiness。仅在 DEBUG 环境开放，用于可复现 runtime smoke。"""
+    from app.api.app import postgres_db
+    from app.config import settings
+
+    if not settings.debug:
+        raise HTTPException(status_code=404, detail="资源需求创建接口仅在 DEBUG 环境可用")
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+
+    project_id = _validate_uuid(request.project_id, "项目 ID", required=True)
+    outline_id = _validate_text_id(request.outline_id, "大纲 ID", required=True)
+    normalized_severity = _validate_resource_requirement_severity(request.severity, default="blocking")
+    normalized_status = _validate_resource_requirement_status(request.status, required=True)
+
+    requirement_id = await postgres_db.save_outline_resource_requirement({
+        "project_id": project_id,
+        "outline_id": outline_id,
+        "chapter_num": request.chapter_num,
+        "requirement_type": request.requirement_type,
+        "resource_name": request.resource_name,
+        "severity": normalized_severity,
+        "status": normalized_status,
+        "reason": request.reason or "",
+        "suggested_payload": request.suggested_payload,
+        "metadata": {
+            **request.metadata,
+            "created_by": "debug_resource_requirement_api",
+            "debug_only": True,
+        },
+        "source_agent": request.source_agent,
+        "source_node_id": request.source_node_id or "debug_resource_requirement_api",
+        "source_execution_id": request.source_execution_id,
+    })
+    rows = await postgres_db.execute_query(
+        "SELECT * FROM outline_resource_requirements WHERE id = CAST(:id AS UUID)",
+        {"id": requirement_id},
+    )
+    requirement = rows[0] if rows else None
+    readiness = await postgres_db.update_chapter_resource_readiness(
+        project_id=project_id,
+        outline_id=outline_id,
+        chapter_num=request.chapter_num,
+    )
+    return {
+        "requirement": requirement,
+        "readiness": readiness,
+        "message": "已创建资源需求并刷新章节 readiness",
+    }
+
+
 @router.get("/resource-requirements", response_model=Dict[str, Any])
 async def list_resource_requirements(
     project_id: str = Query(..., description="项目ID"),
@@ -607,6 +729,11 @@ async def list_resource_requirements(
 
     if not postgres_db:
         raise HTTPException(status_code=503, detail="数据库未连接")
+
+    project_id = _validate_uuid(project_id, "项目 ID", required=True)
+    outline_id = _validate_text_id(outline_id, "大纲 ID")
+    status = _validate_resource_requirement_status(status)
+    severity = _validate_resource_requirement_severity(severity)
 
     requirements = await postgres_db.get_outline_resource_requirements(
         project_id=project_id,
@@ -631,6 +758,9 @@ async def list_resource_readiness(
 
     if not postgres_db:
         raise HTTPException(status_code=503, detail="数据库未连接")
+
+    project_id = _validate_uuid(project_id, "项目 ID", required=True)
+    outline_id = _validate_text_id(outline_id, "大纲 ID")
 
     if refresh and chapter_num is not None:
         await postgres_db.update_chapter_resource_readiness(
@@ -657,11 +787,15 @@ async def update_resource_requirement_status(
     if not postgres_db:
         raise HTTPException(status_code=503, detail="数据库未连接")
 
+    requirement_id = _validate_uuid(requirement_id, "资源需求 ID", required=True)
+    matched_resource_id = _validate_uuid(request.matched_resource_id, "绑定资源 ID")
+    status = _validate_resource_requirement_status(request.status, required=True)
+
     try:
         updated = await postgres_db.update_outline_resource_requirement_status(
             requirement_id=requirement_id,
-            status=request.status,
-            matched_resource_id=request.matched_resource_id,
+            status=status,
+            matched_resource_id=matched_resource_id,
             matched_resource_type=request.matched_resource_type,
             resolution_method=request.resolution_method,
         )

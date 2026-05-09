@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { Card, Button, Input, TextArea, Modal } from '@/components/ui'
 import PageLayout from '@/components/PageLayout'
 import {
@@ -34,6 +35,7 @@ import {
   type OutlineResourceRequirement,
 } from '@/api/outlines'
 import { formatApiErrorMessage } from '@/api/workflows'
+import { formatRequirementSummary } from '@/utils/resourceRequirementDisplay'
 
 const categoryIcons: Record<LoreCategory, React.ReactNode> = {
   world_rule: <Shield size={18} />,
@@ -54,6 +56,53 @@ const priorityLabels: Record<LorePriority, string> = {
   core: '核心',
   standard: '标准',
   flexible: '灵活',
+}
+
+const loreCategories = new Set<LoreCategory>([
+  'world_rule',
+  'geography',
+  'history',
+  'faction',
+  'culture',
+  'race',
+  'profession',
+  'character_setting',
+  'item',
+  'skill',
+  'custom',
+])
+
+const requirementTypeCategoryMap: Record<string, LoreCategory> = {
+  setting: 'world_rule',
+  '设定': 'world_rule',
+  faction: 'faction',
+  organization: 'faction',
+  '势力': 'faction',
+  '组织': 'faction',
+  item: 'item',
+  '道具': 'item',
+  ability: 'skill',
+  '能力': 'skill',
+  relationship: 'character_setting',
+  character_state: 'character_setting',
+  continuity: 'world_rule',
+  event_rule: 'world_rule',
+  crisis_resolution: 'world_rule',
+  crisis: 'world_rule',
+  '关系': 'character_setting',
+  '关系变化': 'character_setting',
+  '角色状态': 'character_setting',
+  '连续性': 'world_rule',
+  '事件规则': 'world_rule',
+  '危机解法': 'world_rule',
+  '危机': 'world_rule',
+}
+
+const normalizeLoreCategory = (value: unknown, requirementType?: unknown): LoreCategory => {
+  const category = String(value || '').trim().toLowerCase() as LoreCategory
+  if (loreCategories.has(category)) return category
+  const normalizedRequirementType = String(requirementType || '').trim().toLowerCase()
+  return requirementTypeCategoryMap[normalizedRequirementType] || 'custom'
 }
 
 const normalizeStringArray = (value: unknown): string[] => {
@@ -94,6 +143,7 @@ export default function Lore() {
   const { currentProject } = useProject()
   const { theme } = useTheme()
   const isDark = theme === 'dark'
+  const [searchParams, setSearchParams] = useSearchParams()
 
   const [loreList, setLoreList] = useState<LoreEntry[]>([])
   const [loading, setLoading] = useState(true)
@@ -125,6 +175,7 @@ export default function Lore() {
   })
   const [keywordsInput, setKeywordsInput] = useState('')
   const [pendingRequirement, setPendingRequirement] = useState<OutlineResourceRequirement | null>(null)
+  const [focusedRequirement, setFocusedRequirement] = useState<OutlineResourceRequirement | null>(null)
   const [requirementRefreshKey, setRequirementRefreshKey] = useState(0)
   const [viewMode, setViewMode] = useState<'list' | 'tree'>('list')
   const [showAgentChat, setShowAgentChat] = useState(false)
@@ -194,6 +245,18 @@ export default function Lore() {
     loadOptions()
   }, [])
 
+  const focusRequirementId = searchParams.get('requirement_id')
+  const shouldAutoCreateFromRequirement = searchParams.get('action') === 'create'
+  const autoOpenedRequirementIdRef = useRef<string | null>(null)
+
+  const clearRequirementRecoveryParams = useCallback(() => {
+    if (!searchParams.has('requirement_id') && !searchParams.has('action')) return
+    const next = new URLSearchParams(searchParams)
+    next.delete('requirement_id')
+    next.delete('action')
+    setSearchParams(next, { replace: true })
+  }, [searchParams, setSearchParams])
+
   const openCreateModal = (requirement?: OutlineResourceRequirement) => {
     if (!currentProject) return
     const payload = requirement?.suggested_payload || {}
@@ -205,7 +268,7 @@ export default function Lore() {
       id: String(payload.id || `lore_${Date.now()}`),
       project_id: currentProject.id,
       title,
-      category: (payload.category as LoreCategory) || 'custom',
+      category: normalizeLoreCategory(payload.category, requirement?.requirement_type),
       priority: normalizeLorePriority(payload.priority),
       content,
       summary: String(payload.summary || ''),
@@ -222,6 +285,13 @@ export default function Lore() {
     setPendingRequirement(requirement || null)
     setShowModal(true)
   }
+
+  useEffect(() => {
+    if (!shouldAutoCreateFromRequirement || !focusedRequirement || showModal || pendingRequirement) return
+    if (autoOpenedRequirementIdRef.current === focusedRequirement.id) return
+    autoOpenedRequirementIdRef.current = focusedRequirement.id
+    openCreateModal(focusedRequirement)
+  }, [shouldAutoCreateFromRequirement, focusedRequirement, showModal, pendingRequirement])
 
   const openEditModal = (lore: LoreEntry) => {
     const keywords = normalizeStringArray(lore.keywords)
@@ -311,7 +381,9 @@ export default function Lore() {
             matched_resource_type: 'lore',
             resolution_method: 'create_resource',
           })
+          setFocusedRequirement(null)
           setRequirementRefreshKey(value => value + 1)
+          clearRequirementRecoveryParams()
         }
       }
       await loadLore()
@@ -394,8 +466,17 @@ export default function Lore() {
           <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
             {/* 左侧：筛选器和列表 */}
             <div className="lg:col-span-1 space-y-4">
+              {focusedRequirement && (
+                <div className={`rounded-xl border px-4 py-3 ${isDark ? 'border-blue-800 bg-blue-950/40 text-blue-100' : 'border-blue-200 bg-blue-50 text-blue-900'}`}>
+                  <div className="text-sm font-semibold">正在补齐启动阻塞资源</div>
+                  <div className="mt-1 text-sm opacity-90">{formatRequirementSummary(focusedRequirement)}</div>
+                  <div className="mt-1 text-xs opacity-75">创建或绑定设定后，系统会自动把该资源需求标记为已解决并刷新章节 readiness。</div>
+                </div>
+              )}
               <OutlineRequirementPanel
                 projectId={currentProject.id}
+                focusRequirementId={focusRequirementId}
+                onFocusedRequirementLoaded={setFocusedRequirement}
                 requirementTypes={[
                   'lore', 'setting', '设定',
                   'faction', 'organization', '势力', '组织',
@@ -414,9 +495,15 @@ export default function Lore() {
                 }))}
                 onBound={async () => {
                   await loadLore()
+                  setFocusedRequirement(null)
+                  clearRequirementRecoveryParams()
                 }}
-                onRequirementChanged={() => {
+                onRequirementChanged={(requirement, status) => {
                   setRequirementRefreshKey(value => value + 1)
+                  if (requirement?.id === focusRequirementId && (status === 'resolved' || status === 'ignored' || status === 'superseded')) {
+                    setFocusedRequirement(null)
+                    clearRequirementRecoveryParams()
+                  }
                 }}
                 refreshKey={requirementRefreshKey}
               />

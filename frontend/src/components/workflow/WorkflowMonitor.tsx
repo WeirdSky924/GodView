@@ -3,9 +3,9 @@
  * v8 Agent协作可视化工作台
  */
 
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, startTransition } from 'react'
 import { useTheme } from '@/contexts/ThemeContext'
-import type { WorkflowExecution, NodeExecutionState, WorkflowEventMessage } from '@/api/workflows'
+import type { WorkflowExecution, NodeExecutionState, WorkflowEventMessage, WorkflowSseState } from '@/api/workflows'
 import { createWorkflowExecutionEventSource, getExecution } from '@/api/workflows'
 import {
   Activity,
@@ -21,6 +21,8 @@ import {
 interface WorkflowMonitorProps {
   executionId: string | null
   onRefresh?: () => void
+  onExecutionChange?: (execution: WorkflowExecution | null) => void
+  onConnectionStateChange?: (state: WorkflowSseState, message?: string) => void
 }
 
 // 状态图标
@@ -66,22 +68,61 @@ function JsonBlock({
   )
 }
 
-export default function WorkflowMonitor({ executionId, onRefresh }: WorkflowMonitorProps) {
+export default function WorkflowMonitor({
+  executionId,
+  onRefresh,
+  onExecutionChange,
+  onConnectionStateChange,
+}: WorkflowMonitorProps) {
   const { theme } = useTheme()
   const isDark = theme === 'dark'
 
   const [execution, setExecution] = useState<WorkflowExecution | null>(null)
   const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set())
   const [loading, setLoading] = useState(false)
+  const [connectionState, setConnectionState] = useState<WorkflowSseState>('closed')
+  const [connectionMessage, setConnectionMessage] = useState<string>('')
   const onRefreshRef = useRef(onRefresh)
+  const onExecutionChangeRef = useRef(onExecutionChange)
+  const onConnectionStateChangeRef = useRef(onConnectionStateChange)
 
   useEffect(() => {
     onRefreshRef.current = onRefresh
   }, [onRefresh])
 
+  useEffect(() => {
+    onExecutionChangeRef.current = onExecutionChange
+  }, [onExecutionChange])
+
+  useEffect(() => {
+    onConnectionStateChangeRef.current = onConnectionStateChange
+  }, [onConnectionStateChange])
+
+  const notifyConnectionState = (state: WorkflowSseState, message = '') => {
+    startTransition(() => {
+      onConnectionStateChangeRef.current?.(state, message)
+    })
+  }
+
+  const updateConnectionState = (state: WorkflowSseState, message = '') => {
+    setConnectionState(state)
+    setConnectionMessage(message)
+    notifyConnectionState(state, message)
+  }
+
+  const publishExecution = (next: WorkflowExecution | null) => {
+    startTransition(() => {
+      onExecutionChangeRef.current?.(next)
+      onRefreshRef.current?.()
+    })
+  }
+
+  useEffect(() => {
+    publishExecution(execution)
+  }, [execution])
+
   const applyExecutionSnapshot = (snapshot: WorkflowExecution) => {
     setExecution(snapshot)
-    onRefreshRef.current?.()
   }
 
   const applyWorkflowEvent = (payload: WorkflowEventMessage) => {
@@ -102,18 +143,55 @@ export default function WorkflowMonitor({ executionId, onRefresh }: WorkflowMoni
 
       if (payload.type === 'workflow_started') {
         next.status = 'running'
-      } else if (payload.type === 'workflow_completed') {
+      } else if (payload.type === 'workflow_completed' || payload.type === 'workflow_failed') {
         const status = data.status
         if (status === 'completed' || status === 'failed' || status === 'cancelled' || status === 'paused') {
           next.status = status
+        } else if (payload.type === 'workflow_failed') {
+          next.status = 'failed'
         }
         if (typeof data.error === 'string') next.error = data.error
+        if (typeof data.trace_id === 'string') next.trace_id = data.trace_id
+        if (typeof data.total_duration_ms === 'number') next.total_duration_ms = data.total_duration_ms
       } else if (payload.type === 'workflow_paused') {
         next.status = 'paused'
+        if (typeof data.current_node === 'string') next.current_node = data.current_node
       } else if (payload.type === 'workflow_resumed') {
         next.status = 'running'
+        if (typeof data.current_node === 'string') next.current_node = data.current_node
       } else if (payload.type === 'workflow_cancelled') {
         next.status = 'cancelled'
+        if (typeof data.error === 'string') next.error = data.error
+      } else if (payload.type === 'workflow_recovery_started') {
+        next.status = 'running'
+        next.error = undefined
+        if (typeof data.current_node === 'string') next.current_node = data.current_node
+        if (typeof data.recovered_node_id === 'string') next.current_node = data.recovered_node_id
+        const resetNodeIds = Array.isArray(data.reset_node_ids)
+          ? data.reset_node_ids.filter((nodeId): nodeId is string => typeof nodeId === 'string')
+          : []
+        for (const nodeId of resetNodeIds) {
+          const previousState = next.node_states[nodeId]
+          next.node_states[nodeId] = {
+            node_id: nodeId,
+            status: 'pending',
+            input_data: {},
+            output_data: {},
+            retry_count: previousState?.retry_count,
+          }
+        }
+        if (data.recovery_entry) {
+          const history = Array.isArray(next.context.recovery_history)
+            ? next.context.recovery_history
+            : []
+          const attempt = typeof data.recovery_attempt === 'number' ? data.recovery_attempt : undefined
+          const alreadyRecorded = attempt != null
+            && history.some((entry) => typeof entry === 'object' && entry && (entry as Record<string, unknown>).attempt === attempt)
+          next.context.recovery_history = alreadyRecorded ? history : [...history, data.recovery_entry]
+        }
+        if (data.resume_cursor && typeof data.resume_cursor === 'object') {
+          next.resume_cursor = data.resume_cursor as Record<string, any>
+        }
       } else if (payload.type === 'waiting_user_confirmation') {
         next.status = 'paused'
         next.context.waiting_confirmation = data
@@ -131,13 +209,13 @@ export default function WorkflowMonitor({ executionId, onRefresh }: WorkflowMoni
         if (data.persisted_asset_refs) {
           next.context.persisted_asset_refs = data.persisted_asset_refs
         }
-      } else if (payload.type === 'node_started' || payload.type === 'node_completed') {
+      } else if (payload.type === 'node_started' || payload.type === 'node_completed' || payload.type === 'node_failed') {
         const nodeId = typeof data.node_id === 'string' ? data.node_id : null
         if (nodeId) {
           const previousState = next.node_states[nodeId]
           next.node_states[nodeId] = {
             node_id: nodeId,
-            status: payload.type === 'node_started' ? 'running' : (data.status as NodeExecutionState['status']) || 'completed',
+            status: payload.type === 'node_started' ? 'running' : (data.status as NodeExecutionState['status']) || (payload.type === 'node_failed' ? 'failed' : 'completed'),
             input_data: (data.input as Record<string, any>) || previousState?.input_data || {},
             output_data: (data.output as Record<string, any>) || previousState?.output_data || {},
             output_contract_id: (data.output_contract_id as string | undefined) || previousState?.output_contract_id,
@@ -145,9 +223,11 @@ export default function WorkflowMonitor({ executionId, onRefresh }: WorkflowMoni
             output_schema_name: (data.output_schema_name as string | undefined) || previousState?.output_schema_name,
             output_schema_version: (data.output_schema_version as string | undefined) || previousState?.output_schema_version,
             error: (data.error as string | undefined) || previousState?.error,
+            retry_count: (data.retry_count as number | undefined) ?? previousState?.retry_count,
             duration_ms: (data.duration_ms as number | undefined) || previousState?.duration_ms,
           }
           next.current_node = payload.type === 'node_started' ? nodeId : next.current_node
+          if (payload.type === 'node_failed' && typeof data.error === 'string') next.error = data.error
           if (payload.type === 'node_completed') {
             const contextUpdates = Array.isArray(data.context_updates) ? data.context_updates : []
             for (const key of contextUpdates) {
@@ -161,13 +241,13 @@ export default function WorkflowMonitor({ executionId, onRefresh }: WorkflowMoni
 
       return next
     })
-    onRefreshRef.current?.()
   }
 
   // 通过 SSE 订阅执行状态，避免每秒 REST 轮询刷屏
   useEffect(() => {
     if (!executionId) {
       setExecution(null)
+      updateConnectionState('closed')
       return
     }
 
@@ -193,13 +273,20 @@ export default function WorkflowMonitor({ executionId, onRefresh }: WorkflowMoni
       fallbackInterval = setInterval(fetchExecution, 15000)
     }
 
+    updateConnectionState('connecting', '正在连接实时事件流')
     void fetchExecution()
     eventSource = createWorkflowExecutionEventSource(executionId)
+    eventSource.onopen = () => {
+      if (active) updateConnectionState('connected', '实时事件流已连接')
+    }
 
     eventSource.addEventListener('workflow_event', ((event: MessageEvent<string>) => {
       try {
         const payload = JSON.parse(event.data) as WorkflowEventMessage
-        if (active) applyWorkflowEvent(payload)
+        if (active) {
+          updateConnectionState('connected', payload.replayed ? '正在回放历史事件' : '实时事件流已连接')
+          applyWorkflowEvent(payload)
+        }
       } catch (error) {
         console.error('Failed to parse workflow SSE message:', error)
       }
@@ -207,6 +294,7 @@ export default function WorkflowMonitor({ executionId, onRefresh }: WorkflowMoni
 
     eventSource.onerror = () => {
       if (!active) return
+      updateConnectionState('degraded', '实时事件流异常，已降级为定时刷新')
       startFallbackPolling()
     }
 
@@ -214,6 +302,7 @@ export default function WorkflowMonitor({ executionId, onRefresh }: WorkflowMoni
       active = false
       if (fallbackInterval) clearInterval(fallbackInterval)
       if (eventSource) eventSource.close()
+      updateConnectionState('closed')
     }
   }, [executionId])
 
@@ -281,16 +370,31 @@ export default function WorkflowMonitor({ executionId, onRefresh }: WorkflowMoni
           <Activity size={16} />
           执行监控
         </h3>
-        <div
-          className={`
-            px-2 py-1 rounded text-xs font-medium
-            ${execution.status === 'running' ? 'bg-blue-100 text-blue-600' : ''}
-            ${execution.status === 'completed' ? 'bg-green-100 text-green-600' : ''}
-            ${execution.status === 'failed' ? 'bg-red-100 text-red-600' : ''}
-            ${execution.status === 'paused' ? 'bg-yellow-100 text-yellow-600' : ''}
-          `}
-        >
-          {execution.status}
+        <div className="flex items-center gap-2">
+          <div
+            className={`
+              px-2 py-1 rounded text-xs font-medium
+              ${connectionState === 'connected' ? 'bg-emerald-100 text-emerald-700' : ''}
+              ${connectionState === 'connecting' ? 'bg-blue-100 text-blue-700' : ''}
+              ${connectionState === 'degraded' ? 'bg-amber-100 text-amber-700' : ''}
+              ${connectionState === 'closed' ? 'bg-gray-100 text-gray-600' : ''}
+            `}
+            title={connectionMessage || connectionState}
+          >
+            {connectionState === 'connected' ? '实时' : connectionState === 'degraded' ? '轮询' : connectionState === 'connecting' ? '连接中' : '已断开'}
+          </div>
+          <div
+            className={`
+              px-2 py-1 rounded text-xs font-medium
+              ${execution.status === 'running' ? 'bg-blue-100 text-blue-600' : ''}
+              ${execution.status === 'completed' ? 'bg-green-100 text-green-600' : ''}
+              ${execution.status === 'failed' ? 'bg-red-100 text-red-600' : ''}
+              ${execution.status === 'paused' ? 'bg-yellow-100 text-yellow-600' : ''}
+              ${execution.status === 'cancelled' ? 'bg-gray-100 text-gray-600' : ''}
+            `}
+          >
+            {execution.status}
+          </div>
         </div>
       </div>
 

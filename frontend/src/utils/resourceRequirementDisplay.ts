@@ -116,10 +116,10 @@ export function getRequirementOriginalType(item?: RequirementLike | null) {
 
 export function getRequirementTargetType(item?: RequirementLike | null) {
   if (!item) return ''
-  const explicit = normalizeRequirementType(item.resource_type || item.matched_resource_type)
-  if (explicit) return explicit
   const original = getRequirementOriginalType(item)
-  return TARGET_TYPE_BY_REQUIREMENT[original] || original || 'lore'
+  if (original) return TARGET_TYPE_BY_REQUIREMENT[original] || original
+  const explicit = normalizeRequirementType(item.resource_type || item.matched_resource_type)
+  return TARGET_TYPE_BY_REQUIREMENT[explicit] || explicit || 'lore'
 }
 
 export function formatRequirementTypeFlow(item?: RequirementLike | null) {
@@ -135,6 +135,22 @@ export function formatRequirementSummary(item?: RequirementLike | null) {
   if (!item) return '未知资源需求'
   const name = item.resource_name || item.draft_payload?.name || item.draft_payload?.title || item.id || '未命名资源'
   return `${getRequirementTypeLabel(getRequirementOriginalType(item))} · ${name}`
+}
+
+export function getRequirementRecoveryPath(item?: RequirementLike | null) {
+  const targetType = getRequirementTargetType(item)
+  const basePath = targetType === 'character' ? '/characters' : targetType === 'location' ? '/world-map' : '/lore'
+  const requirementId = String(item?.id || '').trim()
+  if (!requirementId) return basePath
+  const params = new URLSearchParams({ requirement_id: requirementId, action: 'create' })
+  return `${basePath}?${params.toString()}`
+}
+
+export function getRequirementRecoveryActionLabel(item?: RequirementLike | null) {
+  const targetType = getRequirementTargetType(item)
+  if (targetType === 'character') return '去角色库补齐'
+  if (targetType === 'location') return '去世界地图补齐'
+  return '去设定库补齐'
 }
 
 export function formatRequirementList(items: RequirementLike[], limit = 5) {

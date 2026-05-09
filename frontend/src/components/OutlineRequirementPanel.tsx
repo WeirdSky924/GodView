@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { AlertTriangle, Check, Loader2, X } from 'lucide-react'
+import { AlertTriangle, Check, Loader2, Target, X } from 'lucide-react'
 
 import { Button, Card } from '@/components/ui'
 import {
@@ -11,6 +11,7 @@ import {
 import { formatApiErrorMessage } from '@/api/workflows'
 import { useTheme } from '@/contexts/ThemeContext'
 import {
+  formatRequirementSummary,
   formatRequirementTypeFlow,
   getRequirementOriginalType,
   getRequirementTargetType,
@@ -33,10 +34,12 @@ interface OutlineRequirementPanelProps {
   emptyText?: string
   maxItems?: number
   refreshKey?: number
+  focusRequirementId?: string | null
+  onFocusedRequirementLoaded?: (requirement: OutlineResourceRequirement | null) => void
   onCreate?: (requirement: OutlineResourceRequirement) => void
   bindableResources?: BindableRequirementResource[]
   onBound?: () => void
-  onRequirementChanged?: () => void
+  onRequirementChanged?: (requirement?: OutlineResourceRequirement, status?: ResourceRequirementStatus) => void
 }
 
 const severityLabels: Record<string, string> = {
@@ -85,6 +88,8 @@ export default function OutlineRequirementPanel({
   emptyText = '暂无来自大纲的待补需求。',
   maxItems = 5,
   refreshKey = 0,
+  focusRequirementId,
+  onFocusedRequirementLoaded,
   onCreate,
   bindableResources = [],
   onBound,
@@ -115,28 +120,31 @@ export default function OutlineRequirementPanel({
 
     setLoading(true)
     try {
-      const responses = await Promise.all(
-        queryTypes.flatMap(requirementType => ([
-          getOutlineResourceRequirements(projectId, { requirement_type: requirementType, status: 'pending' }),
-          getOutlineResourceRequirements(projectId, { requirement_type: requirementType, status: 'in_progress' }),
-        ])),
-      )
+      const responses = await Promise.all([
+        getOutlineResourceRequirements(projectId, { status: 'pending' }),
+        getOutlineResourceRequirements(projectId, { status: 'in_progress' }),
+      ])
       const loaded = uniqueRequirements(responses.flatMap(response => response.requirements))
         .filter(requirement => normalizedTypes.includes(normalizeRequirementType(requirement.requirement_type)))
         .sort((a, b) => {
+          if (focusRequirementId) {
+            if (a.id === focusRequirementId) return -1
+            if (b.id === focusRequirementId) return 1
+          }
           const severityRank = { blocking: 0, advisory: 1, optional: 2 }
           const severityDiff = severityRank[a.severity] - severityRank[b.severity]
           if (severityDiff !== 0) return severityDiff
           return (a.chapter_num || 0) - (b.chapter_num || 0)
         })
       setRequirements(loaded)
+      onFocusedRequirementLoaded?.(focusRequirementId ? loaded.find(requirement => requirement.id === focusRequirementId) || null : null)
     } catch (error) {
       console.error('Failed to load outline resource requirements:', error)
       setRequirements([])
     } finally {
       setLoading(false)
     }
-  }, [projectId, queryTypes, normalizedTypes])
+  }, [projectId, normalizedTypes, focusRequirementId, onFocusedRequirementLoaded])
 
   useEffect(() => {
     loadRequirements()
@@ -151,7 +159,10 @@ export default function OutlineRequirementPanel({
         ...(status === 'ignored' ? { resolution_method: 'ignored' as const } : {}),
       })
       await loadRequirements()
-      onRequirementChanged?.()
+      onRequirementChanged?.(
+        requirements.find(requirement => requirement.id === requirementId),
+        status,
+      )
     } catch (error) {
       console.error('Failed to update outline resource requirement:', error)
       alert(formatApiErrorMessage(error, '更新资源需求状态失败'))
@@ -222,16 +233,28 @@ export default function OutlineRequirementPanel({
             加载资源需求...
           </div>
         ) : displayedRequirements.length === 0 ? (
-          <p className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>{emptyText}</p>
+          <div className="space-y-2">
+            <p className={`text-sm ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>{emptyText}</p>
+            {focusRequirementId && (
+              <p className={`text-xs ${isDark ? 'text-amber-300' : 'text-amber-700'}`}>
+                当前链接指向的资源需求不在待处理列表中，可能已解决、已忽略或不属于此资源入口。
+              </p>
+            )}
+          </div>
         ) : (
           displayedRequirements.map(requirement => {
             const severityClass = severityClasses[requirement.severity]
+            const summary = formatRequirementSummary(requirement)
             const targetType = getRequirementTargetType(requirement)
             const selectedBindingId = selectedBindingByRequirementId[requirement.id] || ''
             const typeFlow = formatRequirementTypeFlow(requirement)
             const bindableOptions = bindableResources.filter(resource => normalizeRequirementType(resource.type) === targetType)
             return (
-              <div key={requirement.id} className={`rounded-lg border p-3 ${isDark ? 'border-gray-700 bg-gray-800/60' : 'border-gray-100 bg-gray-50'}`}>
+              <div
+                key={requirement.id}
+                data-requirement-id={requirement.id}
+                className={`rounded-lg border p-3 ${requirement.id === focusRequirementId ? (isDark ? 'border-blue-500 bg-blue-950/30 ring-2 ring-blue-500/30' : 'border-blue-400 bg-blue-50 ring-2 ring-blue-200') : (isDark ? 'border-gray-700 bg-gray-800/60' : 'border-gray-100 bg-gray-50')}`}
+              >
                 <div className="flex items-start justify-between gap-3">
                   <div className="min-w-0">
                     <div className="flex items-center gap-2 flex-wrap">
@@ -244,6 +267,12 @@ export default function OutlineRequirementPanel({
                         {requirement.chapter_num ? ` · 第 ${requirement.chapter_num} 章` : ''}
                       </span>
                     </div>
+                    {requirement.id === focusRequirementId && (
+                      <div className={`mt-2 inline-flex items-center gap-1 rounded-full px-2 py-1 text-xs font-medium ${isDark ? 'bg-blue-900/50 text-blue-200' : 'bg-blue-100 text-blue-700'}`}>
+                        <Target className="w-3 h-3" />
+                        正在补齐：{summary}。完成创建或绑定后会自动刷新章节 readiness
+                      </div>
+                    )}
                     <div className={`text-xs mt-1 flex flex-wrap gap-x-3 gap-y-1 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
                       <span>需求类型：{getRequirementTypeLabel(getRequirementOriginalType(requirement))}</span>
                       <span>处理入口：{getRequirementTypeLabel(targetType)}</span>

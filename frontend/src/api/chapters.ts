@@ -3,9 +3,15 @@ import { api } from './client'
 export interface Chapter {
   id?: string
   title: string
+  project_id?: string
   world_id?: string
+  chapter_outline_id?: string
   summary?: string
   content?: string
+  content_path?: string
+  content_storage?: 'database' | 'filesystem'
+  content_size_bytes?: number
+  content_checksum?: string
   word_count?: number
   status: 'draft' | 'published' | 'archived' | 'in_progress' | 'completed'
   events?: string[]

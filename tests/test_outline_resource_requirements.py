@@ -11,8 +11,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.api.routes.chapter_outlines import (
     ConfirmResourceSupplementDraft,
     ConfirmResourceSupplementDraftsRequest,
+    CreateResourceRequirementRequest,
     UpdateResourceRequirementStatusRequest,
     confirm_resource_supplements,
+    create_resource_requirement,
+    list_resource_readiness,
+    list_resource_requirements,
     update_resource_requirement_status,
 )
 from app.database.postgres import PostgresDatabase
@@ -24,14 +28,17 @@ REQUIREMENT_ID = str(uuid.uuid4())
 CHARACTER_ID = str(uuid.uuid4())
 LORE_ID = str(uuid.uuid4())
 REGION_ID = str(uuid.uuid4())
-OUTLINE_ID = str(uuid.uuid4())
+OUTLINE_ID = "outline_runtime_smoke"
 
 
 class _RouteFakePostgresDB:
     def __init__(self):
         self.updated_calls = []
         self.readiness_calls = []
+        self.list_requirement_calls = []
+        self.list_readiness_calls = []
         self.saved_characters = []
+        self.saved_requirements = []
         self.requirement_rows = [{"id": REQUIREMENT_ID}]
         self.updated_requirement = {
             "id": REQUIREMENT_ID,
@@ -54,6 +61,21 @@ class _RouteFakePostgresDB:
     async def update_chapter_resource_readiness(self, **kwargs):
         self.readiness_calls.append(kwargs)
         return {"project_id": kwargs["project_id"], "chapter_num": kwargs["chapter_num"], "readiness_status": "ready"}
+
+    async def get_outline_resource_requirements(self, **kwargs):
+        self.list_requirement_calls.append(kwargs)
+        return [{"id": REQUIREMENT_ID, **kwargs}]
+
+    async def get_chapter_resource_readiness(self, **kwargs):
+        self.list_readiness_calls.append(kwargs)
+        return [{"project_id": kwargs["project_id"], "chapter_num": kwargs.get("chapter_num") or 3, "readiness_status": "ready"}]
+
+    async def save_outline_resource_requirement(self, requirement_data):
+        requirement_id = str(uuid.uuid4())
+        saved = {"id": requirement_id, **requirement_data}
+        self.saved_requirements.append(saved)
+        self.requirement_rows = [saved]
+        return requirement_id
 
     async def execute_query(self, query, params=None):
         return list(self.requirement_rows)
@@ -90,6 +112,113 @@ async def test_update_route_passes_resolution_method_and_refreshes_readiness(rou
     assert route_db.updated_calls[-1]["matched_resource_id"] == CHARACTER_ID
     assert route_db.readiness_calls == [{"project_id": PROJECT_ID, "outline_id": OUTLINE_ID, "chapter_num": 3}]
     assert result["readiness"]["readiness_status"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_list_resource_requirements_rejects_invalid_project_id_before_db(route_db):
+    with pytest.raises(HTTPException) as exc_info:
+        await list_resource_requirements(project_id="__missing__", status="pending")
+
+    assert exc_info.value.status_code == 400
+    assert "项目 ID" in exc_info.value.detail
+    assert route_db.list_requirement_calls == []
+
+
+@pytest.mark.asyncio
+async def test_list_resource_requirements_normalizes_filters_before_db(route_db):
+    result = await list_resource_requirements(
+        project_id=PROJECT_ID,
+        outline_id=OUTLINE_ID,
+        chapter_num=3,
+        status="PENDING",
+        severity="BLOCKING",
+        requirement_type="character",
+    )
+
+    assert result["total"] == 1
+    assert route_db.list_requirement_calls[-1] == {
+        "project_id": PROJECT_ID,
+        "outline_id": OUTLINE_ID,
+        "chapter_num": 3,
+        "status": "pending",
+        "severity": "blocking",
+        "requirement_type": "character",
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_resource_readiness_accepts_text_outline_id(route_db):
+    result = await list_resource_readiness(
+        project_id=PROJECT_ID,
+        outline_id="outline_runtime_smoke",
+        chapter_num=3,
+        refresh=False,
+    )
+
+    assert result["total"] == 1
+    assert route_db.list_readiness_calls[-1] == {
+        "project_id": PROJECT_ID,
+        "outline_id": "outline_runtime_smoke",
+        "chapter_num": 3,
+    }
+    assert route_db.readiness_calls == []
+
+
+@pytest.mark.asyncio
+async def test_list_resource_readiness_rejects_malformed_outline_id_before_db(route_db):
+    with pytest.raises(HTTPException) as exc_info:
+        await list_resource_readiness(project_id=PROJECT_ID, outline_id="outline bad", chapter_num=3, refresh=False)
+
+    assert exc_info.value.status_code == 400
+    assert "大纲 ID" in exc_info.value.detail
+    assert route_db.list_readiness_calls == []
+    assert route_db.readiness_calls == []
+
+
+@pytest.mark.asyncio
+async def test_update_route_rejects_invalid_requirement_id_before_db(route_db):
+    with pytest.raises(HTTPException) as exc_info:
+        await update_resource_requirement_status(
+            "bad-requirement",
+            UpdateResourceRequirementStatusRequest(status="resolved", resolution_method="manual_resolved"),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "资源需求 ID" in exc_info.value.detail
+    assert route_db.updated_calls == []
+    assert route_db.readiness_calls == []
+
+
+@pytest.mark.asyncio
+async def test_update_route_rejects_invalid_matched_resource_id_before_db(route_db):
+    with pytest.raises(HTTPException) as exc_info:
+        await update_resource_requirement_status(
+            REQUIREMENT_ID,
+            UpdateResourceRequirementStatusRequest(
+                status="resolved",
+                matched_resource_id="not-a-resource-id",
+                matched_resource_type="character",
+                resolution_method="bind_existing",
+            ),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "绑定资源 ID" in exc_info.value.detail
+    assert route_db.updated_calls == []
+    assert route_db.readiness_calls == []
+
+
+@pytest.mark.asyncio
+async def test_update_route_rejects_invalid_status_before_db(route_db):
+    with pytest.raises(HTTPException) as exc_info:
+        await update_resource_requirement_status(
+            REQUIREMENT_ID,
+            UpdateResourceRequirementStatusRequest(status="done", resolution_method="manual_resolved"),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "无效的资源需求状态"
+    assert route_db.updated_calls == []
 
 
 @pytest.mark.asyncio
@@ -139,6 +268,98 @@ async def test_confirm_resource_supplements_marks_requirement_as_created_resourc
     assert route_db.updated_calls[-1]["resolution_method"] == "create_resource"
     assert route_db.updated_calls[-1]["matched_resource_type"] == "character"
     assert route_db.readiness_calls[-1] == {"project_id": PROJECT_ID, "outline_id": OUTLINE_ID, "chapter_num": 3}
+
+
+@pytest.mark.asyncio
+async def test_debug_create_resource_requirement_persists_and_refreshes_readiness(route_db, monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "debug", True)
+
+    result = await create_resource_requirement(
+        CreateResourceRequirementRequest(
+            project_id=PROJECT_ID,
+            outline_id=OUTLINE_ID,
+            chapter_num=3,
+            requirement_type="character",
+            resource_name="缺失角色",
+            severity="blocking",
+            status="pending",
+            reason="启动前必须补齐",
+        )
+    )
+
+    assert result["requirement"]["severity"] == "blocking"
+    assert route_db.saved_requirements[-1]["metadata"]["created_by"] == "debug_resource_requirement_api"
+    assert route_db.readiness_calls[-1] == {"project_id": PROJECT_ID, "outline_id": OUTLINE_ID, "chapter_num": 3}
+    assert result["readiness"]["readiness_status"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_debug_create_resource_requirement_rejects_invalid_project_id_before_db(route_db, monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "debug", True)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await create_resource_requirement(
+            CreateResourceRequirementRequest(
+                project_id="not-a-project-id",
+                outline_id=OUTLINE_ID,
+                chapter_num=3,
+                requirement_type="character",
+                resource_name="缺失角色",
+            )
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "项目 ID" in exc_info.value.detail
+    assert route_db.saved_requirements == []
+    assert route_db.readiness_calls == []
+
+
+@pytest.mark.asyncio
+async def test_debug_create_resource_requirement_rejects_invalid_severity_before_db(route_db, monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "debug", True)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await create_resource_requirement(
+            CreateResourceRequirementRequest(
+                project_id=PROJECT_ID,
+                outline_id=OUTLINE_ID,
+                chapter_num=3,
+                requirement_type="character",
+                resource_name="缺失角色",
+                severity="fatal",
+            )
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "无效的资源需求严重级别"
+    assert route_db.saved_requirements == []
+
+
+@pytest.mark.asyncio
+async def test_debug_create_resource_requirement_is_hidden_when_debug_disabled(route_db, monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "debug", False)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await create_resource_requirement(
+            CreateResourceRequirementRequest(
+                project_id=PROJECT_ID,
+                outline_id=OUTLINE_ID,
+                chapter_num=3,
+                requirement_type="character",
+                resource_name="缺失角色",
+            )
+        )
+
+    assert exc_info.value.status_code == 404
+    assert route_db.saved_requirements == []
 
 
 class _RequirementStatusDB(PostgresDatabase):
@@ -300,6 +521,40 @@ async def test_db_reopen_clears_resolved_at_and_records_reopened_metadata():
     assert updated["resolved_at"] is None
     assert updated["metadata"]["reopened_at"]
     assert updated["metadata"]["previous_status"] == "resolved"
+
+
+class _SaveRequirementDB(PostgresDatabase):
+    def __init__(self, rows):
+        self.rows = rows
+        self.saved_query = None
+        self.saved_params = None
+
+    async def execute_query(self, query, params=None):
+        self.saved_query = query
+        self.saved_params = dict(params or {})
+        return list(self.rows)
+
+
+@pytest.mark.asyncio
+async def test_save_outline_resource_requirement_returns_actual_upserted_id():
+    existing_id = str(uuid.uuid4())
+    db = _SaveRequirementDB([{"id": existing_id}])
+
+    saved_id = await db.save_outline_resource_requirement({
+        "id": str(uuid.uuid4()),
+        "project_id": PROJECT_ID,
+        "outline_id": OUTLINE_ID,
+        "chapter_num": 3,
+        "requirement_type": "character",
+        "resource_name": "缺失角色",
+        "severity": "blocking",
+        "status": "pending",
+        "reason": "同 fingerprint 的历史需求",
+    })
+
+    assert saved_id == existing_id
+    assert "RETURNING id" in db.saved_query
+    assert db.saved_params["fingerprint"].startswith(f"{PROJECT_ID}|{OUTLINE_ID}|3|character|缺失角色")
 
 
 class _SaveCharacterDB(PostgresDatabase):

@@ -172,6 +172,10 @@ class Chapter(BaseModel):
     # 内容
     summary: Optional[str] = Field(None, description="章节摘要/期望内容")
     content: Optional[str] = Field(None, description="章节正文")
+    content_path: Optional[str] = Field(None, description="章节正文文件路径")
+    content_storage: Optional[str] = Field(None, description="章节正文存储方式：database/filesystem")
+    content_size_bytes: Optional[int] = Field(None, description="章节正文文件大小")
+    content_checksum: Optional[str] = Field(None, description="章节正文 SHA256 校验和")
     word_count: int = Field(default=0, description="字数")
 
     # 状态

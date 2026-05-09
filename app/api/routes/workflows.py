@@ -27,7 +27,7 @@ from app.services.workflow_node_catalog import (
     resolve_disabled_agent_types,
     resolve_workflow_node_types_payload,
 )
-from app.services.workflow_engine import ChapterReadinessBlockedError
+from app.services.workflow_engine import ChapterReadinessBlockedError, WorkflowOperationError
 from app.services.workflow_replay_export_service import (
     get_workflow_replay_export_service,
 )
@@ -63,12 +63,144 @@ def set_workflow_engine(engine):
     _workflow_engine = engine
 
 
+def _raise_workflow_operation_http_error(exc: WorkflowOperationError):
+    raise HTTPException(status_code=exc.http_status, detail=exc.to_payload())
+
+
+def _safe_event_data(raw_event_data: Any) -> Dict[str, Any]:
+    if isinstance(raw_event_data, str):
+        try:
+            raw_event_data = json.loads(raw_event_data)
+        except json.JSONDecodeError:
+            raw_event_data = {"raw": raw_event_data[:500]}
+    if not isinstance(raw_event_data, dict):
+        return {}
+
+    allowed_keys = {
+        "status",
+        "current_node",
+        "node_id",
+        "node_type",
+        "label",
+        "agent_type",
+        "phase",
+        "error",
+        "retry_count",
+        "duration_ms",
+        "completed_at",
+        "started_at",
+        "total_duration_ms",
+        "failed_node_id",
+        "failed_node_error",
+        "recovered_node_id",
+        "reset_node_ids",
+        "recovery_attempt",
+        "recovery_entry",
+        "remediation_entry",
+        "stale_entry",
+        "previous_error",
+        "trace_id",
+        "operation_id",
+        "request_id",
+        "cancel_requested",
+    }
+    safe = {key: raw_event_data.get(key) for key in allowed_keys if key in raw_event_data}
+    if isinstance(safe.get("recovery_entry"), dict):
+        entry = safe["recovery_entry"]
+        safe["recovery_entry"] = {
+            key: entry.get(key)
+            for key in ["attempt", "mode", "target_node_id", "reset_node_ids", "reason", "started_at", "previous_error", "trace_id", "status_at_start"]
+            if key in entry
+        }
+    if isinstance(safe.get("remediation_entry"), dict):
+        entry = safe["remediation_entry"]
+        safe["remediation_entry"] = {
+            key: entry.get(key)
+            for key in ["attempt", "node_id", "category", "diagnosis_category", "reason", "applied_at", "diff"]
+            if key in entry
+        }
+    if isinstance(safe.get("stale_entry"), dict):
+        entry = safe["stale_entry"]
+        safe["stale_entry"] = {
+            key: entry.get(key)
+            for key in ["detected_at", "operation", "previous_status", "lease_expires_at", "last_heartbeat_at", "reason"]
+            if key in entry
+        }
+    return safe
+
+
+def _operation_event_summary(event_type: str, data: Dict[str, Any]) -> str:
+    if event_type == "workflow_recovery_started":
+        return f"从 {data.get('recovered_node_id') or data.get('current_node') or '-'} 开始恢复"
+    if event_type == "workflow_node_remediated":
+        entry = data.get("remediation_entry") if isinstance(data.get("remediation_entry"), dict) else {}
+        return f"修复节点 {entry.get('node_id') or data.get('node_id') or '-'}"
+    if event_type == "workflow_execution_stale":
+        return "执行租约过期并被标记为失败"
+    if event_type == "node_failed":
+        return f"节点失败：{data.get('node_id') or '-'}"
+    if event_type == "workflow_failed":
+        return "工作流失败"
+    if event_type == "workflow_paused":
+        return "工作流已暂停"
+    if event_type == "workflow_resumed":
+        return "工作流已恢复运行"
+    if event_type == "workflow_cancelled":
+        return "工作流已取消"
+    if event_type == "workflow_completed":
+        return "工作流已完成"
+    if event_type == "workflow_started":
+        return "工作流已启动"
+    return event_type
+
+
+_OPERATION_TIMELINE_EVENT_TYPES = {
+    "workflow_started",
+    "workflow_completed",
+    "workflow_failed",
+    "workflow_paused",
+    "workflow_resumed",
+    "workflow_cancelled",
+    "workflow_recovery_started",
+    "workflow_node_remediated",
+    "workflow_execution_stale",
+    "node_failed",
+}
+
+
 class WorkflowExecuteRequest(BaseModel):
     """工作流执行请求，兼容旧版裸 initial_context body。"""
 
     initial_context: Dict[str, Any] = Field(default_factory=dict)
     request_id: Optional[str] = None
     force_new: bool = False
+
+
+class WorkflowRecoveryRequest(BaseModel):
+    """失败工作流恢复请求。"""
+
+    mode: str = "retry_failed"
+    node_id: Optional[str] = None
+    reason: Optional[str] = None
+    context_patch: Dict[str, Any] = Field(default_factory=dict)
+    reset_downstream: bool = True
+
+
+class WorkflowNodeRemediationPatch(BaseModel):
+    """失败节点安全修复补丁。"""
+
+    agent_type: Optional[str] = None
+    scenario: Optional[str] = None
+
+
+class WorkflowRemediationRequest(BaseModel):
+    """失败节点修复并恢复请求。"""
+
+    node_id: Optional[str] = None
+    reason: Optional[str] = None
+    patch: WorkflowNodeRemediationPatch = Field(default_factory=WorkflowNodeRemediationPatch)
+    context_patch: Dict[str, Any] = Field(default_factory=dict)
+    reset_downstream: bool = True
 
 
 def _format_sse(event_name: str, payload: Dict[str, Any]) -> str:
@@ -195,9 +327,61 @@ async def get_execution(execution_id: str):
     if not execution:
         raise HTTPException(status_code=404, detail="执行记录不存在")
 
-    return engine._serialize_for_json(execution)
+    execution_payload = engine._serialize_for_json(execution)
+    execution_payload["operation_summary"] = engine.build_execution_operation_summary(execution)
+    return execution_payload
 
 
+@router.get("/executions/{execution_id}/operation-summary", response_model=Dict[str, Any])
+async def get_execution_operation_summary(execution_id: str):
+    """获取执行生命周期摘要和后端判定的操作能力。"""
+    engine = get_workflow_engine()
+    db = get_db()
+    summary = await engine.get_execution_operation_summary(execution_id, db)
+    if not summary:
+        raise HTTPException(status_code=404, detail="执行记录不存在")
+    return {"success": True, "summary": summary}
+
+
+@router.get("/executions/{execution_id}/operation-events", response_model=Dict[str, Any])
+async def get_execution_operation_events(
+    execution_id: str,
+    limit: int = Query(default=50, ge=1, le=200),
+):
+    """获取面向操作台展示的精简执行事件时间线。"""
+    engine = get_workflow_engine()
+    db = get_db()
+    execution = await engine.get_execution_state(execution_id, db)
+    if not execution:
+        raise HTTPException(status_code=404, detail="执行记录不存在")
+    if not db or not hasattr(db, "get_workflow_execution_events_since"):
+        return {"success": True, "events": []}
+
+    try:
+        normalized_limit = int(limit)
+    except (TypeError, ValueError):
+        normalized_limit = 50
+    normalized_limit = max(1, min(normalized_limit, 200))
+
+    rows = await db.get_workflow_execution_events_since(execution_id, sequence_no=0, limit=500)
+    events = []
+    for row in rows:
+        event_type = row.get("event_type")
+        if event_type not in _OPERATION_TIMELINE_EVENT_TYPES:
+            continue
+        data = _safe_event_data(row.get("event_data") or {})
+        event = {
+            "sequence_no": row.get("sequence_no"),
+            "event_type": event_type,
+            "created_at": row.get("created_at"),
+            "summary": _operation_event_summary(event_type, data),
+            "node_id": data.get("node_id") or data.get("failed_node_id") or data.get("recovered_node_id"),
+            "status": data.get("status"),
+            "severity": "error" if event_type in {"workflow_failed", "node_failed", "workflow_execution_stale"} else "info",
+            "data": data,
+        }
+        events.append(engine._serialize_for_json(event))
+    return {"success": True, "events": events[-normalized_limit:]}
 
 
 @router.get("/executions/{execution_id}/events")
@@ -394,25 +578,75 @@ async def export_execution_markdown(execution_id: str):
     }
 
 
+def _parse_jsonish(value: Any, default: Any) -> Any:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return default
+    return value
+
+
+def _summarize_execution_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    node_states = _parse_jsonish(row.get("node_states"), {})
+    if not isinstance(node_states, dict):
+        node_states = {}
+
+    context = _parse_jsonish(row.get("context"), {})
+    if not isinstance(context, dict):
+        context = {}
+
+    resume_cursor = _parse_jsonish(row.get("resume_cursor"), None)
+    if resume_cursor is not None and not isinstance(resume_cursor, dict):
+        resume_cursor = None
+
+    node_count = len(node_states)
+    completed_node_count = 0
+    failed_node_id = None
+    for node_id, state in node_states.items():
+        if not isinstance(state, dict):
+            continue
+        if state.get("status") == "completed":
+            completed_node_count += 1
+        if failed_node_id is None and state.get("status") == "failed":
+            failed_node_id = node_id
+
+    recovery_history = context.get("recovery_history")
+    if not isinstance(recovery_history, list):
+        recovery_history = []
+    latest_recovery = recovery_history[-1] if recovery_history and isinstance(recovery_history[-1], dict) else None
+
+    return {
+        "id": row["id"],
+        "workflow_id": row["workflow_id"],
+        "project_id": str(row["project_id"]),
+        "status": row["status"],
+        "current_node": row["current_node"],
+        "started_at": row["started_at"].isoformat() if row["started_at"] else None,
+        "completed_at": row["completed_at"].isoformat() if row["completed_at"] else None,
+        "total_duration_ms": row["total_duration_ms"],
+        "trace_id": str(row.get("trace_id")) if row.get("trace_id") else None,
+        "error": row["error"],
+        "node_count": node_count,
+        "completed_node_count": completed_node_count,
+        "failed_node_id": failed_node_id,
+        "recovery_count": len(recovery_history),
+        "latest_recovery": latest_recovery,
+        "resume_cursor": resume_cursor,
+    }
+
+
 @router.get("/executions", response_model=List[Dict[str, Any]])
 async def list_executions(
     project_id: str = Query(..., description="项目ID"),
     status: Optional[str] = Query(None, description="状态过滤"),
     limit: int = Query(default=50, le=200),
     offset: int = Query(default=0, ge=0),
+    workflow_id: Optional[str] = Query(None, description="工作流ID过滤"),
 ):
-    """
-    获取工作流执行列表
-
-    Args:
-        project_id: 项目ID
-        status: 状态过滤
-        limit: 返回数量
-        offset: 偏移量
-
-    Returns:
-        List: 执行列表
-    """
+    """获取工作流执行历史摘要列表。"""
     db = get_db()
     if not db:
         raise HTTPException(status_code=503, detail="数据库未连接")
@@ -424,6 +658,9 @@ async def list_executions(
         if status:
             conditions.append("status = :status")
             params["status"] = status
+        if workflow_id:
+            conditions.append("workflow_id = :workflow_id")
+            params["workflow_id"] = workflow_id
 
         query = f"""
         SELECT * FROM workflow_executions
@@ -433,23 +670,7 @@ async def list_executions(
         """
 
         results = await db.execute_query(query, params)
-
-        executions = []
-        for row in results:
-            executions.append({
-                "id": row["id"],
-                "workflow_id": row["workflow_id"],
-                "project_id": str(row["project_id"]),
-                "status": row["status"],
-                "current_node": row["current_node"],
-                "started_at": row["started_at"].isoformat() if row["started_at"] else None,
-                "completed_at": row["completed_at"].isoformat() if row["completed_at"] else None,
-                "total_duration_ms": row["total_duration_ms"],
-                "trace_id": str(row.get("trace_id")) if row.get("trace_id") else None,
-                "error": row["error"],
-            })
-
-        return executions
+        return [_summarize_execution_row(row) for row in results]
     except Exception as e:
         logger.error(f"获取执行列表失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -692,13 +913,18 @@ async def pause_execution(execution_id: str):
     engine = get_workflow_engine()
     db = get_db()
 
-    success = await engine.pause_workflow(execution_id, db)
+    try:
+        success = await engine.pause_workflow(execution_id, db)
+    except WorkflowOperationError as exc:
+        _raise_workflow_operation_http_error(exc)
     if not success:
         raise HTTPException(status_code=400, detail="无法暂停工作流（可能不在运行状态）")
 
+    execution = await engine.get_execution_state(execution_id, db)
     return {
         "success": True,
         "message": f"工作流 {execution_id} 已暂停",
+        "execution": engine._serialize_for_json(execution) if execution else None,
     }
 
 
@@ -720,14 +946,109 @@ async def resume_execution(execution_id: str):
     if execution:
         await _setup_agent_provider_for_execution(execution.project_id)
 
-    success = await engine.resume_workflow(execution_id, db)
+    try:
+        success = await engine.resume_workflow(execution_id, db)
+    except WorkflowOperationError as exc:
+        _raise_workflow_operation_http_error(exc)
     if not success:
         raise HTTPException(status_code=400, detail="无法恢复工作流（可能不在暂停状态）")
 
+    execution = await engine.get_execution_state(execution_id, db)
     return {
         "success": True,
         "message": f"工作流 {execution_id} 已恢复",
+        "execution": engine._serialize_for_json(execution) if execution else None,
     }
+
+
+@router.get("/executions/{execution_id}/failed-node-diagnosis", response_model=Dict[str, Any])
+async def diagnose_failed_execution_node(
+    execution_id: str,
+    node_id: Optional[str] = Query(None, description="失败节点ID"),
+):
+    """获取失败节点诊断摘要。"""
+    engine = get_workflow_engine()
+    db = get_db()
+    try:
+        return await engine.diagnose_failed_workflow_node(execution_id, db, node_id=node_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.error("诊断失败节点失败: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"诊断失败：{exc}")
+
+
+@router.post("/executions/{execution_id}/remediations/validate", response_model=Dict[str, Any])
+async def validate_failed_execution_remediation(execution_id: str, request: WorkflowRemediationRequest):
+    """验证失败节点安全修复补丁。"""
+    engine = get_workflow_engine()
+    db = get_db()
+    try:
+        return await engine.validate_failed_node_remediation(
+            execution_id,
+            db,
+            node_id=request.node_id,
+            patch=request.patch.model_dump(exclude_none=True),
+            context_patch=request.context_patch,
+        )
+    except WorkflowOperationError as exc:
+        _raise_workflow_operation_http_error(exc)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.error("验证失败节点修复失败: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"验证失败：{exc}")
+
+
+@router.post("/executions/{execution_id}/remediate-and-recover", response_model=Dict[str, Any])
+async def remediate_and_recover_execution(execution_id: str, request: WorkflowRemediationRequest):
+    """应用失败节点安全修复并恢复同一执行。"""
+    engine = get_workflow_engine()
+    db = get_db()
+    try:
+        return await engine.remediate_failed_workflow_node(
+            execution_id,
+            db,
+            node_id=request.node_id,
+            patch=request.patch.model_dump(exclude_none=True),
+            reason=request.reason,
+            context_patch=request.context_patch,
+            reset_downstream=request.reset_downstream,
+        )
+    except WorkflowOperationError as exc:
+        _raise_workflow_operation_http_error(exc)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.error("修复并恢复失败节点失败: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"修复恢复失败：{exc}")
+
+
+@router.post("/executions/{execution_id}/recover", response_model=Dict[str, Any])
+async def recover_execution(execution_id: str, request: WorkflowRecoveryRequest):
+    """从失败节点恢复工作流执行。"""
+    engine = get_workflow_engine()
+    db = get_db()
+
+    execution = await engine.get_execution_state(execution_id, db)
+    if not execution:
+        raise HTTPException(status_code=404, detail="工作流执行不存在")
+    await _setup_agent_provider_for_execution(execution.project_id)
+
+    try:
+        return await engine.recover_failed_workflow(
+            execution_id,
+            db,
+            mode=request.mode,
+            node_id=request.node_id,
+            reason=request.reason,
+            context_patch=request.context_patch,
+            reset_downstream=request.reset_downstream,
+        )
+    except WorkflowOperationError as exc:
+        _raise_workflow_operation_http_error(exc)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/executions/{execution_id}/confirm-discussion", response_model=Dict[str, Any])
@@ -784,11 +1105,16 @@ async def cancel_execution(execution_id: str):
     engine = get_workflow_engine()
     db = get_db()
 
-    success = await engine.cancel_workflow(execution_id, db)
+    try:
+        success = await engine.cancel_workflow(execution_id, db)
+    except WorkflowOperationError as exc:
+        _raise_workflow_operation_http_error(exc)
     if not success:
         raise HTTPException(status_code=400, detail="无法取消工作流")
 
+    execution = await engine.get_execution_state(execution_id, db)
     return {
         "success": True,
         "message": f"工作流 {execution_id} 已取消",
+        "execution": engine._serialize_for_json(execution) if execution else None,
     }

@@ -1,4 +1,5 @@
-import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react'
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { Edit2, Link2, MapPin, Plus, Search, Trash2, Users } from 'lucide-react'
 
 import PageLayout from '@/components/PageLayout'
@@ -20,6 +21,7 @@ import {
   type OutlineResourceRequirement,
 } from '@/api/outlines'
 import { formatApiErrorMessage } from '@/api/workflows'
+import { formatRequirementSummary } from '@/utils/resourceRequirementDisplay'
 
 const REGION_TYPES = [
   { value: 'custom', label: '自定义' },
@@ -106,6 +108,7 @@ const stringifyItems = (items?: Array<Record<string, unknown>>) =>
 
 export default function WorldMap() {
   const { currentProject } = useProject()
+  const [searchParams, setSearchParams] = useSearchParams()
   const {
     worlds,
     selectedWorldId,
@@ -123,6 +126,7 @@ export default function WorldMap() {
   const [editingRegion, setEditingRegion] = useState<Region | null>(null)
   const [formData, setFormData] = useState<RegionFormState>(emptyForm)
   const [pendingRequirement, setPendingRequirement] = useState<OutlineResourceRequirement | null>(null)
+  const [focusedRequirement, setFocusedRequirement] = useState<OutlineResourceRequirement | null>(null)
   const [requirementRefreshKey, setRequirementRefreshKey] = useState(0)
 
   const loadRegions = useCallback(async () => {
@@ -232,6 +236,18 @@ export default function WorldMap() {
     })
   }, [filteredRegions, charactersByRegion])
 
+  const focusRequirementId = searchParams.get('requirement_id')
+  const shouldAutoCreateFromRequirement = searchParams.get('action') === 'create'
+  const autoOpenedRequirementIdRef = useRef<string | null>(null)
+
+  const clearRequirementRecoveryParams = useCallback(() => {
+    if (!searchParams.has('requirement_id') && !searchParams.has('action')) return
+    const next = new URLSearchParams(searchParams)
+    next.delete('requirement_id')
+    next.delete('action')
+    setSearchParams(next, { replace: true })
+  }, [searchParams, setSearchParams])
+
   const openCreateModal = (requirement?: OutlineResourceRequirement) => {
     const payload = requirement?.suggested_payload || {}
     setEditingRegion(null)
@@ -253,6 +269,13 @@ export default function WorldMap() {
     setPendingRequirement(requirement || null)
     setShowModal(true)
   }
+
+  useEffect(() => {
+    if (!shouldAutoCreateFromRequirement || !focusedRequirement || showModal || pendingRequirement || !selectedWorldId) return
+    if (autoOpenedRequirementIdRef.current === focusedRequirement.id) return
+    autoOpenedRequirementIdRef.current = focusedRequirement.id
+    openCreateModal(focusedRequirement)
+  }, [shouldAutoCreateFromRequirement, focusedRequirement, showModal, pendingRequirement, selectedWorldId])
 
   const openEditModal = (region: Region) => {
     setEditingRegion(region)
@@ -309,7 +332,9 @@ export default function WorldMap() {
             matched_resource_type: 'location',
             resolution_method: 'create_resource',
           })
+          setFocusedRequirement(null)
           setRequirementRefreshKey(value => value + 1)
+          clearRequirementRecoveryParams()
         }
       }
       setPendingRequirement(null)
@@ -355,11 +380,25 @@ export default function WorldMap() {
         <div className="h-full flex items-center justify-center text-gray-500">当前项目没有世界，请先到世界管理创建世界</div>
       ) : (
         <div className="h-full flex flex-col gap-4">
+          {focusedRequirement && (
+            <div className="rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-blue-900">
+              <div className="text-sm font-semibold">正在补齐启动阻塞资源</div>
+              <div className="mt-1 text-sm opacity-90">{formatRequirementSummary(focusedRequirement)}</div>
+              <div className="mt-1 text-xs opacity-75">创建或绑定地点后，系统会自动把该资源需求标记为已解决并刷新章节 readiness。</div>
+              {!selectedWorldId && (
+                <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                  当前项目还没有可用世界。请先创建或选择世界后再创建地点；已有地点仍可直接绑定到该需求。
+                </div>
+              )}
+            </div>
+          )}
           <OutlineRequirementPanel
             projectId={currentProject.id}
+            focusRequirementId={focusRequirementId}
+            onFocusedRequirementLoaded={setFocusedRequirement}
             requirementTypes={['location', 'place', '地点', '场景地点']}
             title="大纲待补地点"
-            description="来自大纲的地点/区域资源缺口，可预填新建区域、绑定已有区域或标记处理状态。创建/绑定后会标记需求为已解决。"
+            description={selectedWorldId ? '来自大纲的地点/区域资源缺口，可预填新建区域、绑定已有区域或标记处理状态。创建/绑定后会标记需求为已解决。' : '当前项目还没有可用世界；创建地点前需先创建或选择世界，已有地点仍可绑定或标记处理状态。'}
             onCreate={selectedWorldId ? openCreateModal : undefined}
             bindableResources={regions
               .filter(region => Boolean(region.id))
@@ -371,9 +410,15 @@ export default function WorldMap() {
               }))}
             onBound={async () => {
               await loadRegions()
+              setFocusedRequirement(null)
+              clearRequirementRecoveryParams()
             }}
-            onRequirementChanged={() => {
+            onRequirementChanged={(requirement, status) => {
               setRequirementRefreshKey(value => value + 1)
+              if (requirement?.id === focusRequirementId && (status === 'resolved' || status === 'ignored' || status === 'superseded')) {
+                setFocusedRequirement(null)
+                clearRequirementRecoveryParams()
+              }
             }}
             refreshKey={requirementRefreshKey}
           />

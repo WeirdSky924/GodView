@@ -5,7 +5,7 @@
 
 import { api } from './client'
 
-const API_BASE = '/workflow'
+const API_BASE = '/workflows'
 
 // ==================== 类型定义 ====================
 

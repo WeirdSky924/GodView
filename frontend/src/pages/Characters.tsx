@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { Card, Button, Input, TextArea, Modal } from '@/components/ui'
 import PageLayout from '@/components/PageLayout'
 import {
@@ -37,6 +38,7 @@ import {
   type OutlineResourceRequirement,
 } from '@/api/outlines'
 import { formatApiErrorMessage } from '@/api/workflows'
+import { formatRequirementSummary } from '@/utils/resourceRequirementDisplay'
 
 function splitCsvInput(value: string) {
   return value
@@ -104,6 +106,7 @@ const STATUS_CONFIG: Record<string, { label: string; bgClass: string; textClass:
 export default function Characters() {
   const { currentProject } = useProject()
   const { theme } = useTheme()
+  const [searchParams, setSearchParams] = useSearchParams()
   const isDark = theme === 'dark'
 
   const [characters, setCharacters] = useState<Character[]>([])
@@ -124,6 +127,7 @@ export default function Characters() {
   const [generatingPersonality, setGeneratingPersonality] = useState(false)
   const [regions, setRegions] = useState<Region[]>([])
   const [pendingRequirement, setPendingRequirement] = useState<OutlineResourceRequirement | null>(null)
+  const [focusedRequirement, setFocusedRequirement] = useState<OutlineResourceRequirement | null>(null)
   const [requirementRefreshKey, setRequirementRefreshKey] = useState(0)
   const { worlds, formatWorldLabel } = useProjectWorlds(currentProject?.id, currentProject?.world_id)
 
@@ -223,6 +227,18 @@ export default function Characters() {
     }
   }, [selectedCharacterId, loadVoiceSamples])
 
+  const focusRequirementId = searchParams.get('requirement_id')
+  const shouldAutoCreateFromRequirement = searchParams.get('action') === 'create'
+  const autoOpenedRequirementIdRef = useRef<string | null>(null)
+
+  const clearRequirementRecoveryParams = useCallback(() => {
+    if (!searchParams.has('requirement_id') && !searchParams.has('action')) return
+    const next = new URLSearchParams(searchParams)
+    next.delete('requirement_id')
+    next.delete('action')
+    setSearchParams(next, { replace: true })
+  }, [searchParams, setSearchParams])
+
   const openCreateModal = (requirement?: OutlineResourceRequirement) => {
     const payload = requirement?.suggested_payload || {}
     setEditingChar(null)
@@ -260,6 +276,13 @@ export default function Characters() {
     setPendingRequirement(requirement || null)
     setShowModal(true)
   }
+
+  useEffect(() => {
+    if (!shouldAutoCreateFromRequirement || !focusedRequirement || showModal || pendingRequirement) return
+    if (autoOpenedRequirementIdRef.current === focusedRequirement.id) return
+    autoOpenedRequirementIdRef.current = focusedRequirement.id
+    openCreateModal(focusedRequirement)
+  }, [shouldAutoCreateFromRequirement, focusedRequirement, showModal, pendingRequirement])
 
   const openEditModal = (character: Character) => {
     setEditingChar(character)
@@ -336,7 +359,9 @@ export default function Characters() {
             matched_resource_type: 'character',
             resolution_method: 'create_resource',
           })
+          setFocusedRequirement(null)
           setRequirementRefreshKey(value => value + 1)
+          clearRequirementRecoveryParams()
         }
       }
       await loadCharacters()
@@ -542,9 +567,18 @@ export default function Characters() {
         <p className={`text-center py-12 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>加载中...</p>
       ) : (
         <div className="space-y-4">
+          {focusedRequirement && (
+            <div className={`rounded-xl border px-4 py-3 ${isDark ? 'border-blue-800 bg-blue-950/40 text-blue-100' : 'border-blue-200 bg-blue-50 text-blue-900'}`}>
+              <div className="text-sm font-semibold">正在补齐启动阻塞资源</div>
+              <div className="mt-1 text-sm opacity-90">{formatRequirementSummary(focusedRequirement)}</div>
+              <div className="mt-1 text-xs opacity-75">创建或绑定角色后，系统会自动把该资源需求标记为已解决并刷新章节 readiness。</div>
+            </div>
+          )}
           <OutlineRequirementPanel
             projectId={currentProject.id}
             requirementTypes={['character', 'role', '角色', '人物']}
+            focusRequirementId={focusRequirementId}
+            onFocusedRequirementLoaded={setFocusedRequirement}
             title="大纲待补角色"
             description="来自已审批/已保存大纲的角色资源缺口，可直接预填创建、绑定已有角色或标记处理状态。创建/绑定后会标记需求为已解决。"
             onCreate={openCreateModal}
@@ -558,9 +592,15 @@ export default function Characters() {
               }))}
             onBound={async () => {
               await loadCharacters()
+              setFocusedRequirement(null)
+              clearRequirementRecoveryParams()
             }}
-            onRequirementChanged={() => {
+            onRequirementChanged={(requirement, status) => {
               setRequirementRefreshKey(value => value + 1)
+              if (requirement?.id === focusRequirementId && (status === 'resolved' || status === 'ignored' || status === 'superseded')) {
+                setFocusedRequirement(null)
+                clearRequirementRecoveryParams()
+              }
             }}
             refreshKey={requirementRefreshKey}
           />

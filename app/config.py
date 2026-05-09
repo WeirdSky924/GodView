@@ -29,8 +29,8 @@ class Settings(BaseSettings):
 
     # 应用基本信息
     app_name: str = "Godview"
-    app_version: str = "1.3.108"
-    debug: bool = False
+    app_version: str = "1.3.124"
+    debug: bool = os.getenv("DEBUG", "false").lower() in {"1", "true", "yes", "on"}
     log_level: str = "INFO"
 
     # 服务器配置（前后端分离时需要）

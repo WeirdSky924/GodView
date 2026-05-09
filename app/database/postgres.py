@@ -1633,13 +1633,20 @@ class PostgresDatabase:
         project_id_value = params.get('project_id')
         chapter_outline_id_value = params.get('chapter_outline_id')
 
+        params.setdefault('content_path', None)
+        params.setdefault('content_storage', 'database')
+        params.setdefault('content_size_bytes', None)
+        params.setdefault('content_checksum', None)
+
         query = """
-        INSERT INTO chapters (id, title, project_id, world_id, chapter_outline_id, summary, content, word_count, status, events,
-                             hooks_planted, hooks_resolved, main_plot_progress, reader_scores,
-                             created_at, updated_at, completed_at, deleted_at)
-        VALUES (:id, :title, """ + (f"CAST(:project_id AS UUID)" if project_id_value else "NULL") + """, """ + (f"CAST(:world_id AS UUID)" if world_id_value else "NULL") + """, :chapter_outline_id, :summary, :content, :word_count, :status, :events,
-                :hooks_planted, :hooks_resolved, :main_plot_progress, :reader_scores,
-                :created_at, :updated_at, :completed_at, :deleted_at)
+        INSERT INTO chapters (id, title, project_id, world_id, chapter_outline_id, summary, content,
+                             content_path, content_storage, content_size_bytes, content_checksum,
+                             word_count, status, events, hooks_planted, hooks_resolved,
+                             main_plot_progress, reader_scores, created_at, updated_at, completed_at, deleted_at)
+        VALUES (:id, :title, """ + (f"CAST(:project_id AS UUID)" if project_id_value else "NULL") + """, """ + (f"CAST(:world_id AS UUID)" if world_id_value else "NULL") + """, :chapter_outline_id, :summary, :content,
+                :content_path, :content_storage, :content_size_bytes, :content_checksum,
+                :word_count, :status, :events, :hooks_planted, :hooks_resolved,
+                :main_plot_progress, :reader_scores, :created_at, :updated_at, :completed_at, :deleted_at)
         ON CONFLICT (id) DO UPDATE SET
             title = EXCLUDED.title,
             project_id = EXCLUDED.project_id,
@@ -1647,6 +1654,10 @@ class PostgresDatabase:
             chapter_outline_id = EXCLUDED.chapter_outline_id,
             summary = EXCLUDED.summary,
             content = EXCLUDED.content,
+            content_path = EXCLUDED.content_path,
+            content_storage = EXCLUDED.content_storage,
+            content_size_bytes = EXCLUDED.content_size_bytes,
+            content_checksum = EXCLUDED.content_checksum,
             word_count = EXCLUDED.word_count,
             status = EXCLUDED.status,
             events = EXCLUDED.events,
@@ -1949,8 +1960,11 @@ class PostgresDatabase:
             metadata = EXCLUDED.metadata,
             updated_at = EXCLUDED.updated_at,
             resolved_at = COALESCE(outline_resource_requirements.resolved_at, EXCLUDED.resolved_at)
+        RETURNING id
         """
-        await self.execute_write(query, record)
+        rows = await self.execute_query(query, record)
+        if rows and rows[0].get("id"):
+            return str(rows[0]["id"])
         return requirement_id
 
     async def save_outline_resource_requirements(self, requirements: List[Dict[str, Any]]) -> List[str]:
@@ -3118,8 +3132,13 @@ class PostgresDatabase:
             chapter_schema_updates = [
                 "ALTER TABLE chapters ADD COLUMN IF NOT EXISTS chapter_outline_id TEXT",
                 "ALTER TABLE chapters ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP WITH TIME ZONE",
+                "ALTER TABLE chapters ADD COLUMN IF NOT EXISTS content_path TEXT",
+                "ALTER TABLE chapters ADD COLUMN IF NOT EXISTS content_storage VARCHAR(32) DEFAULT 'database'",
+                "ALTER TABLE chapters ADD COLUMN IF NOT EXISTS content_size_bytes BIGINT",
+                "ALTER TABLE chapters ADD COLUMN IF NOT EXISTS content_checksum TEXT",
                 "CREATE INDEX IF NOT EXISTS idx_chapters_outline_id ON chapters(chapter_outline_id)",
                 "CREATE INDEX IF NOT EXISTS idx_chapters_deleted_at ON chapters(deleted_at)",
+                "CREATE INDEX IF NOT EXISTS idx_chapters_content_storage ON chapters(content_storage)",
             ]
             if 'chapters' in existing_tables:
                 for statement in chapter_schema_updates:

@@ -17,6 +17,44 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _filesystem_chapter_payload(
+    chapter_data: Dict[str, Any],
+    content: str,
+    *,
+    preserve_existing_path: bool = True,
+) -> Dict[str, Any]:
+    from app.services.chapter_document_storage import chapter_document_storage
+
+    metadata = chapter_document_storage.write_chapter(
+        chapter_id=str(chapter_data["id"]),
+        project_id=chapter_data.get("project_id"),
+        title=chapter_data.get("title") or "未命名章节",
+        content=content,
+        existing_path=chapter_data.get("content_path") if preserve_existing_path else None,
+    )
+    chapter_data.update(metadata)
+    chapter_data["content"] = ""
+    chapter_data["word_count"] = len(content)
+    return chapter_data
+
+
+def _hydrate_chapter_content(chapter: Dict[str, Any]) -> Dict[str, Any]:
+    from app.services.chapter_document_storage import chapter_document_storage
+
+    try:
+        return chapter_document_storage.hydrate_chapter(chapter)
+    except FileNotFoundError as exc:
+        logger.error("章节文件不存在: %s", exc)
+        raise HTTPException(status_code=500, detail="章节文件不存在") from exc
+    except ValueError as exc:
+        logger.error("章节文件路径非法: %s", exc)
+        raise HTTPException(status_code=500, detail="章节文件路径非法") from exc
+
+
+def _hydrate_chapters_content(chapters: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [_hydrate_chapter_content(chapter) for chapter in chapters]
+
+
 @router.get("/hooks", response_model=List[Dict[str, Any]])
 async def list_hooks(
     project_id: Optional[str] = Query(None, description="按项目 ID 过滤"),
@@ -236,7 +274,7 @@ async def list_chapters(
         if status and chapters:
             chapters = [c for c in chapters if c.get("status") == status]
 
-    return chapters[:limit]
+    return _hydrate_chapters_content(chapters[:limit])
 
 
 @router.get("/chapters/{chapter_id}", response_model=Dict[str, Any])
@@ -260,7 +298,7 @@ async def get_chapter(chapter_id: str):
     if not chapter:
         raise HTTPException(status_code=404, detail="章节不存在")
 
-    return chapter
+    return _hydrate_chapter_content(chapter)
 
 
 @router.post("/chapters", response_model=Dict[str, Any])
@@ -318,8 +356,9 @@ async def create_chapter(chapter: CreateChapterDTO):
     }
 
     try:
+        chapter_data = _filesystem_chapter_payload(chapter_data, content)
         await postgres_db.save_chapter(chapter_data)
-        return chapter_data
+        return _hydrate_chapter_content(chapter_data)
     except Exception as e:
         logger.error(f"创建章节失败：{e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -346,14 +385,42 @@ async def update_chapter(chapter_id: str, chapter: UpdateChapterDTO):
     if not existing:
         raise HTTPException(status_code=404, detail="章节不存在")
 
+    existing = _hydrate_chapter_content(existing)
     update_payload = chapter.model_dump(mode="json", exclude_unset=True)
+    content_changed = "content" in update_payload
+    title_changed = "title" in update_payload and update_payload.get("title") != existing.get("title")
     merged = {**existing, **update_payload}
-    merged["word_count"] = len(merged.get("content") or "")
+    content = merged.get("content") or ""
     merged["updated_at"] = datetime.now()  # 使用 datetime 对象而非字符串
 
     try:
+        if content_changed:
+            old_content_path = existing.get("content_path")
+            merged = _filesystem_chapter_payload(
+                merged,
+                content,
+                preserve_existing_path=not title_changed,
+            )
+            if title_changed and old_content_path and old_content_path != merged.get("content_path"):
+                from app.services.chapter_document_storage import chapter_document_storage
+                chapter_document_storage.delete_chapter_file(str(old_content_path))
+        elif title_changed and merged.get("content_path"):
+            from app.services.chapter_document_storage import chapter_document_storage
+            metadata = chapter_document_storage.rename_chapter(
+                str(merged["content_path"]),
+                str(merged["id"]),
+                merged.get("project_id"),
+                merged.get("title") or "未命名章节",
+            )
+            merged.update(metadata)
+            merged["content"] = ""
+            merged["word_count"] = len(content)
+        else:
+            merged["word_count"] = len(content)
+            if merged.get("content_storage") == "filesystem":
+                merged["content"] = ""
         await postgres_db.save_chapter(merged)
-        return merged
+        return _hydrate_chapter_content(merged)
     except Exception as e:
         logger.error(f"更新章节失败：{e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -373,6 +440,7 @@ async def evaluate_chapter(chapter_id: str):
     chapter = await postgres_db.get_chapter(chapter_id)
     if not chapter:
         raise HTTPException(status_code=404, detail="章节不存在")
+    chapter = _hydrate_chapter_content(chapter)
 
     try:
         director = DirectorSystem(
@@ -417,6 +485,7 @@ async def simulate_reader_for_chapter(chapter_id: str):
     chapter = await postgres_db.get_chapter(chapter_id)
     if not chapter:
         raise HTTPException(status_code=404, detail="章节不存在")
+    chapter = _hydrate_chapter_content(chapter)
 
     try:
         director = DirectorSystem(
@@ -495,7 +564,7 @@ async def get_visualization_data(world_id: str):
     if not world:
         raise HTTPException(status_code=404, detail="世界不存在")
 
-    chapters = await postgres_db.get_chapters_by_world(world_id)
+    chapters = _hydrate_chapters_content(await postgres_db.get_chapters_by_world(world_id))
     snapshots = await postgres_db.get_snapshots_by_world(world_id)
     project_id = world.get("project_id")
     hooks = await postgres_db.get_all_hooks(
@@ -713,12 +782,21 @@ async def delete_chapter(chapter_id: str):
     if not existing:
         raise HTTPException(status_code=404, detail="章节不存在")
 
+    archived_path = None
+    try:
+        from app.services.chapter_document_storage import chapter_document_storage
+        archived_path = chapter_document_storage.archive_deleted_chapter_file(existing.get("content_path"))
+    except ValueError as exc:
+        logger.error("归档删除章节文件路径非法：%s", exc)
+        raise HTTPException(status_code=500, detail="章节文件路径非法") from exc
+
     query = "DELETE FROM chapters WHERE id = CAST(:id AS UUID)"
     await postgres_db.execute_write(query, {"id": chapter_id})
 
     return {
         "success": True,
         "message": f"章节 {chapter_id} 已删除",
+        "archived_content_path": archived_path,
     }
 
 

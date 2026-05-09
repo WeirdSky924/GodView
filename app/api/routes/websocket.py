@@ -517,6 +517,17 @@ async def _persist_runtime_state(director: DirectorSystem):
         chapter_payload.setdefault("created_at", datetime.utcnow().isoformat())
         chapter_payload["updated_at"] = datetime.utcnow().isoformat()
         chapter_payload.setdefault("completed_at", None)
+        content = chapter_payload.get("content") or ""
+        from app.services.chapter_document_storage import chapter_document_storage
+        metadata = chapter_document_storage.write_chapter(
+            chapter_id=str(chapter_payload.get("id")),
+            project_id=chapter_payload.get("project_id"),
+            title=chapter_payload.get("title") or "未命名章节",
+            content=content,
+            existing_path=chapter_payload.get("content_path"),
+        )
+        chapter_payload.update(metadata)
+        chapter_payload["content"] = ""
         await postgres_db.save_chapter(chapter_payload)
 
     for hook_id in director.hooks_planted:

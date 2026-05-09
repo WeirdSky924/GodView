@@ -4,6 +4,7 @@
  */
 
 import { api } from './client'
+import { getCachedQuery, invalidateQueryCache, type QueryCacheOptions } from './queryCache'
 
 const API_BASE = '/outlines'
 
@@ -511,6 +512,7 @@ export async function getOutlineResourceRequirements(
     status?: ResourceRequirementStatus
     severity?: ResourceRequirementSeverity
     requirement_type?: string
+    cache?: QueryCacheOptions
   }
 ): Promise<{ requirements: OutlineResourceRequirement[]; total: number }> {
   const params = new URLSearchParams({ project_id: projectId })
@@ -519,7 +521,12 @@ export async function getOutlineResourceRequirements(
   if (filters?.status) params.set('status', filters.status)
   if (filters?.severity) params.set('severity', filters.severity)
   if (filters?.requirement_type) params.set('requirement_type', filters.requirement_type)
-  return await api.get(`${API_BASE}/resource-requirements?${params.toString()}`)
+  const query = params.toString()
+  return await getCachedQuery(
+    `outline-resource-requirements:${query}`,
+    () => api.get(`${API_BASE}/resource-requirements?${query}`),
+    filters?.cache,
+  )
 }
 
 /**
@@ -552,5 +559,11 @@ export async function updateOutlineResourceRequirementStatus(
     resolution_method?: ResourceRequirementResolutionMethod
   }
 ): Promise<{ requirement: OutlineResourceRequirement; readiness?: ChapterResourceReadiness | null }> {
-  return await api.patch(`${API_BASE}/resource-requirements/${requirementId}`, data)
+  const result = await api.patch(`${API_BASE}/resource-requirements/${requirementId}`, data)
+  invalidateOutlineResourceRequirementCaches()
+  return result
+}
+
+export function invalidateOutlineResourceRequirementCaches(): void {
+  invalidateQueryCache('outline-resource-requirements')
 }

@@ -75,6 +75,41 @@ class ChapterReadinessBlockedError(ValueError):
         super().__init__(str(message))
 
 
+class WorkflowOperationError(ValueError):
+    """工作流执行操作被状态机拒绝。"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        operation: str,
+        execution_id: str,
+        status: Optional[str] = None,
+        http_status: int = 409,
+        payload: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.operation = operation
+        self.execution_id = execution_id
+        self.status = status
+        self.http_status = http_status
+        self.payload = payload or {}
+
+    def to_payload(self) -> Dict[str, Any]:
+        return {
+            "success": False,
+            "code": self.code,
+            "operation": self.operation,
+            "execution_id": self.execution_id,
+            "status": self.status,
+            "message": self.message,
+            **self.payload,
+        }
+
+
 class WorkflowEngine:
     """工作流执行引擎"""
 
@@ -884,6 +919,64 @@ class WorkflowEngine:
                 state.duration_ms = None
         logger.info(f"{reason}，已重置节点: {sorted(node_ids)}")
 
+    def _collect_downstream_nodes(self, workflow: WorkflowDefinition, node_id: str) -> Set[str]:
+        """Collect a workflow node and every graph descendant reachable from it."""
+        successors = self._build_successor_graph(workflow)
+        if node_id not in successors:
+            return {node_id}
+
+        downstream: Set[str] = set()
+        queue: deque[str] = deque([node_id])
+        while queue:
+            current_node_id = queue.popleft()
+            if current_node_id in downstream:
+                continue
+            downstream.add(current_node_id)
+            for next_node_id in successors.get(current_node_id, []):
+                queue.append(next_node_id)
+        return downstream
+
+    def _reset_nodes_for_recovery(
+        self,
+        execution: WorkflowExecution,
+        reset_node_ids: Set[str],
+        *,
+        target_node_id: str,
+        reason: str,
+    ) -> None:
+        """Reset failed/downstream node state while preserving upstream execution context."""
+        node_outputs = execution.context.get("node_outputs")
+        if isinstance(node_outputs, dict):
+            for node_id in reset_node_ids:
+                node_outputs.pop(node_id, None)
+
+        latest_output = execution.context.get("latest_node_output")
+        if isinstance(latest_output, dict):
+            source_node_id = latest_output.get("node_id")
+            if source_node_id in reset_node_ids:
+                execution.context.pop("latest_node_output", None)
+
+        for node_id in reset_node_ids:
+            state = execution.node_states.get(node_id)
+            if not state:
+                state = NodeExecutionState(node_id=node_id)
+                execution.node_states[node_id] = state
+            previous_retry_count = state.retry_count or 0
+            state.status = NodeStatus.PENDING
+            state.started_at = None
+            state.completed_at = None
+            state.input_data = {}
+            state.output_data = {}
+            state.output_contract_id = None
+            state.output_mode = None
+            state.output_schema_name = None
+            state.output_schema_version = None
+            state.error = None
+            state.duration_ms = None
+            if node_id == target_node_id:
+                state.retry_count = previous_retry_count + 1
+        logger.info(f"{reason}，已重置恢复节点: {sorted(reset_node_ids)}")
+
     async def _merge_predecessor_outputs(
         self,
         node: WorkflowNode,
@@ -1204,6 +1297,217 @@ class WorkflowEngine:
             await operation_service.cancel_requested(operation, payload)
         elif execution.status == WorkflowStatus.FAILED:
             await operation_service.fail(operation, execution.error or "workflow failed", payload)
+
+    def _build_execution_event_payload(self, execution: WorkflowExecution, **extra: Any) -> Dict[str, Any]:
+        """Build a compact JSON-safe execution event payload for UI/state reconciliation."""
+        payload = {
+            "execution_id": execution.id,
+            "workflow_id": execution.workflow_id,
+            "project_id": execution.project_id,
+            "status": execution.status.value,
+            "current_node": execution.current_node,
+            "trace_id": execution.trace_id,
+            "operation_id": execution.operation_id,
+            "request_id": execution.request_id,
+            "cancel_requested": execution.cancel_requested,
+            "error": execution.error,
+        }
+        payload.update(extra)
+        return self._serialize_for_json(payload)
+
+    def _build_node_failure_event_payload(
+        self,
+        execution: WorkflowExecution,
+        node: WorkflowNode,
+        node_state: NodeExecutionState,
+        *,
+        node_type: Optional[NodeType] = None,
+        phase: str = "execute",
+    ) -> Dict[str, Any]:
+        """Build structured node failure details while preserving string error fields."""
+        actual_node_type = node_type or node.node_type
+        payload = self._build_execution_event_payload(
+            execution,
+            node_id=node.id,
+            node_type=actual_node_type.value,
+            label=node.label,
+            agent_type=node.agent_type,
+            phase=phase,
+            status=node_state.status.value,
+            error=node_state.error,
+            retry_count=node_state.retry_count,
+            duration_ms=node_state.duration_ms,
+            started_at=node_state.started_at,
+            completed_at=node_state.completed_at,
+        )
+        return payload
+
+    def _build_workflow_failure_event_payload(self, execution: WorkflowExecution) -> Dict[str, Any]:
+        """Build compact workflow failure details for frontend recovery panels and SSE replay."""
+        failed_nodes = [
+            {
+                "node_id": state.node_id,
+                "status": state.status.value,
+                "error": state.error,
+                "retry_count": state.retry_count,
+                "duration_ms": state.duration_ms,
+            }
+            for state in execution.node_states.values()
+            if state.status == NodeStatus.FAILED
+        ]
+        first_failed = failed_nodes[0] if failed_nodes else None
+        return self._build_execution_event_payload(
+            execution,
+            failed_node_id=first_failed.get("node_id") if first_failed else None,
+            failed_node_error=first_failed.get("error") if first_failed else execution.error,
+            failed_nodes=failed_nodes,
+            completed_at=execution.completed_at,
+            total_duration_ms=execution.total_duration_ms,
+        )
+
+    def _operation_capability(
+        self,
+        *,
+        allowed: bool,
+        label: str,
+        reason: Optional[str] = None,
+        severity: str = "info",
+        next_status: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "allowed": allowed,
+            "label": label,
+            "reason": reason,
+            "severity": severity,
+            "next_status": next_status,
+        }
+
+    def build_execution_operation_summary(self, execution: WorkflowExecution) -> Dict[str, Any]:
+        """Build backend-authoritative operation capabilities and lifecycle summary for consoles."""
+        active_task = self._active_task_for_execution(execution.id) is not None
+        status = execution.status.value if hasattr(execution.status, "value") else str(execution.status)
+        now = datetime.now(tz=execution.lease_expires_at.tzinfo) if execution.lease_expires_at and execution.lease_expires_at.tzinfo else datetime.now()
+        lease_expired = self._is_execution_lease_expired(execution, now)
+        lease_seconds_remaining = None
+        if execution.lease_expires_at:
+            lease_seconds_remaining = max(0, int((execution.lease_expires_at - now).total_seconds()))
+
+        failed_nodes = [
+            {
+                "node_id": node_id,
+                "error": state.error,
+                "retry_count": state.retry_count,
+                "completed_at": state.completed_at,
+            }
+            for node_id, state in execution.node_states.items()
+            if state.status == NodeStatus.FAILED
+        ]
+        first_failed = failed_nodes[0] if failed_nodes else None
+        node_status_counts: Dict[str, int] = {}
+        for state in execution.node_states.values():
+            state_value = state.status.value if hasattr(state.status, "value") else str(state.status)
+            node_status_counts[state_value] = node_status_counts.get(state_value, 0) + 1
+
+        recovery_history = execution.context.get("recovery_history") if isinstance(execution.context, dict) else None
+        if not isinstance(recovery_history, list):
+            recovery_history = []
+        remediation_history = execution.context.get("remediation_history") if isinstance(execution.context, dict) else None
+        if not isinstance(remediation_history, list):
+            remediation_history = []
+        stale_history = execution.context.get("stale_execution_history") if isinstance(execution.context, dict) else None
+        if not isinstance(stale_history, list):
+            stale_history = []
+
+        can_pause = status == WorkflowStatus.RUNNING.value and not lease_expired
+        can_resume = status == WorkflowStatus.PAUSED.value and not active_task
+        can_cancel = status in {WorkflowStatus.PENDING.value, WorkflowStatus.RUNNING.value, WorkflowStatus.PAUSED.value}
+        can_recover = status == WorkflowStatus.FAILED.value and not active_task
+        can_remediate = status == WorkflowStatus.FAILED.value and not active_task and bool(first_failed)
+
+        capabilities = {
+            "pause": self._operation_capability(
+                allowed=can_pause,
+                label="暂停",
+                reason=None if can_pause else ("租约已过期，刷新状态后可从失败节点恢复" if lease_expired else "仅运行中的执行可暂停"),
+                next_status=WorkflowStatus.PAUSED.value,
+            ),
+            "resume": self._operation_capability(
+                allowed=can_resume,
+                label="恢复",
+                reason=None if can_resume else ("已有活跃运行任务，不能重复恢复" if active_task else "仅暂停中的执行可恢复"),
+                next_status=WorkflowStatus.RUNNING.value,
+            ),
+            "cancel": self._operation_capability(
+                allowed=can_cancel,
+                label="取消",
+                reason=None if can_cancel else "已完成、失败或已取消的执行不能取消",
+                severity="warning",
+                next_status=WorkflowStatus.CANCELLED.value,
+            ),
+            "recover": self._operation_capability(
+                allowed=can_recover,
+                label="从失败节点重试",
+                reason=None if can_recover else ("已有活跃运行任务，不能恢复" if active_task else "仅失败状态可恢复"),
+                severity="warning",
+                next_status=WorkflowStatus.RUNNING.value,
+            ),
+            "remediate": self._operation_capability(
+                allowed=can_remediate,
+                label="修复并恢复",
+                reason=None if can_remediate else ("没有可修复的失败节点" if status == WorkflowStatus.FAILED.value else "仅失败状态可修复"),
+                severity="warning",
+                next_status=WorkflowStatus.RUNNING.value,
+            ),
+        }
+
+        attention: List[Dict[str, Any]] = []
+        if lease_expired:
+            attention.append({"type": "stale_lease", "severity": "blocking", "message": "运行租约已过期，执行状态需要刷新/恢复。"})
+        if active_task and status != WorkflowStatus.RUNNING.value:
+            attention.append({"type": "active_task_conflict", "severity": "blocking", "message": "执行存在活跃任务但状态不是 running，操作被保护。"})
+        if first_failed:
+            attention.append({"type": "failed_node", "severity": "blocking", "message": f"失败节点：{first_failed.get('node_id')}"})
+        if stale_history:
+            attention.append({"type": "stale_history", "severity": "warning", "message": f"曾检测到 {len(stale_history)} 次陈旧执行。"})
+
+        return self._serialize_for_json({
+            "execution_id": execution.id,
+            "workflow_id": execution.workflow_id,
+            "project_id": execution.project_id,
+            "status": status,
+            "current_node": execution.current_node,
+            "active_task": active_task,
+            "terminal": status in {WorkflowStatus.COMPLETED.value, WorkflowStatus.FAILED.value, WorkflowStatus.CANCELLED.value},
+            "capabilities": capabilities,
+            "node_summary": {
+                "total": len(execution.node_states),
+                "counts": node_status_counts,
+                "failed_node_id": first_failed.get("node_id") if first_failed else None,
+                "failed_node_error": first_failed.get("error") if first_failed else execution.error,
+                "failed_nodes": failed_nodes,
+            },
+            "lease": {
+                "lease_expires_at": execution.lease_expires_at,
+                "last_heartbeat_at": execution.last_heartbeat_at,
+                "expired": lease_expired,
+                "seconds_remaining": lease_seconds_remaining,
+                "cancel_requested": execution.cancel_requested,
+            },
+            "recovery": {
+                "count": len(recovery_history),
+                "latest": recovery_history[-1] if recovery_history else None,
+                "resume_cursor": execution.resume_cursor,
+            },
+            "remediation": {
+                "count": len(remediation_history),
+                "latest": remediation_history[-1] if remediation_history else None,
+            },
+            "stale": {
+                "count": len(stale_history),
+                "latest": stale_history[-1] if stale_history else None,
+            },
+            "attention": attention,
+        })
 
     async def _run_workflow(
         self,
@@ -1660,19 +1964,24 @@ class WorkflowEngine:
                 if replay_path and db:
                     await self._save_execution_to_db(execution, db)
 
-            # 广播完成事件
+            # 广播完成事件；保留 workflow_completed 兼容事件，同时为失败提供显式事件。
             if execution.status == WorkflowStatus.PAUSED:
-                await self._broadcast_status(execution_id, "workflow_paused", {
-                    "status": execution.status.value,
-                    "pending_user_input": execution.context.get("pending_user_input"),
-                    "trace_id": execution.trace_id,
-                })
+                await self._broadcast_status(execution_id, "workflow_paused", self._build_execution_event_payload(
+                    execution,
+                    pending_user_input=execution.context.get("pending_user_input"),
+                ))
             else:
-                await self._broadcast_status(execution_id, "workflow_completed", {
-                    "status": execution.status.value,
-                    "error": execution.error,
-                    "trace_id": execution.trace_id,
-                })
+                if execution.status == WorkflowStatus.FAILED:
+                    await self._broadcast_status(
+                        execution_id,
+                        "workflow_failed",
+                        self._build_workflow_failure_event_payload(execution),
+                    )
+                await self._broadcast_status(execution_id, "workflow_completed", self._build_execution_event_payload(
+                    execution,
+                    completed_at=execution.completed_at,
+                    total_duration_ms=execution.total_duration_ms,
+                ))
 
     async def _execute_node_with_merge(
         self,
@@ -2474,13 +2783,22 @@ class WorkflowEngine:
                         "completed_at": data.get("completed_at") or datetime.now(),
                         "deleted_at": data.get("deleted_at"),
                     }
+                    from app.services.chapter_document_storage import chapter_document_storage
+                    metadata = chapter_document_storage.write_chapter(
+                        chapter_id=str(chapter_record["id"]),
+                        project_id=chapter_record.get("project_id"),
+                        title=chapter_record.get("title") or "未命名章节",
+                        content=str(chapter_record.get("content") or ""),
+                    )
+                    chapter_record.update(metadata)
+                    chapter_record["content"] = ""
                     saved_id = await db.save_chapter(chapter_record)
                     if execution:
                         get_workflow_state(execution).set_asset_state(
                             {"saved_chapter_id": saved_id or chapter_record["id"]},
                             source="generic_output_persistence",
                         )
-                    logger.info(f"保存章节到数据库: {chapter_record['title']}")
+                    logger.info(f"保存章节到本地文档: {chapter_record['title']}")
 
             elif table_key == "hooks":
                 # 保存伏笔：兼容旧 outputs.database 配置，但统一走 HookManager 持久化逻辑
@@ -2933,6 +3251,12 @@ class WorkflowEngine:
         if db:
             await self._save_execution_to_db(execution, db)
         if node_state.status == NodeStatus.FAILED:
+            failure_payload = self._build_node_failure_event_payload(
+                execution,
+                node,
+                node_state,
+                node_type=actual_node_type,
+            )
             await trace_service.record_event("node_failed", {
                 "node_id": node.id,
                 "node_type": actual_node_type.value,
@@ -2941,6 +3265,7 @@ class WorkflowEngine:
             }, severity="error")
             if db and node_span_id:
                 await db.finish_trace_span(node_span_id, "failed", error=node_state.error)
+            await self._broadcast_status(execution.id, "node_failed", failure_payload)
         else:
             await trace_service.record_event("node_completed", {
                 "node_id": node.id,
@@ -4828,6 +5153,79 @@ class WorkflowEngine:
         query_text = " ".join(part for part in query_parts if isinstance(part, str) and part.strip())
         return query_text if query_text else f"{agent_type} 任务"
 
+    async def _mark_outline_after_writer_save(
+        self,
+        execution: "WorkflowExecution",
+        db,
+    ) -> None:
+        """Mark the exact approved outline as completed after Writer persists its chapter."""
+        outline_id = execution.context.get("chapter_outline_id")
+        chapter_num = execution.context.get("chapter_num")
+        if not outline_id or not db:
+            return
+
+        try:
+            results = await db.execute_query(
+                """
+                SELECT id, project_id, chapter_number, status, next_outline_id
+                FROM chapter_outlines
+                WHERE id = :id
+                LIMIT 1
+                """,
+                {"id": str(outline_id)},
+            )
+            if not results:
+                logger.warning("Writer 保存章节后未找到对应大纲: %s", outline_id)
+                return
+
+            outline = results[0]
+            if str(outline.get("project_id")) != str(execution.project_id):
+                logger.warning("Writer 保存章节后跳过跨项目大纲状态更新: %s", outline_id)
+                return
+            if chapter_num is not None and int(outline.get("chapter_number") or 0) != int(chapter_num):
+                logger.warning(
+                    "Writer 保存章节后跳过章节号不匹配的大纲状态更新: outline=%s outline_chapter=%s context_chapter=%s",
+                    outline_id,
+                    outline.get("chapter_number"),
+                    chapter_num,
+                )
+                return
+            if outline.get("next_outline_id"):
+                logger.warning("Writer 保存章节后跳过非当前大纲状态更新: %s", outline_id)
+                return
+            if str(outline.get("status") or "").lower() != "approved":
+                logger.info("Writer 保存章节后大纲状态不是 approved，保持不变: %s", outline_id)
+                return
+
+            await db.execute_write(
+                """
+                UPDATE chapter_outlines
+                SET status = 'completed', updated_at = CURRENT_TIMESTAMP
+                WHERE id = :id
+                  AND project_id = :project_id
+                  AND status = 'approved'
+                  AND next_outline_id IS NULL
+                """,
+                {"id": str(outline_id), "project_id": str(execution.project_id)},
+            )
+            execution.context["chapter_outline_status"] = "completed"
+            try:
+                from app.services.plot_outline_service import get_plot_outline_service
+
+                get_plot_outline_service()._mark_outline_project_dirty(str(execution.project_id), chapter_num)
+            except Exception as cache_exc:
+                logger.debug("Writer 保存章节后清理大纲缓存失败: %s", cache_exc)
+            trace_service = get_trace_service(db)
+            await trace_service.record_event("chapter_outline_completed", {
+                "chapter_outline_id": str(outline_id),
+                "chapter_num": chapter_num,
+                "chapter_id": execution.context.get("chapter_id"),
+            })
+            logger.info("章节大纲已随 Writer 章节保存标记 completed: %s", outline_id)
+        except Exception as exc:
+            logger.error("Writer 保存章节后更新大纲状态失败: %s", exc)
+            execution.context["chapter_outline_status_update_error"] = str(exc)
+
     async def _save_chapter_from_writer(
         self,
         execution: "WorkflowExecution",
@@ -4835,8 +5233,8 @@ class WorkflowEngine:
         db=None,
     ):
         """
-        保存 Writer Agent 输出的章节到数据库
-        只保存正文内容和必要的元数据
+        保存 Writer Agent 输出的章节到本地文档
+        数据库只保存路径和必要的元数据
 
         Args:
             execution: 工作流执行实例
@@ -4887,15 +5285,25 @@ class WorkflowEngine:
                 "completed_at": datetime.now(),
             }
 
-            # 保存到数据库
+            # 保存到本地文档，数据库仅保留路径和元数据
+            from app.services.chapter_document_storage import chapter_document_storage
+            metadata = chapter_document_storage.write_chapter(
+                chapter_id=str(chapter_data["id"]),
+                project_id=chapter_data.get("project_id"),
+                title=chapter_data.get("title") or "未命名章节",
+                content=content,
+            )
+            chapter_data.update(metadata)
+            chapter_data["content"] = ""
             await db.save_chapter(chapter_data)
 
             # 更新执行上下文
             execution.context["chapter_id"] = chapter_id
             execution.context["chapter_content"] = content
             execution.context["chapter_saved"] = True
+            await self._mark_outline_after_writer_save(execution, db)
 
-            logger.info(f"章节已保存到数据库: {chapter_id} - {chapter_title} ({word_count} 字)")
+            logger.info(f"章节已保存到本地文档: {chapter_id} - {chapter_title} ({word_count} 字)")
             trace_service = get_trace_service(db)
             await trace_service.record_event("chapter_saved", {
                 "chapter_id": chapter_id,
@@ -10135,105 +10543,628 @@ class WorkflowEngine:
 
     # ==================== 执行控制 ====================
 
-    async def pause_workflow(self, execution_id: str, db=None) -> bool:
-        """暂停工作流"""
+    def _execution_lock(self, execution_id: str) -> asyncio.Lock:
+        lock = self._execution_locks.get(execution_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._execution_locks[execution_id] = lock
+        return lock
+
+    async def _get_or_load_execution(self, execution_id: str, db=None) -> Optional[WorkflowExecution]:
         execution = self._executions.get(execution_id)
         if not execution and db:
             execution = await self._load_execution_from_db(execution_id, db)
             if execution:
                 self._executions[execution_id] = execution
-        if not execution:
-            return False
+        return execution
 
-        if execution.status == WorkflowStatus.PAUSED:
-            return True
-        if execution.status != WorkflowStatus.RUNNING:
-            return False
-
-        execution.status = WorkflowStatus.PAUSED
-
-        replay_path = await self._export_execution_replay_markdown(execution, db=db)
-        if replay_path:
-            execution.context["replay_markdown_path"] = replay_path
-
-        if db:
-            await self._save_execution_to_db(execution, db)
-
-        await self._broadcast_status(execution_id, "workflow_paused", {})
-        logger.info(f"暂停工作流: {execution_id}")
-        return True
-
-    async def resume_workflow(self, execution_id: str, db=None) -> bool:
-        """恢复工作流执行"""
-        execution = self._executions.get(execution_id)
-        if not execution:
-            # 尝试从数据库加载
-            if db:
-                execution = await self._load_execution_from_db(execution_id, db)
-                if execution:
-                    self._executions[execution_id] = execution
-
-        if not execution:
-            logger.warning(f"工作流执行不存在: {execution_id}")
-            return False
-
-        active_task = self._running_tasks.get(execution_id)
-        if active_task and not active_task.done():
-            return True
-        if execution.status == WorkflowStatus.RUNNING:
-            workflow = await self.get_workflow(execution.workflow_id, db)
-            if workflow:
-                self._start_workflow_task(execution_id, workflow, db)
-            return True
-        if execution.status != WorkflowStatus.PAUSED:
-            return False
-
-        execution.status = WorkflowStatus.RUNNING
-        execution.cancel_requested = False
-
-        if db:
-            await self._save_execution_to_db(execution, db)
-
-        await self._broadcast_status(execution_id, "workflow_resumed", {})
-        logger.info(f"恢复工作流: {execution_id}")
-
-        # 重新启动执行循环
-        workflow = await self.get_workflow(execution.workflow_id, db)
-        if workflow:
-            self._start_workflow_task(execution_id, workflow, db)
-
-        return True
-
-    async def cancel_workflow(self, execution_id: str, db=None) -> bool:
-        """取消工作流"""
-        execution = self._executions.get(execution_id)
-        if not execution and db:
-            execution = await self._load_execution_from_db(execution_id, db)
-            if execution:
-                self._executions[execution_id] = execution
-        if not execution:
-            return False
-
-        if execution.status == WorkflowStatus.CANCELLED:
-            return True
-        if execution.status in [WorkflowStatus.COMPLETED, WorkflowStatus.FAILED]:
-            return False
-
-        execution.cancel_requested = True
-        execution.status = WorkflowStatus.CANCELLED
-        execution.completed_at = datetime.now()
-
+    def _active_task_for_execution(self, execution_id: str) -> Optional[asyncio.Task]:
         task = self._running_tasks.get(execution_id)
         if task and not task.done():
-            task.cancel()
+            return task
+        if task and task.done():
+            self._running_tasks.pop(execution_id, None)
+        return None
 
+    def _is_execution_lease_expired(self, execution: WorkflowExecution, now: Optional[datetime] = None) -> bool:
+        if execution.status != WorkflowStatus.RUNNING or not execution.lease_expires_at:
+            return False
+        expires_at = execution.lease_expires_at
+        if now is not None:
+            current_time = now
+        elif expires_at.tzinfo:
+            current_time = datetime.now(tz=expires_at.tzinfo)
+        else:
+            current_time = datetime.now()
+        return expires_at <= current_time
+
+    async def _mark_running_execution_stale_if_orphaned(
+        self,
+        execution: WorkflowExecution,
+        db=None,
+        *,
+        operation: str,
+    ) -> bool:
+        if execution.status != WorkflowStatus.RUNNING:
+            return False
+        if self._active_task_for_execution(execution.id):
+            return False
+        if not self._is_execution_lease_expired(execution):
+            return False
+
+        now = datetime.now()
+        stale_entry = {
+            "detected_at": now.isoformat(),
+            "operation": operation,
+            "previous_status": execution.status.value,
+            "lease_expires_at": execution.lease_expires_at.isoformat() if execution.lease_expires_at else None,
+            "last_heartbeat_at": execution.last_heartbeat_at.isoformat() if execution.last_heartbeat_at else None,
+            "reason": "running execution has no active task and its lease has expired",
+        }
+        stale_history = execution.context.get("stale_execution_history")
+        if not isinstance(stale_history, list):
+            stale_history = []
+            execution.context["stale_execution_history"] = stale_history
+        stale_history.append(stale_entry)
+        failed_node_id = execution.current_node or next(
+            (
+                node_id
+                for node_id, state in execution.node_states.items()
+                if state.status in {NodeStatus.RUNNING, NodeStatus.PENDING}
+            ),
+            None,
+        )
+        if failed_node_id:
+            node_state = execution.node_states.get(failed_node_id) or NodeExecutionState(node_id=failed_node_id)
+            node_state.status = NodeStatus.FAILED
+            node_state.completed_at = now
+            node_state.error = "工作流执行租约已过期，运行任务已丢失"
+            execution.node_states[failed_node_id] = node_state
+            execution.current_node = failed_node_id
+
+        execution.status = WorkflowStatus.FAILED
+        execution.error = "工作流执行租约已过期，且当前进程没有活跃运行任务；已标记为失败，可从失败节点恢复。"
+        execution.completed_at = now
+        execution.lease_expires_at = None
+        execution.resume_cursor = {
+            **(execution.resume_cursor or {}),
+            "stale_detected_at": now.isoformat(),
+            "stale_operation": operation,
+        }
         if db:
             await self._save_execution_to_db(execution, db)
             await self._mark_operation_terminal(execution, db)
-
-        await self._broadcast_status(execution_id, "workflow_cancelled", {})
-        logger.info(f"取消工作流: {execution_id}")
+        if db:
+            await self._broadcast_status(execution.id, "workflow_execution_stale", self._build_execution_event_payload(
+                execution,
+                stale_entry=stale_entry,
+            ))
+        logger.warning("工作流执行租约过期并被标记为失败: %s", execution.id)
         return True
+
+    def _raise_operation_error(
+        self,
+        execution_id: str,
+        operation: str,
+        message: str,
+        *,
+        code: str = "workflow_operation_conflict",
+        status: Optional[WorkflowStatus] = None,
+        http_status: int = 409,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        raise WorkflowOperationError(
+            message,
+            code=code,
+            operation=operation,
+            execution_id=execution_id,
+            status=status.value if hasattr(status, "value") else status,
+            http_status=http_status,
+            payload=payload,
+        )
+
+    async def pause_workflow(self, execution_id: str, db=None) -> bool:
+        """暂停工作流"""
+        async with self._execution_lock(execution_id):
+            execution = await self._get_or_load_execution(execution_id, db)
+            if not execution:
+                self._raise_operation_error(execution_id, "pause", "工作流执行不存在", code="workflow_execution_not_found", http_status=404)
+
+            await self._mark_running_execution_stale_if_orphaned(execution, db, operation="pause")
+            if execution.status == WorkflowStatus.PAUSED:
+                return True
+            if execution.status != WorkflowStatus.RUNNING:
+                self._raise_operation_error(
+                    execution_id,
+                    "pause",
+                    "只能暂停运行中的工作流执行",
+                    status=execution.status,
+                    payload={"allowed_statuses": [WorkflowStatus.RUNNING.value]},
+                )
+
+            execution.status = WorkflowStatus.PAUSED
+            execution.lease_expires_at = None
+
+            replay_path = await self._export_execution_replay_markdown(execution, db=db)
+            if replay_path:
+                execution.context["replay_markdown_path"] = replay_path
+
+            if db:
+                await self._save_execution_to_db(execution, db)
+
+            await self._broadcast_status(execution_id, "workflow_paused", self._build_execution_event_payload(execution))
+            logger.info(f"暂停工作流: {execution_id}")
+            return True
+
+    async def resume_workflow(self, execution_id: str, db=None) -> bool:
+        """恢复工作流执行"""
+        async with self._execution_lock(execution_id):
+            execution = await self._get_or_load_execution(execution_id, db)
+            if not execution:
+                logger.warning(f"工作流执行不存在: {execution_id}")
+                self._raise_operation_error(execution_id, "resume", "工作流执行不存在", code="workflow_execution_not_found", http_status=404)
+
+            active_task = self._active_task_for_execution(execution_id)
+            if active_task:
+                if execution.status == WorkflowStatus.RUNNING:
+                    return True
+                self._raise_operation_error(
+                    execution_id,
+                    "resume",
+                    "工作流执行已有活跃运行任务，不能重复恢复",
+                    status=execution.status,
+                    code="workflow_execution_active_task_conflict",
+                )
+
+            await self._mark_running_execution_stale_if_orphaned(execution, db, operation="resume")
+            if execution.status == WorkflowStatus.RUNNING:
+                workflow = await self.get_workflow(execution.workflow_id, db)
+                if not workflow:
+                    self._raise_operation_error(execution_id, "resume", f"工作流不存在: {execution.workflow_id}", status=execution.status)
+                self._start_workflow_task(execution_id, workflow, db)
+                return True
+            if execution.status != WorkflowStatus.PAUSED:
+                self._raise_operation_error(
+                    execution_id,
+                    "resume",
+                    "只能恢复暂停中的工作流执行",
+                    status=execution.status,
+                    payload={"allowed_statuses": [WorkflowStatus.PAUSED.value]},
+                )
+
+            execution.status = WorkflowStatus.RUNNING
+            execution.cancel_requested = False
+            execution.last_heartbeat_at = datetime.now()
+            execution.lease_expires_at = execution.last_heartbeat_at + timedelta(seconds=getattr(settings, "operation_lease_ttl_seconds", 60))
+
+            if db:
+                await self._save_execution_to_db(execution, db)
+
+            await self._broadcast_status(execution_id, "workflow_resumed", self._build_execution_event_payload(execution))
+            logger.info(f"恢复工作流: {execution_id}")
+
+            workflow = await self.get_workflow(execution.workflow_id, db)
+            if not workflow:
+                self._raise_operation_error(execution_id, "resume", f"工作流不存在: {execution.workflow_id}", status=execution.status)
+            self._start_workflow_task(execution_id, workflow, db)
+
+            return True
+
+    def _find_failed_recovery_target(
+        self,
+        execution: "WorkflowExecution",
+        workflow: WorkflowDefinition,
+        *,
+        mode: str = "retry_failed",
+        node_id: Optional[str] = None,
+    ) -> str:
+        workflow_node_ids = {node.id for node in workflow.nodes}
+        normalized_mode = (mode or "retry_failed").strip().lower()
+        if normalized_mode == "retry_failed":
+            failed_entry = next(
+                (
+                    (failed_node_id, state)
+                    for failed_node_id, state in execution.node_states.items()
+                    if state.status == NodeStatus.FAILED
+                ),
+                None,
+            )
+            if not failed_entry:
+                raise ValueError("执行中没有可恢复的失败节点")
+            target_node_id = failed_entry[0]
+        elif normalized_mode == "retry_from_node":
+            if not node_id:
+                raise ValueError("retry_from_node 模式需要 node_id")
+            target_node_id = node_id
+        else:
+            raise ValueError("不支持的恢复模式")
+        if target_node_id not in workflow_node_ids:
+            raise ValueError(f"恢复节点不存在: {target_node_id}")
+        return target_node_id
+
+    async def diagnose_failed_workflow_node(
+        self,
+        execution_id: str,
+        db=None,
+        *,
+        node_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        execution = self._executions.get(execution_id)
+        if not execution and db:
+            execution = await self._load_execution_from_db(execution_id, db)
+            if execution:
+                self._executions[execution_id] = execution
+        if not execution:
+            raise ValueError("执行不存在")
+        workflow = await self.get_workflow(execution.workflow_id, db)
+        if not workflow:
+            raise ValueError(f"工作流不存在: {execution.workflow_id}")
+        from app.services.workflow_failure_diagnosis_service import workflow_failure_diagnosis_service
+        return workflow_failure_diagnosis_service.diagnose(execution, workflow, node_id=node_id)
+
+    def _build_node_remediation_diff(
+        self,
+        node,
+        patch: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        before: Dict[str, Any] = {}
+        after: Dict[str, Any] = {}
+        changed_fields: List[str] = []
+
+        if "agent_type" in patch and patch.get("agent_type") is not None:
+            new_agent_type = str(patch["agent_type"]).strip()
+            if not new_agent_type:
+                raise ValueError("agent_type 不能为空")
+            if node.agent_type != new_agent_type:
+                before["agent_type"] = node.agent_type
+                after["agent_type"] = new_agent_type
+                changed_fields.append("agent_type")
+                node.agent_type = new_agent_type
+
+        if "scenario" in patch and patch.get("scenario") is not None:
+            new_scenario = str(patch["scenario"]).strip()
+            if not new_scenario:
+                raise ValueError("scenario 不能为空")
+            config = dict(node.config or {})
+            if config.get("scenario") != new_scenario:
+                before["scenario"] = config.get("scenario")
+                after["scenario"] = new_scenario
+                changed_fields.append("scenario")
+                config["scenario"] = new_scenario
+                node.config = config
+
+        if not changed_fields:
+            raise ValueError("没有可应用的修复字段")
+        return {"before": before, "after": after, "changed_fields": changed_fields}
+
+    async def validate_failed_node_remediation(
+        self,
+        execution_id: str,
+        db=None,
+        *,
+        node_id: Optional[str] = None,
+        patch: Optional[Dict[str, Any]] = None,
+        context_patch: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        execution = await self._get_or_load_execution(execution_id, db)
+        if not execution:
+            self._raise_operation_error(execution_id, "remediate", "执行不存在", code="workflow_execution_not_found", http_status=404)
+        if self._active_task_for_execution(execution_id):
+            self._raise_operation_error(
+                execution_id,
+                "remediate",
+                "工作流执行仍在运行，不能修复",
+                status=execution.status,
+                code="workflow_execution_active_task_conflict",
+            )
+        await self._mark_running_execution_stale_if_orphaned(execution, db, operation="remediate")
+        if execution.status != WorkflowStatus.FAILED:
+            self._raise_operation_error(
+                execution_id,
+                "remediate",
+                "只有失败状态的工作流执行可以修复",
+                status=execution.status,
+                payload={"allowed_statuses": [WorkflowStatus.FAILED.value]},
+            )
+        workflow = await self.get_workflow(execution.workflow_id, db)
+        if not workflow:
+            raise ValueError(f"工作流不存在: {execution.workflow_id}")
+        target_node_id = self._find_failed_recovery_target(
+            execution,
+            workflow,
+            mode="retry_from_node" if node_id else "retry_failed",
+            node_id=node_id,
+        )
+        if context_patch:
+            protected_keys = [key for key in context_patch if is_protected_context_key(key)]
+            if protected_keys:
+                raise ValueError(f"修复上下文不能覆盖受保护字段: {', '.join(sorted(protected_keys))}")
+        workflow_copy = workflow.model_copy(deep=True)
+        target_node = next((node for node in workflow_copy.nodes if node.id == target_node_id), None)
+        if not target_node:
+            raise ValueError(f"修复节点不存在: {target_node_id}")
+        target_node_type = target_node.node_type.value if hasattr(target_node.node_type, "value") else str(target_node.node_type)
+        if target_node_type != "agent":
+            raise ValueError("当前仅支持修复 Agent 节点")
+        diff = self._build_node_remediation_diff(target_node, patch or {})
+        validation = self.validate_workflow(workflow_copy)
+        if not validation.valid:
+            raise ValueError(f"修复后的工作流验证失败: {validation.errors}")
+        diagnosis = await self.diagnose_failed_workflow_node(execution_id, db, node_id=target_node_id)
+        return {
+            "valid": True,
+            "execution_id": execution_id,
+            "workflow_id": workflow.id,
+            "node_id": target_node_id,
+            "diagnosis": diagnosis,
+            "diff": diff,
+            "warnings": validation.warnings,
+        }
+
+    async def remediate_failed_workflow_node(
+        self,
+        execution_id: str,
+        db=None,
+        *,
+        node_id: Optional[str] = None,
+        patch: Optional[Dict[str, Any]] = None,
+        reason: Optional[str] = None,
+        context_patch: Optional[Dict[str, Any]] = None,
+        reset_downstream: bool = True,
+    ) -> Dict[str, Any]:
+        async with self._execution_lock(execution_id):
+            preview = await self.validate_failed_node_remediation(
+                execution_id,
+                db,
+                node_id=node_id,
+                patch=patch,
+                context_patch=context_patch,
+            )
+            execution = self._executions[execution_id]
+            workflow = await self.get_workflow(execution.workflow_id, db)
+            target_node = next(node for node in workflow.nodes if node.id == preview["node_id"])
+            diff = self._build_node_remediation_diff(target_node, patch or {})
+            validation = self.validate_workflow(workflow)
+            if not validation.valid:
+                raise ValueError(f"修复后的工作流验证失败: {validation.errors}")
+            workflow.updated_at = datetime.now()
+            if db:
+                await self._save_workflow_to_db(workflow, db)
+            remediation_history = execution.context.get("remediation_history")
+            if not isinstance(remediation_history, list):
+                remediation_history = []
+                execution.context["remediation_history"] = remediation_history
+            remediation_entry = {
+                "attempt": len(remediation_history) + 1,
+                "node_id": preview["node_id"],
+                "category": preview["diagnosis"].get("category"),
+                "diagnosis_category": preview["diagnosis"].get("category"),
+                "reason": reason or "manual_remediation",
+                "started_at": datetime.now().isoformat(),
+                "previous_error": execution.error or (execution.node_states.get(preview["node_id"]).error if execution.node_states.get(preview["node_id"]) else None),
+                "diff": diff,
+            }
+            remediation_history.append(remediation_entry)
+            if db:
+                await self._save_execution_to_db(execution, db)
+            await self._broadcast_status(execution_id, "workflow_node_remediated", {
+                "execution_id": execution_id,
+                "workflow_id": workflow.id,
+                "node_id": preview["node_id"],
+                "remediation_entry": remediation_entry,
+            })
+            recovery = await self._recover_failed_workflow_locked(
+                execution_id,
+                db,
+                mode="retry_from_node",
+                node_id=preview["node_id"],
+                reason=reason or "manual_remediation",
+                context_patch=context_patch,
+                reset_downstream=reset_downstream,
+            )
+            return {
+                "success": True,
+                "message": "失败节点已修复并开始恢复",
+                "diagnosis": preview["diagnosis"],
+                "remediation_entry": remediation_entry,
+                "recovery": recovery,
+            }
+
+    async def recover_failed_workflow(
+        self,
+        execution_id: str,
+        db=None,
+        *,
+        mode: str = "retry_failed",
+        node_id: Optional[str] = None,
+        reason: Optional[str] = None,
+        context_patch: Optional[Dict[str, Any]] = None,
+        reset_downstream: bool = True,
+    ) -> Dict[str, Any]:
+        """Recover a failed execution by resetting the failed node and downstream nodes."""
+        async with self._execution_lock(execution_id):
+            return await self._recover_failed_workflow_locked(
+                execution_id,
+                db,
+                mode=mode,
+                node_id=node_id,
+                reason=reason,
+                context_patch=context_patch,
+                reset_downstream=reset_downstream,
+            )
+
+    async def _recover_failed_workflow_locked(
+        self,
+        execution_id: str,
+        db=None,
+        *,
+        mode: str = "retry_failed",
+        node_id: Optional[str] = None,
+        reason: Optional[str] = None,
+        context_patch: Optional[Dict[str, Any]] = None,
+        reset_downstream: bool = True,
+    ) -> Dict[str, Any]:
+        execution = await self._get_or_load_execution(execution_id, db)
+        if not execution:
+            self._raise_operation_error(execution_id, "recover", "执行不存在", code="workflow_execution_not_found", http_status=404)
+
+        if self._active_task_for_execution(execution_id):
+            self._raise_operation_error(
+                execution_id,
+                "recover",
+                "工作流执行仍在运行，不能重复恢复",
+                status=execution.status,
+                code="workflow_execution_active_task_conflict",
+            )
+        await self._mark_running_execution_stale_if_orphaned(execution, db, operation="recover")
+        if execution.status != WorkflowStatus.FAILED:
+            self._raise_operation_error(
+                execution_id,
+                "recover",
+                "只有失败状态的工作流执行可以恢复",
+                status=execution.status,
+                payload={"allowed_statuses": [WorkflowStatus.FAILED.value]},
+            )
+
+        workflow = await self.get_workflow(execution.workflow_id, db)
+        if not workflow:
+            raise ValueError(f"工作流不存在: {execution.workflow_id}")
+        workflow_node_ids = {node.id for node in workflow.nodes}
+
+        normalized_mode = (mode or "retry_failed").strip().lower()
+        target_node_id = self._find_failed_recovery_target(
+            execution,
+            workflow,
+            mode=normalized_mode,
+            node_id=node_id,
+        )
+
+        reset_node_ids = (
+            self._collect_downstream_nodes(workflow, target_node_id)
+            if reset_downstream
+            else {target_node_id}
+        )
+        reset_node_ids = {reset_node_id for reset_node_id in reset_node_ids if reset_node_id in workflow_node_ids}
+        if not reset_node_ids:
+            raise ValueError("没有可重置的恢复节点")
+
+        if context_patch:
+            protected_keys = [key for key in context_patch if is_protected_context_key(key)]
+            if protected_keys:
+                raise ValueError(f"恢复上下文不能覆盖受保护字段: {', '.join(sorted(protected_keys))}")
+
+        previous_status = execution.status.value
+        previous_error = execution.error or execution.node_states.get(target_node_id, NodeExecutionState(node_id=target_node_id)).error
+        previous_completed_at = execution.completed_at
+        recovery_history = execution.context.get("recovery_history")
+        if not isinstance(recovery_history, list):
+            recovery_history = []
+            execution.context["recovery_history"] = recovery_history
+        recovery_attempt = len(recovery_history) + 1
+        started_at = datetime.now()
+        recovery_entry = {
+            "attempt": recovery_attempt,
+            "mode": normalized_mode,
+            "target_node_id": target_node_id,
+            "reset_node_ids": sorted(reset_node_ids),
+            "reason": reason or "manual_recovery",
+            "started_at": started_at.isoformat(),
+            "previous_error": previous_error,
+            "previous_completed_at": previous_completed_at.isoformat() if previous_completed_at else None,
+            "trace_id": execution.trace_id,
+            "status_at_start": previous_status,
+        }
+        recovery_history.append(recovery_entry)
+
+        self._reset_nodes_for_recovery(
+            execution,
+            reset_node_ids,
+            target_node_id=target_node_id,
+            reason="恢复失败工作流",
+        )
+        if context_patch:
+            execution.context.update(context_patch)
+
+        execution.status = WorkflowStatus.RUNNING
+        execution.started_at = started_at
+        execution.error = None
+        execution.completed_at = None
+        execution.total_duration_ms = None
+        execution.cancel_requested = False
+        execution.current_node = target_node_id
+        execution.last_heartbeat_at = started_at
+        execution.lease_expires_at = started_at + timedelta(seconds=getattr(settings, "operation_lease_ttl_seconds", 60))
+        execution.resume_cursor = {
+            "recovery_attempt": recovery_attempt,
+            "recovered_node_id": target_node_id,
+            "reset_node_ids": sorted(reset_node_ids),
+            "mode": normalized_mode,
+            "started_at": started_at.isoformat(),
+        }
+
+        if db:
+            await self._save_execution_to_db(execution, db)
+
+        recovery_payload = self._build_execution_event_payload(
+            execution,
+            recovered_node_id=target_node_id,
+            reset_node_ids=sorted(reset_node_ids),
+            recovery_attempt=recovery_attempt,
+            recovery_entry=recovery_entry,
+            previous_error=previous_error,
+        )
+        await self._broadcast_status(execution_id, "workflow_recovery_started", recovery_payload)
+        self._start_workflow_task(execution_id, workflow, db)
+        logger.info(f"恢复失败工作流: {execution_id}, target={target_node_id}, reset={sorted(reset_node_ids)}")
+        return {
+            "success": True,
+            "message": "工作流已从失败节点恢复",
+            "execution_id": execution_id,
+            "status": execution.status.value,
+            "recovered_node_id": target_node_id,
+            "reset_node_ids": sorted(reset_node_ids),
+            "recovery_attempt": recovery_attempt,
+            "trace_id": execution.trace_id,
+            "recovery_entry": recovery_entry,
+        }
+
+    async def cancel_workflow(self, execution_id: str, db=None) -> bool:
+        """取消工作流"""
+        async with self._execution_lock(execution_id):
+            execution = await self._get_or_load_execution(execution_id, db)
+            if not execution:
+                self._raise_operation_error(execution_id, "cancel", "工作流执行不存在", code="workflow_execution_not_found", http_status=404)
+
+            if execution.status == WorkflowStatus.CANCELLED:
+                return True
+            if execution.status in [WorkflowStatus.COMPLETED, WorkflowStatus.FAILED]:
+                self._raise_operation_error(
+                    execution_id,
+                    "cancel",
+                    "只能取消待执行、运行中或暂停中的工作流执行",
+                    status=execution.status,
+                    payload={"allowed_statuses": [WorkflowStatus.PENDING.value, WorkflowStatus.RUNNING.value, WorkflowStatus.PAUSED.value]},
+                )
+
+            execution.cancel_requested = True
+            execution.status = WorkflowStatus.CANCELLED
+            execution.completed_at = datetime.now()
+            execution.lease_expires_at = None
+
+            task = self._active_task_for_execution(execution_id)
+            if task:
+                task.cancel()
+
+            if db:
+                await self._save_execution_to_db(execution, db)
+                await self._mark_operation_terminal(execution, db)
+
+            await self._broadcast_status(execution_id, "workflow_cancelled", self._build_execution_event_payload(
+                execution,
+                completed_at=execution.completed_at,
+            ))
+            logger.info(f"取消工作流: {execution_id}")
+            return True
 
     async def confirm_discussion(
         self,
@@ -10541,15 +11472,16 @@ class WorkflowEngine:
 
     async def get_execution_state(self, execution_id: str, db=None) -> Optional[WorkflowExecution]:
         """获取执行状态"""
-        # 先查内存
-        if execution_id in self._executions:
-            return self._executions[execution_id]
+        execution = await self._get_or_load_execution(execution_id, db)
+        if execution:
+            await self._mark_running_execution_stale_if_orphaned(execution, db, operation="inspect")
+        return execution
 
-        # 查数据库
-        if db:
-            return await self._load_execution_from_db(execution_id, db)
-
-        return None
+    async def get_execution_operation_summary(self, execution_id: str, db=None) -> Optional[Dict[str, Any]]:
+        execution = await self.get_execution_state(execution_id, db)
+        if not execution:
+            return None
+        return self.build_execution_operation_summary(execution)
 
     # ==================== WebSocket 广播 ====================
 

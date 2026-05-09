@@ -41,9 +41,16 @@ import {
   formatChapterReadinessGateMessage,
   formatApiErrorMessage,
   getActiveWorkflowExecution,
+  getExecutions,
+  getReadinessStatusLabel,
+  isReadinessBlockedStatus,
   getExecution,
+  getExecutionOperationEvents,
   pauseExecution,
   resumeExecution,
+  recoverExecution,
+  getFailedNodeDiagnosis,
+  remediateAndRecoverExecution,
   cancelExecution,
   confirmDiscussion,
   type WorkflowDefinition,
@@ -52,43 +59,78 @@ import {
   type WorkflowEdge as WfEdge,
   type NodeInputConfig,
   type NodeOutputConfig,
+  type WorkflowSseState,
+  type WorkflowStatus,
+  type WorkflowExecutionHistoryRow,
+  type WorkflowRecoveryHistoryEntry,
+  type WorkflowFailureDiagnosis,
+  type WorkflowOperationSummary,
+  type WorkflowOperationEvent,
 } from '@/api/workflows'
-import { getWorkflowNodeTypes, type NodeTypeInfo, type WorkflowNodeTypes } from '@/api/nodeTypes'
+import { getAgentTypeOptions, getWorkflowNodeTypes, type NodeTypeInfo, type WorkflowNodeTypes } from '@/api/nodeTypes'
 import WorkflowMonitor from '@/components/workflow/WorkflowMonitor'
 import WorkflowTrace from '@/components/workflow/WorkflowTrace'
 import { Network, Users, GitBranch, Play, Save, Trash2, Plus, Loader2, Pause, Square, RotateCcw, Orbit, Map } from 'lucide-react'
 import { useTheme } from '@/contexts/ThemeContext'
-import { formatRequirementList } from '@/utils/resourceRequirementDisplay'
+import {
+  formatRequirementList,
+  formatRequirementSummary,
+  getRequirementRecoveryActionLabel,
+  getRequirementRecoveryPath,
+} from '@/utils/resourceRequirementDisplay'
 import { useProject } from '@/contexts/ProjectContext'
 import WorkflowHelp from '@/components/workflow/WorkflowHelp'
 import WorldMap3D from '@/components/visualizer/WorldMap3D'
 import CharacterRelationshipGraph3D from '@/components/visualizer/CharacterRelationshipGraph3D'
 
-function AgentNode({ data }: { data: any }) {
+function getExecutionNodeChrome(data: VisualNodeData, baseClasses: string): string {
+  const status = data.status || 'pending'
+  if (status === 'running') return `${baseClasses} border-blue-500 bg-blue-50 shadow-blue-200 shadow-md animate-pulse`
+  if (status === 'completed') return `${baseClasses} border-emerald-500 bg-emerald-50 shadow-emerald-100 shadow-sm`
+  if (status === 'failed') return `${baseClasses} border-red-500 bg-red-50 shadow-red-100 shadow-md`
+  return baseClasses
+}
+
+function NodeExecutionBadge({ data }: { data: VisualNodeData }) {
+  const status = data.status || 'pending'
+  if (status === 'pending') return null
+  return (
+    <div
+      className={`mt-1 rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
+        status === 'running'
+          ? 'bg-blue-600 text-white'
+          : status === 'completed'
+            ? 'bg-emerald-600 text-white'
+            : status === 'failed'
+              ? 'bg-red-600 text-white'
+              : 'bg-gray-600 text-white'
+      }`}
+      title={data.error || (data.duration_ms ? `${data.duration_ms}ms` : status)}
+    >
+      {status === 'running' ? '运行中' : status === 'completed' ? '完成' : status === 'failed' ? '失败' : status}
+    </div>
+  )
+}
+
+function AgentNode({ data }: { data: VisualNodeData }) {
   const { theme } = useTheme()
   const isDark = theme === 'dark'
-  const status = data.status || 'pending'
-
-  const statusColors: Record<string, string> = {
-    pending: isDark ? 'bg-gray-700 border-gray-600' : 'bg-gray-100 border-gray-300',
-    running: 'bg-blue-100 border-blue-400 animate-pulse',
-    completed: 'bg-green-100 border-green-400',
-    failed: 'bg-red-100 border-red-400',
-  }
+  const base = isDark ? 'bg-gray-700 border-gray-600' : 'bg-gray-100 border-gray-300'
 
   return (
-    <div className={`px-4 py-3 rounded-lg border-2 min-w-[120px] ${statusColors[status]}`}>
+    <div className={getExecutionNodeChrome(data, `px-4 py-3 rounded-lg border-2 min-w-[120px] ${base}`)} title={data.error}>
       <Handle type="target" position={Position.Top} className="!bg-gray-400 !w-3 !h-3" />
       <div className="font-medium text-sm">{data.label}</div>
       {data.agent_type && <div className="text-xs opacity-70">{data.agent_type}</div>}
+      <NodeExecutionBadge data={data} />
       <Handle type="source" position={Position.Bottom} className="!bg-gray-400 !w-3 !h-3" />
     </div>
   )
 }
 
-function ConditionNode({ data }: { data: any }) {
+function ConditionNode({ data }: { data: VisualNodeData }) {
   return (
-    <div className="px-4 py-3 rounded-lg border-2 border-orange-400 bg-orange-50 min-w-[150px]">
+    <div className={getExecutionNodeChrome(data, "px-4 py-3 rounded-lg border-2 border-orange-400 bg-orange-50 min-w-[150px]")} title={data.error}>
       <Handle type="target" position={Position.Top} className="!bg-orange-400 !w-3 !h-3" />
       <div className="font-medium text-sm">条件分支</div>
       <div className="text-xs opacity-70">{data.label || '评估结果'}</div>
@@ -96,71 +138,78 @@ function ConditionNode({ data }: { data: any }) {
         <span className="text-green-600">通过</span>
         <span className="text-red-600">重试</span>
       </div>
+      <NodeExecutionBadge data={data} />
       <Handle type="source" position={Position.Left} id="pass" className="!bg-green-500 !w-3 !h-3" />
       <Handle type="source" position={Position.Right} id="retry" className="!bg-red-500 !w-3 !h-3" />
     </div>
   )
 }
 
-function ParallelNode({ data }: { data: any }) {
+function ParallelNode({ data }: { data: VisualNodeData }) {
   return (
-    <div className="px-4 py-3 rounded-lg border-2 border-purple-400 bg-purple-50 min-w-[120px]">
+    <div className={getExecutionNodeChrome(data, "px-4 py-3 rounded-lg border-2 border-purple-400 bg-purple-50 min-w-[120px]")} title={data.error}>
       <Handle type="target" position={Position.Top} className="!bg-purple-400 !w-3 !h-3" />
       <div className="font-medium text-sm">并行执行</div>
       <div className="text-xs opacity-70">{data.label || '同时执行多个分支'}</div>
+      <NodeExecutionBadge data={data} />
       <Handle type="source" position={Position.Bottom} className="!bg-purple-400 !w-3 !h-3" />
     </div>
   )
 }
 
-function ScenePerformanceNode({ data }: { data: any }) {
+function ScenePerformanceNode({ data }: { data: VisualNodeData }) {
   return (
-    <div className="px-4 py-3 rounded-lg border-2 border-rose-400 bg-rose-50 min-w-[150px]">
+    <div className={getExecutionNodeChrome(data, "px-4 py-3 rounded-lg border-2 border-rose-400 bg-rose-50 min-w-[150px]")} title={data.error}>
       <Handle type="target" position={Position.Top} className="!bg-rose-400 !w-3 !h-3" />
       <div className="font-medium text-sm">场景演绎</div>
       <div className="text-xs opacity-70">{data.label || '多角色同台表演'}</div>
       <div className="text-xs text-rose-600 mt-1">自动协调角色 Agent</div>
+      <NodeExecutionBadge data={data} />
       <Handle type="source" position={Position.Bottom} className="!bg-rose-400 !w-3 !h-3" />
     </div>
   )
 }
 
-function GroupDiscussionNode({ data }: { data: any }) {
+function GroupDiscussionNode({ data }: { data: VisualNodeData }) {
   return (
-    <div className="px-4 py-3 rounded-lg border-2 border-indigo-400 bg-indigo-50 min-w-[150px]">
+    <div className={getExecutionNodeChrome(data, "px-4 py-3 rounded-lg border-2 border-indigo-400 bg-indigo-50 min-w-[150px]")} title={data.error}>
       <Handle type="target" position={Position.Top} className="!bg-indigo-400 !w-3 !h-3" />
       <div className="font-medium text-sm">集体讨论</div>
       <div className="text-xs opacity-70">{data.label || '多 Agent 讨论'}</div>
+      <NodeExecutionBadge data={data} />
       <Handle type="source" position={Position.Bottom} className="!bg-indigo-400 !w-3 !h-3" />
     </div>
   )
 }
 
-function StartNode({ data }: { data: any }) {
+function StartNode({ data }: { data: VisualNodeData }) {
   return (
-    <div className="px-4 py-3 rounded-lg border-2 border-green-500 bg-green-50 min-w-[100px]">
+    <div className={getExecutionNodeChrome(data, "px-4 py-3 rounded-lg border-2 border-green-500 bg-green-50 min-w-[100px]")} title={data.error}>
       <Handle type="target" position={Position.Top} id="loop" className="!bg-green-400 !w-3 !h-3" />
       <div className="font-medium text-sm text-center">{data.label || '开始'}</div>
+      <NodeExecutionBadge data={data} />
       <Handle type="source" position={Position.Bottom} className="!bg-green-500 !w-3 !h-3" />
     </div>
   )
 }
 
-function EndNode({ data }: { data: any }) {
+function EndNode({ data }: { data: VisualNodeData }) {
   return (
-    <div className="px-4 py-3 rounded-lg border-2 border-red-500 bg-red-50 min-w-[100px]">
+    <div className={getExecutionNodeChrome(data, "px-4 py-3 rounded-lg border-2 border-red-500 bg-red-50 min-w-[100px]")} title={data.error}>
       <Handle type="target" position={Position.Top} className="!bg-red-400 !w-3 !h-3" />
       <div className="font-medium text-sm text-center">{data.label || '结束'}</div>
+      <NodeExecutionBadge data={data} />
     </div>
   )
 }
 
-function InputNode({ data }: { data: any }) {
+function InputNode({ data }: { data: VisualNodeData }) {
   return (
-    <div className="px-4 py-3 rounded-lg border-2 border-blue-400 bg-blue-50 min-w-[120px]">
+    <div className={getExecutionNodeChrome(data, "px-4 py-3 rounded-lg border-2 border-blue-400 bg-blue-50 min-w-[120px]")} title={data.error}>
       <Handle type="target" position={Position.Top} className="!bg-blue-400 !w-3 !h-3" />
       <div className="font-medium text-sm">用户输入</div>
       <div className="text-xs opacity-70">{data.label || '等待用户输入'}</div>
+      <NodeExecutionBadge data={data} />
       <Handle type="source" position={Position.Bottom} className="!bg-blue-400 !w-3 !h-3" />
     </div>
   )
@@ -187,6 +236,8 @@ type VisualNodeData = {
   inputs?: NodeInputConfig[]
   outputs?: NodeOutputConfig[]
   status?: string
+  error?: string
+  duration_ms?: number
 }
 
 type WorkflowOrigin = 'project' | 'global_template'
@@ -194,6 +245,14 @@ type WorkflowOrigin = 'project' | 'global_template'
 const generateId = () => `node_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`
 const isActiveExecutionStatus = (status?: string) => status === 'pending' || status === 'running' || status === 'paused'
 const executionStorageKey = (projectId: string, workflowId: string) => `workflowExecution:${projectId}:${workflowId}`
+const shortExecutionId = (id: string) => id.length > 12 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id
+const formatExecutionDate = (value?: string | null) => value ? new Date(value).toLocaleString('zh-CN') : '-'
+const formatExecutionDuration = (ms?: number | null) => {
+  if (!ms) return '-'
+  if (ms < 1000) return `${ms}ms`
+  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`
+  return `${(ms / 60000).toFixed(1)}m`
+}
 
 const standardAllNodesDefinition = {
   name: '全内置节点标准流程',
@@ -750,6 +809,24 @@ export default function Visualizer() {
   const [currentExecutionId, setCurrentExecutionId] = useState<string | null>(null)
   const [currentExecutionStatus, setCurrentExecutionStatus] = useState<string | null>(null)
   const [currentExecution, setCurrentExecution] = useState<WorkflowExecution | null>(null)
+  const [executionOperationSummary, setExecutionOperationSummary] = useState<WorkflowOperationSummary | null>(null)
+  const [executionOperationEvents, setExecutionOperationEvents] = useState<WorkflowOperationEvent[]>([])
+  const [executionRestoreError, setExecutionRestoreError] = useState<string | null>(null)
+  const [workflowSseState, setWorkflowSseState] = useState<WorkflowSseState>('closed')
+  const [workflowSseMessage, setWorkflowSseMessage] = useState('')
+  const [executionActionError, setExecutionActionError] = useState<string | null>(null)
+  const [recoveringExecution, setRecoveringExecution] = useState(false)
+  const [recoveryReason, setRecoveryReason] = useState('visualize_manual_recovery')
+  const [failedNodeDiagnosis, setFailedNodeDiagnosis] = useState<WorkflowFailureDiagnosis | null>(null)
+  const [failedNodeDiagnosisLoading, setFailedNodeDiagnosisLoading] = useState(false)
+  const [failedNodeDiagnosisError, setFailedNodeDiagnosisError] = useState<string | null>(null)
+  const [remediationAgentType, setRemediationAgentType] = useState('')
+  const [remediationScenario, setRemediationScenario] = useState('')
+  const [remediatingExecution, setRemediatingExecution] = useState(false)
+  const [executionHistory, setExecutionHistory] = useState<WorkflowExecutionHistoryRow[]>([])
+  const [executionHistoryLoading, setExecutionHistoryLoading] = useState(false)
+  const [executionHistoryError, setExecutionHistoryError] = useState<string | null>(null)
+  const [executionHistoryStatusFilter, setExecutionHistoryStatusFilter] = useState<WorkflowStatus | 'all'>('all')
   const [rightWorkflowPanel, setRightWorkflowPanel] = useState<'monitor' | 'trace'>('monitor')
 
   useEffect(() => {
@@ -883,6 +960,32 @@ export default function Visualizer() {
     setEdges((eds) => addEdge({ ...connection, animated: true }, eds))
   }, [])
 
+  const clearExecutionProjection = useCallback(() => {
+    setNodes((currentNodes) => currentNodes.map((node) => ({
+      ...node,
+      data: {
+        ...node.data,
+        status: undefined,
+        error: undefined,
+        duration_ms: undefined,
+      },
+    })))
+  }, [])
+
+  const resetExecutionState = useCallback(() => {
+    setCurrentExecution(null)
+    setCurrentExecutionId(null)
+    setCurrentExecutionStatus(null)
+    setExecutionActionError(null)
+    setFailedNodeDiagnosis(null)
+    setFailedNodeDiagnosisError(null)
+    setRemediationAgentType('')
+    setRemediationScenario('')
+    setWorkflowSseState('closed')
+    setWorkflowSseMessage('')
+    clearExecutionProjection()
+  }, [clearExecutionProjection])
+
   const handleSelectWorkflow = (workflow: WorkflowDefinition) => {
     const origin = getWorkflowOrigin(workflow)
     setSelectedWorkflow(origin === 'global_template' ? null : workflow)
@@ -890,9 +993,7 @@ export default function Visualizer() {
     setWorkflowName(buildWorkflowDisplayName(workflow, origin))
     setNodes(workflowToCanvasNodes(workflow))
     setEdges(workflowToCanvasEdges(workflow))
-    setCurrentExecution(null)
-    setCurrentExecutionId(null)
-    setCurrentExecutionStatus(null)
+    resetExecutionState()
   }
 
   const handleNewWorkflow = () => {
@@ -904,9 +1005,7 @@ export default function Visualizer() {
       { id: 'end', type: 'end', position: { x: 250, y: 400 }, data: { label: '结束' } },
     ])
     setEdges([])
-    setCurrentExecution(null)
-    setCurrentExecutionId(null)
-    setCurrentExecutionStatus(null)
+    resetExecutionState()
   }
 
   const handleLoadStandardWorkflow = () => {
@@ -917,9 +1016,7 @@ export default function Visualizer() {
     setWorkflowName(workflow.name)
     setNodes(workflowToCanvasNodes(workflow))
     setEdges(workflowToCanvasEdges(workflow))
-    setCurrentExecution(null)
-    setCurrentExecutionId(null)
-    setCurrentExecutionStatus(null)
+    resetExecutionState()
   }
 
   const handleAddNode = (nodeInfo: NodeTypeInfo) => {
@@ -965,11 +1062,162 @@ export default function Visualizer() {
     return result.workflow
   }, [currentProject, nodes, edges, workflowName, selectedWorkflow, workflowSelectionMode])
 
-  const applyExecutionState = (execution: WorkflowExecution) => {
+  const applyExecutionState = useCallback((execution: WorkflowExecution | null) => {
     setCurrentExecution(execution)
-    setCurrentExecutionId(execution.id)
-    setCurrentExecutionStatus(execution.status)
-  }
+    setCurrentExecutionId(execution?.id || null)
+    setCurrentExecutionStatus(execution?.status || null)
+    setExecutionOperationSummary(execution?.operation_summary || null)
+    if (execution?.status !== 'failed') setExecutionActionError(null)
+    setNodes((currentNodes) => currentNodes.map((node) => {
+      const state = execution?.node_states?.[node.id]
+      return {
+        ...node,
+        data: {
+          ...node.data,
+          status: state?.status,
+          error: state?.error,
+          duration_ms: state?.duration_ms,
+        },
+      }
+    }))
+  }, [])
+
+  const updateCurrentExecutionStatus = useCallback((status: WorkflowStatus) => {
+    setCurrentExecutionStatus(status)
+    setCurrentExecution((current) => current ? { ...current, status } : current)
+    setExecutionOperationSummary(null)
+  }, [])
+
+  const loadOperationEvents = useCallback(async (executionId?: string | null) => {
+    if (!executionId) {
+      setExecutionOperationEvents([])
+      return
+    }
+    try {
+      const events = await getExecutionOperationEvents(executionId, 40)
+      setExecutionOperationEvents(events)
+    } catch (error) {
+      console.warn('Failed to load operation events:', error)
+      setExecutionOperationEvents([])
+    }
+  }, [])
+
+  const loadExecutionHistory = useCallback(async () => {
+    if (!currentProject) return
+    setExecutionHistoryLoading(true)
+    setExecutionHistoryError(null)
+    try {
+      const rows = await getExecutions(
+        currentProject.id,
+        executionHistoryStatusFilter === 'all' ? undefined : executionHistoryStatusFilter,
+        25,
+        0,
+        selectedWorkflow?.id,
+      )
+      setExecutionHistory(rows)
+    } catch (error) {
+      console.warn('Failed to load execution history:', error)
+      setExecutionHistoryError(formatApiErrorMessage(error, '加载执行历史失败'))
+    } finally {
+      setExecutionHistoryLoading(false)
+    }
+  }, [currentProject, selectedWorkflow?.id, executionHistoryStatusFilter])
+
+  const reconcileExecution = useCallback(async (
+    executionId: string,
+    options?: { openTrace?: boolean; updateUrl?: boolean; requireProject?: boolean; source?: string },
+  ) => {
+    if (!currentProject) return null
+    setExecutionActionError(null)
+    setExecutionRestoreError(null)
+    try {
+      const execution = await getExecution(executionId)
+      if (options?.requireProject !== false && execution.project_id !== currentProject.id) {
+        throw new Error(`执行 ${execution.id} 属于项目 ${execution.project_id}，不属于当前项目 ${currentProject.id}`)
+      }
+      const workflow = workflows.find((item) => item.id === execution.workflow_id)
+      if (!workflow) {
+        throw new Error(`执行 ${execution.id} 对应的工作流 ${execution.workflow_id} 不在当前项目工作流列表中`)
+      }
+      if (workflow.id !== selectedWorkflow?.id) {
+        handleSelectWorkflow(workflow)
+      }
+      applyExecutionState(execution)
+      localStorage.setItem(executionStorageKey(currentProject.id, workflow.id), execution.id)
+      if (options?.updateUrl !== false) {
+        const params = new URLSearchParams(window.location.search)
+        params.set('project_id', currentProject.id)
+        params.set('execution_id', execution.id)
+        window.history.replaceState({}, '', `${window.location.pathname}?${params.toString()}`)
+      }
+      if (options?.openTrace) setRightWorkflowPanel('trace')
+      void loadOperationEvents(execution.id)
+      return execution
+    } catch (error) {
+      console.error('Failed to reconcile execution:', error)
+      const message = formatApiErrorMessage(error, '加载执行失败')
+      setExecutionActionError(message)
+      setExecutionRestoreError(message)
+      setExecutionOperationEvents([])
+      return null
+    }
+  }, [applyExecutionState, currentProject, loadOperationEvents, selectedWorkflow?.id, workflows])
+
+  const inspectExecution = useCallback(async (executionId: string, options?: { openTrace?: boolean }) => {
+    await reconcileExecution(executionId, { ...options, updateUrl: true, source: 'history' })
+  }, [reconcileExecution])
+
+  useEffect(() => {
+    if (activeTab !== 'workflow') return
+    void loadExecutionHistory()
+  }, [activeTab, loadExecutionHistory])
+
+  useEffect(() => {
+    if (activeTab !== 'workflow' || !currentExecutionId) return
+    const handle = window.setTimeout(() => {
+      void loadExecutionHistory()
+    }, 800)
+    return () => window.clearTimeout(handle)
+  }, [activeTab, currentExecutionId, currentExecutionStatus, loadExecutionHistory])
+
+  useEffect(() => {
+    const failedEntry = currentExecution
+      ? Object.entries(currentExecution.node_states).find(([, state]) => state.status === 'failed')
+      : null
+    const failedNodeId = failedEntry?.[0]
+
+    if (activeTab !== 'workflow' || currentExecutionStatus !== 'failed' || !currentExecutionId || !failedNodeId) {
+      setFailedNodeDiagnosis(null)
+      setFailedNodeDiagnosisError(null)
+      setRemediationAgentType('')
+      setRemediationScenario('')
+      return
+    }
+
+    let cancelled = false
+    setFailedNodeDiagnosisLoading(true)
+    setFailedNodeDiagnosisError(null)
+    void getFailedNodeDiagnosis(currentExecutionId, failedNodeId)
+      .then((diagnosis) => {
+        if (cancelled) return
+        setFailedNodeDiagnosis(diagnosis)
+        setRemediationAgentType(diagnosis.current_agent_type || '')
+        setRemediationScenario(diagnosis.current_scenario || '')
+      })
+      .catch((error) => {
+        if (cancelled) return
+        console.warn('Failed to load failed-node diagnosis:', error)
+        setFailedNodeDiagnosis(null)
+        setFailedNodeDiagnosisError(formatApiErrorMessage(error, '加载失败节点诊断失败'))
+      })
+      .finally(() => {
+        if (!cancelled) setFailedNodeDiagnosisLoading(false)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [activeTab, currentExecution, currentExecutionId, currentExecutionStatus])
 
   const hasPendingDiscussionConfirmation = currentExecutionStatus === 'paused'
     && Boolean(currentExecution?.context?.waiting_confirmation)
@@ -1009,48 +1257,27 @@ export default function Visualizer() {
 
   useEffect(() => {
     if (!currentProject || !workflows.length) return
-
     const params = new URLSearchParams(window.location.search)
     const urlExecutionId = params.get('execution_id')
-    if (!urlExecutionId || selectedWorkflow) return
-
-    const restoreWorkflowFromUrl = async () => {
-      try {
-        const execution = await getExecution(urlExecutionId)
-        const workflow = workflows.find((item) => item.id === execution.workflow_id)
-        if (!workflow) return
-        handleSelectWorkflow(workflow)
-        applyExecutionState(execution)
-        localStorage.setItem(executionStorageKey(currentProject.id, workflow.id), execution.id)
-      } catch (error) {
-        console.warn('Failed to restore workflow from URL execution:', error)
-      }
-    }
-
-    void restoreWorkflowFromUrl()
-  }, [currentProject, workflows, selectedWorkflow])
+    if (!urlExecutionId || currentExecutionId === urlExecutionId) return
+    void reconcileExecution(urlExecutionId, { updateUrl: true, requireProject: true, source: 'url' })
+  }, [currentExecutionId, currentProject, reconcileExecution, workflows])
 
   useEffect(() => {
     if (!currentProject || !selectedWorkflow) return
+    const params = new URLSearchParams(window.location.search)
+    if (params.get('execution_id')) return
 
     const restoreExecution = async () => {
-      const params = new URLSearchParams(window.location.search)
-      const urlExecutionId = params.get('execution_id')
       const storedExecutionId = localStorage.getItem(executionStorageKey(currentProject.id, selectedWorkflow.id))
 
       try {
-        if (urlExecutionId) {
-          const execution = await getExecution(urlExecutionId)
-          applyExecutionState(execution)
-          localStorage.setItem(executionStorageKey(currentProject.id, selectedWorkflow.id), execution.id)
-          return
-        }
-
         if (storedExecutionId) {
           const execution = await getExecution(storedExecutionId)
-          if (isActiveExecutionStatus(execution.status)) {
+          if (execution.workflow_id === selectedWorkflow.id && isActiveExecutionStatus(execution.status)) {
             applyExecutionState(execution)
             localStorage.setItem(executionStorageKey(currentProject.id, selectedWorkflow.id), execution.id)
+            void loadOperationEvents(execution.id)
             return
           }
           localStorage.removeItem(executionStorageKey(currentProject.id, selectedWorkflow.id))
@@ -1060,14 +1287,16 @@ export default function Visualizer() {
         if (active.execution && isActiveExecutionStatus(active.execution.status)) {
           applyExecutionState(active.execution)
           localStorage.setItem(executionStorageKey(currentProject.id, selectedWorkflow.id), active.execution.id)
+          void loadOperationEvents(active.execution.id)
         }
       } catch (error) {
         console.warn('Failed to restore workflow execution:', error)
+        setExecutionRestoreError(formatApiErrorMessage(error, '恢复执行状态失败'))
       }
     }
 
     void restoreExecution()
-  }, [currentProject, selectedWorkflow])
+  }, [applyExecutionState, currentProject, loadOperationEvents, selectedWorkflow])
   const loadStartReadinessPrecheck = useCallback(async () => {
     if (!currentProject) return null
 
@@ -1083,9 +1312,15 @@ export default function Visualizer() {
         getOutlines(currentProject.id),
         getChapters(currentProject.id),
       ])
+      const completedChapters = (chaptersResult || []).filter(chapter => chapter.status === 'completed')
+      const completedOutlineIds = new Set(
+        completedChapters
+          .map(chapter => String(chapter.chapter_outline_id || '').trim())
+          .filter(Boolean),
+      )
       const completedChapterNumbers = new Set(
-        (chaptersResult || [])
-          .filter(chapter => chapter.status === 'completed')
+        completedChapters
+          .filter(chapter => !chapter.chapter_outline_id)
           .map(chapter => {
             const match = String(chapter.title || '').match(/第\s*(\d+)\s*章/)
             return match ? Number(match[1]) : null
@@ -1093,12 +1328,15 @@ export default function Visualizer() {
           .filter((value): value is number => Number.isFinite(value as number)),
       )
       const targetOutline = [...(outlinesResult.outlines || [])]
-        .filter(outline => ['approved', 'completed'].includes(outline.status))
+        .filter(outline => outline.status === 'approved' && !outline.next_outline_id)
         .sort((a, b) => a.chapter_number - b.chapter_number)
-        .find(outline => !completedChapterNumbers.has(outline.chapter_number)) || null
+        .find(outline => (
+          !completedOutlineIds.has(outline.id)
+          && !completedChapterNumbers.has(outline.chapter_number)
+        )) || null
 
       if (!targetOutline) {
-        setStartPrecheckError('当前项目没有可启动的已审批大纲（所有已审批章节都已完成，或尚未审批）。请先在大纲页准备下一章的已审批大纲。')
+        setStartPrecheckError('当前项目没有可启动的当前已审批大纲（所有当前已审批章节都已完成，或尚未审批）。请先在大纲页准备下一章的已审批大纲。')
         return null
       }
 
@@ -1124,10 +1362,11 @@ export default function Visualizer() {
       ))
       setStartPrecheckBlockingRequirements(blocking)
       setStartPrecheckAdvisoryRequirements(advisory)
-      setStartPrecheckReadiness(readinessResult.readiness[0] || null)
+      const readiness = readinessResult.readiness[0] || null
+      setStartPrecheckReadiness(readiness)
 
-      if (blocking.length > 0) {
-        setStartPrecheckError(`第 ${targetOutline.chapter_number} 章存在 unresolved blocking 资源需求：${formatRequirementList(blocking)}`)
+      if (blocking.length > 0 || isReadinessBlockedStatus(readiness?.readiness_status)) {
+        setStartPrecheckError(`第 ${targetOutline.chapter_number} 章存在 unresolved blocking 资源需求：${formatRequirementList(blocking) || '请到大纲页刷新资源需求。'}`)
         return null
       }
 
@@ -1149,15 +1388,16 @@ export default function Visualizer() {
     if (!currentProject) return
 
     if (currentExecutionId && isActiveExecutionStatus(currentExecutionStatus || undefined) && !forceNew) {
-      alert(`当前已有运行中的执行：${currentExecutionId}`)
+      setExecutionActionError(`当前已有运行中的执行：${currentExecutionId}`)
       return
     }
 
+    setExecutionActionError(null)
     setExecuting(true)
     try {
       const workflow = await persistCurrentWorkflow()
       if (!workflow) {
-        alert('请先保存工作流')
+        setExecutionActionError('请先保存工作流')
         return
       }
 
@@ -1167,7 +1407,7 @@ export default function Visualizer() {
 
       const targetOutline = await loadStartReadinessPrecheck()
       if (!targetOutline) {
-        alert('启动前预检失败，请先修复阻塞项后再执行。')
+        setExecutionActionError(startPrecheckError || '启动前预检失败，请先修复阻塞项后再执行。')
         return
       }
 
@@ -1183,24 +1423,32 @@ export default function Visualizer() {
         },
         { requestId, forceNew },
       )
-      setCurrentExecution(null)
-      setCurrentExecutionId(result.execution_id)
-      setCurrentExecutionStatus(result.status || 'running')
+      applyExecutionState({
+        id: result.execution_id,
+        workflow_id: workflow.id,
+        project_id: currentProject.id,
+        status: result.status || 'running',
+        node_states: {},
+        context: {},
+        intervention_ids: [],
+        started_at: new Date().toISOString(),
+        trace_id: result.trace_id,
+      })
       localStorage.setItem(executionStorageKey(currentProject.id, workflow.id), result.execution_id)
       const params = new URLSearchParams(window.location.search)
       params.set('execution_id', result.execution_id)
       window.history.replaceState(null, '', `${window.location.pathname}?${params.toString()}`)
-      alert(`工作流已启动！执行ID: ${result.execution_id}`)
     } catch (error: any) {
       const gateDetail = extractChapterReadinessGateDetail(error)
-      if (gateDetail) {
-        alert(formatChapterReadinessGateMessage(gateDetail, formatRequirementList))
-      } else {
-        alert(formatApiErrorMessage(error, '执行失败'))
-      }
+      setExecutionActionError(
+        gateDetail
+          ? formatChapterReadinessGateMessage(gateDetail, formatRequirementList)
+          : formatApiErrorMessage(error, '执行失败'),
+      )
       console.error('Failed to execute workflow:', error)
     } finally {
       setExecuting(false)
+      void loadExecutionHistory()
     }
   }
 
@@ -1212,41 +1460,151 @@ export default function Visualizer() {
 
   const handlePauseExecution = async () => {
     if (!currentExecutionId) return
+    setExecutionActionError(null)
     try {
-      await pauseExecution(currentExecutionId)
-      setCurrentExecution(null)
-      setCurrentExecutionStatus('paused')
+      const result = await pauseExecution(currentExecutionId)
+      if (result.execution) {
+        applyExecutionState(result.execution)
+      } else {
+        updateCurrentExecutionStatus('paused')
+      }
+      void loadExecutionHistory()
+      void loadOperationEvents(currentExecutionId)
     } catch (error) {
       console.error('Failed to pause execution:', error)
-      alert('暂停失败')
+      setExecutionActionError(formatApiErrorMessage(error, '暂停失败'))
     }
   }
 
   const handleResumeExecution = async () => {
     if (!currentExecutionId) return
+    setExecutionActionError(null)
     try {
-      await resumeExecution(currentExecutionId)
-      setCurrentExecution(null)
-      setCurrentExecutionStatus('running')
+      const result = await resumeExecution(currentExecutionId)
+      if (result.execution) {
+        applyExecutionState(result.execution)
+      } else {
+        updateCurrentExecutionStatus('running')
+      }
+      void loadExecutionHistory()
+      void loadOperationEvents(currentExecutionId)
     } catch (error) {
       console.error('Failed to resume execution:', error)
-      alert('恢复失败')
+      setExecutionActionError(formatApiErrorMessage(error, '恢复失败'))
     }
   }
 
   const handleCancelExecution = async () => {
     if (!currentExecutionId) return
     if (!confirm('确定要取消当前工作流执行吗？')) return
+    setExecutionActionError(null)
     try {
-      await cancelExecution(currentExecutionId)
-      setCurrentExecution(null)
-      setCurrentExecutionStatus('cancelled')
+      const result = await cancelExecution(currentExecutionId)
+      if (result.execution) {
+        applyExecutionState(result.execution)
+      } else {
+        updateCurrentExecutionStatus('cancelled')
+      }
       if (currentProject && selectedWorkflow) {
         localStorage.removeItem(executionStorageKey(currentProject.id, selectedWorkflow.id))
       }
+      void loadExecutionHistory()
+      void loadOperationEvents(currentExecutionId)
     } catch (error) {
       console.error('Failed to cancel execution:', error)
-      alert('取消失败')
+      setExecutionActionError(formatApiErrorMessage(error, '取消失败'))
+    }
+  }
+
+  const reconcileRecoveredExecution = useCallback((executionId: string) => {
+    void getExecution(executionId)
+      .then((execution) => {
+        applyExecutionState(execution)
+        void loadOperationEvents(executionId)
+      })
+      .catch((error) => console.warn('Failed to reconcile recovered execution:', error))
+    for (const delay of [1200, 3000, 7000]) {
+      window.setTimeout(() => {
+        void getExecution(executionId)
+          .then((execution) => {
+            applyExecutionState(execution)
+            void loadOperationEvents(executionId)
+          })
+          .catch((error) => console.warn('Failed to reconcile recovered execution:', error))
+      }, delay)
+    }
+  }, [applyExecutionState, loadOperationEvents])
+
+  const handleRecoverExecution = async () => {
+    if (!currentExecutionId || !selectedWorkflow || !failedNodeState) return
+    const normalizedReason = recoveryReason.trim() || 'visualize_manual_recovery'
+
+    setRecoveryReason(normalizedReason)
+    setExecutionActionError(null)
+    setRecoveringExecution(true)
+    try {
+      const result = await recoverExecution(currentExecutionId, {
+        mode: 'retry_failed',
+        reason: normalizedReason,
+        reset_downstream: true,
+      })
+      updateCurrentExecutionStatus(result.status || 'running')
+      reconcileRecoveredExecution(currentExecutionId)
+      if (currentProject && selectedWorkflow) {
+        localStorage.setItem(executionStorageKey(currentProject.id, selectedWorkflow.id), currentExecutionId)
+      }
+      void loadExecutionHistory()
+      void loadOperationEvents(currentExecutionId)
+    } catch (error) {
+      console.error('Failed to recover execution:', error)
+      setExecutionActionError(formatApiErrorMessage(error, '恢复失败'))
+    } finally {
+      setRecoveringExecution(false)
+    }
+  }
+
+  const handleRemediateAndRecoverExecution = async () => {
+    if (!currentExecutionId || !selectedWorkflow || !failedNodeState || !failedNodeDiagnosis) return
+    const normalizedReason = recoveryReason.trim() || 'visualize_remediation_recovery'
+    const patch: { agent_type?: string; scenario?: string } = {}
+    const agentType = remediationAgentType.trim()
+    const scenario = remediationScenario.trim()
+
+    if (agentType && agentType !== (failedNodeDiagnosis.current_agent_type || '')) {
+      patch.agent_type = agentType
+    }
+    if (scenario && scenario !== (failedNodeDiagnosis.current_scenario || '')) {
+      patch.scenario = scenario
+    }
+
+    if (!patch.agent_type && !patch.scenario) {
+      setExecutionActionError('请至少修改 Agent 类型或场景后再保存修复。')
+      return
+    }
+
+    setRecoveryReason(normalizedReason)
+    setExecutionActionError(null)
+    setRemediatingExecution(true)
+    try {
+      const result = await remediateAndRecoverExecution(currentExecutionId, {
+        node_id: failedNodeDiagnosis.failed_node_id || failedNodeState.node_id,
+        reason: normalizedReason,
+        patch,
+        reset_downstream: true,
+      })
+      updateCurrentExecutionStatus(result.recovery.status || 'running')
+      setFailedNodeDiagnosis(result.diagnosis)
+      reconcileRecoveredExecution(currentExecutionId)
+      if (currentProject && selectedWorkflow) {
+        localStorage.setItem(executionStorageKey(currentProject.id, selectedWorkflow.id), currentExecutionId)
+      }
+      void loadExecutionHistory()
+      void loadOperationEvents(currentExecutionId)
+    } catch (error) {
+      console.error('Failed to remediate and recover execution:', error)
+      setExecutionActionError(formatApiErrorMessage(error, '保存修复并恢复失败'))
+    } finally {
+      setRemediatingExecution(false)
     }
   }
 
@@ -1255,13 +1613,20 @@ export default function Visualizer() {
     const feedback = approved ? undefined : window.prompt('请输入返工反馈')
     if (!approved && !feedback) return
 
+    setExecutionActionError(null)
     try {
       await confirmDiscussion(currentExecutionId, approved, feedback || undefined)
-      setCurrentExecution(null)
-      setCurrentExecutionStatus('running')
+      updateCurrentExecutionStatus('running')
+      setCurrentExecution((current) => current ? {
+        ...current,
+        context: {
+          ...current.context,
+          waiting_confirmation: undefined,
+        },
+      } : current)
     } catch (error) {
       console.error('Failed to confirm discussion:', error)
-      alert('讨论确认失败')
+      setExecutionActionError(formatApiErrorMessage(error, '讨论确认失败'))
     }
   }
 
@@ -1286,9 +1651,7 @@ export default function Visualizer() {
         setNodes([])
         setEdges([])
         setWorkflowName('新工作流')
-        setCurrentExecution(null)
-        setCurrentExecutionId(null)
-        setCurrentExecutionStatus(null)
+        resetExecutionState()
       }
       await loadWorkflows()
     } catch (error) {
@@ -1343,6 +1706,52 @@ export default function Visualizer() {
     { key: 'world3d', label: '3D地图', icon: <Map size={18} /> },
     { key: 'relationships3d', label: '3D关系', icon: <Orbit size={18} /> },
   ]
+
+  const failedNodeEntry = currentExecution
+    ? Object.entries(currentExecution.node_states).find(([, state]) => state.status === 'failed')
+    : null
+  const failedNodeState = failedNodeEntry?.[1]
+  const operationSummary = executionOperationSummary || currentExecution?.operation_summary || null
+  const operationCapabilities = operationSummary?.capabilities
+  const operationEventsNewestFirst = [...executionOperationEvents].reverse()
+  const canPauseExecution = operationCapabilities?.pause?.allowed ?? currentExecutionStatus === 'running'
+  const canResumeExecution = operationCapabilities?.resume?.allowed ?? currentExecutionStatus === 'paused'
+  const canCancelExecution = operationCapabilities?.cancel?.allowed ?? isActiveExecutionStatus(currentExecutionStatus || undefined)
+  const canRecoverExecution = operationCapabilities?.recover?.allowed ?? currentExecutionStatus === 'failed'
+  const canRemediateExecution = operationCapabilities?.remediate?.allowed ?? currentExecutionStatus === 'failed'
+  const agentTypeOptions = getAgentTypeOptions(nodeTypesData)
+  const remediationPatchChanged = Boolean(
+    failedNodeDiagnosis && (
+      (remediationAgentType.trim() && remediationAgentType.trim() !== (failedNodeDiagnosis.current_agent_type || '')) ||
+      (remediationScenario.trim() && remediationScenario.trim() !== (failedNodeDiagnosis.current_scenario || ''))
+    ),
+  )
+  const remediationHistory = Array.isArray(currentExecution?.context?.remediation_history)
+    ? currentExecution.context.remediation_history.filter((entry: unknown): entry is Record<string, any> => Boolean(entry && typeof entry === 'object'))
+    : []
+  const remediationHistoryNewestFirst = [...remediationHistory].reverse()
+  const recoveryHistory: WorkflowRecoveryHistoryEntry[] = Array.isArray(currentExecution?.context?.recovery_history)
+    ? currentExecution.context.recovery_history.filter((entry: unknown): entry is WorkflowRecoveryHistoryEntry => Boolean(entry && typeof entry === 'object'))
+    : []
+  const recoveryHistoryNewestFirst = [...recoveryHistory].reverse()
+  const latestRecovery = recoveryHistory.length > 0 ? recoveryHistory[recoveryHistory.length - 1] : null
+  const recoveryCursor = currentExecution?.resume_cursor || null
+  const getRecoveryOutcome = (entry: WorkflowRecoveryHistoryEntry, indexFromNewest: number) => {
+    if (indexFromNewest > 0) return '已被后续恢复覆盖'
+    if (currentExecutionStatus === 'running' || currentExecutionStatus === 'pending') return '恢复执行中'
+    if (currentExecutionStatus === 'completed') return '恢复后完成'
+    if (currentExecutionStatus === 'failed') return '恢复后再次失败'
+    return entry.attempt === latestRecovery?.attempt ? '状态未知' : '已被后续恢复覆盖'
+  }
+  const executionStatusTone = currentExecutionStatus === 'failed'
+    ? 'border-red-200 bg-red-50 text-red-800'
+    : currentExecutionStatus === 'completed'
+      ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+      : currentExecutionStatus === 'cancelled'
+        ? 'border-gray-200 bg-gray-50 text-gray-700'
+        : workflowSseState === 'degraded'
+          ? 'border-amber-200 bg-amber-50 text-amber-800'
+          : 'border-blue-200 bg-blue-50 text-blue-800'
 
   return (
     <PageLayout
@@ -1468,6 +1877,125 @@ export default function Visualizer() {
               </div>
             </Card>
 
+            <Card className="p-3">
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <h3 className={`text-sm font-semibold ${isDark ? 'text-gray-200' : 'text-gray-700'}`}>
+                  执行历史
+                </h3>
+                <button
+                  onClick={() => void loadExecutionHistory()}
+                  disabled={executionHistoryLoading || !currentProject}
+                  className="text-xs text-blue-500 hover:text-blue-600 disabled:opacity-50"
+                >
+                  刷新
+                </button>
+              </div>
+              <div className="mb-2 flex gap-1 text-[11px]">
+                {[
+                  { key: 'all', label: '全部' },
+                  { key: 'running', label: '运行中' },
+                  { key: 'failed', label: '失败' },
+                  { key: 'completed', label: '完成' },
+                ].map((item) => (
+                  <button
+                    key={item.key}
+                    onClick={() => setExecutionHistoryStatusFilter(item.key as WorkflowStatus | 'all')}
+                    className={`rounded px-2 py-1 ${
+                      executionHistoryStatusFilter === item.key
+                        ? 'bg-blue-600 text-white'
+                        : isDark
+                          ? 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                          : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                    }`}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+              {executionHistoryError && (
+                <div className="mb-2 rounded border border-red-200 bg-red-50 p-2 text-[11px] text-red-700">
+                  {executionHistoryError}
+                </div>
+              )}
+              <div className="max-h-52 space-y-1 overflow-y-auto">
+                {executionHistoryLoading ? (
+                  <div className="flex items-center gap-2 py-3 text-xs text-blue-500">
+                    <Loader2 size={14} className="animate-spin" /> 加载执行历史...
+                  </div>
+                ) : executionHistory.length === 0 ? (
+                  <div className={`py-3 text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+                    {selectedWorkflow ? '暂无执行历史' : '选择工作流后查看执行历史'}
+                  </div>
+                ) : executionHistory.map((row) => (
+                  <div
+                    key={row.id}
+                    className={`rounded border p-2 text-xs ${
+                      currentExecutionId === row.id
+                        ? 'border-blue-400 bg-blue-50 text-blue-900'
+                        : isDark
+                          ? 'border-gray-700 bg-gray-800 text-gray-300 hover:bg-gray-700'
+                          : 'border-gray-200 bg-white text-gray-700 hover:bg-gray-50'
+                    }`}
+                  >
+                    <div
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => void inspectExecution(row.id)}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter' || event.key === ' ') void inspectExecution(row.id)
+                      }}
+                      className="w-full cursor-pointer text-left"
+                    >
+                      <div className="mb-1 flex items-center justify-between gap-2">
+                        <span className="font-mono text-[11px]">{shortExecutionId(row.id)}</span>
+                        <span className={`rounded px-1.5 py-0.5 text-[10px] ${
+                          row.status === 'failed'
+                            ? 'bg-red-100 text-red-700'
+                            : row.status === 'completed'
+                              ? 'bg-emerald-100 text-emerald-700'
+                              : isActiveExecutionStatus(row.status)
+                                ? 'bg-blue-100 text-blue-700'
+                                : 'bg-gray-100 text-gray-600'
+                        }`}>{row.status}</span>
+                      </div>
+                      <div className="flex items-center justify-between text-[11px] opacity-75">
+                        <span>{formatExecutionDate(row.started_at)}</span>
+                        <span>{formatExecutionDuration(row.total_duration_ms)}</span>
+                      </div>
+                      <div className="mt-1 flex flex-wrap gap-1 text-[10px]">
+                        {row.node_count != null && (
+                          <span className="rounded bg-slate-100 px-1.5 py-0.5 text-slate-600">
+                            {row.completed_node_count || 0}/{row.node_count} 节点
+                          </span>
+                        )}
+                        {row.failed_node_id && (
+                          <span className="rounded bg-red-100 px-1.5 py-0.5 text-red-700">
+                            失败：{row.failed_node_id}
+                          </span>
+                        )}
+                        {(row.recovery_count || 0) > 0 && (
+                          <span className="rounded bg-amber-100 px-1.5 py-0.5 text-amber-700">
+                            恢复 {row.recovery_count} 次
+                          </span>
+                        )}
+                        {row.trace_id && (
+                          <button
+                            onClick={(event) => {
+                              event.stopPropagation()
+                              void inspectExecution(row.id, { openTrace: true })
+                            }}
+                            className="rounded bg-indigo-100 px-1.5 py-0.5 text-indigo-700 hover:bg-indigo-200"
+                          >
+                            Trace
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </Card>
+
             <Card className="p-3 flex-1 overflow-y-auto">
               {loadingNodeTypes ? (
                 <div className="flex items-center justify-center h-32">
@@ -1582,29 +2110,39 @@ export default function Visualizer() {
                   </div>
                 )}
               </div>
-              <div className={`mt-2 rounded border p-2 text-xs ${
+              <div className={`mt-2 rounded-xl border p-3 text-xs ${
                 startPrecheckError
-                  ? 'border-red-200 bg-red-50 text-red-700'
+                  ? 'border-red-200 bg-red-50 text-red-800'
                   : startPrecheckAdvisoryRequirements.length > 0
-                    ? 'border-yellow-200 bg-yellow-50 text-yellow-700'
-                    : 'border-gray-200 bg-gray-50 text-gray-600'
+                    ? 'border-amber-200 bg-amber-50 text-amber-800'
+                    : 'border-emerald-200 bg-emerald-50 text-emerald-800'
               }`}>
                 {startPrechecking ? (
-                  <div>正在检查已审批大纲和章节资源 readiness...</div>
+                  <div className="flex items-center gap-2"><span className="h-2 w-2 animate-pulse rounded-full bg-current" />正在检查已审批大纲和章节资源 readiness...</div>
+                ) : startPrecheckOutline ? (
+                  <div className="space-y-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-semibold">第 {startPrecheckOutline.chapter_number} 章</span>
+                      <span className={`rounded-full px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide ${startPrecheckError ? 'bg-red-600 text-white' : startPrecheckAdvisoryRequirements.length > 0 ? 'bg-amber-500 text-white' : 'bg-emerald-600 text-white'}`}>
+                        {getReadinessStatusLabel(startPrecheckReadiness?.readiness_status || (startPrecheckError ? 'blocked' : 'ready'))}
+                      </span>
+                      <span>blocking {startPrecheckBlockingRequirements.length}</span>
+                      <span>advisory {startPrecheckAdvisoryRequirements.length}</span>
+                    </div>
+                    {startPrecheckError && <div className="font-medium">{startPrecheckError}</div>}
+                    {[...startPrecheckBlockingRequirements, ...startPrecheckAdvisoryRequirements].slice(0, 4).map(requirement => (
+                      <a
+                        key={requirement.id}
+                        href={getRequirementRecoveryPath(requirement)}
+                        className="block rounded-lg border border-white/70 bg-white/70 px-3 py-2 hover:bg-white"
+                      >
+                        <div className="font-medium">{formatRequirementSummary(requirement)}</div>
+                        <div className="mt-1 opacity-80">{getRequirementRecoveryActionLabel(requirement)}</div>
+                      </a>
+                    ))}
+                  </div>
                 ) : startPrecheckError ? (
                   <div>{startPrecheckError}</div>
-                ) : startPrecheckOutline ? (
-                  <div className="space-y-1">
-                    <div>
-                      readiness: {startPrecheckReadiness?.readiness_status || 'ready'}；blocking: {startPrecheckBlockingRequirements.length}；advisory: {startPrecheckAdvisoryRequirements.length}
-                    </div>
-                    {startPrecheckBlockingRequirements.length > 0 && (
-                      <div>阻塞资源：{formatRequirementList(startPrecheckBlockingRequirements)}</div>
-                    )}
-                    {startPrecheckAdvisoryRequirements.length > 0 && (
-                      <div>建议补齐：{formatRequirementList(startPrecheckAdvisoryRequirements)}</div>
-                    )}
-                  </div>
                 ) : (
                   <div>等待启动前预检...</div>
                 )}
@@ -1612,24 +2150,273 @@ export default function Visualizer() {
               {currentExecutionId && (
                 <div className="mt-2 space-y-2 text-xs">
                   <div className="truncate text-gray-500" title={currentExecutionId}>执行ID: {currentExecutionId}</div>
+                  <div className={`rounded-xl border p-3 ${executionStatusTone}`}>
+                    <div className="mb-2 flex items-center justify-between gap-2">
+                      <span className="font-semibold">执行状态：{currentExecutionStatus || 'unknown'}</span>
+                      <span className="rounded-full bg-white/70 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide">
+                        {workflowSseState === 'connected' ? '实时' : workflowSseState === 'degraded' ? '轮询降级' : workflowSseState === 'connecting' ? '连接中' : '已断开'}
+                      </span>
+                    </div>
+                    <div className="space-y-1">
+                      {currentExecution?.current_node && <div>当前节点：{currentExecution.current_node}</div>}
+                      {currentExecution?.trace_id && <div className="truncate" title={currentExecution.trace_id}>Trace：{currentExecution.trace_id}</div>}
+                      {workflowSseMessage && <div>{workflowSseMessage}</div>}
+                      {currentExecution?.error && <div className="font-medium">工作流错误：{currentExecution.error}</div>}
+                      {failedNodeState && (
+                        <div className="rounded-lg bg-white/70 p-2">
+                          <div className="font-semibold">失败节点：{failedNodeState.node_id}</div>
+                          {failedNodeState.error && <div className="mt-1 whitespace-pre-wrap">{failedNodeState.error}</div>}
+                        </div>
+                      )}
+                      {currentExecutionStatus === 'failed' && failedNodeState && (
+                        <div className="rounded-lg border border-red-200 bg-white/80 p-2 text-red-800">
+                          <div className="mb-2 flex items-center justify-between gap-2">
+                            <span className="font-semibold">失败诊断与恢复</span>
+                            {failedNodeDiagnosis && (
+                              <span className="rounded-full bg-red-100 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide">
+                                {failedNodeDiagnosis.category}
+                              </span>
+                            )}
+                          </div>
+                          <div className="mb-2 text-[11px] leading-relaxed opacity-80">
+                            先判断失败是否可直接重试；若是确定性配置错误，可保存安全修复并继续使用当前执行 ID 恢复。
+                          </div>
+                          {failedNodeDiagnosisLoading ? (
+                            <div className="mb-2 rounded bg-red-50 p-2 text-[11px]">正在加载失败节点诊断...</div>
+                          ) : failedNodeDiagnosisError ? (
+                            <div className="mb-2 rounded bg-red-50 p-2 text-[11px] font-medium whitespace-pre-wrap">{failedNodeDiagnosisError}</div>
+                          ) : failedNodeDiagnosis ? (
+                            <div className="mb-2 space-y-2 text-[11px]">
+                              <div className="rounded border border-red-100 bg-red-50 p-2">
+                                <div className="font-semibold">{failedNodeDiagnosis.summary}</div>
+                                <div className="mt-1">失败节点：{failedNodeDiagnosis.failed_node_label || failedNodeDiagnosis.failed_node_id}</div>
+                                <div className="mt-1">当前 Agent：{failedNodeDiagnosis.current_agent_type || '-'}</div>
+                                {failedNodeDiagnosis.current_scenario && <div className="mt-1">当前场景：{failedNodeDiagnosis.current_scenario}</div>}
+                                {failedNodeDiagnosis.retry_without_fix_likely_to_fail && (
+                                  <div className="mt-2 rounded bg-white px-2 py-1 font-medium text-red-700">
+                                    诊断认为直接重试大概率会再次失败，建议先修复配置。
+                                  </div>
+                                )}
+                                {failedNodeDiagnosis.evidence.length > 0 && (
+                                  <div className="mt-2 max-h-16 overflow-y-auto whitespace-pre-wrap rounded bg-white p-1 text-red-700">
+                                    证据：{failedNodeDiagnosis.evidence.join('\n')}
+                                  </div>
+                                )}
+                              </div>
+                              {failedNodeDiagnosis.remediable && (
+                                <div className="rounded border border-amber-200 bg-amber-50 p-2 text-amber-900">
+                                  <div className="mb-2 font-semibold">安全修复补丁</div>
+                                  <label className="mb-1 block font-medium">替换 Agent 类型</label>
+                                  <select
+                                    value={remediationAgentType}
+                                    onChange={(event) => setRemediationAgentType(event.target.value)}
+                                    className="mb-2 w-full rounded border border-amber-200 bg-white px-2 py-1 text-[11px] outline-none focus:border-amber-400"
+                                  >
+                                    <option value="">选择 Agent 类型</option>
+                                    {agentTypeOptions.map((option) => (
+                                      <option key={option.value} value={option.value}>{option.label} · {option.value}</option>
+                                    ))}
+                                  </select>
+                                  <label className="mb-1 block font-medium">场景（可选）</label>
+                                  <input
+                                    value={remediationScenario}
+                                    onChange={(event) => setRemediationScenario(event.target.value)}
+                                    maxLength={80}
+                                    className="mb-2 w-full rounded border border-amber-200 bg-white px-2 py-1 text-[11px] outline-none focus:border-amber-400"
+                                    placeholder="保留为空或输入新 scenario"
+                                  />
+                                  <div className="mb-2 rounded bg-white p-2 text-[10px]">
+                                    <div className="font-semibold">补丁预览</div>
+                                    <div>Agent：{failedNodeDiagnosis.current_agent_type || '-'} → {remediationAgentType.trim() || '-'}</div>
+                                    <div>场景：{failedNodeDiagnosis.current_scenario || '-'} → {remediationScenario.trim() || '-'}</div>
+                                  </div>
+                                  <button
+                                    onClick={handleRemediateAndRecoverExecution}
+                                    disabled={remediatingExecution || executing || !remediationPatchChanged || !canRemediateExecution}
+                                    className="w-full rounded bg-amber-600 px-2 py-1 text-white hover:bg-amber-700 disabled:opacity-50"
+                                    title={operationCapabilities?.remediate?.reason || ''}
+                                  >
+                                    {remediatingExecution ? '修复恢复中...' : '保存修复并从失败节点恢复'}
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                          ) : null}
+                          <label className="mb-1 block text-[11px] font-medium">恢复/修复原因</label>
+                          <input
+                            value={recoveryReason}
+                            onChange={(event) => setRecoveryReason(event.target.value)}
+                            maxLength={120}
+                            className="mb-2 w-full rounded border border-red-200 bg-white px-2 py-1 text-[11px] text-red-900 outline-none focus:border-red-400"
+                            placeholder="visualize_manual_recovery"
+                          />
+                          <button
+                            onClick={handleRecoverExecution}
+                            disabled={recoveringExecution || remediatingExecution || executing || !canRecoverExecution}
+                            className="w-full rounded bg-red-600 px-2 py-1 text-white hover:bg-red-700 disabled:opacity-50"
+                            title={operationCapabilities?.recover?.reason || ''}
+                          >
+                            {recoveringExecution ? '恢复中...' : '从失败节点重试'}
+                          </button>
+                        </div>
+                      )}
+                      {remediationHistory.length > 0 && (
+                        <div className="rounded-lg border border-orange-200 bg-white/80 p-2 text-orange-900">
+                          <div className="mb-2 flex items-center justify-between gap-2">
+                            <span className="font-semibold">修复审计</span>
+                            <span className="rounded bg-orange-100 px-1.5 py-0.5 text-[10px]">{remediationHistory.length} 次</span>
+                          </div>
+                          <div className="space-y-2">
+                            {remediationHistoryNewestFirst.slice(0, 3).map((entry, index) => {
+                              const diff = entry.diff || {}
+                              const before = diff.before || {}
+                              const after = diff.after || {}
+                              return (
+                                <div key={`${entry.node_id || index}-${entry.applied_at || index}`} className="rounded border border-orange-100 bg-white p-2 text-[11px]">
+                                  <div className="mb-1 flex items-center justify-between gap-2">
+                                    <span className="font-semibold">{entry.node_id || '-'}</span>
+                                    <span className="rounded bg-orange-100 px-1.5 py-0.5 text-[10px]">{entry.diagnosis_category || 'unknown'}</span>
+                                  </div>
+                                  <div>原因：{entry.reason || '-'}</div>
+                                  <div>时间：{formatExecutionDate(entry.applied_at || entry.started_at)}</div>
+                                  {before.agent_type !== undefined || after.agent_type !== undefined ? (
+                                    <div>Agent：{before.agent_type || '-'} → {after.agent_type || '-'}</div>
+                                  ) : null}
+                                  {before.scenario !== undefined || after.scenario !== undefined ? (
+                                    <div>场景：{before.scenario || '-'} → {after.scenario || '-'}</div>
+                                  ) : null}
+                                </div>
+                              )
+                            })}
+                          </div>
+                        </div>
+                      )}
+                      {recoveryHistory.length > 0 && (
+                        <div className="rounded-lg border border-amber-200 bg-white/80 p-2 text-amber-900">
+                          <div className="mb-2 flex items-center justify-between gap-2">
+                            <span className="font-semibold">恢复审计</span>
+                            <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px]">{recoveryHistory.length} 次</span>
+                          </div>
+                          {recoveryCursor && (
+                            <div className="mb-2 rounded bg-amber-50 p-2 text-[11px]">
+                              <div>游标：#{recoveryCursor.recovery_attempt || '-'} · {recoveryCursor.recovered_node_id || '-'}</div>
+                              {Array.isArray(recoveryCursor.reset_node_ids) && (
+                                <div className="mt-1 truncate" title={recoveryCursor.reset_node_ids.join(', ')}>
+                                  重置：{recoveryCursor.reset_node_ids.join(', ')}
+                                </div>
+                              )}
+                            </div>
+                          )}
+                          <div className="space-y-2">
+                            {recoveryHistoryNewestFirst.slice(0, 4).map((entry, index) => (
+                              <div key={`${entry.attempt || index}-${entry.started_at || index}`} className="rounded border border-amber-100 bg-white p-2 text-[11px]">
+                                <div className="mb-1 flex items-center justify-between gap-2">
+                                  <span className="font-semibold">Attempt #{entry.attempt || '?'}</span>
+                                  <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px]">{getRecoveryOutcome(entry, index)}</span>
+                                </div>
+                                <div>目标：{entry.target_node_id || '-'}</div>
+                                <div>模式：{entry.mode || '-'}</div>
+                                <div>原因：{entry.reason || '-'}</div>
+                                <div>时间：{formatExecutionDate(entry.started_at)}</div>
+                                {Array.isArray(entry.reset_node_ids) && entry.reset_node_ids.length > 0 && (
+                                  <div className="truncate" title={entry.reset_node_ids.join(', ')}>
+                                    重置 {entry.reset_node_ids.length} 个：{entry.reset_node_ids.join(', ')}
+                                  </div>
+                                )}
+                                {entry.previous_error && (
+                                  <div className="mt-1 max-h-12 overflow-y-auto whitespace-pre-wrap rounded bg-red-50 p-1 text-red-700">
+                                    上次错误：{entry.previous_error}
+                                  </div>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      {executionRestoreError && (
+                        <div className="rounded-lg border border-red-200 bg-red-50 p-2 text-red-800">
+                          <div className="font-semibold">执行恢复失败</div>
+                          <div className="mt-1 whitespace-pre-wrap">{executionRestoreError}</div>
+                        </div>
+                      )}
+                      {operationSummary && (
+                        <div className="rounded-lg border border-slate-200 bg-white/80 p-2 text-slate-800">
+                          <div className="mb-2 flex items-center justify-between gap-2">
+                            <span className="font-semibold">运行操作台</span>
+                            <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px]">
+                              {operationSummary.active_task ? '任务活跃' : operationSummary.terminal ? '终态' : '可操作'}
+                            </span>
+                          </div>
+                          <div className="grid grid-cols-2 gap-1 text-[11px]">
+                            <div>节点：{operationSummary.node_summary.total}</div>
+                            <div>失败：{operationSummary.node_summary.counts.failed || 0}</div>
+                            <div>恢复：{operationSummary.recovery.count} 次</div>
+                            <div>修复：{operationSummary.remediation.count} 次</div>
+                            <div>陈旧：{operationSummary.stale.count} 次</div>
+                            <div>租约：{operationSummary.lease.expired ? '已过期' : operationSummary.lease.seconds_remaining !== null && operationSummary.lease.seconds_remaining !== undefined ? `${operationSummary.lease.seconds_remaining}s` : '-'}</div>
+                          </div>
+                          {operationSummary.attention.length > 0 && (
+                            <div className="mt-2 space-y-1">
+                              {operationSummary.attention.slice(0, 3).map((item) => (
+                                <div key={`${item.type}-${item.message}`} className="rounded bg-slate-50 px-2 py-1 text-[11px]">
+                                  {item.message}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      {executionOperationEvents.length > 0 && (
+                        <div className="rounded-lg border border-indigo-200 bg-white/80 p-2 text-indigo-900">
+                          <div className="mb-2 flex items-center justify-between gap-2">
+                            <span className="font-semibold">操作事件时间线</span>
+                            <span className="rounded bg-indigo-100 px-1.5 py-0.5 text-[10px]">{executionOperationEvents.length} 条</span>
+                          </div>
+                          <div className="max-h-44 space-y-2 overflow-y-auto">
+                            {operationEventsNewestFirst.slice(0, 8).map((event) => (
+                              <div key={`${event.sequence_no || event.event_type}-${event.created_at || ''}`} className="rounded border border-indigo-100 bg-white p-2 text-[11px]">
+                                <div className="mb-1 flex items-center justify-between gap-2">
+                                  <span className="font-semibold">{event.summary}</span>
+                                  <span className={`rounded px-1.5 py-0.5 text-[10px] ${event.severity === 'error' ? 'bg-red-100 text-red-700' : 'bg-indigo-100 text-indigo-700'}`}>
+                                    {event.event_type}
+                                  </span>
+                                </div>
+                                <div className="flex items-center justify-between gap-2 opacity-75">
+                                  <span>{formatExecutionDate(event.created_at)}</span>
+                                  {event.node_id && <span className="truncate" title={event.node_id}>节点：{event.node_id}</span>}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      {executionActionError && <div className="font-medium whitespace-pre-wrap">{executionActionError}</div>}
+                      {(currentExecution?.error || failedNodeState || executionActionError) && (
+                        <div className="opacity-80">可切换右侧 Trace 面板查看调用链和产物详情。</div>
+                      )}
+                    </div>
+                  </div>
                   <div className="grid grid-cols-3 gap-1">
                     <button
                       onClick={handlePauseExecution}
-                      disabled={currentExecutionStatus !== 'running'}
+                      disabled={!canPauseExecution}
+                      title={operationCapabilities?.pause?.reason || ''}
                       className="flex items-center justify-center gap-1 px-2 py-1 rounded bg-yellow-100 text-yellow-700 disabled:opacity-50"
                     >
                       <Pause size={12} /> 暂停
                     </button>
                     <button
                       onClick={handleResumeExecution}
-                      disabled={currentExecutionStatus !== 'paused'}
+                      disabled={!canResumeExecution}
+                      title={operationCapabilities?.resume?.reason || ''}
                       className="flex items-center justify-center gap-1 px-2 py-1 rounded bg-blue-100 text-blue-700 disabled:opacity-50"
                     >
                       <RotateCcw size={12} /> 恢复
                     </button>
                     <button
                       onClick={handleCancelExecution}
-                      disabled={!isActiveExecutionStatus(currentExecutionStatus || undefined)}
+                      disabled={!canCancelExecution}
+                      title={operationCapabilities?.cancel?.reason || ''}
                       className="flex items-center justify-center gap-1 px-2 py-1 rounded bg-red-100 text-red-700 disabled:opacity-50"
                     >
                       <Square size={12} /> 取消
@@ -1764,7 +2551,14 @@ export default function Visualizer() {
               </div>
               <div className="flex-1 overflow-hidden">
                 {rightWorkflowPanel === 'monitor' ? (
-                  <WorkflowMonitor executionId={currentExecutionId} />
+                  <WorkflowMonitor
+                    executionId={currentExecutionId}
+                    onExecutionChange={applyExecutionState}
+                    onConnectionStateChange={(state, message) => {
+                      setWorkflowSseState(state)
+                      setWorkflowSseMessage(message || '')
+                    }}
+                  />
                 ) : (
                   <WorkflowTrace executionId={currentExecutionId} />
                 )}
