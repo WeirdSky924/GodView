@@ -27,6 +27,7 @@ const Prompts = lazy(() => import('./pages/Prompts'))
 const AgentTemplates = lazy(() => import('./pages/AgentTemplates'))
 const WritingRules = lazy(() => import('./pages/WritingRules'))
 const Outlines = lazy(() => import('./pages/Outlines'))
+const StateChanges = lazy(() => import('./pages/StateChanges'))
 
 function RouteFallback() {
   return (
@@ -67,6 +68,7 @@ function App() {
           <Route path="/agent-templates" element={<AgentTemplates />} />
           <Route path="/writing-rules" element={<WritingRules />} />
           <Route path="/outlines" element={<Outlines />} />
+          <Route path="/state-changes" element={<StateChanges />} />
         </Routes>
       </Suspense>
     </Layout>

@@ -171,6 +171,7 @@ dmypy.json
 # Agent handoff local development docs
 AGENT_HANDOFF.md
 AGENT_SESSION_PROMPTS.md
+OPTIMIZATION_BACKLOG.md
 
 # Playwright MCP 临时快照
 .playwright-mcp/

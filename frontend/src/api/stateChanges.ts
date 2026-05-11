@@ -28,6 +28,8 @@ export type NarrativeStateChangeStatus = 'proposed' | 'confirmed' | 'applied' | 
 export interface NarrativeStateChange {
   id: string
   project_id: string
+  world_id?: string | null
+  scope_type?: string | null
   entity_type: NarrativeStateEntityType | string
   entity_id?: string | null
   entity_name?: string | null
@@ -61,6 +63,9 @@ export interface StateChangeQueryParams {
   entity_id?: string
   status?: NarrativeStateChangeStatus
   change_type?: NarrativeStateChangeType | string
+  chapter_id?: string
+  world_id?: string
+  workflow_execution_id?: string
   limit?: number
 }
 
@@ -110,6 +115,9 @@ export async function getStateChanges(params: StateChangeQueryParams): Promise<N
   if (params.entity_id) searchParams.append('entity_id', params.entity_id)
   if (params.status) searchParams.append('status', params.status)
   if (params.change_type) searchParams.append('change_type', params.change_type)
+  if (params.chapter_id) searchParams.append('chapter_id', params.chapter_id)
+  if (params.world_id) searchParams.append('world_id', params.world_id)
+  if (params.workflow_execution_id) searchParams.append('workflow_execution_id', params.workflow_execution_id)
   if (params.limit !== undefined) searchParams.append('limit', String(params.limit))
 
   const response = await api.get<NarrativeStateChange[]>(`/state-changes?${searchParams.toString()}`)

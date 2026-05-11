@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { NavLink, useNavigate, useLocation } from 'react-router-dom'
 import {
-  LayoutDashboard, Users, Globe, BookOpen, BookMarked, FileText, Settings, Flag, GitCompare, ShieldAlert, Eye, Network, Mic2, CheckCircle2, FolderOpen, ChevronDown, Plus, Layers, MessageSquare, Bot, PenTool, Sparkles, Sun, Moon, Database, Server, AlertCircle, CheckCircle, XCircle, Clapperboard, Play, ListTree, MapPin, Compass, Boxes, PenLine, BarChart3, Cpu
+  LayoutDashboard, Users, Globe, BookOpen, BookMarked, FileText, Settings, Flag, GitCompare, ShieldAlert, Eye, Network, Mic2, CheckCircle2, FolderOpen, ChevronDown, Plus, Layers, MessageSquare, Bot, PenTool, Sparkles, Sun, Moon, Database, Server, AlertCircle, CheckCircle, XCircle, Clapperboard, Play, ListTree, MapPin, Compass, Boxes, PenLine, BarChart3, Cpu, ShieldCheck
 } from 'lucide-react'
 import { useProject } from '@/contexts/ProjectContext'
 import { useTheme } from '@/contexts/ThemeContext'
@@ -52,6 +52,7 @@ const navGroups: NavGroup[] = [
       { path: '/plots', icon: <BookOpen size={18} />, label: '剧情管理' },
       { path: '/outlines', icon: <ListTree size={18} />, label: '章节大纲' },
       { path: '/hooks', icon: <Flag size={18} />, label: '伏笔管理' },
+      { path: '/state-changes', icon: <ShieldCheck size={18} />, label: '状态确认' },
       { path: '/novel', icon: <FileText size={18} />, label: '小说编辑器' },
       { path: '/diff', icon: <GitCompare size={18} />, label: '版本对比' },
     ],

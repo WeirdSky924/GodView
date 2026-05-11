@@ -1,20 +1,31 @@
 import { useEffect, useMemo, useState, useCallback, useRef } from 'react'
+import { Link } from 'react-router-dom'
 import { Card, Button, Input, TextArea, Modal } from '@/components/ui'
 import PageLayout from '@/components/PageLayout'
 import { useDynamicWebSocket } from '@/hooks/useWebSocket'
 import { getDirectorState, getSnapshotTree } from '@/api/director'
 import { getCharacters } from '@/api/characters'
 import {
+  executeWorkflow,
   extractChapterReadinessGateDetail,
   formatChapterReadinessGateMessage,
   formatApiErrorMessage,
   getActiveWorkflowExecution,
   getWorkflows,
   getExecution,
+  getExecutionOperationEvents,
+  getExecutionOperationSummary,
+  pauseExecution,
+  resumeExecution,
+  recoverExecution,
+  cancelExecution,
   createWorkflowExecutionEventSource,
   type WorkflowDefinition,
   type WorkflowExecution,
   type WorkflowEventMessage,
+  type WorkflowOperationEvent,
+  type WorkflowOperationSummary,
+  type ChapterReadinessGateDetail,
 } from '@/api/workflows'
 import {
   getOutlines,
@@ -25,12 +36,20 @@ import {
   type OutlineResourceRequirement,
   type ChapterResourceReadiness,
 } from '@/api/outlines'
-import { formatRequirementList } from '@/utils/resourceRequirementDisplay'
+import {
+  formatRequirementList,
+  formatRequirementSummary,
+  getRequirementRecoveryActionLabel,
+  getRequirementRecoveryPath,
+  getRequirementTypeLabel,
+  getRequirementTargetType,
+} from '@/utils/resourceRequirementDisplay'
 import { useWorkflowAgents, type AgentStatus, getAgentDisplayName } from '@/hooks/useWorkflowAgents'
 import {
   Play, Pause, RotateCcw, Target, BookOpen, MessageSquare, GitBranch, Settings,
   Sparkles, FileText, Network, FolderOpen, UserPlus, UserMinus, Users, ChevronDown,
-  ChevronUp, Send, X, Circle, Copy, Check, Shield, Zap, Brain, Keyboard
+  ChevronUp, Send, X, Circle, Copy, Check, Shield, Zap, Brain, Keyboard,
+  ExternalLink, RefreshCw, Square, Activity, AlertTriangle
 } from 'lucide-react'
 import { useProject } from '@/contexts/ProjectContext'
 import { useTheme } from '@/contexts/ThemeContext'
@@ -47,6 +66,32 @@ import VolumePlanner from '@/components/VolumePlanner'
 
 type WorkflowOrigin = 'project' | 'global_template'
 type AutoOutlineMode = 'selected' | 'auto_progression'
+type GeneratedChapterStatus = 'generated' | 'saved' | 'failed'
+
+type DirectorGeneratedChapter = {
+  chapter_num: number
+  title: string
+  word_count: number
+  content: string
+  chapter_id?: string
+  chapter_outline_id?: string
+  snapshot_id?: string
+  execution_id?: string
+  workflow_id?: string
+  project_id?: string
+  status?: GeneratedChapterStatus
+  saved_at?: string
+  content_storage?: string
+  content_path?: string
+  content_size_bytes?: number
+  content_checksum?: string
+  content_chars?: number
+  quality_gate_status?: string
+  quality_gate_passed?: boolean
+  quality_gate_score?: number
+  quality_gate_attempts?: number
+  revision_attempts?: number
+}
 
 type PendingUserInput = {
   node_id: string
@@ -215,7 +260,10 @@ function isWorkflowExecutionEventType(type?: string): boolean {
     'workflow_paused',
     'workflow_resumed',
     'workflow_cancelled',
+    'chapter_saved',
+    'chapter_save_failed',
     'node_started',
+    'node_failed',
     'node_completed',
     'node_output',
     'node_streaming',
@@ -335,12 +383,78 @@ function getDirectorExecutionSessionId(execution: WorkflowExecution): string {
   return String(execution.director_session_id || execution.context?.director_session_id || '')
 }
 
+function getDirectorChapterFromPayload(
+  payload: any,
+  fallback: Partial<DirectorGeneratedChapter> = {},
+): DirectorGeneratedChapter | null {
+  const data = payload?.data || payload || {}
+  const chapterId = data.chapter_id || data.id || data.chapter?.id || fallback.chapter_id
+  const outlineId = data.chapter_outline_id || data.chapter?.chapter_outline_id || data.outline_id || fallback.chapter_outline_id
+  const chapterNum = data.chapter_num ?? data.chapter_number ?? data.chapter?.chapter_num ?? data.chapter?.chapter_number ?? fallback.chapter_num
+  const title = data.title || data.chapter_title || data.chapter?.title || fallback.title || (chapterNum ? `第 ${chapterNum} 章` : '已保存章节')
+  const content = data.content ?? data.chapter_content ?? data.chapter?.content ?? fallback.content ?? ''
+  const wordCount = data.word_count ?? data.chapter?.word_count ?? fallback.word_count ?? (typeof content === 'string' ? content.length : 0)
+
+  if (!chapterId && !outlineId && chapterNum === undefined) return null
+
+  return {
+    chapter_num: Number(chapterNum || fallback.chapter_num || 0),
+    title,
+    word_count: Number(wordCount || 0),
+    content: typeof content === 'string' ? content : '',
+    chapter_id: chapterId,
+    chapter_outline_id: outlineId,
+    snapshot_id: data.snapshot_id || data.chapter?.snapshot_id || fallback.snapshot_id,
+    execution_id: data.execution_id || fallback.execution_id,
+    workflow_id: data.workflow_id || fallback.workflow_id,
+    project_id: data.project_id || data.chapter?.project_id || fallback.project_id,
+    status: data.status || fallback.status || (chapterId ? 'saved' : 'generated'),
+    saved_at: data.saved_at || data.created_at || fallback.saved_at,
+    content_storage: data.content_storage || data.chapter?.content_storage || fallback.content_storage,
+    content_path: data.content_path || data.chapter?.content_path || fallback.content_path,
+    content_size_bytes: data.content_size_bytes ?? data.chapter?.content_size_bytes ?? fallback.content_size_bytes,
+    content_checksum: data.content_checksum || data.chapter?.content_checksum || fallback.content_checksum,
+    content_chars: data.content_chars ?? data.chapter?.content_chars ?? fallback.content_chars,
+    quality_gate_status: data.quality_gate_status ?? data.chapter?.quality_gate_status ?? fallback.quality_gate_status,
+    quality_gate_passed: data.quality_gate_passed ?? data.chapter?.quality_gate_passed ?? fallback.quality_gate_passed,
+    quality_gate_score: data.quality_gate_score ?? data.chapter?.quality_gate_score ?? fallback.quality_gate_score,
+    quality_gate_attempts: data.quality_gate_attempts ?? data.chapter?.quality_gate_attempts ?? fallback.quality_gate_attempts,
+    revision_attempts: data.revision_attempts ?? data.chapter?.revision_attempts ?? fallback.revision_attempts,
+  }
+}
+
+function upsertDirectorChapter(
+  chapters: DirectorGeneratedChapter[],
+  nextChapter: DirectorGeneratedChapter,
+): DirectorGeneratedChapter[] {
+  const index = chapters.findIndex((chapter) => (
+    (nextChapter.chapter_id && chapter.chapter_id === nextChapter.chapter_id) ||
+    (nextChapter.chapter_outline_id && chapter.chapter_outline_id === nextChapter.chapter_outline_id) ||
+    (nextChapter.chapter_num > 0 && chapter.chapter_num === nextChapter.chapter_num)
+  ))
+
+  if (index === -1) return [nextChapter, ...chapters]
+
+  return chapters.map((chapter, chapterIndex) => (
+    chapterIndex === index
+      ? { ...chapter, ...nextChapter, content: nextChapter.content || chapter.content }
+      : chapter
+  ))
+}
+
 function isTerminalExecutionStatus(status?: string): boolean {
   return ['completed', 'failed', 'cancelled'].includes(status || '')
 }
 
 function isActiveExecutionStatus(status?: string): boolean {
   return ['running', 'paused', 'pending'].includes(status || '')
+}
+
+function getFailureDiagnosticsHref(projectId?: string, executionId?: string | null, nodeId?: string | null): string {
+  if (!projectId || !executionId) return ''
+  const params = new URLSearchParams({ project_id: projectId, execution_id: executionId })
+  if (nodeId) params.set('node_id', nodeId)
+  return `/visualize?${params.toString()}`
 }
 
 // Agent 状态指示器
@@ -734,11 +848,13 @@ function QuickActionButton({
 function ChapterCard({
   chapter,
   onCopy,
-  isDark
+  isDark,
+  projectId,
 }: {
-  chapter: { chapter_num: number; title: string; word_count: number; content: string }
+  chapter: DirectorGeneratedChapter
   onCopy: () => void
   isDark: boolean
+  projectId?: string
 }) {
   const [copied, setCopied] = useState(false)
 
@@ -748,6 +864,18 @@ function ChapterCard({
     setTimeout(() => setCopied(false), 2000)
     onCopy()
   }
+
+  const links = chapter.chapter_id
+    ? [
+      { label: '正文', href: `/novel?chapter_id=${encodeURIComponent(chapter.chapter_id)}` },
+      { label: '对比', href: `/diff?left_chapter_id=${encodeURIComponent(chapter.chapter_id)}` },
+      { label: '评估', href: `/chapter-evaluator?chapter_id=${encodeURIComponent(chapter.chapter_id)}` },
+      { label: '读者', href: `/simulator?chapter_id=${encodeURIComponent(chapter.chapter_id)}` },
+      { label: '状态', href: `/state-changes?chapter_id=${encodeURIComponent(chapter.chapter_id)}&status=proposed` },
+    ]
+    : []
+  const diagnosticsHref = getFailureDiagnosticsHref(projectId, chapter.execution_id)
+  const isFailed = chapter.status === 'failed'
 
   return (
     <details className={`group rounded-lg border ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
@@ -766,6 +894,22 @@ function ChapterCard({
           <span className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
             {chapter.word_count.toLocaleString()} 字
           </span>
+          {chapter.status && (
+            <span className={`text-xs px-2 py-0.5 rounded-full ${chapter.status === 'saved'
+              ? isDark ? 'bg-green-900/40 text-green-300' : 'bg-green-100 text-green-700'
+              : isDark ? 'bg-gray-800 text-gray-400' : 'bg-gray-100 text-gray-500'
+            }`}>
+              {chapter.status === 'saved' ? '已保存' : chapter.status === 'failed' ? '失败' : '已生成'}
+            </span>
+          )}
+          {chapter.quality_gate_status && (
+            <span className={`text-xs px-2 py-0.5 rounded-full ${chapter.quality_gate_passed
+              ? isDark ? 'bg-emerald-900/40 text-emerald-300' : 'bg-emerald-100 text-emerald-700'
+              : isDark ? 'bg-amber-900/40 text-amber-300' : 'bg-amber-100 text-amber-700'
+            }`}>
+              质量门 {chapter.quality_gate_status}{typeof chapter.quality_gate_score === 'number' ? ` · ${chapter.quality_gate_score}` : ''}
+            </span>
+          )}
         </div>
         <button
           onClick={(e) => { e.stopPropagation(); handleCopy() }}
@@ -777,10 +921,48 @@ function ChapterCard({
         </button>
       </summary>
       <div className={`px-4 pb-4 ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
+        {isFailed && diagnosticsHref && (
+          <div className={`mb-3 rounded-lg border px-3 py-2 text-xs ${isDark ? 'border-red-800 bg-red-950/30 text-red-200' : 'border-red-200 bg-red-50 text-red-700'}`}>
+            保存或生成失败。请从诊断入口查看失败节点、原因和恢复操作，Director 不内嵌修复面板。
+          </div>
+        )}
+        {(chapter.quality_gate_status || typeof chapter.quality_gate_attempts === 'number' || typeof chapter.revision_attempts === 'number') && (
+          <div className={`mb-3 rounded-lg border px-3 py-2 text-xs ${isDark ? 'border-emerald-900/60 bg-emerald-950/20 text-emerald-200' : 'border-emerald-200 bg-emerald-50 text-emerald-700'}`}>
+            质量门：{chapter.quality_gate_status || '-'}
+            {typeof chapter.quality_gate_score === 'number' ? ` · 分数 ${chapter.quality_gate_score}` : ''}
+            {typeof chapter.quality_gate_attempts === 'number' ? ` · 尝试 ${chapter.quality_gate_attempts}` : ''}
+            {typeof chapter.revision_attempts === 'number' ? ` · 修订 ${chapter.revision_attempts}` : ''}
+          </div>
+        )}
+        {(links.length > 0 || diagnosticsHref) && (
+          <div className="flex flex-wrap gap-2 mb-3">
+            {links.map((link) => (
+              <a
+                key={link.label}
+                href={link.href}
+                className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium ${
+                  isDark ? 'bg-gray-800 text-blue-300 hover:bg-gray-700' : 'bg-blue-50 text-blue-700 hover:bg-blue-100'
+                }`}
+              >
+                {link.label}<ExternalLink size={12} />
+              </a>
+            ))}
+            {diagnosticsHref && (
+              <a
+                href={diagnosticsHref}
+                className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium ${
+                  isDark ? 'bg-gray-800 text-amber-300 hover:bg-gray-700' : 'bg-amber-50 text-amber-700 hover:bg-amber-100'
+                }`}
+              >
+                {isFailed ? '诊断/修复' : '诊断'}<ExternalLink size={12} />
+              </a>
+            )}
+          </div>
+        )}
         <div className={`p-4 rounded-lg max-h-64 overflow-y-auto text-sm leading-relaxed whitespace-pre-wrap ${
           isDark ? 'bg-gray-800/50' : 'bg-gray-50'
         }`}>
-          {chapter.content}
+          {chapter.content || '章节已保存，可通过上方链接进入正文页面查看完整内容。'}
         </div>
       </div>
     </details>
@@ -828,6 +1010,9 @@ export default function Director() {
   const [selectedWorkflowId, setSelectedWorkflowId] = useState('')
   const [executionId, setExecutionId] = useState('')
   const [isExecutionStreamReady, setIsExecutionStreamReady] = useState(false)
+  const [operationSummary, setOperationSummary] = useState<WorkflowOperationSummary | null>(null)
+  const [operationEvents, setOperationEvents] = useState<WorkflowOperationEvent[]>([])
+  const [operationBusy, setOperationBusy] = useState<string | null>(null)
   const pendingSnapshotRef = useRef<{ execution: WorkflowExecution; workflow: WorkflowDefinition | null } | null>(null)
 
   const selectedWorkflow = useMemo(
@@ -839,6 +1024,29 @@ export default function Director() {
   useEffect(() => {
     selectedWorkflowRef.current = selectedWorkflow
   }, [selectedWorkflow])
+
+  const stateHandoffSummary = useMemo(() => {
+    const handoffEvents = operationEvents.filter(event => [
+      'chapter_state_writeback_proposed',
+      'chapter_state_writeback_applied',
+      'chapter_state_writeback_failed',
+      'chapter_state_handoff_loaded',
+    ].includes(event.event_type))
+    if (!handoffEvents.length) return null
+    return handoffEvents.reduce(
+      (acc, event) => {
+        const data = event.data || {}
+        acc.proposed = Math.max(acc.proposed, Number(data.proposed_count || 0))
+        acc.applied = Math.max(acc.applied, Number(data.applied_count || 0))
+        acc.pending = Math.max(acc.pending, Number(data.pending_count || 0))
+        acc.errors = Math.max(acc.errors, Number(data.error_count || 0))
+        acc.prior = Math.max(acc.prior, Number(data.prior_chapter_count || 0))
+        acc.confirmed = Math.max(acc.confirmed, Number(data.confirmed_state_count || 0))
+        return acc
+      },
+      { proposed: 0, applied: 0, pending: 0, errors: 0, prior: 0, confirmed: 0 },
+    )
+  }, [operationEvents])
 
   // 检查当前选中的工作流是否包含 group_discussion 节点
   const hasGroupDiscussionNode = useMemo(() => {
@@ -862,12 +1070,7 @@ export default function Director() {
 
   // Auto mode state
   const [autoModeRunning, setAutoModeRunning] = useState(false)
-  const [autoModeChapters, setAutoModeChapters] = useState<Array<{
-    chapter_num: number
-    title: string
-    word_count: number
-    content: string
-  }>>([])
+  const [autoModeChapters, setAutoModeChapters] = useState<DirectorGeneratedChapter[]>([])
   const [showAutoModeModal, setShowAutoModeModal] = useState(false)
   const [autoModeForm, setAutoModeForm] = useState({
     chapter_count: 3,
@@ -877,7 +1080,10 @@ export default function Director() {
   const [chapterOutlines, setChapterOutlines] = useState<ChapterOutline[]>([])
   const [outlineResourceRequirementsByKey, setOutlineResourceRequirementsByKey] = useState<Record<string, OutlineResourceRequirement[]>>({})
   const [outlineReadinessByKey, setOutlineReadinessByKey] = useState<Record<string, ChapterResourceReadiness>>({})
+  const [resourceRequirementRefreshMessage, setResourceRequirementRefreshMessage] = useState('')
   const [outlinesLoading, setOutlinesLoading] = useState(false)
+  const [outlineRefreshNonce, setOutlineRefreshNonce] = useState(0)
+  const [runtimeRefreshNonce, setRuntimeRefreshNonce] = useState(0)
   const [selectedSingleOutlineId, setSelectedSingleOutlineId] = useState('')
   const [selectedAutoOutlineIds, setSelectedAutoOutlineIds] = useState<string[]>([])
   const [autoOutlineMode, setAutoOutlineMode] = useState<AutoOutlineMode>('selected')
@@ -904,6 +1110,7 @@ export default function Director() {
   const [chapterForm, setChapterForm] = useState({
     targetWordCount: 2000,
   })
+  const [singleChapterGateDetail, setSingleChapterGateDetail] = useState<ChapterReadinessGateDetail | null>(null)
 
   // Discussion state
   const [groupDiscussion, setGroupDiscussion] = useState<{
@@ -965,6 +1172,25 @@ export default function Director() {
     setLogs(prev => [`[${timestamp}] ${message}`, ...prev.slice(0, 199)])
   }, [])
 
+  const refreshWorkflowOperations = useCallback(async (targetExecutionId = executionId) => {
+    if (!targetExecutionId) {
+      setOperationSummary(null)
+      setOperationEvents([])
+      return
+    }
+
+    try {
+      const [summary, events] = await Promise.all([
+        getExecutionOperationSummary(targetExecutionId),
+        getExecutionOperationEvents(targetExecutionId, 8),
+      ])
+      setOperationSummary(summary)
+      setOperationEvents(events)
+    } catch (error) {
+      console.error('Failed to refresh workflow operations:', error)
+    }
+  }, [executionId])
+
   const updateAgentFromNode = useCallback((
     data: { agent?: string; agent_type?: string; label?: string; node_type?: string; node_id?: string },
     patch: Partial<AgentStatus>,
@@ -987,6 +1213,30 @@ export default function Director() {
     if (!execution) return
 
     setExecutionId(execution.id)
+    if (execution.operation_summary) {
+      setOperationSummary(execution.operation_summary)
+    }
+
+    const savedPayload = execution.context?.chapter_saved_payload
+    const hasFinalSavedChapter = execution.context?.chapter_saved === true || savedPayload?.status === 'saved'
+    if (hasFinalSavedChapter) {
+      const savedChapter = getDirectorChapterFromPayload(savedPayload || execution.context, {
+        execution_id: execution.id,
+        workflow_id: execution.workflow_id,
+        project_id: execution.project_id,
+        chapter_id: execution.context?.chapter_id,
+        chapter_outline_id: execution.context?.chapter_outline_id,
+        content_storage: execution.context?.chapter_content_storage,
+        content_path: execution.context?.chapter_content_path,
+        content_size_bytes: execution.context?.chapter_content_size_bytes,
+        content_checksum: execution.context?.chapter_content_checksum,
+        status: 'saved',
+        saved_at: execution.context?.chapter_saved_at,
+      })
+      if (savedChapter && savedChapter.chapter_id) {
+        setAutoModeChapters(prev => upsertDirectorChapter(prev, savedChapter))
+      }
+    }
 
     const pendingInput = execution.status === 'paused'
       ? execution.context?.pending_user_input
@@ -1070,6 +1320,7 @@ export default function Director() {
         }
         addLog('🚀 工作流已启动')
         setIsGenerating(true)
+        void refreshWorkflowOperations(nextExecutionId || executionId)
         return true
       }
       case 'workflow_completed': {
@@ -1077,6 +1328,7 @@ export default function Director() {
         setIsGenerating(false)
         setPendingUserInput(null)
         setWorkflowUserInput('')
+        void refreshWorkflowOperations(getExecutionIdFromPayload(payload) || executionId)
         return true
       }
       case 'workflow_start_blocked': {
@@ -1089,8 +1341,12 @@ export default function Director() {
         return true
       }
       case 'workflow_failed': {
-        addLog(`❌ 工作流执行失败: ${getGatePayloadMessage(eventData) || eventData?.error || '未知错误'}`)
+        const failedExecutionId = getExecutionIdFromPayload(payload) || executionId
+        const failedNodeId = eventData?.failed_node_id || eventData?.node_id || eventData?.current_node || eventData?.failed_node?.id
+        const diagnosticsHref = getFailureDiagnosticsHref(currentProject?.id, failedExecutionId, failedNodeId)
+        addLog(`❌ 工作流执行失败: ${getGatePayloadMessage(eventData) || eventData?.error || '未知错误'}${diagnosticsHref ? `；诊断/修复: ${diagnosticsHref}` : ''}`)
         setIsGenerating(false)
+        void refreshWorkflowOperations(failedExecutionId)
         return true
       }
       case 'workflow_paused': {
@@ -1102,16 +1358,50 @@ export default function Director() {
         } else {
           addLog('⏸️ 工作流已暂停')
         }
+        void refreshWorkflowOperations(getExecutionIdFromPayload(payload) || executionId)
         return true
       }
       case 'workflow_resumed': {
         addLog('▶️ 工作流已恢复')
         setIsGenerating(true)
+        void refreshWorkflowOperations(getExecutionIdFromPayload(payload) || executionId)
         return true
       }
       case 'workflow_cancelled': {
         addLog('🛑 工作流已取消')
         setIsGenerating(false)
+        void refreshWorkflowOperations(getExecutionIdFromPayload(payload) || executionId)
+        return true
+      }
+      case 'chapter_saved': {
+        const savedChapter = getDirectorChapterFromPayload(eventData, {
+          execution_id: getExecutionIdFromPayload(payload) || executionId,
+          workflow_id: selectedWorkflowId,
+          project_id: currentProject?.id,
+          status: 'saved',
+        })
+        if (savedChapter) {
+          setAutoModeChapters(prev => upsertDirectorChapter(prev, savedChapter))
+          addLog(`💾 章节已保存并可交接: ${savedChapter.title}${savedChapter.chapter_id ? ` (${savedChapter.chapter_id})` : ''}`)
+          setRuntimeRefreshNonce(value => value + 1)
+          setOutlineRefreshNonce(value => value + 1)
+          void refreshWorkflowOperations(savedChapter.execution_id || executionId)
+        }
+        return true
+      }
+      case 'chapter_save_failed': {
+        const failedChapter = getDirectorChapterFromPayload(eventData, {
+          execution_id: getExecutionIdFromPayload(payload) || executionId,
+          workflow_id: selectedWorkflowId,
+          project_id: currentProject?.id,
+          status: 'failed',
+        })
+        if (failedChapter) {
+          setAutoModeChapters(prev => upsertDirectorChapter(prev, { ...failedChapter, status: 'failed' }))
+        }
+        addLog(`❌ 章节保存失败: ${eventData?.title || failedChapter?.title || '未知章节'}${eventData?.error ? ` — ${eventData.error}` : ''}`)
+        setRuntimeRefreshNonce(value => value + 1)
+        void refreshWorkflowOperations(eventData?.execution_id || executionId)
         return true
       }
       case 'agent_status': {
@@ -1214,14 +1504,17 @@ export default function Director() {
         }
         return true
       }
+      case 'node_failed':
       case 'node_completed': {
         const displayName = getNodeDisplayName(eventData)
         const nodeKey = getAgentStateKey(eventData)
         const outputText = extractNodeOutputText(eventData.output_data ?? eventData.output)
 
-        if (eventData.status === 'failed' || eventData.error) {
+        if (eventType === 'node_failed' || eventData.status === 'failed' || eventData.error) {
           const message = getGatePayloadMessage(eventData) || eventData.error || '未知错误'
-          addLog(`❌ ${displayName} 执行失败: ${message}`)
+          const nodeId = eventData?.node_id || eventData?.id
+          const diagnosticsHref = getFailureDiagnosticsHref(currentProject?.id, getExecutionIdFromPayload(payload) || executionId, nodeId)
+          addLog(`❌ ${displayName} 执行失败: ${message}${diagnosticsHref ? `；诊断/修复: ${diagnosticsHref}` : ''}`)
           updateAgentFromNode(eventData, { status: 'error', message })
         } else {
           addLog(`✅ ${displayName} 完成`)
@@ -1319,6 +1612,9 @@ export default function Director() {
     applyWorkflowExecutionSnapshot,
     clearAgentStreaming,
     getGatePayloadMessage,
+    executionId,
+    refreshWorkflowOperations,
+    selectedWorkflowId,
     setAgentOutput,
     updateAgentFromNode,
     updateAgentStatus,
@@ -1385,15 +1681,14 @@ export default function Director() {
           case 'auto_mode_chapter_start':
             addLog(`📖 开始写作第 ${data.chapter_num} 章: ${data.title}`)
             break
-          case 'auto_mode_chapter_completed':
+          case 'auto_mode_chapter_completed': {
             addLog(`✅ 第 ${data.chapter_num} 章完成: ${data.title} (${data.word_count} 字)`)
-            setAutoModeChapters(prev => [...prev, {
-              chapter_num: data.chapter_num,
-              title: data.title,
-              word_count: data.word_count,
-              content: data.content,
-            }])
+            const chapter = getDirectorChapterFromPayload(data, { status: data.chapter_id ? 'saved' : 'generated' })
+            if (chapter) {
+              setAutoModeChapters(prev => upsertDirectorChapter(prev, chapter))
+            }
             break
+          }
           case 'auto_mode_completed':
             setAutoModeRunning(false)
             addLog(`🎉 连续创作完成！共 ${data.data?.total_chapters} 章，${data.data?.total_words} 字`)
@@ -1423,12 +1718,15 @@ export default function Director() {
           case 'auto_write_chapter_result':
             if (data.status === 'success') {
               addLog(`✅ 章节生成完成: ${data.data?.title} (${data.data?.word_count} 字)`)
-              setAutoModeChapters(prev => [...prev, {
-                chapter_num: data.data?.chapter_num || prev.length + 1,
-                title: data.data?.title || '',
-                word_count: data.data?.word_count || 0,
-                content: data.data?.content || '',
-              }])
+              const chapter = getDirectorChapterFromPayload(data.data, {
+                chapter_num: autoModeChapters.length + 1,
+                execution_id: executionId,
+                workflow_id: selectedWorkflowId,
+                status: data.data?.chapter_id ? 'saved' : 'generated',
+              })
+              if (chapter) {
+                setAutoModeChapters(prev => upsertDirectorChapter(prev, chapter))
+              }
               loadRuntimePanels()
             } else if (data.status === 'blocked') {
               setIsGenerating(false)
@@ -1533,7 +1831,7 @@ export default function Director() {
       const result = await getOutlines(currentProject.id)
       const sorted = [...result.outlines].sort((a, b) => a.chapter_number - b.chapter_number)
       const [requirementsResult, readinessResult] = await Promise.all([
-        getOutlineResourceRequirements(currentProject.id),
+        getOutlineResourceRequirements(currentProject.id, { cache: { forceRefresh: true } }),
         getChapterResourceReadiness(currentProject.id, { refresh: true }),
       ])
       const nextRequirementsByKey: Record<string, OutlineResourceRequirement[]> = {}
@@ -1623,6 +1921,109 @@ export default function Director() {
       : `第 ${outline.chapter_number} 章资源未就绪，请先刷新资源 readiness。`
   }, [getOutlineBlockingRequirements, getOutlineReadiness])
 
+  const selectedSingleOutlineBlockMessage = useMemo(
+    () => getOutlineReadinessBlockMessage(selectedSingleOutline),
+    [getOutlineReadinessBlockMessage, selectedSingleOutline],
+  )
+
+  const selectedAutoOutlineBlockMessage = useMemo(() => {
+    if (autoOutlineMode === 'selected') {
+      const blockedOutline = selectedAutoOutlines.find(outline => getOutlineReadinessBlockMessage(outline))
+      return blockedOutline ? getOutlineReadinessBlockMessage(blockedOutline) : ''
+    }
+    return getOutlineReadinessBlockMessage(selectedAutoStartOutline)
+  }, [autoOutlineMode, getOutlineReadinessBlockMessage, selectedAutoOutlines, selectedAutoStartOutline])
+
+  const autoModeStartDisabledReason = useMemo(() => {
+    if (outlinesLoading) return '章节大纲正在加载中，请稍候。'
+    if (autoOutlineMode === 'selected') {
+      if (selectedAutoOutlines.length === 0) return '请至少选择一个已审批章节大纲。'
+      if (selectedAutoOutlines.some(outline => !isOutlineWritable(outline))) return '连续创作只能选择已审批章节大纲。'
+      return selectedAutoOutlineBlockMessage
+    }
+    if (!selectedAutoStartOutline || !isOutlineWritable(selectedAutoStartOutline)) return '请选择已审批的起始章节大纲。'
+    return selectedAutoOutlineBlockMessage
+  }, [autoOutlineMode, outlinesLoading, selectedAutoOutlineBlockMessage, selectedAutoOutlines, selectedAutoStartOutline])
+
+  const handleResourceRequirementRefresh = useCallback(async () => {
+    setResourceRequirementRefreshMessage('正在刷新资源需求和 readiness...')
+    try {
+      await loadChapterOutlines()
+      setSingleChapterGateDetail(null)
+      setResourceRequirementRefreshMessage('资源需求和 readiness 已刷新。')
+      addLog('🔄 已刷新章节资源需求和 readiness')
+    } catch (error) {
+      console.error('Failed to refresh resource requirements:', error)
+      setResourceRequirementRefreshMessage('刷新失败，请稍后重试。')
+    }
+  }, [addLog, loadChapterOutlines])
+
+  const renderRequirementActionLink = useCallback((requirement: OutlineResourceRequirement) => {
+    const recoveryPath = getRequirementRecoveryPath(requirement)
+    const projectId = requirement.project_id || currentProject?.id || ''
+    return (
+      <Link
+        key={requirement.id}
+        to={`${recoveryPath}${recoveryPath.includes('?') ? '&' : '?'}project_id=${encodeURIComponent(projectId)}`}
+        className={`block rounded-lg border px-3 py-2 text-xs transition-colors ${isDark ? 'border-gray-700 bg-gray-900 hover:bg-gray-800 text-gray-200' : 'border-gray-200 bg-white hover:bg-gray-50 text-gray-700'}`}
+      >
+        <div className="flex items-center justify-between gap-2">
+          <span className="font-medium">{formatRequirementSummary(requirement)}</span>
+          <ExternalLink className="h-3 w-3 shrink-0" />
+        </div>
+        <div className={`mt-1 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+          {getRequirementRecoveryActionLabel(requirement)} · {getRequirementTypeLabel(getRequirementTargetType(requirement))}
+        </div>
+      </Link>
+    )
+  }, [currentProject, isDark])
+
+  const renderResourceRequirementWorkbench = useCallback((outline?: ChapterOutline | null, compact = false, gateDetail?: ChapterReadinessGateDetail | null) => {
+    if (!outline) return null
+    const gateRequirements = [
+      ...(gateDetail?.blocking_requirements || []),
+      ...(gateDetail?.advisory_requirements || []),
+    ] as OutlineResourceRequirement[]
+    const requirements = gateRequirements.length > 0 ? gateRequirements : getOutlineRequirements(outline)
+    const unresolvedStatuses = new Set(['pending', 'in_progress'])
+    const unresolved = requirements.filter(requirement => unresolvedStatuses.has(requirement.status || 'pending'))
+    const blocking = unresolved.filter(requirement => requirement.severity === 'blocking')
+    const advisory = unresolved.filter(requirement => requirement.severity === 'advisory')
+    if (unresolved.length === 0) return null
+
+    return (
+      <div className={`mt-3 rounded-xl border p-3 ${blocking.length > 0 ? (isDark ? 'border-red-800 bg-red-950/20' : 'border-red-200 bg-red-50') : (isDark ? 'border-amber-800 bg-amber-950/20' : 'border-amber-200 bg-amber-50')}`}>
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <div className={`flex items-center gap-2 text-sm font-semibold ${blocking.length > 0 ? (isDark ? 'text-red-200' : 'text-red-800') : (isDark ? 'text-amber-200' : 'text-amber-800')}`}>
+              <AlertTriangle className="h-4 w-4" />
+              资源补齐闭环
+            </div>
+            <p className={`mt-1 text-xs ${isDark ? 'text-gray-300' : 'text-gray-600'}`}>
+              {blocking.length > 0
+                ? '阻塞资源未解决前不会启动章节生成；请创建、绑定、忽略或人工标记解决后刷新 readiness。'
+                : '存在建议补齐资源；可先处理，也可在确认风险后继续。'}
+            </p>
+          </div>
+          <Button size="sm" variant="secondary" loading={outlinesLoading} onClick={handleResourceRequirementRefresh}>
+            <RefreshCw className="mr-1 h-3 w-3" />刷新 readiness
+          </Button>
+        </div>
+
+        <div className="mt-3 grid gap-2">
+          {(compact ? unresolved.slice(0, 3) : unresolved).map(renderRequirementActionLink)}
+        </div>
+        {compact && unresolved.length > 3 && (
+          <p className={`mt-2 text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>还有 {unresolved.length - 3} 项资源需求，请打开单章生成面板查看完整列表。</p>
+        )}
+        <p className={`mt-2 text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
+          当前未解决：blocking {blocking.length} · advisory {advisory.length}
+          {resourceRequirementRefreshMessage ? ` · ${resourceRequirementRefreshMessage}` : ''}
+        </p>
+      </div>
+    )
+  }, [getOutlineRequirements, handleResourceRequirementRefresh, isDark, outlinesLoading, renderRequirementActionLink, resourceRequirementRefreshMessage])
+
   const renderOutlineReadiness = useCallback((outline?: ChapterOutline | null, compact = false) => {
     if (!outline) return null
     const readiness = getOutlineReadiness(outline)
@@ -1665,6 +2066,7 @@ export default function Director() {
   }, [getOutlineReadiness, getOutlineRequirements, isDark])
 
   const openWriteChapterModal = () => {
+    setSingleChapterGateDetail(null)
     void loadChapterOutlines()
     setShowWriteChapterModal(true)
   }
@@ -1676,8 +2078,8 @@ export default function Director() {
 
   useEffect(() => { loadCharacters() }, [currentProject])
   useEffect(() => { loadWorkflows() }, [loadWorkflows])
-  useEffect(() => { loadChapterOutlines() }, [loadChapterOutlines])
-  useEffect(() => { if (sessionId.trim()) loadRuntimePanels() }, [sessionId])
+  useEffect(() => { loadChapterOutlines() }, [loadChapterOutlines, outlineRefreshNonce])
+  useEffect(() => { if (sessionId.trim()) loadRuntimePanels() }, [sessionId, runtimeRefreshNonce])
 
   useEffect(() => {
     if (!currentProject || !selectedWorkflowId || !sessionId.trim()) return
@@ -1758,6 +2160,8 @@ export default function Director() {
   useEffect(() => {
     if (!executionId) {
       setIsExecutionStreamReady(false)
+      setOperationSummary(null)
+      setOperationEvents([])
       return
     }
 
@@ -1769,6 +2173,7 @@ export default function Director() {
         const execution = await getExecution(executionId)
         if (!active) return false
         applyWorkflowExecutionSnapshot(execution, selectedWorkflowRef.current)
+        void refreshWorkflowOperations(execution.id)
         return true
       } catch (error) {
         if (!active) return false
@@ -1820,7 +2225,7 @@ export default function Director() {
         eventSource.close()
       }
     }
-  }, [addLog, applyDirectorEvent, applyWorkflowExecutionSnapshot, executionId])
+  }, [addLog, applyDirectorEvent, applyWorkflowExecutionSnapshot, executionId, refreshWorkflowOperations])
 
   // 当 WebSocket 连接成功后，发送 start_session
   useEffect(() => {
@@ -1882,6 +2287,8 @@ export default function Director() {
     setSnapshotTree([])
     setAutoModeChapters([])
     setExecutionId('')
+    setOperationSummary(null)
+    setOperationEvents([])
     if (currentProject) {
       localStorage.removeItem(getDirectorStorageKey(currentProject.id, 'execution', sessionId.trim()))
     }
@@ -2010,27 +2417,79 @@ export default function Director() {
     addLog(`📨 已提交用户输入：${pendingUserInput.label || '用户输入'}`)
   }
 
-  const handleWriteChapter = () => {
+  const handleWorkflowOperation = async (
+    operation: 'pause' | 'resume' | 'cancel' | 'recover',
+    action: () => Promise<{ execution?: WorkflowExecution | null; status?: string; message?: string; success?: boolean }>,
+  ) => {
+    if (!executionId) return addLog('当前没有可操作的工作流执行')
+    setOperationBusy(operation)
+    try {
+      const result = await action()
+      if (result.execution) {
+        applyWorkflowExecutionSnapshot(result.execution, selectedWorkflowRef.current)
+      } else if (result.status) {
+        const execution = await getExecution(executionId)
+        applyWorkflowExecutionSnapshot(execution, selectedWorkflowRef.current)
+      }
+      addLog(`✅ ${result.message || '操作已提交'}`)
+      void refreshWorkflowOperations(executionId)
+    } catch (error) {
+      addLog(`❌ 操作失败: ${formatApiErrorMessage(error, '操作失败')}`)
+    } finally {
+      setOperationBusy(null)
+    }
+  }
+
+  const handleWriteChapter = async () => {
     if (!selectedWorkflowId) return addLog('请先选择工作流')
     if (!currentProject) return addLog('请先选择项目')
+    if (!sessionId.trim()) return addLog('请先启动或输入导演会话 ID')
     if (!selectedSingleOutline || !isOutlineWritable(selectedSingleOutline)) return addLog('请选择已审批章节大纲')
-    const blockMessage = getOutlineReadinessBlockMessage(selectedSingleOutline)
-    if (blockMessage) return addLog(`⛔ ${blockMessage}`)
+    if (selectedSingleOutlineBlockMessage) return addLog(`⛔ ${selectedSingleOutlineBlockMessage}`)
 
-    send({
-      type: 'auto_write_chapter',
-      workflow_id: selectedWorkflowId,
-      project_id: currentProject.id,
+    const normalizedSessionId = sessionId.trim()
+    const targetWordCount = chapterForm.targetWordCount || selectedSingleOutline.target_word_count
+    const requestId = `director:${currentProject.id}:${selectedWorkflowId}:${normalizedSessionId}:${selectedSingleOutline.id}`
+    const initialContext: Record<string, any> = {
+      director_session_id: normalizedSessionId,
       chapter_outline_id: selectedSingleOutline.id,
       chapter_outline: selectedSingleOutline,
-      director_session_id: sessionId.trim(),
       chapter_num: selectedSingleOutline.chapter_number,
-      target_word_count: chapterForm.targetWordCount || selectedSingleOutline.target_word_count,
-    })
-    addLog(`📝 开始根据大纲生成章节: 第 ${selectedSingleOutline.chapter_number} 章《${selectedSingleOutline.title}》`)
-    setSelectedSingleOutlineId('')
-    setChapterForm({ targetWordCount: 2000 })
-    setShowWriteChapterModal(false)
+      chapter_title: selectedSingleOutline.title,
+      target_word_count: targetWordCount,
+    }
+    if (autoModeForm.style_reference.trim()) {
+      initialContext.style_reference = autoModeForm.style_reference.trim()
+    }
+
+    setSingleChapterGateDetail(null)
+    setOperationBusy('start')
+    try {
+      const result = await executeWorkflow(selectedWorkflowId, currentProject.id, initialContext, { requestId })
+      setExecutionId(result.execution_id)
+      localStorage.setItem(getDirectorStorageKey(currentProject.id, 'execution', normalizedSessionId), result.execution_id)
+      setIsGenerating(true)
+      addLog(`${result.deduplicated ? '♻️ 复用' : '📝 开始'}章节工作流: 第 ${selectedSingleOutline.chapter_number} 章《${selectedSingleOutline.title}》`)
+      void refreshWorkflowOperations(result.execution_id)
+      setSelectedSingleOutlineId('')
+      setChapterForm({ targetWordCount: 2000 })
+      setShowWriteChapterModal(false)
+    } catch (error) {
+      const detail = extractChapterReadinessGateDetail(error)
+      if (detail) {
+        setSingleChapterGateDetail(detail)
+        setOutlineRefreshNonce(value => value + 1)
+        addLog(`⛔ ${formatChapterReadinessGateMessage(
+          detail,
+          requirements => formatRequirementList(requirements as OutlineResourceRequirement[], 5),
+        )}`)
+      } else {
+        addLog(`❌ 章节工作流启动失败: ${formatApiErrorMessage(error, '启动失败')}`)
+      }
+      setIsGenerating(false)
+    } finally {
+      setOperationBusy(null)
+    }
   }
 
   // Header actions
@@ -2330,6 +2789,7 @@ export default function Director() {
                         chapter={chapter}
                         onCopy={() => addLog(`已复制: ${chapter.title}`)}
                         isDark={isDark}
+                        projectId={currentProject.id}
                       />
                     ))}
                   </div>
@@ -2352,6 +2812,92 @@ export default function Director() {
                 </p>
               </div>
             </Card>
+
+            {executionId && (
+              <Card>
+                <div className="p-4 space-y-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <h3 className={`text-sm font-semibold ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>工作流运行</h3>
+                      <p className={`text-xs mt-1 ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+                        {operationSummary?.status || '同步中'} · {isExecutionStreamReady ? 'SSE 已连接' : 'SSE 连接中'}
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => void refreshWorkflowOperations(executionId)}
+                      className={`p-2 rounded-lg ${isDark ? 'hover:bg-gray-800 text-gray-400' : 'hover:bg-gray-100 text-gray-500'}`}
+                      title="刷新运行状态"
+                    >
+                      <RefreshCw size={15} />
+                    </button>
+                  </div>
+                  {operationSummary?.attention?.[0] && (
+                    <p className={`text-xs rounded-lg px-3 py-2 ${isDark ? 'bg-amber-950/30 text-amber-300' : 'bg-amber-50 text-amber-700'}`}>
+                      {operationSummary.attention[0].message}
+                    </p>
+                  )}
+                  <div className="grid grid-cols-2 gap-2">
+                    {[
+                      { key: 'pause' as const, icon: Pause, label: '暂停', run: () => pauseExecution(executionId) },
+                      { key: 'resume' as const, icon: Play, label: '恢复', run: () => resumeExecution(executionId) },
+                      { key: 'cancel' as const, icon: Square, label: '取消', run: () => cancelExecution(executionId) },
+                      { key: 'recover' as const, icon: RotateCcw, label: '恢复失败点', run: () => recoverExecution(executionId, { reason: 'Director run control recovery' }) },
+                    ].map(({ key, icon: Icon, label, run }) => {
+                      const capability = operationSummary?.capabilities?.[key]
+                      const disabled = operationBusy !== null || !capability?.allowed
+                      return (
+                        <button
+                          key={key}
+                          onClick={() => void handleWorkflowOperation(key, run)}
+                          disabled={disabled}
+                          title={capability?.reason || label}
+                          className={`flex items-center justify-center gap-2 px-3 py-2 rounded-lg border text-xs font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+                            isDark ? 'bg-gray-800 hover:bg-gray-700 text-gray-300 border-gray-700' : 'bg-white hover:bg-gray-50 text-gray-700 border-gray-200'
+                          }`}
+                        >
+                          <Icon size={14} /> {operationBusy === key ? '处理中' : label}
+                        </button>
+                      )
+                    })}
+                  </div>
+                  {operationSummary?.capabilities?.recover?.reason && !operationSummary.capabilities.recover.allowed && (
+                    <p className={`text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>{operationSummary.capabilities.recover.reason}</p>
+                  )}
+                  {stateHandoffSummary && (
+                    <div className={`rounded-xl border px-3 py-2 text-xs ${isDark ? 'border-cyan-900/60 bg-cyan-950/20 text-cyan-200' : 'border-cyan-200 bg-cyan-50 text-cyan-800'}`}>
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-semibold">状态交接</span>
+                        <span className={isDark ? 'text-cyan-300/80' : 'text-cyan-700/80'}>
+                          前文 {stateHandoffSummary.prior} · 确认 {stateHandoffSummary.confirmed}
+                        </span>
+                      </div>
+                      <div className="mt-1 flex flex-wrap gap-1.5">
+                        <span>已提案 {stateHandoffSummary.proposed}</span>
+                        <span>已应用 {stateHandoffSummary.applied}</span>
+                        <span>待确认 {stateHandoffSummary.pending}</span>
+                        <span className={stateHandoffSummary.errors > 0 ? 'text-red-400' : undefined}>错误 {stateHandoffSummary.errors}</span>
+                      </div>
+                    </div>
+                  )}
+                  <a
+                    href={getFailureDiagnosticsHref(currentProject.id, executionId)}
+                    className={`inline-flex items-center gap-1 text-xs font-medium ${isDark ? 'text-blue-300 hover:text-blue-200' : 'text-blue-600 hover:text-blue-700'}`}
+                  >
+                    打开工作流诊断 <ExternalLink size={12} />
+                  </a>
+                  {operationEvents.length > 0 && (
+                    <div className={`space-y-1 pt-2 border-t ${isDark ? 'border-gray-800' : 'border-gray-100'}`}>
+                      {operationEvents.slice(0, 3).map((event, index) => (
+                        <div key={`${event.sequence_no || index}-${event.event_type}`} className="flex items-start gap-2 text-xs">
+                          <Activity size={12} className={event.severity === 'error' ? 'text-red-400 mt-0.5' : 'text-gray-400 mt-0.5'} />
+                          <span className={isDark ? 'text-gray-400' : 'text-gray-500'}>{event.summary}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </Card>
+            )}
 
             {/* 快速操作 */}
             <Card>
@@ -2791,6 +3337,7 @@ export default function Director() {
                         <p className={`mt-1 line-clamp-2 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>{outline.summary || '暂无摘要'}</p>
                         <p className={`mt-1 text-xs ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>{outline.scenes.length} 个场景 · 目标 {outline.target_word_count} 字</p>
                         {renderOutlineReadiness(outline, true)}
+                        {checked && renderResourceRequirementWorkbench(outline, true)}
                       </div>
                     </label>
                   )
@@ -2815,6 +3362,7 @@ export default function Director() {
                     ))}
                   </select>
                   {selectedAutoStartOutline && renderOutlineReadiness(selectedAutoStartOutline)}
+                  {selectedAutoStartOutline && renderResourceRequirementWorkbench(selectedAutoStartOutline)}
                 </div>
                 <div>
                   <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>
@@ -2836,6 +3384,12 @@ export default function Director() {
             )}
           </div>
 
+          {selectedAutoOutlineBlockMessage && (
+            <div className={`rounded-lg border px-3 py-2 text-xs ${isDark ? 'border-red-800 bg-red-950/30 text-red-200' : 'border-red-200 bg-red-50 text-red-700'}`}>
+              {selectedAutoOutlineBlockMessage}
+            </div>
+          )}
+
           <TextArea
             label="风格参考（可选）"
             value={autoModeForm.style_reference}
@@ -2847,10 +3401,8 @@ export default function Director() {
             <Button variant="secondary" onClick={() => setShowAutoModeModal(false)}>取消</Button>
             <Button
               onClick={handleStartAutoMode}
-              disabled={
-                outlinesLoading ||
-                (autoOutlineMode === 'selected' ? selectedAutoOutlines.length === 0 : !isOutlineWritable(selectedAutoStartOutline))
-              }
+              disabled={!!autoModeStartDisabledReason}
+              title={autoModeStartDisabledReason || undefined}
             >
               <Play size={16} className="mr-1" /> 开始
             </Button>
@@ -2933,6 +3485,7 @@ export default function Director() {
                 <span>目标 {selectedSingleOutline.target_word_count} 字</span>
               </div>
               {renderOutlineReadiness(selectedSingleOutline)}
+              {renderResourceRequirementWorkbench(selectedSingleOutline)}
             </div>
           )}
 
@@ -2956,9 +3509,39 @@ export default function Director() {
             </p>
           </div>
 
+          {selectedSingleOutlineBlockMessage && (
+            <div className={`rounded-lg border px-3 py-2 text-xs ${isDark ? 'border-red-800 bg-red-950/30 text-red-200' : 'border-red-200 bg-red-50 text-red-700'}`}>
+              {selectedSingleOutlineBlockMessage}
+            </div>
+          )}
+
+          {singleChapterGateDetail && selectedSingleOutline && (
+            <div className={`rounded-xl border p-3 text-xs ${isDark ? 'border-red-800 bg-red-950/30 text-red-100' : 'border-red-200 bg-red-50 text-red-700'}`}>
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <p className="font-semibold">后端 readiness gate 已拒绝本次启动</p>
+                  <p className="mt-1">
+                    {formatChapterReadinessGateMessage(
+                      singleChapterGateDetail,
+                      requirements => formatRequirementList(requirements as OutlineResourceRequirement[], 5),
+                    )}
+                  </p>
+                </div>
+                <Button size="sm" variant="secondary" loading={outlinesLoading} onClick={handleResourceRequirementRefresh}>
+                  <RefreshCw className="mr-1 h-3 w-3" />刷新后重试
+                </Button>
+              </div>
+              {renderResourceRequirementWorkbench(selectedSingleOutline, false, singleChapterGateDetail)}
+            </div>
+          )}
+
           <div className="flex justify-end gap-3 pt-2">
             <Button variant="secondary" onClick={() => setShowWriteChapterModal(false)}>取消</Button>
-            <Button onClick={handleWriteChapter} disabled={outlinesLoading || !isOutlineWritable(selectedSingleOutline)}>
+            <Button
+              onClick={handleWriteChapter}
+              disabled={outlinesLoading || !isOutlineWritable(selectedSingleOutline) || !!selectedSingleOutlineBlockMessage}
+              title={selectedSingleOutlineBlockMessage || undefined}
+            >
               <FileText size={16} className="mr-1" /> 生成章节
             </Button>
           </div>

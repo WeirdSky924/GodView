@@ -46,6 +46,10 @@ import {
   isReadinessBlockedStatus,
   getExecution,
   getExecutionOperationEvents,
+  inspectExecutionStaleness,
+  resolveStaleExecution,
+  createRuntimeFixture,
+  cleanupRuntimeFixture,
   pauseExecution,
   resumeExecution,
   recoverExecution,
@@ -66,11 +70,12 @@ import {
   type WorkflowFailureDiagnosis,
   type WorkflowOperationSummary,
   type WorkflowOperationEvent,
+  type WorkflowStaleInspection,
 } from '@/api/workflows'
 import { getAgentTypeOptions, getWorkflowNodeTypes, type NodeTypeInfo, type WorkflowNodeTypes } from '@/api/nodeTypes'
 import WorkflowMonitor from '@/components/workflow/WorkflowMonitor'
 import WorkflowTrace from '@/components/workflow/WorkflowTrace'
-import { Network, Users, GitBranch, Play, Save, Trash2, Plus, Loader2, Pause, Square, RotateCcw, Orbit, Map } from 'lucide-react'
+import { Network, Users, GitBranch, Play, Save, Trash2, Plus, Loader2, Pause, Square, RotateCcw, Orbit, Map, FileClock, ShieldAlert } from 'lucide-react'
 import { useTheme } from '@/contexts/ThemeContext'
 import {
   formatRequirementList,
@@ -252,6 +257,29 @@ const formatExecutionDuration = (ms?: number | null) => {
   if (ms < 1000) return `${ms}ms`
   if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`
   return `${(ms / 60000).toFixed(1)}m`
+}
+
+const operationEventKey = (event: WorkflowOperationEvent, index: number) => `${event.sequence_no ?? 'no-seq'}:${event.event_type}:${event.created_at || index}`
+const operationEventCategory = (event: WorkflowOperationEvent) => {
+  if (event.event_type === 'workflow_node_remediated') return 'remediation'
+  if (event.event_type === 'workflow_recovery_started') return 'recovery'
+  if (event.event_type === 'workflow_execution_stale') return 'stale'
+  if (event.event_type === 'node_failed' || event.event_type === 'workflow_failed' || event.severity === 'error') return 'failure'
+  if (event.event_type.startsWith('node_')) return 'node'
+  return 'lifecycle'
+}
+const operationEventMatchesFilter = (event: WorkflowOperationEvent, filter: 'all' | 'lifecycle' | 'node' | 'failure' | 'recovery' | 'remediation' | 'stale') => {
+  if (filter === 'all') return true
+  return operationEventCategory(event) === filter
+}
+const formatEventPayloadValue = (value: any): string => {
+  if (value === null || value === undefined || value === '') return '-'
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value)
+  try {
+    return JSON.stringify(value, null, 2)
+  } catch {
+    return String(value)
+  }
 }
 
 const standardAllNodesDefinition = {
@@ -827,6 +855,16 @@ export default function Visualizer() {
   const [executionHistoryLoading, setExecutionHistoryLoading] = useState(false)
   const [executionHistoryError, setExecutionHistoryError] = useState<string | null>(null)
   const [executionHistoryStatusFilter, setExecutionHistoryStatusFilter] = useState<WorkflowStatus | 'all'>('all')
+  const [pendingUrlExecutionId, setPendingUrlExecutionId] = useState<string | null>(null)
+  const [executionAuditPanelOpen, setExecutionAuditPanelOpen] = useState(false)
+  const [operationEventFilter, setOperationEventFilter] = useState<'all' | 'lifecycle' | 'node' | 'failure' | 'recovery' | 'remediation' | 'stale'>('all')
+  const [selectedOperationEventKey, setSelectedOperationEventKey] = useState<string | null>(null)
+  const [staleInspection, setStaleInspection] = useState<WorkflowStaleInspection | null>(null)
+  const [staleInspectionLoading, setStaleInspectionLoading] = useState(false)
+  const [staleActionLoading, setStaleActionLoading] = useState(false)
+  const [runtimeFixtureLoading, setRuntimeFixtureLoading] = useState(false)
+  const [runtimeFixtureCleanupLoading, setRuntimeFixtureCleanupLoading] = useState(false)
+  const [runtimeFixture, setRuntimeFixture] = useState<{ executionId: string; workflowId: string; cleanupToken: string } | null>(null)
   const [rightWorkflowPanel, setRightWorkflowPanel] = useState<'monitor' | 'trace'>('monitor')
 
   useEffect(() => {
@@ -901,15 +939,17 @@ export default function Visualizer() {
     }
   }
 
-  const loadWorkflows = async () => {
-    if (!currentProject) return
+  const loadWorkflows = useCallback(async (): Promise<WorkflowDefinition[]> => {
+    if (!currentProject) return []
     try {
       const result = await getWorkflows(currentProject.id, true)
       setWorkflows(result)
+      return result
     } catch (error) {
       console.error('Failed to load workflows:', error)
+      return []
     }
-  }
+  }, [currentProject])
 
   const loadSceneData = async () => {
     if (!currentProject) return
@@ -983,16 +1023,23 @@ export default function Visualizer() {
     setRemediationScenario('')
     setWorkflowSseState('closed')
     setWorkflowSseMessage('')
+    setExecutionOperationEvents([])
+    setSelectedOperationEventKey(null)
+    setStaleInspection(null)
     clearExecutionProjection()
   }, [clearExecutionProjection])
 
-  const handleSelectWorkflow = (workflow: WorkflowDefinition) => {
+  const projectWorkflowFromDefinition = useCallback((workflow: WorkflowDefinition) => {
     const origin = getWorkflowOrigin(workflow)
     setSelectedWorkflow(origin === 'global_template' ? null : workflow)
     setWorkflowSelectionMode(origin)
     setWorkflowName(buildWorkflowDisplayName(workflow, origin))
     setNodes(workflowToCanvasNodes(workflow))
     setEdges(workflowToCanvasEdges(workflow))
+  }, [])
+
+  const handleSelectWorkflow = (workflow: WorkflowDefinition) => {
+    projectWorkflowFromDefinition(workflow)
     resetExecutionState()
   }
 
@@ -1091,14 +1138,21 @@ export default function Visualizer() {
   const loadOperationEvents = useCallback(async (executionId?: string | null) => {
     if (!executionId) {
       setExecutionOperationEvents([])
+      setSelectedOperationEventKey(null)
       return
     }
     try {
-      const events = await getExecutionOperationEvents(executionId, 40)
+      const events = await getExecutionOperationEvents(executionId, 80)
       setExecutionOperationEvents(events)
+      setSelectedOperationEventKey((current) => {
+        if (current && events.some((event, index) => operationEventKey(event, index) === current)) return current
+        const newest = [...events].reverse()[0]
+        return newest ? operationEventKey(newest, 0) : null
+      })
     } catch (error) {
       console.warn('Failed to load operation events:', error)
       setExecutionOperationEvents([])
+      setSelectedOperationEventKey(null)
     }
   }, [])
 
@@ -1125,7 +1179,7 @@ export default function Visualizer() {
 
   const reconcileExecution = useCallback(async (
     executionId: string,
-    options?: { openTrace?: boolean; updateUrl?: boolean; requireProject?: boolean; source?: string },
+    options?: { openTrace?: boolean; updateUrl?: boolean; requireProject?: boolean; source?: string; availableWorkflows?: WorkflowDefinition[] },
   ) => {
     if (!currentProject) return null
     setExecutionActionError(null)
@@ -1135,14 +1189,21 @@ export default function Visualizer() {
       if (options?.requireProject !== false && execution.project_id !== currentProject.id) {
         throw new Error(`执行 ${execution.id} 属于项目 ${execution.project_id}，不属于当前项目 ${currentProject.id}`)
       }
-      const workflow = workflows.find((item) => item.id === execution.workflow_id)
+      const workflowSource = options?.availableWorkflows?.length ? options.availableWorkflows : workflows
+      const workflow = workflowSource.find((item) => item.id === execution.workflow_id)
       if (!workflow) {
         throw new Error(`执行 ${execution.id} 对应的工作流 ${execution.workflow_id} 不在当前项目工作流列表中`)
       }
       if (workflow.id !== selectedWorkflow?.id) {
-        handleSelectWorkflow(workflow)
+        projectWorkflowFromDefinition(workflow)
       }
       applyExecutionState(execution)
+      if (execution.status === 'failed') {
+        setRightWorkflowPanel('trace')
+        setExecutionAuditPanelOpen(true)
+      } else if (isActiveExecutionStatus(execution.status)) {
+        setRightWorkflowPanel('monitor')
+      }
       localStorage.setItem(executionStorageKey(currentProject.id, workflow.id), execution.id)
       if (options?.updateUrl !== false) {
         const params = new URLSearchParams(window.location.search)
@@ -1152,6 +1213,7 @@ export default function Visualizer() {
       }
       if (options?.openTrace) setRightWorkflowPanel('trace')
       void loadOperationEvents(execution.id)
+      setStaleInspection(execution.operation_summary?.stale_inspection || null)
       return execution
     } catch (error) {
       console.error('Failed to reconcile execution:', error)
@@ -1161,7 +1223,7 @@ export default function Visualizer() {
       setExecutionOperationEvents([])
       return null
     }
-  }, [applyExecutionState, currentProject, loadOperationEvents, selectedWorkflow?.id, workflows])
+  }, [applyExecutionState, currentProject, loadOperationEvents, projectWorkflowFromDefinition, selectedWorkflow?.id, workflows])
 
   const inspectExecution = useCallback(async (executionId: string, options?: { openTrace?: boolean }) => {
     await reconcileExecution(executionId, { ...options, updateUrl: true, source: 'history' })
@@ -1252,16 +1314,36 @@ export default function Visualizer() {
   }
 
   useEffect(() => {
-    loadWorkflows()
+    void loadWorkflows()
+  }, [loadWorkflows])
+
+  useEffect(() => {
+    if (!currentProject) return
+    const params = new URLSearchParams(window.location.search)
+    const urlExecutionId = params.get('execution_id')
+    setPendingUrlExecutionId(urlExecutionId)
+    if (urlExecutionId) setActiveTab('workflow')
   }, [currentProject])
 
   useEffect(() => {
-    if (!currentProject || !workflows.length) return
-    const params = new URLSearchParams(window.location.search)
-    const urlExecutionId = params.get('execution_id')
-    if (!urlExecutionId || currentExecutionId === urlExecutionId) return
-    void reconcileExecution(urlExecutionId, { updateUrl: true, requireProject: true, source: 'url' })
-  }, [currentExecutionId, currentProject, reconcileExecution, workflows])
+    if (!currentProject || !pendingUrlExecutionId || currentExecutionId === pendingUrlExecutionId) return
+    let cancelled = false
+    const restoreUrlExecution = async () => {
+      const workflowSource = workflows.length ? workflows : await loadWorkflows()
+      if (cancelled) return
+      const execution = await reconcileExecution(pendingUrlExecutionId, {
+        updateUrl: true,
+        requireProject: true,
+        source: 'url',
+        availableWorkflows: workflowSource,
+      })
+      if (!cancelled && execution) setPendingUrlExecutionId(null)
+    }
+    void restoreUrlExecution()
+    return () => {
+      cancelled = true
+    }
+  }, [currentExecutionId, currentProject, loadWorkflows, pendingUrlExecutionId, reconcileExecution, workflows])
 
   useEffect(() => {
     if (!currentProject || !selectedWorkflow) return
@@ -1630,6 +1712,84 @@ export default function Visualizer() {
     }
   }
 
+  const handleInspectStaleExecution = async () => {
+    if (!currentExecutionId) return
+    setStaleInspectionLoading(true)
+    setExecutionActionError(null)
+    try {
+      const inspection = await inspectExecutionStaleness(currentExecutionId)
+      setStaleInspection(inspection)
+    } catch (error) {
+      setExecutionActionError(formatApiErrorMessage(error, '陈旧状态检查失败'))
+    } finally {
+      setStaleInspectionLoading(false)
+    }
+  }
+
+  const handleMarkExecutionStaleFailed = async () => {
+    if (!currentExecutionId) return
+    if (!confirm('确认将该执行标记为陈旧失败？该操作会写入审计历史，之后可从失败节点恢复。')) return
+    setStaleActionLoading(true)
+    setExecutionActionError(null)
+    try {
+      const result = await resolveStaleExecution(currentExecutionId, 'mark_failed', 'visualize_manual_stale_resolution')
+      setStaleInspection(result.inspection)
+      if (result.execution) applyExecutionState(result.execution)
+      void loadOperationEvents(currentExecutionId)
+      void loadExecutionHistory()
+    } catch (error) {
+      setExecutionActionError(formatApiErrorMessage(error, '陈旧执行治理失败'))
+    } finally {
+      setStaleActionLoading(false)
+    }
+  }
+
+  const handleCreateStaleRuntimeFixture = async () => {
+    if (!currentProject) return
+    setRuntimeFixtureLoading(true)
+    setExecutionActionError(null)
+    try {
+      const fixture = await createRuntimeFixture(currentProject.id, 'stale_running', `Visualizer stale fixture ${Date.now()}`)
+      const workflow = fixture.workflow
+      setRuntimeFixture({ executionId: fixture.execution.id, workflowId: workflow.id, cleanupToken: fixture.cleanup_token })
+      setWorkflows((items) => [workflow, ...items.filter((item) => item.id !== workflow.id)])
+      projectWorkflowFromDefinition(workflow)
+      applyExecutionState(fixture.execution)
+      setStaleInspection(fixture.inspection || null)
+      setRightWorkflowPanel('monitor')
+      const params = new URLSearchParams(window.location.search)
+      params.set('project_id', currentProject.id)
+      params.set('execution_id', fixture.execution.id)
+      window.history.replaceState({}, '', `${window.location.pathname}?${params.toString()}`)
+      void loadOperationEvents(fixture.execution.id)
+      void loadExecutionHistory()
+    } catch (error) {
+      setExecutionActionError(formatApiErrorMessage(error, '创建运行时夹具失败。请确认后端处于 DEBUG 模式。'))
+    } finally {
+      setRuntimeFixtureLoading(false)
+    }
+  }
+
+  const handleCleanupRuntimeFixture = async () => {
+    if (!runtimeFixture) return
+    if (!confirm('确认清理本次 DEBUG 运行时夹具？仅带有匹配 cleanup token 的夹具记录会被删除。')) return
+    setRuntimeFixtureCleanupLoading(true)
+    setExecutionActionError(null)
+    try {
+      await cleanupRuntimeFixture(runtimeFixture.executionId, runtimeFixture.workflowId, runtimeFixture.cleanupToken)
+      setRuntimeFixture(null)
+      resetExecutionState()
+      await loadWorkflows()
+      const params = new URLSearchParams(window.location.search)
+      params.delete('execution_id')
+      window.history.replaceState({}, '', `${window.location.pathname}?${params.toString()}`)
+    } catch (error) {
+      setExecutionActionError(formatApiErrorMessage(error, '清理运行时夹具失败'))
+    } finally {
+      setRuntimeFixtureCleanupLoading(false)
+    }
+  }
+
   const handleForceNewExecution = async () => {
     if (!confirm('当前可能已有执行在运行。确定要强制启动一个新执行吗？')) return
     await handleExecuteWorkflow(true)
@@ -1713,7 +1873,11 @@ export default function Visualizer() {
   const failedNodeState = failedNodeEntry?.[1]
   const operationSummary = executionOperationSummary || currentExecution?.operation_summary || null
   const operationCapabilities = operationSummary?.capabilities
+  const currentStaleInspection = staleInspection || operationSummary?.stale_inspection || null
   const operationEventsNewestFirst = [...executionOperationEvents].reverse()
+  const filteredOperationEvents = operationEventsNewestFirst.filter((event) => operationEventMatchesFilter(event, operationEventFilter))
+  const selectedOperationEvent = filteredOperationEvents.find((event, index) => operationEventKey(event, index) === selectedOperationEventKey) || filteredOperationEvents[0] || null
+  const selectedOperationEventPayload = selectedOperationEvent ? Object.entries(selectedOperationEvent.data || {}) : []
   const canPauseExecution = operationCapabilities?.pause?.allowed ?? currentExecutionStatus === 'running'
   const canResumeExecution = operationCapabilities?.resume?.allowed ?? currentExecutionStatus === 'paused'
   const canCancelExecution = operationCapabilities?.cancel?.allowed ?? isActiveExecutionStatus(currentExecutionStatus || undefined)
@@ -1807,7 +1971,7 @@ export default function Visualizer() {
       }
     >
       {activeTab === 'workflow' ? (
-        <div className="flex gap-4" style={{ height: 'calc(100vh - 280px)', minHeight: '500px' }}>
+        <>
           <div className="w-80 flex flex-col gap-3">
             <Card className="p-3">
               <div className="flex items-center justify-between mb-2">
@@ -2364,17 +2528,89 @@ export default function Visualizer() {
                               ))}
                             </div>
                           )}
+                          <div className="mt-2 rounded-lg border border-slate-200 bg-slate-50 p-2 text-[11px]">
+                            <div className="mb-1 flex items-center justify-between gap-2">
+                              <span className="font-semibold">陈旧执行治理</span>
+                              <span className={`rounded px-1.5 py-0.5 text-[10px] ${currentStaleInspection?.suspected_stale ? 'bg-red-100 text-red-700' : 'bg-slate-200 text-slate-700'}`}>
+                                {currentStaleInspection?.suspected_stale ? '疑似陈旧' : '状态正常'}
+                              </span>
+                            </div>
+                            <div className="mb-2 rounded border border-amber-200 bg-amber-50 px-2 py-1 text-[10px] text-amber-800">
+                              工作流界面只负责结构完整性、诊断与治理验证；实际生成运行请在 Director 发起，章节编辑/版本对比在 Novel/Diff 界面处理。
+                            </div>
+                            <div className="space-y-0.5 opacity-80">
+                              <div>活跃任务：{currentStaleInspection?.active_task ? '存在' : '无'}</div>
+                              <div>建议：{currentStaleInspection?.recommendation || '点击检查获取治理建议。'}</div>
+                            </div>
+                            <div className="mt-2 flex gap-1">
+                              <button
+                                type="button"
+                                onClick={handleInspectStaleExecution}
+                                disabled={!currentExecutionId || staleInspectionLoading}
+                                className="rounded bg-white px-2 py-1 text-[10px] text-slate-700 shadow-sm hover:bg-slate-100 disabled:opacity-50"
+                              >
+                                {staleInspectionLoading ? '检查中...' : '检查'}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={handleMarkExecutionStaleFailed}
+                                disabled={!currentExecutionId || staleActionLoading || !currentStaleInspection?.suspected_stale}
+                                className="rounded bg-red-600 px-2 py-1 text-[10px] text-white shadow-sm hover:bg-red-700 disabled:opacity-50"
+                                title={currentStaleInspection?.suspected_stale ? '' : '仅租约过期且无活跃任务时可标记'}
+                              >
+                                {staleActionLoading ? '处理中...' : '标记失败'}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={handleCreateStaleRuntimeFixture}
+                                disabled={!currentProject || runtimeFixtureLoading}
+                                className="rounded bg-amber-100 px-2 py-1 text-[10px] text-amber-800 shadow-sm hover:bg-amber-200 disabled:opacity-50"
+                                title="DEBUG-only：创建隔离 stale-running 夹具用于验证治理链路"
+                              >
+                                {runtimeFixtureLoading ? '创建中...' : '创建陈旧夹具'}
+                              </button>
+                              {runtimeFixture && (
+                                <button
+                                  type="button"
+                                  onClick={handleCleanupRuntimeFixture}
+                                  disabled={runtimeFixtureCleanupLoading}
+                                  className="rounded bg-slate-200 px-2 py-1 text-[10px] text-slate-700 shadow-sm hover:bg-slate-300 disabled:opacity-50"
+                                >
+                                  {runtimeFixtureCleanupLoading ? '清理中...' : '清理夹具'}
+                                </button>
+                              )}
+                            </div>
+                            {runtimeFixture && (
+                              <div className="mt-1 text-[10px] text-slate-500">
+                                当前夹具：{shortExecutionId(runtimeFixture.executionId)} · token 已绑定，仅允许清理本次创建的数据。
+                              </div>
+                            )}
+                          </div>
                         </div>
                       )}
                       {executionOperationEvents.length > 0 && (
                         <div className="rounded-lg border border-indigo-200 bg-white/80 p-2 text-indigo-900">
                           <div className="mb-2 flex items-center justify-between gap-2">
                             <span className="font-semibold">操作事件时间线</span>
-                            <span className="rounded bg-indigo-100 px-1.5 py-0.5 text-[10px]">{executionOperationEvents.length} 条</span>
+                            <button
+                              type="button"
+                              onClick={() => setExecutionAuditPanelOpen(true)}
+                              className="rounded bg-indigo-100 px-1.5 py-0.5 text-[10px] hover:bg-indigo-200"
+                            >
+                              审计 {executionOperationEvents.length} 条
+                            </button>
                           </div>
                           <div className="max-h-44 space-y-2 overflow-y-auto">
-                            {operationEventsNewestFirst.slice(0, 8).map((event) => (
-                              <div key={`${event.sequence_no || event.event_type}-${event.created_at || ''}`} className="rounded border border-indigo-100 bg-white p-2 text-[11px]">
+                            {operationEventsNewestFirst.slice(0, 8).map((event, index) => (
+                              <button
+                                type="button"
+                                key={operationEventKey(event, index)}
+                                onClick={() => {
+                                  setSelectedOperationEventKey(operationEventKey(event, index))
+                                  setExecutionAuditPanelOpen(true)
+                                }}
+                                className="w-full rounded border border-indigo-100 bg-white p-2 text-left text-[11px] transition hover:-translate-y-0.5 hover:border-indigo-300 hover:shadow-sm"
+                              >
                                 <div className="mb-1 flex items-center justify-between gap-2">
                                   <span className="font-semibold">{event.summary}</span>
                                   <span className={`rounded px-1.5 py-0.5 text-[10px] ${event.severity === 'error' ? 'bg-red-100 text-red-700' : 'bg-indigo-100 text-indigo-700'}`}>
@@ -2385,7 +2621,7 @@ export default function Visualizer() {
                                   <span>{formatExecutionDate(event.created_at)}</span>
                                   {event.node_id && <span className="truncate" title={event.node_id}>节点：{event.node_id}</span>}
                                 </div>
-                              </div>
+                              </button>
                             ))}
                           </div>
                         </div>
@@ -2565,7 +2801,176 @@ export default function Visualizer() {
               </div>
             </div>
           </div>
-        </div>
+          {executionAuditPanelOpen && activeTab === 'workflow' && (
+            <div className="fixed inset-0 z-50 flex justify-end bg-slate-950/35 backdrop-blur-[2px]" onClick={() => setExecutionAuditPanelOpen(false)}>
+              <div
+                className={`h-full w-full max-w-4xl overflow-hidden border-l shadow-2xl ${
+                  isDark ? 'border-slate-700 bg-slate-950 text-slate-100' : 'border-slate-200 bg-[#f8f6ef] text-slate-950'
+                }`}
+                onClick={(event) => event.stopPropagation()}
+              >
+                <div className={`border-b px-5 py-4 ${isDark ? 'border-slate-800 bg-slate-900' : 'border-stone-300 bg-stone-100'}`}>
+                  <div className="flex items-start justify-between gap-4">
+                    <div>
+                      <div className="flex items-center gap-2 text-xs uppercase tracking-[0.28em] text-indigo-500">
+                        <FileClock size={15} /> Operation Ledger
+                      </div>
+                      <h2 className="mt-1 text-2xl font-semibold tracking-tight">执行审计事件</h2>
+                      <p className={`mt-1 text-sm ${isDark ? 'text-slate-400' : 'text-slate-600'}`}>
+                        {currentExecutionId ? `Execution ${currentExecutionId}` : '未选择执行'} · 已脱敏展示运行、失败、修复、恢复和租约事件
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setExecutionAuditPanelOpen(false)}
+                      className={`rounded-full px-3 py-1 text-sm ${isDark ? 'bg-slate-800 hover:bg-slate-700' : 'bg-white hover:bg-stone-200'}`}
+                    >
+                      关闭
+                    </button>
+                  </div>
+                  <div className="mt-4 flex flex-wrap gap-2 text-xs">
+                    {[
+                      ['all', '全部'],
+                      ['lifecycle', '生命周期'],
+                      ['node', '节点'],
+                      ['failure', '失败'],
+                      ['recovery', '恢复'],
+                      ['remediation', '修复'],
+                      ['stale', '陈旧'],
+                    ].map(([key, label]) => (
+                      <button
+                        type="button"
+                        key={key}
+                        onClick={() => {
+                          setOperationEventFilter(key as typeof operationEventFilter)
+                          setSelectedOperationEventKey(null)
+                        }}
+                        className={`rounded-full border px-3 py-1 transition ${
+                          operationEventFilter === key
+                            ? 'border-indigo-500 bg-indigo-600 text-white shadow-sm'
+                            : isDark
+                              ? 'border-slate-700 bg-slate-900 text-slate-300 hover:border-indigo-500'
+                              : 'border-stone-300 bg-white text-slate-700 hover:border-indigo-400'
+                        }`}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div className="grid h-[calc(100%-132px)] grid-cols-[310px_1fr]">
+                  <div className={`overflow-y-auto border-r p-3 ${isDark ? 'border-slate-800' : 'border-stone-300'}`}>
+                    {filteredOperationEvents.length === 0 ? (
+                      <div className={`rounded-xl border border-dashed p-4 text-sm ${isDark ? 'border-slate-700 text-slate-400' : 'border-stone-300 text-slate-500'}`}>
+                        当前过滤条件下暂无事件。
+                      </div>
+                    ) : filteredOperationEvents.map((event, index) => {
+                      const key = operationEventKey(event, index)
+                      const selected = selectedOperationEventKey ? selectedOperationEventKey === key : index === 0
+                      return (
+                        <button
+                          type="button"
+                          key={key}
+                          onClick={() => setSelectedOperationEventKey(key)}
+                          className={`mb-2 w-full rounded-xl border p-3 text-left transition ${
+                            selected
+                              ? 'border-indigo-500 bg-indigo-600 text-white shadow-lg shadow-indigo-900/20'
+                              : isDark
+                                ? 'border-slate-800 bg-slate-900 text-slate-200 hover:border-slate-600'
+                                : 'border-stone-300 bg-white text-slate-800 hover:border-indigo-300'
+                          }`}
+                        >
+                          <div className="mb-1 flex items-center justify-between gap-2">
+                            <span className="truncate text-sm font-semibold">{event.summary}</span>
+                            <span className={`rounded px-1.5 py-0.5 text-[10px] ${event.severity === 'error' ? 'bg-red-100 text-red-700' : selected ? 'bg-white/20 text-white' : 'bg-indigo-100 text-indigo-700'}`}>
+                              {operationEventCategory(event)}
+                            </span>
+                          </div>
+                          <div className={`text-[11px] ${selected ? 'text-white/75' : isDark ? 'text-slate-400' : 'text-slate-500'}`}>
+                            #{event.sequence_no ?? '-'} · {event.event_type}
+                          </div>
+                          <div className={`mt-1 text-[11px] ${selected ? 'text-white/75' : isDark ? 'text-slate-500' : 'text-slate-500'}`}>
+                            {formatExecutionDate(event.created_at)}
+                          </div>
+                        </button>
+                      )
+                    })}
+                  </div>
+                  <div className="overflow-y-auto p-5">
+                    {selectedOperationEvent ? (
+                      <div className="space-y-4">
+                        <div className={`rounded-2xl border p-4 ${isDark ? 'border-slate-800 bg-slate-900' : 'border-stone-300 bg-white'}`}>
+                          <div className="flex items-start justify-between gap-4">
+                            <div>
+                              <div className="text-xs uppercase tracking-[0.22em] text-indigo-500">{selectedOperationEvent.event_type}</div>
+                              <h3 className="mt-1 text-xl font-semibold">{selectedOperationEvent.summary}</h3>
+                            </div>
+                            <span className={`rounded-full px-2 py-1 text-xs ${selectedOperationEvent.severity === 'error' ? 'bg-red-100 text-red-700' : 'bg-indigo-100 text-indigo-700'}`}>
+                              {selectedOperationEvent.severity}
+                            </span>
+                          </div>
+                          <div className="mt-4 grid grid-cols-2 gap-3 text-sm">
+                            <div><span className="opacity-60">Sequence</span><div className="font-mono">{selectedOperationEvent.sequence_no ?? '-'}</div></div>
+                            <div><span className="opacity-60">时间</span><div>{formatExecutionDate(selectedOperationEvent.created_at)}</div></div>
+                            <div><span className="opacity-60">节点</span><div className="font-mono">{selectedOperationEvent.node_id || '-'}</div></div>
+                            <div><span className="opacity-60">状态</span><div>{selectedOperationEvent.status || '-'}</div></div>
+                          </div>
+                          <div className="mt-4 flex flex-wrap gap-2">
+                            {selectedOperationEvent.node_id && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setNodes((current) => current.map((node) => ({ ...node, selected: node.id === selectedOperationEvent.node_id })))
+                                  setExecutionAuditPanelOpen(false)
+                                }}
+                                className="rounded bg-indigo-600 px-3 py-1.5 text-xs text-white hover:bg-indigo-700"
+                              >
+                                定位节点
+                              </button>
+                            )}
+                            {(selectedOperationEvent.data?.trace_id || currentExecution?.trace_id) && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setRightWorkflowPanel('trace')
+                                  setExecutionAuditPanelOpen(false)
+                                }}
+                                className={`rounded px-3 py-1.5 text-xs ${isDark ? 'bg-slate-800 hover:bg-slate-700' : 'bg-stone-100 hover:bg-stone-200'}`}
+                              >
+                                打开 Trace
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                        <div className={`rounded-2xl border p-4 ${isDark ? 'border-slate-800 bg-slate-900' : 'border-stone-300 bg-white'}`}>
+                          <div className="mb-3 flex items-center gap-2 text-sm font-semibold">
+                            <ShieldAlert size={15} /> 脱敏事件载荷
+                          </div>
+                          {selectedOperationEventPayload.length === 0 ? (
+                            <div className={`text-sm ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>无可展示载荷。</div>
+                          ) : (
+                            <div className="space-y-2">
+                              {selectedOperationEventPayload.map(([key, value]) => (
+                                <div key={key} className={`rounded-lg border p-2 ${isDark ? 'border-slate-800 bg-slate-950' : 'border-stone-200 bg-stone-50'}`}>
+                                  <div className="mb-1 font-mono text-[11px] text-indigo-500">{key}</div>
+                                  <pre className="max-h-44 overflow-auto whitespace-pre-wrap break-words text-xs leading-relaxed">{formatEventPayloadValue(value)}</pre>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    ) : (
+                      <div className={`rounded-2xl border border-dashed p-8 text-center ${isDark ? 'border-slate-700 text-slate-400' : 'border-stone-300 text-slate-500'}`}>
+                        选择左侧事件查看审计详情。
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+        </>
       ) : activeTab === 'world3d' ? (
         <Card className="min-h-[650px] overflow-hidden p-0">
           {loadingSceneData ? (

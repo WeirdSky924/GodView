@@ -54,13 +54,16 @@ async def test_create_chapter_writes_file_and_stores_path(fake_chapter_db):
         title="第一章：启程",
         project_id="00000000-0000-0000-0000-000000000001",
         content="正文内容",
+        chapter_outline_id="outline-001",
     ))
 
     stored = db.chapters[result["id"]]
     assert stored["content"] == ""
     assert stored["content_storage"] == "filesystem"
+    assert stored["chapter_outline_id"] == "outline-001"
     assert stored["content_path"]
     assert (tmp_path / stored["content_path"]).read_text(encoding="utf-8") == "正文内容"
+    assert result["chapter_outline_id"] == "outline-001"
     assert result["content"] == "正文内容"
 
 
@@ -108,6 +111,7 @@ async def test_update_content_rewrites_file_and_rename_changes_path(fake_chapter
     ))
     old_path = db.chapters[created["id"]]["content_path"]
 
+    db.chapters[created["id"]]["chapter_outline_id"] = "outline-preserved"
     updated = await plots.update_chapter(created["id"], plots.UpdateChapterDTO(
         title="新名",
         content="新正文",
@@ -115,9 +119,11 @@ async def test_update_content_rewrites_file_and_rename_changes_path(fake_chapter
 
     stored = db.chapters[created["id"]]
     assert stored["content"] == ""
+    assert stored["chapter_outline_id"] == "outline-preserved"
     assert stored["content_path"] != old_path
     assert not (tmp_path / old_path).exists()
     assert (tmp_path / stored["content_path"]).read_text(encoding="utf-8") == "新正文"
+    assert updated["chapter_outline_id"] == "outline-preserved"
     assert updated["content"] == "新正文"
 
 

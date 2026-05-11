@@ -11,6 +11,7 @@ import re
 import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from app.agents.base import AgentResponse
@@ -108,6 +109,15 @@ class WorkflowOperationError(ValueError):
             "message": self.message,
             **self.payload,
         }
+
+
+@dataclass
+class WorkflowExecutionStartResult:
+    """工作流启动结果，保留真实幂等命中语义供 API/UI 展示。"""
+
+    execution_id: str
+    replayed: bool = False
+    deduplicated: bool = False
 
 
 class WorkflowEngine:
@@ -1056,6 +1066,25 @@ class WorkflowEngine:
         request_id: Optional[str] = None,
         force_new: bool = False,
     ) -> str:
+        result = await self.start_workflow_execution(
+            workflow_id=workflow_id,
+            project_id=project_id,
+            initial_context=initial_context,
+            db=db,
+            request_id=request_id,
+            force_new=force_new,
+        )
+        return result.execution_id
+
+    async def start_workflow_execution(
+        self,
+        workflow_id: str,
+        project_id: str,
+        initial_context: Dict[str, Any] = None,
+        db=None,
+        request_id: Optional[str] = None,
+        force_new: bool = False,
+    ) -> WorkflowExecutionStartResult:
         """执行工作流
 
         Args:
@@ -1101,13 +1130,21 @@ class WorkflowEngine:
             response_payload = operation.get("response_payload") or {}
             existing_execution_id = response_payload.get("execution_id")
             if operation_result.replayed and existing_execution_id:
-                return existing_execution_id
+                return WorkflowExecutionStartResult(
+                    execution_id=existing_execution_id,
+                    replayed=True,
+                    deduplicated=False,
+                )
             if operation_result.deduplicated:
                 existing_execution_id = existing_execution_id or await self._get_execution_id_by_operation_id(
                     str(operation.get("id")), db
                 )
                 if existing_execution_id:
-                    return existing_execution_id
+                    return WorkflowExecutionStartResult(
+                        execution_id=existing_execution_id,
+                        replayed=False,
+                        deduplicated=True,
+                    )
 
         # 显式 world_id 参与幂等；隐式默认 world 只写入执行上下文和 trace，不改变旧请求 hash
         world_scope: Dict[str, Any] = {}
@@ -1256,7 +1293,7 @@ class WorkflowEngine:
         self._start_workflow_task(execution.id, workflow, db)
 
         logger.info(f"启动工作流执行: {execution.id}, 章节: {context.get('chapter_num')}")
-        return execution.id
+        return WorkflowExecutionStartResult(execution_id=execution.id)
 
     def _start_workflow_task(self, execution_id: str, workflow: WorkflowDefinition, db=None) -> asyncio.Task:
         """启动并登记 workflow task；若已有活跃 task 则复用。"""
@@ -1297,6 +1334,611 @@ class WorkflowEngine:
             await operation_service.cancel_requested(operation, payload)
         elif execution.status == WorkflowStatus.FAILED:
             await operation_service.fail(operation, execution.error or "workflow failed", payload)
+
+    async def create_runtime_fixture(
+        self,
+        project_id: str,
+        db=None,
+        *,
+        fixture_type: str = "stale_running",
+        label: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Create an isolated workflow runtime fixture for local smoke validation.
+
+        This is intentionally scoped to DEBUG mode and marks all created records with a
+        cleanup token so runtime smokes can exercise governance flows without reusing or
+        mutating long-lived user data.
+        """
+        if not settings.debug:
+            self._raise_operation_error(
+                "runtime-fixture",
+                "fixture",
+                "运行时夹具只能在 DEBUG 模式下创建",
+                code="workflow_fixture_disabled",
+                http_status=403,
+            )
+        if not db:
+            self._raise_operation_error(
+                "runtime-fixture",
+                "fixture",
+                "创建运行时夹具需要数据库连接",
+                code="workflow_fixture_database_required",
+                http_status=503,
+            )
+        normalized_type = (fixture_type or "stale_running").strip().lower()
+        allowed_fixture_types = {"stale_running", "missing_agent_failed", "saved_chapter", "quality_gate_revision", "state_handoff_context"}
+        if normalized_type not in allowed_fixture_types:
+            self._raise_operation_error(
+                "runtime-fixture",
+                "fixture",
+                f"不支持的运行时夹具类型: {fixture_type}",
+                code="workflow_fixture_type_not_supported",
+                payload={"allowed_fixture_types": sorted(allowed_fixture_types)},
+            )
+
+        now = datetime.now()
+        cleanup_token = uuid.uuid4().hex
+        suffix = uuid.uuid4().hex[:8]
+        if normalized_type in {"quality_gate_revision", "state_handoff_context"}:
+            is_state_handoff_fixture = normalized_type == "state_handoff_context"
+            workflow = WorkflowDefinition(
+                id=f"workflow_fixture_{suffix}",
+                project_id=project_id,
+                name=label or f"Runtime {normalized_type} fixture {suffix}",
+                description=(
+                    "DEBUG-only isolated runtime fixture for confirmed state handoff smoke tests."
+                    if is_state_handoff_fixture
+                    else "DEBUG-only isolated runtime fixture for quality-gated Writer revision smoke tests."
+                ),
+                nodes=[
+                    WorkflowNode(id="start", node_type=NodeType.START, label="开始", position={"x": 0, "y": 0}),
+                    WorkflowNode(
+                        id="writer",
+                        node_type=NodeType.AGENT,
+                        agent_type="writer",
+                        label="Writer 状态交接夹具" if is_state_handoff_fixture else "Writer 质量门夹具",
+                        config={"quality_gate_enabled": True},
+                        position={"x": 220, "y": 0},
+                    ),
+                    WorkflowNode(
+                        id="evaluator",
+                        node_type=NodeType.AGENT,
+                        agent_type="evaluator",
+                        label="Evaluator 状态交接夹具" if is_state_handoff_fixture else "Evaluator 质量门夹具",
+                        position={"x": 440, "y": 0},
+                    ),
+                    WorkflowNode(id="gate", node_type=NodeType.CONDITION, label="质量门", position={"x": 660, "y": 0}),
+                    WorkflowNode(id="end", node_type=NodeType.END, label="结束", position={"x": 880, "y": 0}),
+                ],
+                edges=[
+                    WorkflowEdge(id="edge_start_writer", source="start", target="writer"),
+                    WorkflowEdge(id="edge_writer_evaluator", source="writer", target="evaluator"),
+                    WorkflowEdge(id="edge_evaluator_gate", source="evaluator", target="gate"),
+                    WorkflowEdge(id="edge_gate_end", source="gate", target="end", condition={"result": "pass"}),
+                    WorkflowEdge(id="edge_gate_retry", source="gate", target="writer", condition={"result": "retry"}),
+                ],
+                variables={"runtime_fixture": True, "fixture_type": normalized_type, "cleanup_token": cleanup_token},
+                is_template=False,
+                created_at=now,
+                updated_at=now,
+            )
+        else:
+            workflow = WorkflowDefinition(
+                id=f"workflow_fixture_{suffix}",
+                project_id=project_id,
+                name=label or f"Runtime {normalized_type} fixture {suffix}",
+                description="DEBUG-only isolated runtime fixture for workflow governance smoke tests.",
+                nodes=[
+                    WorkflowNode(id="start", node_type=NodeType.START, label="开始", position={"x": 0, "y": 0}),
+                    WorkflowNode(
+                        id="fixture_agent",
+                        node_type=NodeType.AGENT,
+                        agent_type=(
+                            "smoke_contract_failure"
+                            if normalized_type == "missing_agent_failed"
+                            else "writer"
+                            if normalized_type == "saved_chapter"
+                            else "plot_outline"
+                        ),
+                        label="Writer 夹具" if normalized_type == "saved_chapter" else "夹具 Agent",
+                        config={"scenario": "runtime_fixture"},
+                        position={"x": 220, "y": 0},
+                    ),
+                    WorkflowNode(id="end", node_type=NodeType.END, label="结束", position={"x": 440, "y": 0}),
+                ],
+                edges=[
+                    WorkflowEdge(id="edge_start_agent", source="start", target="fixture_agent"),
+                    WorkflowEdge(id="edge_agent_end", source="fixture_agent", target="end"),
+                ],
+                variables={"runtime_fixture": True, "fixture_type": normalized_type, "cleanup_token": cleanup_token},
+                is_template=False,
+                created_at=now,
+                updated_at=now,
+            )
+        await self._save_workflow_to_db(workflow, db)
+        self._workflows[workflow.id] = workflow
+
+        if normalized_type == "stale_running":
+            execution = WorkflowExecution(
+                id=f"exec_fixture_{suffix}",
+                workflow_id=workflow.id,
+                project_id=project_id,
+                status=WorkflowStatus.RUNNING,
+                current_node="fixture_agent",
+                node_states={
+                    "start": NodeExecutionState(node_id="start", status=NodeStatus.COMPLETED, started_at=now - timedelta(seconds=80), completed_at=now - timedelta(seconds=75)),
+                    "fixture_agent": NodeExecutionState(node_id="fixture_agent", status=NodeStatus.RUNNING, started_at=now - timedelta(seconds=70)),
+                    "end": NodeExecutionState(node_id="end", status=NodeStatus.PENDING),
+                },
+                context={
+                    "runtime_fixture": True,
+                    "fixture_type": normalized_type,
+                    "cleanup_token": cleanup_token,
+                    "created_by": "workflow_runtime_fixture",
+                },
+                started_at=now - timedelta(seconds=80),
+                lease_token=f"fixture_{cleanup_token}",
+                lease_expires_at=now - timedelta(seconds=10),
+                last_heartbeat_at=now - timedelta(seconds=80),
+                resume_cursor={"runtime_fixture": True, "cleanup_token": cleanup_token},
+            )
+        elif normalized_type == "missing_agent_failed":
+            execution = WorkflowExecution(
+                id=f"exec_fixture_{suffix}",
+                workflow_id=workflow.id,
+                project_id=project_id,
+                status=WorkflowStatus.FAILED,
+                current_node="fixture_agent",
+                node_states={
+                    "start": NodeExecutionState(node_id="start", status=NodeStatus.COMPLETED, started_at=now - timedelta(seconds=20), completed_at=now - timedelta(seconds=18)),
+                    "fixture_agent": NodeExecutionState(
+                        node_id="fixture_agent",
+                        status=NodeStatus.FAILED,
+                        started_at=now - timedelta(seconds=18),
+                        completed_at=now - timedelta(seconds=16),
+                        error="无法获取 Agent: smoke_contract_failure",
+                    ),
+                    "end": NodeExecutionState(node_id="end", status=NodeStatus.PENDING),
+                },
+                context={
+                    "runtime_fixture": True,
+                    "fixture_type": normalized_type,
+                    "cleanup_token": cleanup_token,
+                    "created_by": "workflow_runtime_fixture",
+                },
+                started_at=now - timedelta(seconds=20),
+                completed_at=now - timedelta(seconds=16),
+                error="无法获取 Agent: smoke_contract_failure",
+                resume_cursor={"runtime_fixture": True, "cleanup_token": cleanup_token},
+            )
+        elif normalized_type in {"quality_gate_revision", "state_handoff_context"}:
+            is_state_handoff_fixture = normalized_type == "state_handoff_context"
+            chapter_outline_id = f"outline_fixture_{suffix}"
+            prior_chapter_ids: List[str] = []
+            excluded_draft_chapter_ids: List[str] = []
+            seeded_state_change_ids: List[str] = []
+            if is_state_handoff_fixture:
+                prior_chapter_one_id = str(uuid.uuid4())
+                prior_chapter_two_id = str(uuid.uuid4())
+                draft_chapter_id = str(uuid.uuid4())
+                prior_chapter_ids = [prior_chapter_one_id, prior_chapter_two_id]
+                excluded_draft_chapter_ids = [draft_chapter_id]
+                for chapter_data in [
+                    {
+                        "id": prior_chapter_one_id,
+                        "project_id": project_id,
+                        "title": f"状态交接前文章节一 {suffix}",
+                        "chapter_number": 1,
+                        "chapter_num": 1,
+                        "summary": "前文一确认主角离开旧城。",
+                        "content": "状态交接夹具前文一，用于证明下一章只读取已保存前文摘要。",
+                        "word_count": 24,
+                        "status": "saved",
+                        "content_checksum": f"fixture-prior-one-{suffix}",
+                        "events": [],
+                        "hooks_planted": [],
+                        "hooks_resolved": [],
+                        "main_plot_progress": {},
+                        "reader_scores": {},
+                        "created_at": now - timedelta(days=2),
+                        "updated_at": now - timedelta(days=2),
+                        "completed_at": now - timedelta(days=2),
+                    },
+                    {
+                        "id": prior_chapter_two_id,
+                        "project_id": project_id,
+                        "title": f"状态交接前文章节二 {suffix}",
+                        "chapter_number": 2,
+                        "chapter_num": 2,
+                        "summary": "前文二确认主角获得星砂印记。",
+                        "content": "状态交接夹具前文二，用于证明下一章读取多个已保存前文章节。",
+                        "word_count": 26,
+                        "status": "saved",
+                        "content_checksum": f"fixture-prior-two-{suffix}",
+                        "events": [],
+                        "hooks_planted": [],
+                        "hooks_resolved": [],
+                        "main_plot_progress": {},
+                        "reader_scores": {},
+                        "created_at": now - timedelta(days=1),
+                        "updated_at": now - timedelta(days=1),
+                        "completed_at": now - timedelta(days=1),
+                    },
+                    {
+                        "id": draft_chapter_id,
+                        "project_id": project_id,
+                        "title": f"状态交接草稿章节 {suffix}",
+                        "chapter_number": 2,
+                        "chapter_num": 2,
+                        "summary": "这个草稿必须被 confirmed_prior_state_packet 排除。",
+                        "content": "不应进入前文状态包的草稿内容。",
+                        "word_count": 12,
+                        "status": "draft",
+                        "content_checksum": f"fixture-draft-{suffix}",
+                        "events": [],
+                        "hooks_planted": [],
+                        "hooks_resolved": [],
+                        "main_plot_progress": {},
+                        "reader_scores": {},
+                        "created_at": now - timedelta(hours=12),
+                        "updated_at": now - timedelta(hours=12),
+                        "completed_at": None,
+                    },
+                ]:
+                    await db.save_chapter(chapter_data)
+
+                from app.services.narrative_state_change_service import NarrativeStateChangeService
+
+                state_service = NarrativeStateChangeService(db)
+                first_applied_change = await state_service.create_change({
+                    "project_id": project_id,
+                    "entity_type": "character",
+                    "entity_id": "00000000-0000-0000-0000-000000000101",
+                    "entity_name": "林砚",
+                    "change_type": "status_change",
+                    "status": "applied",
+                    "confirmation_required": False,
+                    "title": f"林砚受伤 {suffix}",
+                    "summary": "林砚在第一段前文中受伤，这是后续章节必须承接的已应用状态。",
+                    "chapter_id": prior_chapter_one_id,
+                    "after_state": {"status": "injured", "location": "旧城", "traits": ["wounded", "steady"], "notes": {"origin": "first-pass"}},
+                    "metadata": {"source": "runtime_state_handoff_fixture", "chapter_num": 1, "cleanup_token": cleanup_token},
+                    "created_at": now - timedelta(days=2, minutes=-5),
+                    "applied_at": now - timedelta(days=2, minutes=-4),
+                })
+                latest_applied_change = await state_service.create_change({
+                    "project_id": project_id,
+                    "entity_type": "character",
+                    "entity_id": "00000000-0000-0000-0000-000000000101",
+                    "entity_name": "林砚",
+                    "change_type": "location_change",
+                    "status": "applied",
+                    "confirmation_required": False,
+                    "title": f"林砚抵达星门 {suffix}",
+                    "summary": "林砚在第二段前文中带伤抵达星门，这是下一章必须使用的最新角色状态。",
+                    "chapter_id": prior_chapter_two_id,
+                    "after_state": {"status": "recovering", "location": "星门", "traits": ["steady", "focused"], "notes": {"phase": "stable", "pace": "measured"}},
+                    "metadata": {"source": "runtime_state_handoff_fixture", "chapter_num": 2, "cleanup_token": cleanup_token},
+                    "created_at": now - timedelta(days=1, minutes=-5),
+                    "applied_at": now - timedelta(days=1, minutes=-4),
+                })
+                confirmed_plot_change = await state_service.create_change({
+                    "project_id": project_id,
+                    "entity_type": "plot",
+                    "entity_id": "fixture-plot-star-sand-mark",
+                    "entity_name": "星砂印记",
+                    "change_type": "custom",
+                    "status": "confirmed",
+                    "confirmation_required": True,
+                    "title": f"星砂印记已确认 {suffix}",
+                    "summary": "主角已获得星砂印记，这是下一章必须尊重的已确认剧情状态。",
+                    "chapter_id": prior_chapter_two_id,
+                    "after_state": {"obtained": True},
+                    "metadata": {"source": "runtime_state_handoff_fixture", "chapter_num": 2, "cleanup_token": cleanup_token},
+                    "created_at": now - timedelta(days=1, minutes=-3),
+                    "confirmed_at": now - timedelta(days=1, minutes=-2),
+                })
+                proposed_change = await state_service.create_change({
+                    "project_id": project_id,
+                    "entity_type": "world",
+                    "change_type": "world_state_change",
+                    "status": "proposed",
+                    "confirmation_required": True,
+                    "title": f"星门即将失稳 {suffix}",
+                    "summary": "星门失稳仍是待确认提示，下一章不得当作正史。",
+                    "chapter_id": prior_chapter_two_id,
+                    "metadata": {"source": "runtime_state_handoff_fixture", "chapter_num": 2, "cleanup_token": cleanup_token},
+                })
+                rejected_change = await state_service.create_change({
+                    "project_id": project_id,
+                    "entity_type": "plot",
+                    "entity_id": "fixture-plot-discarded",
+                    "entity_name": "废弃设定",
+                    "change_type": "custom",
+                    "status": "rejected",
+                    "confirmation_required": True,
+                    "title": f"废弃设定 {suffix}",
+                    "summary": "废弃设定不应进入状态包。",
+                    "chapter_id": prior_chapter_two_id,
+                    "metadata": {"source": "runtime_state_handoff_fixture", "chapter_num": 2, "cleanup_token": cleanup_token},
+                })
+                seeded_state_change_ids = [
+                    first_applied_change.get("id"),
+                    latest_applied_change.get("id"),
+                    confirmed_plot_change.get("id"),
+                    proposed_change.get("id"),
+                    rejected_change.get("id"),
+                ]
+
+            execution = WorkflowExecution(
+                id=f"exec_fixture_{suffix}",
+                workflow_id=workflow.id,
+                project_id=project_id,
+                status=WorkflowStatus.COMPLETED,
+                current_node="end",
+                node_states={node.id: NodeExecutionState(node_id=node.id, status=NodeStatus.PENDING) for node in workflow.nodes},
+                context={
+                    "runtime_fixture": True,
+                    "fixture_type": normalized_type,
+                    "cleanup_token": cleanup_token,
+                    "created_by": "workflow_runtime_fixture",
+                    "director_session_id": label or f"director-quality-gate-fixture-{suffix}",
+                    "chapter_num": 3 if is_state_handoff_fixture else 1,
+                    "chapter_title": f"状态交接下一章夹具 {suffix}" if is_state_handoff_fixture else f"质量门修订夹具 {suffix}",
+                    "chapter_outline_id": chapter_outline_id,
+                    "target_word_count": 5,
+                    "fixture_prior_chapter_ids": prior_chapter_ids,
+                    "fixture_excluded_draft_chapter_ids": excluded_draft_chapter_ids,
+                    "fixture_seeded_state_change_ids": [item for item in seeded_state_change_ids if item],
+                },
+                director_session_id=label or f"director-quality-gate-fixture-{suffix}",
+                started_at=now - timedelta(seconds=24),
+                completed_at=now,
+                resume_cursor={"runtime_fixture": True, "cleanup_token": cleanup_token},
+            )
+            writer_node = next(item for item in workflow.nodes if item.id == "writer")
+            evaluator_node = next(item for item in workflow.nodes if item.id == "evaluator")
+            gate_node = next(item for item in workflow.nodes if item.id == "gate")
+            end_node = next(item for item in workflow.nodes if item.id == "end")
+            execution.node_states["start"] = NodeExecutionState(node_id="start", status=NodeStatus.COMPLETED, started_at=now - timedelta(seconds=24), completed_at=now - timedelta(seconds=23))
+            await self._save_execution_to_db(execution, db)
+            if is_state_handoff_fixture:
+                writer_context = await self._load_agent_context("writer", execution, db)
+                evaluator_context = await self._load_agent_context("evaluator", execution, db)
+                execution.context["fixture_writer_confirmed_prior_state_packet"] = writer_context.get("confirmed_prior_state_packet")
+                execution.context["fixture_writer_confirmed_prior_state_packet_provenance"] = writer_context.get("confirmed_prior_state_packet_provenance")
+                execution.context["fixture_evaluator_confirmed_prior_state_packet"] = evaluator_context.get("confirmed_prior_state_packet")
+                execution.context["fixture_evaluator_confirmed_prior_state_packet_provenance"] = evaluator_context.get("confirmed_prior_state_packet_provenance")
+
+            first_writer_output = {
+                "chapter_content": "质量门夹具第一版正文，故意保留动机断裂以触发修订。",
+                "word_count": 24,
+                "hooks_embedded": [],
+                "future_setup": [],
+                "style_check": {"passed": True},
+                "metadata": {"runtime_fixture": True, "attempt": 1},
+            }
+            await self._stage_writer_draft(
+                execution,
+                writer_node,
+                first_writer_output,
+                db,
+                contract_metadata={
+                    "output_contract_id": "writer.workflow_output",
+                    "output_schema_name": "writer.workflow_output",
+                    "output_schema_version": "1.0.0",
+                },
+                prompt_trace={"prompt_ids": ["runtime_fixture_writer"], "template_scenario": "runtime_fixture"},
+            )
+            execution.context.setdefault("node_outputs", {})["writer"] = self._make_json_safe(first_writer_output)
+            execution.context.setdefault("writer_retry_contexts", [])
+            execution.node_states["writer"] = NodeExecutionState(node_id="writer", status=NodeStatus.COMPLETED, started_at=now - timedelta(seconds=23), completed_at=now - timedelta(seconds=22), output_data=self._make_json_safe(first_writer_output))
+
+            first_feedback = {
+                "passed": False,
+                "score": 4,
+                "issues": ["主角动机断裂"],
+                "suggestions": ["重写动机承接并强化选择代价"],
+                "summary": "第一版未通过质量门。",
+                "word_count_check": {"passed": True, "message": "字数满足夹具要求"},
+            }
+            execution.context["evaluation_passed"] = False
+            execution.context["evaluation_feedback"] = first_feedback
+            await self._record_quality_gate_result(execution, evaluator_node, first_feedback, db)
+            execution.node_states["evaluator"] = NodeExecutionState(node_id="evaluator", status=NodeStatus.COMPLETED, started_at=now - timedelta(seconds=22), completed_at=now - timedelta(seconds=21), output_data=self._make_json_safe(first_feedback))
+            await self._execute_condition_node(gate_node, execution, db)
+            execution.context["writer_retry_contexts"].append({
+                "is_retry": execution.context.get("is_retry"),
+                "task_type": "rewrite_by_review",
+                "agent_scenario": "rewrite_by_review",
+                "has_evaluation_feedback": bool(execution.context.get("evaluation_feedback")),
+                "retry_message": execution.context.get("retry_message"),
+                "draft_attempt_before_retry": execution.context.get("chapter_draft_attempt"),
+            })
+
+            second_writer_output = {
+                "chapter_content": "质量门夹具第二版正文，补足动机承接，明确选择代价，并保留后续伏笔。",
+                "word_count": 32,
+                "hooks_embedded": [],
+                "future_setup": [],
+                "style_check": {"passed": True},
+                "state_changes": [
+                    {
+                        "entity_type": "plot",
+                        "change_type": "custom",
+                        "title": "质量门夹具后续伏笔",
+                        "summary": "第二版确认选择代价，并保留后续伏笔作为待确认剧情状态。",
+                    }
+                ],
+                "metadata": {"runtime_fixture": True, "attempt": 2},
+            }
+            await self._stage_writer_draft(
+                execution,
+                writer_node,
+                second_writer_output,
+                db,
+                contract_metadata={
+                    "output_contract_id": "writer.workflow_output",
+                    "output_schema_name": "writer.workflow_output",
+                    "output_schema_version": "1.0.0",
+                },
+                prompt_trace={"prompt_ids": ["runtime_fixture_writer"], "template_scenario": "rewrite_by_review"},
+            )
+            execution.context["node_outputs"]["writer"] = self._make_json_safe(second_writer_output)
+            execution.node_states["writer"] = NodeExecutionState(node_id="writer", status=NodeStatus.COMPLETED, started_at=now - timedelta(seconds=20), completed_at=now - timedelta(seconds=19), output_data=self._make_json_safe(second_writer_output))
+
+            second_feedback = {
+                "passed": True,
+                "score": 8.6,
+                "issues": [],
+                "suggestions": ["可以保存，后续继续回收伏笔"],
+                "summary": "第二版通过质量门。",
+                "word_count_check": {"passed": True, "message": "字数满足夹具要求"},
+            }
+            execution.context["evaluation_passed"] = True
+            execution.context["evaluation_feedback"] = second_feedback
+            await self._record_quality_gate_result(execution, evaluator_node, second_feedback, db)
+            execution.node_states["evaluator"] = NodeExecutionState(node_id="evaluator", status=NodeStatus.COMPLETED, started_at=now - timedelta(seconds=19), completed_at=now - timedelta(seconds=18), output_data=self._make_json_safe(second_feedback))
+            await self._execute_condition_node(gate_node, execution, db)
+            execution.context["retry_count"] = 0
+            execution.context["is_retry"] = False
+            execution.node_states["gate"] = NodeExecutionState(node_id="gate", status=NodeStatus.COMPLETED, started_at=now - timedelta(seconds=18), completed_at=now - timedelta(seconds=17), output_data={"quality_passed": True, "chapter_finalized": True})
+            execution.node_states["end"] = NodeExecutionState(node_id=end_node.id, status=NodeStatus.COMPLETED, started_at=now - timedelta(seconds=1), completed_at=now)
+            execution.context["runtime_fixture_quality_gate_complete"] = True
+            execution.context["fixture_expected_final_content_marker"] = "质量门夹具第二版正文"
+        else:
+            chapter_outline_id = f"outline_fixture_{suffix}"
+            execution = WorkflowExecution(
+                id=f"exec_fixture_{suffix}",
+                workflow_id=workflow.id,
+                project_id=project_id,
+                status=WorkflowStatus.COMPLETED,
+                current_node="end",
+                node_states={
+                    "start": NodeExecutionState(node_id="start", status=NodeStatus.COMPLETED, started_at=now - timedelta(seconds=24), completed_at=now - timedelta(seconds=23)),
+                    "fixture_agent": NodeExecutionState(node_id="fixture_agent", status=NodeStatus.COMPLETED, started_at=now - timedelta(seconds=22), completed_at=now - timedelta(seconds=2)),
+                    "end": NodeExecutionState(node_id="end", status=NodeStatus.COMPLETED, started_at=now - timedelta(seconds=1), completed_at=now),
+                },
+                context={
+                    "runtime_fixture": True,
+                    "fixture_type": normalized_type,
+                    "cleanup_token": cleanup_token,
+                    "created_by": "workflow_runtime_fixture",
+                    "director_session_id": label or f"director-fixture-{suffix}",
+                    "chapter_num": 1,
+                    "chapter_title": f"运行时保存交接夹具 {suffix}",
+                    "chapter_outline_id": chapter_outline_id,
+                    "target_word_count": 800,
+                },
+                director_session_id=label or f"director-fixture-{suffix}",
+                started_at=now - timedelta(seconds=24),
+                completed_at=now,
+                resume_cursor={"runtime_fixture": True, "cleanup_token": cleanup_token},
+            )
+            writer_fixture_node = workflow.nodes[1]
+            execution.context.setdefault("node_runtime_metadata", {})[writer_fixture_node.id] = {
+                "source_node_id": writer_fixture_node.id,
+                "source_node_label": writer_fixture_node.label,
+                "source_agent_type": writer_fixture_node.agent_type,
+                "resolved_agent_type": "writer",
+                "resolved_scenario": "runtime_fixture",
+                "source_trace_id": execution.trace_id,
+                "source_node_input_keys": ["chapter_outline_id", "chapter_title", "target_word_count"],
+                "output_contract_id": "writer.workflow_output",
+                "output_schema_name": "writer.workflow_output",
+                "output_schema_version": "1.0.0",
+            }
+            await self._save_execution_to_db(execution, db)
+            await self._save_chapter_from_writer(
+                execution,
+                {
+                    "chapter_content": "这是一段用于 Director 保存章节交接验证的确定性正文。它验证 Writer 保存、文件系统持久化、SSE 事件元数据和内容页深链选择，而不依赖真实 LLM 输出。",
+                    "word_count": 62,
+                    "metadata": {"runtime_fixture": True},
+                },
+                db,
+                source_node=writer_fixture_node,
+                contract_metadata={
+                    "output_contract_id": "writer.workflow_output",
+                    "output_schema_name": "writer.workflow_output",
+                    "output_schema_version": "1.0.0",
+                },
+                prompt_trace={"prompt_ids": ["runtime_fixture_writer"], "template_scenario": "runtime_fixture"},
+            )
+            execution.context["chapter_saved_payload"]["runtime_fixture"] = True
+
+        await self._save_execution_to_db(execution, db)
+        self._executions[execution.id] = execution
+        await self._broadcast_status(execution.id, "workflow_runtime_fixture_created", self._build_execution_event_payload(
+            execution,
+            fixture_type=normalized_type,
+            cleanup_token=cleanup_token,
+        ))
+        if hasattr(db, "append_workflow_execution_event"):
+            await db.append_workflow_execution_event(execution.id, "workflow_runtime_fixture_created", self._build_execution_event_payload(
+                execution,
+                fixture_type=normalized_type,
+            ))
+        return self._serialize_for_json({
+            "success": True,
+            "fixture_type": normalized_type,
+            "cleanup_token": cleanup_token,
+            "workflow": workflow,
+            "execution": execution,
+            "inspection": self.inspect_execution_staleness(execution),
+        })
+
+    async def cleanup_runtime_fixture(
+        self,
+        execution_id: str,
+        workflow_id: str,
+        cleanup_token: str,
+        db=None,
+    ) -> Dict[str, Any]:
+        """Delete only records created by create_runtime_fixture and guarded by token."""
+        if not settings.debug:
+            self._raise_operation_error(execution_id, "fixture_cleanup", "运行时夹具只能在 DEBUG 模式下清理", code="workflow_fixture_disabled", http_status=403)
+        if not db:
+            self._raise_operation_error(execution_id, "fixture_cleanup", "清理运行时夹具需要数据库连接", code="workflow_fixture_database_required", http_status=503)
+        execution = await self._get_or_load_execution(execution_id, db)
+        workflow = await self.get_workflow(workflow_id, db)
+        execution_context = execution.context if execution else {}
+        workflow_variables = workflow.variables if workflow else {}
+        if not execution or not workflow:
+            self._raise_operation_error(execution_id, "fixture_cleanup", "运行时夹具不存在", code="workflow_fixture_not_found", http_status=404)
+        if not execution_context.get("runtime_fixture") or not workflow_variables.get("runtime_fixture"):
+            self._raise_operation_error(execution_id, "fixture_cleanup", "拒绝清理非夹具数据", code="workflow_fixture_guard_failed")
+        if execution_context.get("cleanup_token") != cleanup_token or workflow_variables.get("cleanup_token") != cleanup_token:
+            self._raise_operation_error(execution_id, "fixture_cleanup", "运行时夹具清理令牌不匹配", code="workflow_fixture_token_mismatch")
+
+        fixture_chapter_id = execution_context.get("chapter_id")
+        if execution_context.get("fixture_type") in {"saved_chapter", "quality_gate_revision", "state_handoff_context"} and fixture_chapter_id:
+            try:
+                from app.services.chapter_document_storage import chapter_document_storage
+                chapter_document_storage.delete_chapter_file(execution_context.get("chapter_content_path"))
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                logger.warning("清理保存章节夹具文件失败: %s", exc)
+            await db.execute_write("DELETE FROM chapters WHERE id = CAST(:id AS UUID)", {"id": fixture_chapter_id})
+
+        for state_change_id in execution_context.get("fixture_seeded_state_change_ids") or []:
+            if state_change_id:
+                await db.execute_write("DELETE FROM narrative_state_changes WHERE id = CAST(:id AS UUID)", {"id": state_change_id})
+        for prior_chapter_id in execution_context.get("fixture_prior_chapter_ids") or []:
+            if prior_chapter_id:
+                await db.execute_write("DELETE FROM chapters WHERE id = CAST(:id AS UUID)", {"id": prior_chapter_id})
+        for draft_chapter_id in execution_context.get("fixture_excluded_draft_chapter_ids") or []:
+            if draft_chapter_id:
+                await db.execute_write("DELETE FROM chapters WHERE id = CAST(:id AS UUID)", {"id": draft_chapter_id})
+
+        if execution_id in self._executions:
+            del self._executions[execution_id]
+        if workflow_id in self._workflows:
+            del self._workflows[workflow_id]
+        await db.execute_write("DELETE FROM workflow_executions WHERE id = :id", {"id": execution_id})
+        await self._delete_workflow_from_db(workflow_id, db)
+        return {"success": True, "deleted": {"execution_id": execution_id, "workflow_id": workflow_id}}
 
     def _build_execution_event_payload(self, execution: WorkflowExecution, **extra: Any) -> Dict[str, Any]:
         """Build a compact JSON-safe execution event payload for UI/state reconciliation."""
@@ -1384,13 +2026,11 @@ class WorkflowEngine:
 
     def build_execution_operation_summary(self, execution: WorkflowExecution) -> Dict[str, Any]:
         """Build backend-authoritative operation capabilities and lifecycle summary for consoles."""
-        active_task = self._active_task_for_execution(execution.id) is not None
+        stale_inspection = self.inspect_execution_staleness(execution)
+        active_task = bool(stale_inspection["active_task"])
         status = execution.status.value if hasattr(execution.status, "value") else str(execution.status)
-        now = datetime.now(tz=execution.lease_expires_at.tzinfo) if execution.lease_expires_at and execution.lease_expires_at.tzinfo else datetime.now()
-        lease_expired = self._is_execution_lease_expired(execution, now)
-        lease_seconds_remaining = None
-        if execution.lease_expires_at:
-            lease_seconds_remaining = max(0, int((execution.lease_expires_at - now).total_seconds()))
+        lease_expired = bool(stale_inspection["lease"]["expired"])
+        lease_seconds_remaining = stale_inspection["lease"].get("seconds_remaining")
 
         failed_nodes = [
             {
@@ -1487,12 +2127,10 @@ class WorkflowEngine:
                 "failed_nodes": failed_nodes,
             },
             "lease": {
-                "lease_expires_at": execution.lease_expires_at,
-                "last_heartbeat_at": execution.last_heartbeat_at,
-                "expired": lease_expired,
-                "seconds_remaining": lease_seconds_remaining,
+                **stale_inspection["lease"],
                 "cancel_requested": execution.cancel_requested,
             },
+            "stale_inspection": stale_inspection,
             "recovery": {
                 "count": len(recovery_history),
                 "latest": recovery_history[-1] if recovery_history else None,
@@ -2158,6 +2796,8 @@ class WorkflowEngine:
                 "role_performance_gate_passed",
                 "role_performance_gate_blockers",
                 "role_performance_gate_warnings",
+                "confirmed_prior_state_packet",
+                "confirmed_prior_state_packet_provenance",
             ]
             for key in runtime_snapshot_keys:
                 if source_context.get(key) is not None and key not in snapshot:
@@ -2178,6 +2818,9 @@ class WorkflowEngine:
             "chapter_title",
             "chapter_summary",
             "chapter_outline",
+            "target_word_count",
+            "chapter_target_word_count",
+            "word_count",
             "chapter_goals",
             "scene_directions",
             "project_info",
@@ -2211,6 +2854,8 @@ class WorkflowEngine:
             "role_performance_gate_passed",
             "role_performance_gate_blockers",
             "role_performance_gate_warnings",
+            "confirmed_prior_state_packet",
+            "confirmed_prior_state_packet_provenance",
         ]
         snapshot = {
             key: source_context.get(key)
@@ -2218,6 +2863,127 @@ class WorkflowEngine:
             if source_context.get(key) is not None
         }
         return self._make_json_safe(snapshot)
+
+    def _compact_prompt_render_trace(self, trace: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """保留可审计的 prompt/config 标识符，不携带 prompt 正文。"""
+        if not isinstance(trace, dict):
+            return {}
+        allowed_keys = [
+            "template_id",
+            "template_scenario",
+            "config_id",
+            "prompt_ids",
+            "skill_ids",
+            "writing_rule_ids",
+            "context_blocks",
+            "fallbacks_used",
+            "deprecated_sources_used",
+            "missing_prompt_ids",
+        ]
+        compact = {key: trace.get(key) for key in allowed_keys if trace.get(key) is not None}
+        return self._make_json_safe(compact)
+
+    async def _capture_effective_agent_input_snapshot(
+        self,
+        execution: "WorkflowExecution",
+        node: WorkflowNode,
+        resolved_agent_type: str,
+        resolved_scenario: Optional[str],
+        context: Dict[str, Any],
+        db=None,
+    ) -> None:
+        """记录 Writer 实际执行前的有效输入，覆盖预执行快照的上下文盲区。"""
+        execution.context.setdefault("node_runtime_metadata", {}).setdefault(node.id, {}).update({
+            "source_node_id": node.id,
+            "source_node_label": node.label,
+            "source_agent_type": node.agent_type,
+            "resolved_agent_type": resolved_agent_type,
+            "resolved_scenario": resolved_scenario or "default",
+            "source_trace_id": execution.trace_id,
+        })
+        if resolved_agent_type != "writer":
+            return
+
+        node_state = execution.node_states.get(node.id)
+        if not node_state:
+            return
+
+        snapshot = self._build_node_input_snapshot(node, execution, context)
+        context_keys = sorted(str(key) for key in context.keys() if key != "_trace")
+        required_context_present = {
+            "chapter_outline": bool(context.get("chapter_outline")),
+            "target_word_count": context.get("target_word_count") is not None,
+            "previous_chapters": bool(context.get("previous_chapters") or context.get("chapter_summaries")),
+            "characters": bool(context.get("characters")),
+            "lore_entries": bool(context.get("lore_entries")),
+            "hooks": bool(context.get("existing_hooks") or context.get("hooks")),
+            "workflow_state": bool(context.get("workflow_state")),
+            "graph_context": bool(context.get("graph_context") or context.get("graph_context_summary")),
+        }
+        snapshot["_effective_agent_input"] = self._make_json_safe({
+            "resolved_agent_type": resolved_agent_type,
+            "resolved_scenario": resolved_scenario or "default",
+            "context_keys": context_keys,
+            "required_context_present": required_context_present,
+        })
+        node_state.input_data = self._make_json_safe(snapshot)
+        execution.context.setdefault("node_runtime_metadata", {}).setdefault(node.id, {}).update({
+            "source_node_id": node.id,
+            "source_node_label": node.label,
+            "source_agent_type": node.agent_type,
+            "resolved_agent_type": resolved_agent_type,
+            "resolved_scenario": resolved_scenario or "default",
+            "source_trace_id": execution.trace_id,
+            "source_node_input_keys": [key for key in node_state.input_data.keys() if key != "_effective_agent_input"],
+        })
+        if db:
+            await self._save_execution_to_db(execution, db)
+            trace_service = get_trace_service(db)
+            await trace_service.record_event("writer_effective_input_captured", {
+                "node_id": node.id,
+                "resolved_agent_type": resolved_agent_type,
+                "resolved_scenario": resolved_scenario or "default",
+                "required_context_present": required_context_present,
+            })
+            await trace_service.record_artifact("node_effective_input", content=node_state.input_data)
+
+    def _build_writer_save_provenance(
+        self,
+        execution: "WorkflowExecution",
+        node: Optional[WorkflowNode],
+        writer_output: Dict[str, Any],
+        *,
+        contract_metadata: Optional[Dict[str, Any]] = None,
+        prompt_trace: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """构建章节保存来源审计信息，仅保存标识符和大小，不保存正文。"""
+        node_id = node.id if node else None
+        node_state = execution.node_states.get(node_id) if node_id else None
+        runtime_metadata = execution.context.get("node_runtime_metadata", {}).get(node_id, {}) if node_id else {}
+        contract_metadata = contract_metadata or {}
+        compact_prompt_trace = self._compact_prompt_render_trace(prompt_trace)
+        content_field = "content" if writer_output.get("content") else "chapter_content"
+        content_value = writer_output.get("content") or writer_output.get("chapter_content") or ""
+        provenance = {
+            "source_node_id": node_id or runtime_metadata.get("source_node_id"),
+            "source_node_label": (node.label if node else None) or runtime_metadata.get("source_node_label"),
+            "source_agent_type": (node.agent_type if node else None) or runtime_metadata.get("source_agent_type"),
+            "resolved_agent_type": runtime_metadata.get("resolved_agent_type") or (node.agent_type if node else None),
+            "resolved_scenario": runtime_metadata.get("resolved_scenario"),
+            "source_trace_id": execution.trace_id,
+            "source_output_contract_id": contract_metadata.get("output_contract_id") or runtime_metadata.get("output_contract_id"),
+            "source_output_schema_name": contract_metadata.get("output_schema_name") or runtime_metadata.get("output_schema_name"),
+            "source_output_schema_version": contract_metadata.get("output_schema_version") or runtime_metadata.get("output_schema_version"),
+            "source_node_input_keys": list((node_state.input_data or {}).keys()) if node_state else runtime_metadata.get("source_node_input_keys", []),
+            "source_node_output_keys": list(writer_output.keys()),
+            "writer_output_content_field": content_field,
+            "writer_output_content_chars": len(content_value),
+            "writer_output_word_count": writer_output.get("word_count"),
+            "writer_prompt_trace_present": bool(compact_prompt_trace),
+        }
+        if compact_prompt_trace:
+            provenance["writer_prompt_trace"] = compact_prompt_trace
+        return self._make_json_safe(provenance)
 
     async def _load_data_from_database(
         self,
@@ -3787,11 +4553,20 @@ class WorkflowEngine:
                 if key not in context or context[key] is None:
                     context[key] = value
 
+        context["_resolved_agent_type"] = resolved_agent_type
         if resolved_scenario:
             context["scenario"] = resolved_scenario
             context["agent_scenario"] = resolved_scenario
 
         if resolved_agent_type == "writer":
+            if context.get("is_retry") and not context.get("task_type"):
+                context["task_type"] = "rewrite_by_review"
+            if context.get("is_retry"):
+                node_config = node.config or {}
+                if not node_config.get("scenario") and not node_config.get("agent_scenario"):
+                    context["agent_scenario"] = "rewrite_by_review"
+                    context["scenario"] = "rewrite_by_review"
+
             canonical_target = (
                 context.get("target_word_count")
                 or context.get("chapter_target_word_count")
@@ -3847,6 +4622,12 @@ class WorkflowEngine:
                 f"跳过 Agent 节点: type={resolved_agent_type}, scenario={resolved_scenario or 'default'}, "
                 f"node_id={node.id}, reason={reason}"
             )
+            prompt_trace = await self._build_workflow_node_prompt_trace(
+                resolved_agent_type,
+                project_id,
+                resolved_scenario,
+                context,
+            )
             skipped_output = {
                 "skipped": True,
                 "reason": reason,
@@ -3854,10 +4635,16 @@ class WorkflowEngine:
                 "scenario": resolved_scenario or "default",
                 "node_id": node.id,
             }
+            skipped_output = self._attach_prompt_render_trace_metadata(
+                skipped_output,
+                prompt_trace,
+                "agent_disabled",
+            )
             return skipped_output, None, None
 
         if adapter:
             execution.context.update(context)
+            await self._capture_effective_agent_input_snapshot(execution, node, resolved_agent_type, resolved_scenario, context, db)
             logger.info(f"节点 '{node.label}' 使用 workflow adapter 执行: {resolved_agent_type}")
             prompt_trace = await self._build_workflow_node_prompt_trace(
                 resolved_agent_type,
@@ -3879,6 +4666,235 @@ class WorkflowEngine:
 
         logger.info(f"Agent 实例获取成功: type={resolved_agent_type}, instance_id={id(agent)}")
         return await self._run_agent_execution(agent, context, execution, node, db)
+
+    def _hash_json_payload(self, payload: Any) -> str:
+        import hashlib
+
+        serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    def _compact_state_packet_text(self, value: Any, limit: int = 240) -> str:
+        text = self._coerce_context_text(value).strip()
+        if not text and isinstance(value, (dict, list)):
+            try:
+                text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+            except (TypeError, ValueError):
+                text = str(value)
+        if len(text) > limit:
+            return text[: limit - 1] + "…"
+        return text
+
+    def _chapter_num_from_record(self, chapter: Dict[str, Any], fallback: int) -> Optional[int]:
+        return self._parse_chapter_number(
+            chapter.get("chapter_number")
+            or chapter.get("chapter_num")
+            or chapter.get("number")
+            or chapter.get("order")
+            or fallback
+        )
+
+    def _state_change_sort_key(self, change: Dict[str, Any]) -> tuple:
+        timestamp = (
+            change.get("applied_at")
+            or change.get("confirmed_at")
+            or change.get("created_at")
+            or ""
+        )
+        return (str(timestamp), str(change.get("id") or ""))
+
+    def _state_entity_key(self, change: Dict[str, Any]) -> str:
+        entity_type = str(change.get("entity_type") or "custom")
+        entity_id = change.get("entity_id") or change.get("entity_name") or change.get("id")
+        return f"{entity_type}:{entity_id}"
+
+    def _compact_confirmed_state_change(self, change: Dict[str, Any]) -> Dict[str, Any]:
+        source_chapter_id = change.get("chapter_id") or self._ensure_context_dict(change.get("metadata")).get("chapter_id")
+        return {
+            "id": change.get("id"),
+            "entity_key": self._state_entity_key(change),
+            "entity_type": change.get("entity_type"),
+            "entity_id": change.get("entity_id"),
+            "entity_name": self._compact_state_packet_text(change.get("entity_name"), 120),
+            "change_type": change.get("change_type"),
+            "summary": self._compact_state_packet_text(change.get("summary") or change.get("title"), 240),
+            "source_chapter_id": source_chapter_id,
+            "status": change.get("status"),
+            "confirmed_at": self._make_json_safe(change.get("confirmed_at")),
+            "applied_at": self._make_json_safe(change.get("applied_at")),
+            "created_at": self._make_json_safe(change.get("created_at")),
+            "after_state": self._make_json_safe(change.get("after_state") or {}),
+        }
+
+    def _merge_state_packet_value(self, current_value: Any, next_value: Any) -> Any:
+        if next_value is None:
+            return self._make_json_safe(current_value)
+        if isinstance(current_value, dict) and isinstance(next_value, dict):
+            merged = dict(current_value)
+            for key, value in next_value.items():
+                merged[key] = self._merge_state_packet_value(merged.get(key), value)
+            return merged
+        if isinstance(current_value, list) and isinstance(next_value, list):
+            merged_list = [self._make_json_safe(item) for item in current_value]
+            seen = {json.dumps(item, ensure_ascii=False, sort_keys=True, default=str) for item in merged_list}
+            for item in next_value:
+                safe_item = self._make_json_safe(item)
+                item_key = json.dumps(safe_item, ensure_ascii=False, sort_keys=True, default=str)
+                if item_key not in seen:
+                    seen.add(item_key)
+                    merged_list.append(safe_item)
+            return merged_list
+        return self._make_json_safe(next_value)
+
+    def _merge_state_packet_payload(self, current_payload: Dict[str, Any], next_payload: Dict[str, Any]) -> Dict[str, Any]:
+        merged = dict(current_payload)
+        for key, value in (next_payload or {}).items():
+            merged[key] = self._merge_state_packet_value(merged.get(key), value)
+        return merged
+
+    def _build_confirmed_state_summary(self, changes: List[Dict[str, Any]], *, limit: int) -> List[Dict[str, Any]]:
+        grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for change in changes:
+            grouped[self._state_entity_key(change)].append(change)
+
+        summaries: List[Dict[str, Any]] = []
+        for entity_key, items in grouped.items():
+            ordered = sorted(items, key=self._state_change_sort_key)
+            latest = ordered[-1]
+            merged_after_state: Dict[str, Any] = {}
+            for item in ordered:
+                merged_after_state = self._merge_state_packet_payload(merged_after_state, item.get("after_state") or {})
+            summaries.append({
+                "entity_key": entity_key,
+                "entity_type": latest.get("entity_type"),
+                "entity_id": latest.get("entity_id"),
+                "entity_name": self._compact_state_packet_text(latest.get("entity_name"), 120),
+                "latest_change_id": latest.get("id"),
+                "latest_status": latest.get("status"),
+                "latest_change_type": latest.get("change_type"),
+                "latest_summary": self._compact_state_packet_text(latest.get("summary") or latest.get("title"), 240),
+                "latest_after_state": self._make_json_safe(merged_after_state),
+                "change_count": len(ordered),
+                "history_change_ids": [item.get("id") for item in ordered[-5:] if item.get("id")],
+            })
+
+        return sorted(
+            summaries,
+            key=lambda item: (str(item.get("entity_type") or ""), str(item.get("entity_id") or item.get("entity_key") or "")),
+        )[:limit]
+
+    async def _load_confirmed_prior_state_packet(
+        self,
+        project_id: str,
+        chapter_num: Optional[int],
+        db,
+        *,
+        limit: int = 20,
+    ) -> Dict[str, Any]:
+        """Load compact saved/prior accepted state for Writer/Evaluator continuity."""
+        packet = {
+            "source": {
+                "quality_gated_only": True,
+                "max_items": limit,
+                "prior_chapter_count": 0,
+            },
+            "prior_chapters": [],
+            "confirmed_state_changes": [],
+            "confirmed_state_summary": [],
+            "open_proposed_changes": [],
+            "continuity_notes": [],
+        }
+        if not db:
+            return packet
+
+        prior_chapters: List[Dict[str, Any]] = []
+        if hasattr(db, "get_chapters_by_project"):
+            try:
+                chapters = await db.get_chapters_by_project(project_id, limit=limit * 2)
+            except TypeError:
+                chapters = await db.get_chapters_by_project(project_id)
+            for index, chapter in enumerate(chapters or [], start=1):
+                if not isinstance(chapter, dict):
+                    continue
+                status = chapter.get("status")
+                if status != "saved":
+                    continue
+                record_num = self._chapter_num_from_record(chapter, index)
+                if chapter_num is not None and record_num is not None and record_num >= chapter_num:
+                    continue
+                prior_chapters.append({
+                    "chapter_id": chapter.get("id") or chapter.get("chapter_id"),
+                    "chapter_number": record_num,
+                    "title": self._compact_state_packet_text(chapter.get("title") or chapter.get("chapter_title"), 120),
+                    "checksum": chapter.get("content_checksum") or chapter.get("chapter_content_checksum"),
+                })
+                if len(prior_chapters) >= limit:
+                    break
+        packet["prior_chapters"] = prior_chapters
+        packet["source"]["prior_chapter_count"] = len(prior_chapters)
+
+        if hasattr(db, "list_narrative_state_changes"):
+            confirmed_records: List[Dict[str, Any]] = []
+            for status in ("applied", "confirmed"):
+                fetch_limit = max(limit * 5, limit)
+                changes = await db.list_narrative_state_changes(project_id, status=status, limit=fetch_limit)
+                for change in changes or []:
+                    if isinstance(change, dict):
+                        confirmed_records.append(change)
+            confirmed_records = sorted(confirmed_records, key=self._state_change_sort_key, reverse=True)
+            packet["confirmed_state_changes"] = [
+                self._compact_confirmed_state_change(change)
+                for change in confirmed_records[:limit]
+            ]
+            packet["confirmed_state_summary"] = self._build_confirmed_state_summary(confirmed_records, limit=limit)
+            packet["source"]["confirmed_state_total"] = len(confirmed_records)
+            packet["source"]["confirmed_entity_count"] = len(packet["confirmed_state_summary"])
+
+            proposed_changes = await db.list_narrative_state_changes(project_id, status="proposed", limit=limit)
+            packet["open_proposed_changes"] = [
+                {
+                    "id": change.get("id"),
+                    "entity_type": change.get("entity_type"),
+                    "summary": self._compact_state_packet_text(change.get("summary") or change.get("title"), 200),
+                    "status": change.get("status"),
+                }
+                for change in (proposed_changes or [])
+                if isinstance(change, dict)
+            ][:limit]
+
+        return packet
+
+    async def _attach_confirmed_prior_state_packet(
+        self,
+        context: Dict[str, Any],
+        execution: "WorkflowExecution",
+        db,
+    ) -> None:
+        if context.get("confirmed_prior_state_packet"):
+            return
+        chapter_num = self._parse_chapter_number(context.get("chapter_num") or execution.context.get("chapter_num"))
+        packet = await self._load_confirmed_prior_state_packet(execution.project_id, chapter_num, db)
+        provenance = {
+            "loaded_at": datetime.now().isoformat(),
+            "project_id": execution.project_id,
+            "chapter_num": chapter_num,
+            "prior_chapter_count": len(packet.get("prior_chapters") or []),
+            "confirmed_state_count": len(packet.get("confirmed_state_changes") or []),
+            "open_proposed_count": len(packet.get("open_proposed_changes") or []),
+            "packet_checksum": self._hash_json_payload(packet),
+        }
+        context["confirmed_prior_state_packet"] = packet
+        context["confirmed_prior_state_packet_provenance"] = provenance
+        execution.context["confirmed_prior_state_packet"] = packet
+        execution.context["confirmed_prior_state_packet_provenance"] = provenance
+        await self._broadcast_status(execution.id, "chapter_state_handoff_loaded", {
+            "execution_id": execution.id,
+            "workflow_id": execution.workflow_id,
+            "chapter_num": chapter_num,
+            "chapter_number": chapter_num,
+            "prior_chapter_count": provenance["prior_chapter_count"],
+            "confirmed_state_count": provenance["confirmed_state_count"],
+            "pending_count": provenance["open_proposed_count"],
+        })
 
     async def _load_agent_context(
         self,
@@ -3980,6 +4996,7 @@ class WorkflowEngine:
 
             # ===== Writer Agent：需要章节历史、伏笔、角色、讨论共识、剧情意图 =====
             if agent_type == "writer":
+                await self._attach_confirmed_prior_state_packet(context, execution, db)
                 # 已有章节
                 if "previous_chapters" not in context:
                     chapters = await self._load_data_from_database("previous_chapters", project_id, db, context) or []
@@ -4194,6 +5211,8 @@ class WorkflowEngine:
                     "selected_lore_entries",
                     "upcoming_outline_context",
                     "upcoming_outline_policy",
+                    "confirmed_prior_state_packet",
+                    "confirmed_prior_state_packet_provenance",
                     "node_outputs",
                     "asset_state",
                     "workflow_state",
@@ -4278,6 +5297,7 @@ class WorkflowEngine:
 
             # ===== Evaluator Agent：需要章节历史、绑定大纲、设定、写作计划和资产状态 =====
             if agent_type == "evaluator":
+                await self._attach_confirmed_prior_state_packet(context, execution, db)
                 self._attach_upcoming_outline_context(context)
                 for workflow_key in [
                     "chapter_outline",
@@ -4321,6 +5341,8 @@ class WorkflowEngine:
                     "saved_region_ids",
                     "saved_hook_ids",
                     "saved_lore_ids",
+                    "confirmed_prior_state_packet",
+                    "confirmed_prior_state_packet_provenance",
                     "workflow_state",
                     "asset_state",
                     "node_outputs",
@@ -4782,6 +5804,15 @@ class WorkflowEngine:
                     if memory_context:
                         context["agent_memory_context"] = memory_context
 
+        await self._capture_effective_agent_input_snapshot(
+            execution,
+            node,
+            context.get("_resolved_agent_type") or node.agent_type,
+            context.get("agent_scenario") or context.get("scenario"),
+            context,
+            db,
+        )
+
         try:
             # 执行 Agent（添加超时保护）
             logger.info(f"开始执行 Agent {node.agent_type} (实例ID: {agent_id})")
@@ -4811,13 +5842,24 @@ class WorkflowEngine:
         result.metadata = result.metadata or {}
         if "prompt_render_trace" not in result.metadata:
             prompt_trace = await self._build_workflow_node_prompt_trace(
-                node.agent_type,
+                context.get("_resolved_agent_type") or node.agent_type,
                 execution.project_id,
                 context.get("agent_scenario") or context.get("scenario"),
                 context,
             )
             result.metadata["prompt_render_trace"] = prompt_trace
             result.metadata.setdefault("config_prompt_source", "agent_template_runtime")
+
+        contract_metadata = self._build_contract_metadata(resolved_contract, result)
+        execution.context.setdefault("node_runtime_metadata", {}).setdefault(node.id, {}).update({
+            "source_node_id": node.id,
+            "source_node_label": node.label,
+            "source_agent_type": node.agent_type,
+            "resolved_agent_type": context.get("_resolved_agent_type") or node.agent_type,
+            "resolved_scenario": context.get("agent_scenario") or context.get("scenario") or "default",
+            "source_trace_id": execution.trace_id,
+            **contract_metadata,
+        })
 
         # 日志记录流式输出统计
         if chunk_count > 0:
@@ -4838,7 +5880,7 @@ class WorkflowEngine:
                 "label": node.label,
                 "output": payload,
             }
-            agent_output_event.update(self._build_contract_metadata(resolved_contract, result))
+            agent_output_event.update(contract_metadata)
             await self._broadcast_status(execution.id, "agent_output", agent_output_event)
 
         output_data = payload if isinstance(payload, dict) else {}
@@ -4918,6 +5960,7 @@ class WorkflowEngine:
                 evaluation_feedback["issues"].insert(0, word_count_check.get("message", "字数不达标"))
 
             execution.context["evaluation_feedback"] = evaluation_feedback
+            await self._record_quality_gate_result(execution, node, evaluation_feedback, db)
 
             # 检测角色死亡事件
             character_events = output_data.get("character_events", [])
@@ -4958,39 +6001,36 @@ class WorkflowEngine:
 
                 logger.info(f"角色 Agent {node.agent_type} 输出已保存")
 
-        # 如果是 Writer Agent，保存章节到数据库
-        if node.agent_type == "writer" and result.success and output_data:
-            await self._save_chapter_from_writer(execution, output_data, db)
-            await self._save_hooks_from_writer_metadata(execution, output_data, db)
+        resolved_agent_type = execution.context.get("node_runtime_metadata", {}).get(node.id, {}).get("resolved_agent_type") or node.agent_type
 
-            # ========== 角色检测与晋升 ==========
-            # 在章节内容生成后，检测可能的新角色
-            chapter_content = output_data.get("content") or output_data.get("chapter_content", "")
-            if chapter_content and len(chapter_content) > 500:
-                # 获取 Writer Agent 的 LLM 模型用于智能角色检测
-                writer_model = getattr(agent, 'model', None) if agent else None
-                await self._detect_and_promote_characters(
-                    execution=execution,
-                    content=chapter_content,
-                    db=db,
-                    llm_model=writer_model,
-                )
-
-        # 如果 Writer 按已确认计划输出了首次出场角色候选，复用讨论资产角色落库路径
-        if node.agent_type == "writer" and result.success and output_data:
-            writer_character_candidates = self._ensure_context_list(
-                output_data.get("character_candidates")
-                or output_data.get("new_characters")
-                or output_data.get("characters_to_create")
-            )
-            if writer_character_candidates:
-                character_result = await self._persist_discussion_characters(
+        # 如果是 Writer Agent，根据质量门状态暂存草稿或直接保存章节到数据库
+        writer_finalized = False
+        writer_quality_gated = False
+        if resolved_agent_type == "writer" and result.success and output_data:
+            writer_quality_gated = self._is_quality_gate_active_for_writer(execution, node)
+            if writer_quality_gated:
+                await self._stage_writer_draft(
                     execution,
-                    writer_character_candidates,
+                    node,
+                    output_data,
                     db,
+                    contract_metadata=contract_metadata,
+                    prompt_trace=result.metadata.get("prompt_render_trace"),
                 )
-                execution.context["writer_created_characters"] = character_result.get("created", [])
-                execution.context["writer_character_persistence_state"] = character_result
+            else:
+                await self._save_chapter_from_writer(
+                    execution,
+                    output_data,
+                    db,
+                    source_node=node,
+                    contract_metadata=contract_metadata,
+                    prompt_trace=result.metadata.get("prompt_render_trace"),
+                )
+                writer_finalized = True
+
+        if writer_finalized:
+            writer_model = getattr(agent, 'model', None) if agent else None
+            await self._run_writer_finalization_side_effects(execution, output_data, db, llm_model=writer_model)
 
         # 如果是伏笔管理 Agent，保存伏笔到数据库
         if node.agent_type == "hook_manager" and result.success and output_data:
@@ -5226,11 +6266,615 @@ class WorkflowEngine:
             logger.error("Writer 保存章节后更新大纲状态失败: %s", exc)
             execution.context["chapter_outline_status_update_error"] = str(exc)
 
+    def _is_quality_gate_active_for_writer(self, execution: "WorkflowExecution", node: WorkflowNode) -> bool:
+        """Return whether Writer output should wait for Evaluator/condition approval before final save."""
+        node_config = node.config or {}
+        explicit = (
+            node_config.get("quality_gate_enabled")
+            if "quality_gate_enabled" in node_config
+            else node_config.get("defer_save_until_quality_pass")
+        )
+        if explicit is not None:
+            return bool(explicit)
+
+        context = execution.context if isinstance(execution.context, dict) else {}
+        for key in ("quality_gate_enabled", "defer_save_until_quality_pass", "chapter_quality_gate_enabled"):
+            if key in context:
+                return bool(context.get(key))
+
+        workflow = self._workflows.get(execution.workflow_id)
+        if not workflow:
+            return False
+
+        node_by_id = {item.id: item for item in workflow.nodes}
+        successors = [edge.target for edge in workflow.edges if edge.source == node.id]
+        visited: Set[str] = set()
+        queue: deque[str] = deque(successors)
+        while queue:
+            next_id = queue.popleft()
+            if next_id in visited:
+                continue
+            visited.add(next_id)
+            next_node = node_by_id.get(next_id)
+            if not next_node:
+                continue
+            next_agent_type = (next_node.agent_type or "").lower()
+            if next_agent_type in {"evaluator", "chapter_evaluator"} or next_node.node_type == NodeType.CONDITION:
+                return True
+            for edge in workflow.edges:
+                if edge.source == next_id:
+                    queue.append(edge.target)
+        return False
+
+    def _extract_writer_content(self, writer_output: Dict[str, Any]) -> str:
+        return writer_output.get("content") or writer_output.get("chapter_content") or ""
+
+    def _build_quality_summary(self, feedback: Dict[str, Any]) -> Dict[str, Any]:
+        issues = feedback.get("issues") if isinstance(feedback, dict) else []
+        suggestions = feedback.get("suggestions") if isinstance(feedback, dict) else []
+        if not isinstance(issues, list):
+            issues = [str(issues)] if issues else []
+        if not isinstance(suggestions, list):
+            suggestions = [str(suggestions)] if suggestions else []
+        return self._make_json_safe({
+            "passed": feedback.get("passed") if isinstance(feedback, dict) else None,
+            "score": feedback.get("score") if isinstance(feedback, dict) else None,
+            "issues_count": len(issues),
+            "suggestions_count": len(suggestions),
+            "issues": [str(item)[:240] for item in issues[:5]],
+            "suggestions": [str(item)[:240] for item in suggestions[:5]],
+            "summary": str(feedback.get("summary") or "")[:500] if isinstance(feedback, dict) else "",
+            "word_count_check": feedback.get("word_count_check") if isinstance(feedback, dict) else None,
+        })
+
+    def _build_quality_gate_saved_metadata(self, execution: "WorkflowExecution") -> Dict[str, Any]:
+        gate = execution.context.get("quality_gate") if isinstance(execution.context, dict) else None
+        history = execution.context.get("quality_gate_history") if isinstance(execution.context, dict) else None
+        revisions = execution.context.get("revision_history") if isinstance(execution.context, dict) else None
+        history = history if isinstance(history, list) else []
+        revisions = revisions if isinstance(revisions, list) else []
+        if not isinstance(gate, dict) and not history and not revisions:
+            return {}
+        gate = gate if isinstance(gate, dict) else {}
+        return self._make_json_safe({
+            "quality_gate_passed": gate.get("passed"),
+            "quality_gate_status": gate.get("status"),
+            "quality_gate_score": gate.get("score"),
+            "quality_gate_attempts": len(history),
+            "revision_attempts": len(revisions),
+            "finalized_from_draft_attempt": execution.context.get("chapter_draft_attempt"),
+            "forced_pass": gate.get("forced_pass"),
+        })
+
+    async def _stage_writer_draft(
+        self,
+        execution: "WorkflowExecution",
+        node: WorkflowNode,
+        writer_output: Dict[str, Any],
+        db=None,
+        *,
+        contract_metadata: Optional[Dict[str, Any]] = None,
+        prompt_trace: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Stage Writer output as a draft for Evaluator review without final persistence."""
+        content = self._extract_writer_content(writer_output)
+        if not content:
+            logger.warning("Writer 输出没有内容，无法进入质量门草稿阶段")
+            return
+
+        attempt = int(execution.context.get("chapter_draft_attempt") or 0) + 1
+        import hashlib
+        checksum = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        word_count = writer_output.get("word_count", len(content))
+        provenance = self._build_writer_save_provenance(
+            execution,
+            node,
+            writer_output,
+            contract_metadata=contract_metadata,
+            prompt_trace=prompt_trace,
+        )
+        draft_payload = {
+            "draft_attempt": attempt,
+            "chapter_num": execution.context.get("chapter_num"),
+            "chapter_number": execution.context.get("chapter_num"),
+            "chapter_title": execution.context.get("chapter_title"),
+            "chapter_outline_id": execution.context.get("chapter_outline_id"),
+            "project_id": execution.project_id,
+            "execution_id": execution.id,
+            "workflow_id": execution.workflow_id,
+            "status": "draft_pending_quality_gate",
+            "created_at": datetime.now().isoformat(),
+            "word_count": word_count,
+            "content_chars": len(content),
+            "content_checksum": checksum,
+            **provenance,
+        }
+
+        execution.context["chapter_content"] = content
+        execution.context["chapter_draft_payload"] = self._make_json_safe(draft_payload)
+        execution.context["chapter_draft_provenance"] = self._make_json_safe(provenance)
+        execution.context["chapter_draft_attempt"] = attempt
+        execution.context["chapter_draft_word_count"] = word_count
+        execution.context["chapter_draft_checksum"] = checksum
+        execution.context["pending_chapter_save"] = True
+        execution.context["quality_gate_status"] = "pending_evaluation"
+        execution.context["quality_gate"] = self._make_json_safe({
+            "status": "pending_evaluation",
+            "draft_attempt": attempt,
+            "content_chars": len(content),
+            "content_checksum": checksum,
+            "updated_at": datetime.now().isoformat(),
+        })
+        await self._broadcast_status(execution.id, "chapter_draft_ready", self._make_json_safe(draft_payload))
+        if db:
+            await get_trace_service(db).record_event("chapter_draft_ready", self._make_json_safe(draft_payload))
+
+    async def _record_quality_gate_result(
+        self,
+        execution: "WorkflowExecution",
+        node: WorkflowNode,
+        evaluation_feedback: Dict[str, Any],
+        db=None,
+    ) -> None:
+        """Record Evaluator gate result as compact audit metadata."""
+        if not execution.context.get("pending_chapter_save") and not execution.context.get("chapter_draft_payload"):
+            return
+
+        passed = bool(evaluation_feedback.get("passed"))
+        draft_payload = execution.context.get("chapter_draft_payload") if isinstance(execution.context.get("chapter_draft_payload"), dict) else {}
+        summary = self._build_quality_summary(evaluation_feedback)
+        attempt = len(execution.context.get("quality_gate_history") or []) + 1
+        entry = self._make_json_safe({
+            "attempt": attempt,
+            "evaluator_node_id": node.id,
+            "evaluator_node_label": node.label,
+            "passed": passed,
+            "score": evaluation_feedback.get("score"),
+            "draft_attempt": execution.context.get("chapter_draft_attempt"),
+            "content_chars": draft_payload.get("content_chars"),
+            "content_checksum": execution.context.get("chapter_draft_checksum") or draft_payload.get("content_checksum"),
+            "issues_count": summary.get("issues_count"),
+            "suggestions_count": summary.get("suggestions_count"),
+            "issues": summary.get("issues"),
+            "suggestions": summary.get("suggestions"),
+            "summary": summary.get("summary"),
+            "word_count_check": summary.get("word_count_check"),
+            "evaluated_at": datetime.now().isoformat(),
+        })
+        history = execution.context.get("quality_gate_history")
+        if not isinstance(history, list):
+            history = []
+        history.append(entry)
+        execution.context["quality_gate_history"] = history
+        status = "passed" if passed else "revision_required"
+        gate = {
+            "status": status,
+            "passed": passed,
+            "score": evaluation_feedback.get("score"),
+            "latest_attempt": attempt,
+            "draft_attempt": execution.context.get("chapter_draft_attempt"),
+            "issues_count": entry.get("issues_count"),
+            "suggestions_count": entry.get("suggestions_count"),
+            "updated_at": entry.get("evaluated_at"),
+        }
+        execution.context["quality_gate"] = self._make_json_safe(gate)
+        execution.context["quality_gate_status"] = status
+        event_type = "quality_gate_passed" if passed else "quality_gate_failed"
+        await self._broadcast_status(execution.id, event_type, entry)
+        if db:
+            await get_trace_service(db).record_event(event_type, entry)
+
+    async def _finalize_chapter_after_quality_pass(
+        self,
+        execution: "WorkflowExecution",
+        db=None,
+    ) -> None:
+        """Persist the latest staged Writer draft after quality approval, idempotently."""
+        if not execution.context.get("pending_chapter_save"):
+            return
+        if execution.context.get("chapter_saved") and execution.context.get("chapter_saved_payload"):
+            execution.context["pending_chapter_save"] = False
+            return
+        draft_payload = execution.context.get("chapter_draft_payload")
+        if not isinstance(draft_payload, dict):
+            raise ValueError("质量门通过但缺少 Writer 草稿元数据，无法保存章节")
+        content = execution.context.get("chapter_content") or ""
+        if not content:
+            raise ValueError("质量门通过但缺少 Writer 草稿正文，无法保存章节")
+        writer_output = {
+            "chapter_content": content,
+            "word_count": draft_payload.get("word_count") or execution.context.get("chapter_draft_word_count") or len(content),
+            "metadata": {"quality_gate_finalized": True, "draft_attempt": execution.context.get("chapter_draft_attempt")},
+        }
+        node_outputs = execution.context.get("node_outputs") if isinstance(execution.context.get("node_outputs"), dict) else {}
+        source_node_id = draft_payload.get("source_node_id")
+        staged_writer_output = node_outputs.get(source_node_id) if source_node_id else None
+        if isinstance(staged_writer_output, dict):
+            writer_output = {**staged_writer_output, **writer_output}
+        source_node = None
+        workflow = self._workflows.get(execution.workflow_id)
+        if workflow and source_node_id:
+            source_node = next((item for item in workflow.nodes if item.id == source_node_id), None)
+        contract_metadata = {
+            "output_contract_id": draft_payload.get("source_output_contract_id"),
+            "output_schema_name": draft_payload.get("source_output_schema_name"),
+            "output_schema_version": draft_payload.get("source_output_schema_version"),
+        }
+        prompt_trace = draft_payload.get("writer_prompt_trace") if isinstance(draft_payload.get("writer_prompt_trace"), dict) else None
+        await self._save_chapter_from_writer(
+            execution,
+            writer_output,
+            db,
+            source_node=source_node,
+            contract_metadata=contract_metadata,
+            prompt_trace=prompt_trace,
+        )
+        await self._run_writer_finalization_side_effects(execution, writer_output, db)
+
+    async def _run_writer_finalization_side_effects(
+        self,
+        execution: "WorkflowExecution",
+        writer_output: Dict[str, Any],
+        db=None,
+        *,
+        llm_model=None,
+    ) -> None:
+        """Persist Writer side effects only after the chapter is finally accepted/saved."""
+        await self._save_hooks_from_writer_metadata(execution, writer_output, db)
+        chapter_content = writer_output.get("content") or writer_output.get("chapter_content", "")
+        if chapter_content and len(chapter_content) > 500:
+            await self._detect_and_promote_characters(
+                execution=execution,
+                content=chapter_content,
+                db=db,
+                llm_model=llm_model,
+            )
+
+        writer_character_candidates = self._ensure_context_list(
+            writer_output.get("character_candidates")
+            or writer_output.get("new_characters")
+            or writer_output.get("characters_to_create")
+        )
+        if writer_character_candidates:
+            character_result = await self._persist_discussion_characters(
+                execution,
+                writer_character_candidates,
+                db,
+            )
+            execution.context["writer_created_characters"] = character_result.get("created", [])
+            execution.context["writer_character_persistence_state"] = character_result
+
+        await self._propose_state_changes_from_saved_chapter(execution, writer_output, db)
+
+    def _collect_saved_chapter_state_change_candidates(
+        self,
+        execution: "WorkflowExecution",
+        writer_output: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Collect accepted Writer/runtime state-change candidates after final chapter save."""
+        candidates: List[Dict[str, Any]] = []
+        candidate_sources = [
+            ("writer.state_deltas", writer_output.get("state_deltas")),
+            ("writer.relationship_deltas", writer_output.get("relationship_deltas")),
+            ("writer.state_changes", writer_output.get("state_changes")),
+            ("writer.narrative_state_changes", writer_output.get("narrative_state_changes")),
+            ("writer.chapter_state_changes", writer_output.get("chapter_state_changes")),
+            ("runtime.state_deltas", execution.context.get("state_deltas")),
+            ("runtime.relationship_deltas", execution.context.get("relationship_deltas")),
+        ]
+
+        for source, raw_items in candidate_sources:
+            for index, item in enumerate(self._ensure_context_list(raw_items)):
+                payload = self._discussion_asset_to_dict(item, default_key="summary")
+                if not payload:
+                    continue
+                payload.setdefault("metadata", {})
+                if isinstance(payload["metadata"], dict):
+                    payload["metadata"] = {**payload["metadata"], "candidate_source": source, "candidate_index": index}
+                else:
+                    payload["metadata"] = {"candidate_source": source, "candidate_index": index}
+                candidates.append(payload)
+
+        continuity_notes = [
+            ("writer.continuity_notes", writer_output.get("continuity_notes")),
+            ("runtime.continuity_notes", execution.context.get("continuity_notes")),
+        ]
+        for source, raw_notes in continuity_notes:
+            for index, note in enumerate(self._ensure_context_list(raw_notes)):
+                if isinstance(note, dict):
+                    summary = self._extract_context_item_text(note, "summary", "note", "content", "description")
+                    payload = dict(note)
+                else:
+                    summary = self._coerce_context_text(note).strip()
+                    payload = {"summary": summary}
+                if not summary:
+                    continue
+                payload.update({
+                    "entity_type": payload.get("entity_type") or "plot",
+                    "change_type": payload.get("change_type") or "custom",
+                    "title": payload.get("title") or "章节连续性备注",
+                    "summary": summary,
+                    "metadata": {
+                        **self._ensure_context_dict(payload.get("metadata")),
+                        "candidate_source": source,
+                        "candidate_index": index,
+                        "continuity_note": True,
+                    },
+                })
+                candidates.append(payload)
+
+        return candidates
+
+    def _normalize_saved_chapter_state_change_candidate(
+        self,
+        raw_change: Dict[str, Any],
+        execution: "WorkflowExecution",
+    ) -> Dict[str, Any]:
+        """Normalize Writer/runtime deltas into NarrativeStateChangeService payload shape."""
+        payload = dict(raw_change)
+        metadata = self._ensure_context_dict(payload.get("metadata"))
+        entity_type = str(
+            payload.get("entity_type")
+            or payload.get("target_type")
+            or payload.get("entity")
+            or payload.get("scope")
+            or "custom"
+        ).lower()
+        if entity_type in {"character_state", "character_status", "角色"}:
+            entity_type = "character"
+        elif entity_type in {"relationship", "关系"}:
+            entity_type = "relationship"
+        elif entity_type in {"hook", "foreshadowing", "伏笔"}:
+            entity_type = "hook"
+        elif entity_type in {"region", "location", "place", "地点", "区域"}:
+            entity_type = "region"
+        elif entity_type in {"world", "lore", "setting", "世界", "设定"}:
+            entity_type = "world"
+        elif entity_type in {"plot", "story", "剧情"}:
+            entity_type = "plot"
+        elif entity_type not in {"character", "region", "hook", "relationship", "world", "plot", "custom"}:
+            metadata["raw_entity_type"] = entity_type
+            entity_type = "custom"
+
+        change_type = str(
+            payload.get("change_type")
+            or payload.get("type")
+            or payload.get("action")
+            or payload.get("delta_type")
+            or "custom"
+        ).lower()
+        change_type_aliases = {
+            "location": "location_change",
+            "move": "location_change",
+            "status": "status_change",
+            "state": "status_change",
+            "relationship": "relationship_change",
+            "relation": "relationship_change",
+            "hook_resolve": "hook_resolved",
+            "resolve_hook": "hook_resolved",
+            "hook_trigger": "hook_triggered",
+            "trigger_hook": "hook_triggered",
+            "region": "region_state_change",
+            "world": "world_state_change",
+        }
+        change_type = change_type_aliases.get(change_type, change_type)
+        valid_change_types = {
+            "status_change",
+            "death",
+            "resurrection",
+            "location_change",
+            "hook_triggered",
+            "hook_resolved",
+            "hook_dropped",
+            "region_state_change",
+            "region_destroyed",
+            "relationship_change",
+            "world_state_change",
+            "custom",
+        }
+        if change_type not in valid_change_types:
+            metadata["raw_change_type"] = change_type
+            if entity_type == "relationship":
+                change_type = "relationship_change"
+            elif entity_type == "region":
+                change_type = "region_state_change"
+            elif entity_type == "world":
+                change_type = "world_state_change"
+            else:
+                change_type = "custom"
+
+        if entity_type == "relationship" and change_type == "custom":
+            change_type = "relationship_change"
+        if entity_type == "region" and change_type == "custom":
+            change_type = "region_state_change"
+        if entity_type == "world" and change_type == "custom":
+            change_type = "world_state_change"
+
+        entity_id = payload.get("entity_id") or payload.get("target_id") or payload.get("character_id") or payload.get("hook_id") or payload.get("region_id")
+        entity_name = payload.get("entity_name") or payload.get("target_name") or payload.get("character_name") or payload.get("name")
+        summary = self._extract_context_item_text(payload, "summary", "description", "content", "note", "delta")
+        title = payload.get("title") or payload.get("name") or summary[:40] or "章节状态变更提案"
+        after_state = self._ensure_context_dict(payload.get("after_state")) or self._ensure_context_dict(payload.get("after"))
+        before_state = self._ensure_context_dict(payload.get("before_state")) or self._ensure_context_dict(payload.get("before"))
+        diff = self._ensure_context_dict(payload.get("diff"))
+        if not after_state:
+            after_state = {
+                key: value
+                for key, value in payload.items()
+                if key not in {
+                    "project_id", "world_id", "scope_type", "entity_type", "target_type", "entity", "scope",
+                    "entity_id", "target_id", "character_id", "hook_id", "region_id", "entity_name",
+                    "target_name", "character_name", "name", "change_type", "type", "action", "delta_type",
+                    "status", "title", "summary", "description", "content", "note", "reason",
+                    "before_state", "after_state", "before", "after", "diff", "metadata",
+                }
+            }
+
+        return {
+            "project_id": payload.get("project_id") or execution.project_id,
+            "world_id": payload.get("world_id") or execution.context.get("world_id"),
+            "scope_type": payload.get("scope_type") or "chapter",
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "entity_name": entity_name,
+            "change_type": change_type,
+            "status": "proposed",
+            "confirmation_required": True,
+            "title": str(title)[:120],
+            "summary": str(summary or title)[:800],
+            "reason": self._coerce_context_text(payload.get("reason"), "accepted_saved_chapter_state_writeback")[:800],
+            "before_state": before_state,
+            "after_state": after_state,
+            "diff": diff,
+            "metadata": {
+                **metadata,
+                "source": "saved_chapter_state_writeback",
+                "chapter_id": execution.context.get("chapter_id"),
+                "chapter_num": execution.context.get("chapter_num"),
+                "chapter_title": execution.context.get("chapter_title"),
+                "chapter_content_checksum": execution.context.get("chapter_content_checksum"),
+                "quality_gate_status": execution.context.get("quality_gate_status"),
+            },
+            "workflow_execution_id": execution.id,
+            "workflow_id": execution.workflow_id,
+            "node_id": payload.get("node_id") or execution.context.get("chapter_writer_provenance", {}).get("source_node_id"),
+            "agent_type": "writer",
+            "chapter_id": execution.context.get("chapter_id"),
+            "source_text": None,
+        }
+
+    async def _propose_state_changes_from_saved_chapter(
+        self,
+        execution: "WorkflowExecution",
+        writer_output: Dict[str, Any],
+        db=None,
+    ) -> Dict[str, Any]:
+        """Create auditable narrative-state proposals after final saved chapter acceptance."""
+        result = {
+            "status": "skipped",
+            "chapter_id": execution.context.get("chapter_id"),
+            "created": [],
+            "applied": [],
+            "pending": [],
+            "errors": [],
+            "entity_type_counts": {},
+            "checkpoint": None,
+        }
+        if not execution.context.get("chapter_saved") or not execution.context.get("chapter_id"):
+            return result
+        if not db:
+            result["status"] = "failed"
+            result["errors"].append("数据库连接不存在")
+            execution.context["state_writeback_status"] = result["status"]
+            execution.context["state_writeback_error"] = result["errors"][0]
+            return result
+
+        chapter_id = execution.context.get("chapter_id")
+        checkpoint = f"{execution.id}:{chapter_id}:{execution.context.get('chapter_content_checksum') or ''}"
+        existing = self._ensure_context_dict(execution.context.get("saved_chapter_state_writeback"))
+        if existing.get("checkpoint") == checkpoint and existing.get("status") in {"completed", "completed_with_errors", "no_candidates"}:
+            return existing
+
+        candidates = self._collect_saved_chapter_state_change_candidates(execution, writer_output)
+        result["checkpoint"] = checkpoint
+        if not candidates:
+            result["status"] = "no_candidates"
+            result["counts"] = {"proposed": 0, "applied": 0, "pending": 0, "errors": 0}
+            execution.context["saved_chapter_state_writeback"] = result
+            execution.context["state_writeback_status"] = result["status"]
+            execution.context["state_writeback_counts"] = result["counts"]
+            return result
+
+        from app.services.narrative_state_change_service import NarrativeStateChangeService
+
+        service = NarrativeStateChangeService(db)
+        source_context = {
+            "workflow_execution_id": execution.id,
+            "workflow_id": execution.workflow_id,
+            "node_id": execution.context.get("chapter_writer_provenance", {}).get("source_node_id"),
+            "agent_type": "writer",
+            "chapter_id": chapter_id,
+            "source_text": None,
+        }
+        safe_auto_apply_types = {"character", "hook", "region"}
+
+        for raw_change in candidates:
+            payload = self._normalize_saved_chapter_state_change_candidate(raw_change, execution)
+            entity_type = payload.get("entity_type") or "custom"
+            result["entity_type_counts"][entity_type] = result["entity_type_counts"].get(entity_type, 0) + 1
+            try:
+                change = await service.create_change(payload, source_context=source_context)
+                change_summary = {
+                    "id": change.get("id"),
+                    "entity_type": change.get("entity_type"),
+                    "entity_id": change.get("entity_id"),
+                    "entity_name": change.get("entity_name"),
+                    "change_type": change.get("change_type"),
+                    "status": change.get("status"),
+                    "title": change.get("title"),
+                }
+                result["created"].append(change_summary)
+                if entity_type in safe_auto_apply_types and (change.get("entity_id") or change.get("entity_name")):
+                    confirmed = await service.confirm_change(change["id"])
+                    applied = await service.apply_change(confirmed["id"])
+                    applied_change = applied.get("change") or {}
+                    result["applied"].append({
+                        "id": applied_change.get("id") or change.get("id"),
+                        "entity_type": applied_change.get("entity_type") or entity_type,
+                        "projection": applied.get("projection"),
+                    })
+                else:
+                    result["pending"].append(change_summary)
+            except Exception as e:
+                logger.error("章节状态写回提案失败: %s: %s", payload.get("title"), e)
+                result["errors"].append({"title": payload.get("title"), "entity_type": entity_type, "error": str(e)})
+
+        counts = {
+            "proposed": len(result["created"]),
+            "applied": len(result["applied"]),
+            "pending": len(result["pending"]),
+            "errors": len(result["errors"]),
+        }
+        result["counts"] = counts
+        result["status"] = "completed_with_errors" if result["errors"] else "completed"
+        execution.context["saved_chapter_state_writeback"] = result
+        execution.context["state_writeback_status"] = result["status"]
+        execution.context["state_writeback_counts"] = counts
+        execution.context.pop("state_writeback_error", None)
+        if result["errors"]:
+            execution.context["state_writeback_error"] = result["errors"][0].get("error")
+
+        event_payload = {
+            "execution_id": execution.id,
+            "workflow_id": execution.workflow_id,
+            "chapter_id": chapter_id,
+            "chapter_num": execution.context.get("chapter_num"),
+            "chapter_number": execution.context.get("chapter_num"),
+            "proposed_count": counts["proposed"],
+            "applied_count": counts["applied"],
+            "pending_count": counts["pending"],
+            "error_count": counts["errors"],
+            "entity_type_counts": result["entity_type_counts"],
+            "state_change_ids": [item.get("id") for item in result["created"][:20] if item.get("id")],
+            "source_node_id": source_context.get("node_id"),
+        }
+        if counts["proposed"]:
+            await self._broadcast_status(execution.id, "chapter_state_writeback_proposed", event_payload)
+        if counts["applied"]:
+            await self._broadcast_status(execution.id, "chapter_state_writeback_applied", event_payload)
+        if counts["errors"]:
+            await self._broadcast_status(execution.id, "chapter_state_writeback_failed", event_payload)
+        return result
+
     async def _save_chapter_from_writer(
         self,
         execution: "WorkflowExecution",
         writer_output: Dict[str, Any],
         db=None,
+        *,
+        source_node: Optional[WorkflowNode] = None,
+        contract_metadata: Optional[Dict[str, Any]] = None,
+        prompt_trace: Optional[Dict[str, Any]] = None,
     ):
         """
         保存 Writer Agent 输出的章节到本地文档
@@ -5248,31 +6892,26 @@ class WorkflowEngine:
         import uuid
         from datetime import datetime
 
+        content = writer_output.get("content") or writer_output.get("chapter_content") or ""
+        if not content:
+            logger.warning("Writer 输出没有内容，跳过保存")
+            return
+
+        chapter_num = execution.context.get("chapter_num", 1)
+        chapter_title = execution.context.get("chapter_title", f"第{chapter_num}章")
+        chapter_outline_id = execution.context.get("chapter_outline_id")
+        word_count = writer_output.get("word_count", len(content))
+        chapter_id = execution.context.get("chapter_id") or str(uuid.uuid4())
+        saved_at = datetime.now().isoformat()
+
         try:
-            # 获取章节正文内容
-            content = writer_output.get("content") or writer_output.get("chapter_content") or ""
-            if not content:
-                logger.warning("Writer 输出没有内容，跳过保存")
-                return
-
-            # 获取上下文中的章节信息
-            chapter_num = execution.context.get("chapter_num", 1)
-            chapter_title = execution.context.get("chapter_title", f"第{chapter_num}章")
-
-            # 计算字数
-            word_count = writer_output.get("word_count", len(content))
-
-            # 生成章节 ID
-            chapter_id = execution.context.get("chapter_id") or str(uuid.uuid4())
-
-            # 构建章节数据 - 只保存正文内容和基本信息
             chapter_data = {
                 "id": chapter_id,
                 "title": chapter_title,
                 "project_id": execution.project_id,
-                "chapter_outline_id": execution.context.get("chapter_outline_id"),
+                "chapter_outline_id": chapter_outline_id,
                 "summary": "",  # 摘要可以后续由 Summarizer Agent 生成
-                "content": content,  # 只保存正文
+                "content": content,
                 "word_count": word_count,
                 "status": "completed",
                 "events": [],
@@ -5297,33 +6936,86 @@ class WorkflowEngine:
             chapter_data["content"] = ""
             await db.save_chapter(chapter_data)
 
-            # 更新执行上下文
+            writer_provenance = self._build_writer_save_provenance(
+                execution,
+                source_node,
+                writer_output,
+                contract_metadata=contract_metadata,
+                prompt_trace=prompt_trace,
+            )
+            saved_payload = {
+                "chapter_id": chapter_id,
+                "chapter_num": chapter_num,
+                "chapter_number": chapter_num,
+                "title": chapter_title,
+                "chapter_title": chapter_title,
+                "chapter_outline_id": chapter_outline_id,
+                "project_id": execution.project_id,
+                "execution_id": execution.id,
+                "workflow_id": execution.workflow_id,
+                "status": "saved",
+                "saved_at": saved_at,
+                "word_count": word_count,
+                "content_chars": len(content),
+                "content_storage": metadata.get("content_storage"),
+                "content_path": metadata.get("content_path"),
+                "content_size_bytes": metadata.get("content_size_bytes"),
+                "content_checksum": metadata.get("content_checksum"),
+                "world_id": execution.context.get("world_id"),
+                **writer_provenance,
+                **self._build_quality_gate_saved_metadata(execution),
+            }
+
+            # 更新执行上下文：正文仅作为当前运行内的瞬态上下文保留，持久化/事件只保存元数据。
+            execution.context.pop("chapter_save_error", None)
             execution.context["chapter_id"] = chapter_id
             execution.context["chapter_content"] = content
             execution.context["chapter_saved"] = True
+            execution.context["chapter_saved_at"] = saved_at
+            execution.context["chapter_outline_id"] = chapter_outline_id
+            execution.context["chapter_saved_payload"] = dict(saved_payload)
+            execution.context["chapter_writer_provenance"] = dict(writer_provenance)
+            execution.context["chapter_content_storage"] = metadata.get("content_storage")
+            execution.context["chapter_content_path"] = metadata.get("content_path")
+            execution.context["chapter_content_size_bytes"] = metadata.get("content_size_bytes")
+            execution.context["chapter_content_checksum"] = metadata.get("content_checksum")
+            execution.context["pending_chapter_save"] = False
+            if isinstance(execution.context.get("quality_gate"), dict):
+                execution.context["quality_gate"] = {
+                    **execution.context["quality_gate"],
+                    "status": "passed" if execution.context["quality_gate"].get("passed") is not False else execution.context["quality_gate"].get("status"),
+                    "saved_at": saved_at,
+                }
+                execution.context["quality_gate_status"] = execution.context["quality_gate"].get("status")
             await self._mark_outline_after_writer_save(execution, db)
 
             logger.info(f"章节已保存到本地文档: {chapter_id} - {chapter_title} ({word_count} 字)")
             trace_service = get_trace_service(db)
-            await trace_service.record_event("chapter_saved", {
-                "chapter_id": chapter_id,
-                "title": chapter_title,
-                "content_chars": len(content),
-                "word_count": word_count,
-                "world_id": execution.context.get("world_id"),
-            })
+            await trace_service.record_event("chapter_saved", saved_payload)
+
+            if saved_payload.get("quality_gate_passed") is not None:
+                await self._broadcast_status(execution.id, "chapter_finalized", saved_payload)
 
             # 广播章节保存事件
-            await self._broadcast_status(execution.id, "chapter_saved", {
-                "chapter_id": chapter_id,
-                "title": chapter_title,
-                "word_count": word_count,
-                "world_id": execution.context.get("world_id"),
-            })
+            await self._broadcast_status(execution.id, "chapter_saved", saved_payload)
 
         except Exception as e:
             logger.error(f"保存章节失败: {e}")
             execution.context["chapter_save_error"] = str(e)
+            failure_payload = {
+                "execution_id": execution.id,
+                "workflow_id": execution.workflow_id,
+                "project_id": execution.project_id,
+                "chapter_outline_id": chapter_outline_id,
+                "chapter_num": chapter_num,
+                "title": chapter_title,
+                "error": str(e),
+            }
+            try:
+                await self._broadcast_status(execution.id, "chapter_save_failed", failure_payload)
+            except Exception as broadcast_error:
+                logger.error("广播章节保存失败事件失败: %s", broadcast_error)
+            raise
 
     async def _detect_and_promote_characters(
         self,
@@ -6349,6 +8041,10 @@ class WorkflowEngine:
             output["revision_notes"] = evaluation_feedback.get("suggestions", [])
             output["issues"] = evaluation_feedback.get("issues", [])
 
+        if evaluation_passed and execution.context.get("pending_chapter_save"):
+            await self._finalize_chapter_after_quality_pass(execution, db)
+            output["chapter_finalized"] = bool(execution.context.get("chapter_saved"))
+
         if not evaluation_passed:
             execution.context["is_retry"] = True
             revision_parts = []
@@ -6363,6 +8059,26 @@ class WorkflowEngine:
                 execution.context["retry_message"] = retry_message
                 execution.context["revision_notes"] = output.get("revision_notes", [])
                 output["retry_message"] = retry_message
+            revision_history = execution.context.get("revision_history")
+            if not isinstance(revision_history, list):
+                revision_history = []
+            revision_entry = self._make_json_safe({
+                "attempt": len(revision_history) + 1,
+                "condition_node_id": node.id,
+                "condition_node_label": node.label,
+                "draft_attempt": execution.context.get("chapter_draft_attempt"),
+                "content_checksum": execution.context.get("chapter_draft_checksum"),
+                "quality_gate_status": execution.context.get("quality_gate_status"),
+                "quality_summary": self._build_quality_summary(evaluation_feedback if isinstance(evaluation_feedback, dict) else {}),
+                "retry_count": retry_count,
+                "requested_at": datetime.now().isoformat(),
+            })
+            revision_history.append(revision_entry)
+            execution.context["revision_history"] = revision_history
+            if isinstance(execution.context.get("quality_gate"), dict):
+                execution.context["quality_gate"] = {**execution.context["quality_gate"], "status": "revision_requested"}
+                execution.context["quality_gate_status"] = "revision_requested"
+            await self._broadcast_status(execution.id, "chapter_revision_requested", revision_entry)
 
         return output
 
@@ -8976,7 +10692,7 @@ class WorkflowEngine:
             evaluation_result = execution.context.get("evaluation_result", {})
             plot_outline = execution.context.get("plot_outline", [])
 
-            context["project_id"] = execution.project_id
+            execution.context["project_id"] = execution.project_id
 
             discussion_messages = []
 
@@ -10446,7 +12162,6 @@ class WorkflowEngine:
                     logger.info(f"条件通过，跳转到节点: {pass_edge.target}")
                     # 清除评估相关上下文，准备下一轮
                     execution.context["retry_count"] = 0
-                    execution.context["retry_history"] = []
                     execution.context["is_retry"] = False
                     return pass_edge.target
                 else:
@@ -10464,11 +12179,18 @@ class WorkflowEngine:
                         logger.warning(f"已达到重试上限 ({self.MAX_RETRY_COUNT} 次)，强制通过")
                         execution.context["forced_pass"] = True
                         execution.context["forced_pass_reason"] = f"已重试 {retry_count} 次仍未通过评估，自动接受当前内容"
+                        if isinstance(execution.context.get("quality_gate"), dict):
+                            execution.context["quality_gate"] = {
+                                **execution.context["quality_gate"],
+                                "status": "forced_pass",
+                                "forced_pass": True,
+                                "forced_pass_reason": execution.context["forced_pass_reason"],
+                            }
+                            execution.context["quality_gate_status"] = "forced_pass"
                         # 找到 pass 分支并返回
                         if pass_edge:
-                            # 清理上下文
+                            # 清理控制上下文；保留 retry_history / quality_gate_history / revision_history 作为审计记录。
                             execution.context["retry_count"] = 0
-                            execution.context["retry_history"] = []
                             execution.context["is_retry"] = False
                             return pass_edge.target
                         # 如果没有 pass 分支，返回 undefined 边或 retry 边
@@ -10577,6 +12299,107 @@ class WorkflowEngine:
         else:
             current_time = datetime.now()
         return expires_at <= current_time
+
+    def inspect_execution_staleness(self, execution: WorkflowExecution) -> Dict[str, Any]:
+        status = execution.status.value if hasattr(execution.status, "value") else str(execution.status)
+        now = datetime.now(tz=execution.lease_expires_at.tzinfo) if execution.lease_expires_at and execution.lease_expires_at.tzinfo else datetime.now()
+        lease_expired = self._is_execution_lease_expired(execution, now)
+        active_task = self._active_task_for_execution(execution.id) is not None
+        lease_seconds_remaining = None
+        if execution.lease_expires_at:
+            lease_seconds_remaining = max(0, int((execution.lease_expires_at - now).total_seconds()))
+        stale_history = execution.context.get("stale_execution_history") if isinstance(execution.context, dict) else None
+        if not isinstance(stale_history, list):
+            stale_history = []
+        safe_actions: List[str] = []
+        recommendation = "执行状态正常，无需治理。"
+        suspected_stale = status == WorkflowStatus.RUNNING.value and lease_expired and not active_task
+        if suspected_stale:
+            safe_actions = ["mark_failed", "inspect_only"]
+            recommendation = "运行租约已过期且当前进程没有活跃任务，建议标记失败后从失败节点恢复。"
+        elif status == WorkflowStatus.RUNNING.value and active_task:
+            safe_actions = ["inspect_only"]
+            recommendation = "检测到活跃运行任务，不能标记陈旧；可继续观察。"
+        elif status == WorkflowStatus.RUNNING.value:
+            safe_actions = ["inspect_only"]
+            recommendation = "执行仍在租约窗口内，暂不应人工改写状态。"
+        elif status == WorkflowStatus.FAILED.value:
+            safe_actions = ["recover", "inspect_only"]
+            recommendation = "执行已失败，可使用恢复或修复并恢复流程处理。"
+        return self._serialize_for_json({
+            "execution_id": execution.id,
+            "workflow_id": execution.workflow_id,
+            "project_id": execution.project_id,
+            "status": status,
+            "active_task": active_task,
+            "suspected_stale": suspected_stale,
+            "safe_actions": safe_actions,
+            "recommendation": recommendation,
+            "lease": {
+                "lease_expires_at": execution.lease_expires_at,
+                "last_heartbeat_at": execution.last_heartbeat_at,
+                "expired": lease_expired,
+                "seconds_remaining": lease_seconds_remaining,
+            },
+            "history": {
+                "count": len(stale_history),
+                "latest": stale_history[-1] if stale_history else None,
+            },
+        })
+
+    async def inspect_execution_staleness_state(self, execution_id: str, db=None) -> Optional[Dict[str, Any]]:
+        execution = await self._get_or_load_execution(execution_id, db)
+        if not execution:
+            return None
+        return self.inspect_execution_staleness(execution)
+
+    async def resolve_stale_execution(self, execution_id: str, db=None, *, action: str = "mark_failed", reason: Optional[str] = None) -> Dict[str, Any]:
+        async with self._execution_lock(execution_id):
+            execution = await self._get_or_load_execution(execution_id, db)
+            if not execution:
+                self._raise_operation_error(execution_id, "stale", "工作流执行不存在", code="workflow_execution_not_found", http_status=404)
+            inspection = self.inspect_execution_staleness(execution)
+            if action == "inspect_only":
+                return {"success": True, "action": action, "inspection": inspection, "execution": self._serialize_for_json(execution)}
+            if action != "mark_failed":
+                self._raise_operation_error(
+                    execution_id,
+                    "stale",
+                    f"不支持的陈旧执行治理动作: {action}",
+                    status=execution.status,
+                    payload={"allowed_actions": ["inspect_only", "mark_failed"]},
+                )
+            if execution.status != WorkflowStatus.RUNNING:
+                self._raise_operation_error(
+                    execution_id,
+                    "stale",
+                    "只有 running 状态的执行可以标记为陈旧失败",
+                    status=execution.status,
+                    payload={"allowed_statuses": [WorkflowStatus.RUNNING.value]},
+                )
+            if self._active_task_for_execution(execution.id):
+                self._raise_operation_error(
+                    execution_id,
+                    "stale",
+                    "执行存在活跃运行任务，不能标记陈旧",
+                    status=execution.status,
+                    code="workflow_execution_active_task_conflict",
+                )
+            if not self._is_execution_lease_expired(execution):
+                self._raise_operation_error(
+                    execution_id,
+                    "stale",
+                    "执行租约尚未过期，不能标记陈旧",
+                    status=execution.status,
+                    payload={"lease_expires_at": execution.lease_expires_at.isoformat() if execution.lease_expires_at else None},
+                )
+            await self._mark_running_execution_stale_if_orphaned(execution, db, operation=reason or "manual_stale_resolution")
+            return {
+                "success": True,
+                "action": action,
+                "inspection": self.inspect_execution_staleness(execution),
+                "execution": self._serialize_for_json(execution),
+            }
 
     async def _mark_running_execution_stale_if_orphaned(
         self,
@@ -10934,25 +12757,29 @@ class WorkflowEngine:
             if not isinstance(remediation_history, list):
                 remediation_history = []
                 execution.context["remediation_history"] = remediation_history
+            applied_at = datetime.now().isoformat()
+            previous_error = execution.error or (execution.node_states.get(preview["node_id"]).error if execution.node_states.get(preview["node_id"]) else None)
             remediation_entry = {
                 "attempt": len(remediation_history) + 1,
                 "node_id": preview["node_id"],
                 "category": preview["diagnosis"].get("category"),
                 "diagnosis_category": preview["diagnosis"].get("category"),
                 "reason": reason or "manual_remediation",
-                "started_at": datetime.now().isoformat(),
-                "previous_error": execution.error or (execution.node_states.get(preview["node_id"]).error if execution.node_states.get(preview["node_id"]) else None),
+                "started_at": applied_at,
+                "applied_at": applied_at,
+                "previous_error": previous_error,
                 "diff": diff,
             }
             remediation_history.append(remediation_entry)
             if db:
                 await self._save_execution_to_db(execution, db)
-            await self._broadcast_status(execution_id, "workflow_node_remediated", {
-                "execution_id": execution_id,
-                "workflow_id": workflow.id,
-                "node_id": preview["node_id"],
-                "remediation_entry": remediation_entry,
-            })
+            await self._broadcast_status(execution_id, "workflow_node_remediated", self._build_execution_event_payload(
+                execution,
+                node_id=preview["node_id"],
+                remediation_entry=remediation_entry,
+                previous_error=previous_error,
+                diagnosis_category=preview["diagnosis"].get("category"),
+            ))
             recovery = await self._recover_failed_workflow_locked(
                 execution_id,
                 db,

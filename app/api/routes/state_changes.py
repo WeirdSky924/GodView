@@ -23,7 +23,7 @@ def _to_http_error(error: Exception) -> HTTPException:
     message = str(error)
     if "不存在" in message:
         return HTTPException(status_code=404, detail=message)
-    if "不能" in message or "缺少" in message or "尚未确认" in message:
+    if "不能" in message or "缺少" in message or "尚未确认" in message or "无效" in message:
         return HTTPException(status_code=400, detail=message)
     logger.exception("剧情状态变更操作失败")
     return HTTPException(status_code=500, detail=message)
@@ -36,20 +36,29 @@ async def list_state_changes(
     entity_id: Optional[str] = Query(None, description="实体 ID"),
     status: Optional[str] = Query(None, description="变更状态"),
     change_type: Optional[str] = Query(None, description="变更类型"),
+    chapter_id: Optional[str] = Query(None, description="关联章节 ID"),
+    world_id: Optional[str] = Query(None, description="关联世界 ID"),
+    workflow_execution_id: Optional[str] = Query(None, description="来源工作流执行 ID"),
     limit: int = Query(default=100, ge=1, le=1000),
 ):
     """列出项目剧情状态变更。"""
     from app.api.app import postgres_db
 
     service = _get_service(postgres_db)
-    return await service.list_changes(
-        project_id=project_id,
-        entity_type=entity_type,
-        entity_id=entity_id,
-        status=status,
-        change_type=change_type,
-        limit=limit,
-    )
+    try:
+        return await service.list_changes(
+            project_id=project_id,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            status=status,
+            change_type=change_type,
+            chapter_id=chapter_id,
+            world_id=world_id,
+            workflow_execution_id=workflow_execution_id,
+            limit=limit,
+        )
+    except Exception as e:
+        raise _to_http_error(e)
 
 
 @router.get("/{change_id}", response_model=Dict[str, Any])

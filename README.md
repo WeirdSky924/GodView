@@ -270,7 +270,7 @@ flowchart TD
 
 | 层 | 文件 | 能力 |
 |---|---|---|
-| 前端页面 | `Visualizer.tsx`、`DirectorWorkflow.tsx` | 工作流画布、编辑、执行监控 |
+| 前端页面 | `Visualizer.tsx` | 工作流画布、编辑、执行监控 |
 | 前端组件 | `WorkflowEditor.tsx`、`WorkflowMonitor.tsx`、`NodePanel.tsx`、`PropertyPanel.tsx` | 工作流编辑与监控核心组件 |
 | 前端节点 | `AgentNode.tsx`、`ConditionNode.tsx`、`ParallelNode.tsx` | 工作流节点 UI |
 | API | `app/api/routes/workflows.py` | 工作流定义、执行、SSE、节点类型 API |
@@ -671,7 +671,6 @@ npm run dev
 | `app/services/agent_communication.py` | Agent 通信服务 |
 | `app/services/agent_config_service.py` | Agent Config 缓存、CRUD 和项目级配置服务 |
 | `app/services/agent_memory_service.py` | Agent 记忆服务 |
-| `app/services/agent_prompt_builder.py` | Agent Prompt 和上下文构建器 |
 | `app/services/agent_prompt_service.py` | Agent 运行时 Prompt 组合服务 |
 | `app/services/agent_template_service.py` | Agent Template 初始化、缓存和 CRUD 服务 |
 | `app/services/bootstrap_orchestrator.py` | Bootstrap 初始化流程编排器 |
@@ -717,7 +716,6 @@ npm run dev
 | `app/services/structured_llm.py` | 结构化 LLM 输出执行工具 |
 | `app/services/time_system.py` | 世界时间系统 |
 | `app/services/token_tracker.py` | Token 用量追踪 |
-| `app/services/workflow.py` | Director 工作流抽象 |
 | `app/services/workflow_engine.py` | 工作流执行引擎 |
 | `app/services/workflow_node_catalog.py` | 工作流节点目录、标签标准化、节点类型选项 |
 | `app/services/workflow_node_registry.py` | 工作流节点适配器注册表 |
@@ -800,7 +798,6 @@ npm run dev
 | `frontend/src/pages/Dashboard.tsx` | 仪表盘首页 |
 | `frontend/src/pages/DiffTool.tsx` | 文本差异对比工具页 |
 | `frontend/src/pages/Director.tsx` | Director 上帝模式主控页 |
-| `frontend/src/pages/DirectorWorkflow.tsx` | 工作流编辑/监控/聊天组合页，目前未在主路由挂载 |
 | `frontend/src/pages/Hooks.tsx` | 伏笔管理页 |
 | `frontend/src/pages/Interventions.tsx` | 人工干预管理页 |
 | `frontend/src/pages/Lore.tsx` | 设定库管理页 |

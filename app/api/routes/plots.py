@@ -341,6 +341,7 @@ async def create_chapter(chapter: CreateChapterDTO):
         "title": chapter.title,
         "project_id": project_id,
         "world_id": world_id,
+        "chapter_outline_id": chapter.chapter_outline_id,
         "summary": chapter.summary or "",
         "content": content,
         "word_count": len(content),

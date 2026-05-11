@@ -16,6 +16,14 @@ from app.models.setting_agent import SettingAgentMode
 logger = logging.getLogger(__name__)
 
 
+class PromptGovernanceError(RuntimeError):
+    """Raised when a production Setting task cannot resolve a governed prompt asset."""
+
+    def __init__(self, message: str, trace: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.trace = trace or {}
+
+
 class SettingAgent(BaseAgent):
     """
     设定 Agent - 统一的工作流 Agent 和设定助手
@@ -174,6 +182,17 @@ class SettingAgent(BaseAgent):
                 },
             )
 
+        except PromptGovernanceError as e:
+            logger.error("Setting Agent prompt governance failed: %s", e)
+            return AgentResponse(
+                success=False,
+                error=str(e),
+                metadata={
+                    "prompt_governance_error": True,
+                    "prompt_render_trace": e.trace,
+                },
+                data={"message": f"设定 Prompt 配置缺失: {str(e)}"},
+            )
         except Exception as e:
             logger.error(f"Setting Agent 执行失败: {e}")
             return AgentResponse(
@@ -196,10 +215,44 @@ class SettingAgent(BaseAgent):
             logger.warning("加载 SettingAgent md prompt 失败: prompt_id=%s, error=%s", prompt_id, e)
         return ""
 
+    def _setting_prompt_trace(self, prompt_id: str, scenario: str, source: str, missing: bool = False) -> Dict[str, Any]:
+        return {
+            "agent_type": self.AGENT_TYPE,
+            "scenario": scenario,
+            "project_id": self.project_id,
+            "template_id": None,
+            "template_scenario": None,
+            "config_id": None,
+            "prompt_ids": [] if missing else [prompt_id],
+            "skill_ids": [],
+            "writing_rule_ids": [],
+            "context_blocks": [],
+            "fallbacks_used": [] if source == "md_prompt_asset" else [source],
+            "deprecated_sources_used": [] if source == "md_prompt_asset" else [f"SettingAgent.{source}"],
+            "missing_prompt_ids": [prompt_id] if missing else [],
+        }
+
+    def _require_md_prompt_asset(self, prompt_id: str, scenario: str) -> str:
+        prompt_asset = self._load_md_prompt_content(prompt_id)
+        if prompt_asset:
+            self._system_prompt_render_trace = self._setting_prompt_trace(prompt_id, scenario, "md_prompt_asset")
+            self.scenario = scenario
+            return prompt_asset
+
+        trace = self._setting_prompt_trace(prompt_id, scenario, "setting_missing_prompt_asset", missing=True)
+        self._system_prompt_render_trace = trace
+        self.scenario = scenario
+        if self.project_id:
+            raise PromptGovernanceError(
+                f"Setting prompt asset is missing for production scenario: {scenario}",
+                trace,
+            )
+        return ""
+
     def _build_chapter_consistency_prompt(self, chapter_content: str) -> str:
-        prompt_asset = self._load_md_prompt_content(self.CHAPTER_CONSISTENCY_PROMPT_ID) or (
-            "【DEPRECATED 最小 fallback】请检查章节内容与世界设定的一致性；如无问题，简要说明检查通过；"
-            "如有问题，列出具体冲突和修改建议。"
+        prompt_asset = self._require_md_prompt_asset(
+            self.CHAPTER_CONSISTENCY_PROMPT_ID,
+            "chapter_consistency",
         )
         return f"""{prompt_asset}
 
@@ -217,9 +270,9 @@ class SettingAgent(BaseAgent):
         world_rules_text: str,
         lore_summaries: List[str],
     ) -> str:
-        prompt_asset = self._load_md_prompt_content(self.WORKFLOW_CONTEXT_ANALYSIS_PROMPT_ID) or (
-            "【DEPRECATED 最小 fallback】请基于当前项目上下文提取本章写作必须遵守的设定约束、可用素材、"
-            "潜在冲突和对后续节点的建议。"
+        prompt_asset = self._require_md_prompt_asset(
+            self.WORKFLOW_CONTEXT_ANALYSIS_PROMPT_ID,
+            self.DEFAULT_SCENARIO,
         )
         lore_text = chr(10).join(lore_summaries) if lore_summaries else "未提供相关设定"
         return f"""{prompt_asset}

@@ -28,6 +28,7 @@ export interface CreateChapterDTO {
   title: string
   project_id?: string
   world_id?: string
+  chapter_outline_id?: string
   summary?: string
   content?: string
   status?: string
@@ -35,6 +36,7 @@ export interface CreateChapterDTO {
 
 export interface UpdateChapterDTO {
   title?: string
+  chapter_outline_id?: string
   summary?: string
   content?: string
   status?: string

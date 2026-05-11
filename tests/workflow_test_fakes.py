@@ -134,6 +134,9 @@ class FakeDiscussionDB:
         entity_id=None,
         status=None,
         change_type=None,
+        chapter_id=None,
+        world_id=None,
+        workflow_execution_id=None,
         limit=100,
     ):
         changes = [change for change in self.state_changes.values() if change.get("project_id") == project_id]
@@ -145,6 +148,12 @@ class FakeDiscussionDB:
             changes = [change for change in changes if change.get("status") == status]
         if change_type:
             changes = [change for change in changes if change.get("change_type") == change_type]
+        if chapter_id:
+            changes = [change for change in changes if change.get("chapter_id") == chapter_id]
+        if world_id:
+            changes = [change for change in changes if change.get("world_id") == world_id]
+        if workflow_execution_id:
+            changes = [change for change in changes if change.get("workflow_execution_id") == workflow_execution_id]
         return [dict(change) for change in changes[:limit]]
 
     async def update_narrative_state_change_status(self, change_id, status, timestamp_field=None):
@@ -158,3 +167,9 @@ class FakeDiscussionDB:
 
     async def mark_narrative_state_change_applied(self, change_id):
         return await self.update_narrative_state_change_status(change_id, "applied", "applied_at")
+
+    async def get_chapters_by_project(self, project_id, status=None, limit=100):
+        chapters = [chapter for chapter in self.chapters if chapter.get("project_id") == project_id]
+        if status:
+            chapters = [chapter for chapter in chapters if chapter.get("status") == status]
+        return [dict(chapter) for chapter in chapters[:limit]]

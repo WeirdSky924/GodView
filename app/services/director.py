@@ -19,6 +19,24 @@ from app.services.md_file_service import get_md_file_service
 from app.services.workflow_engine import ChapterReadinessBlockedError, get_workflow_engine
 
 
+def _prompt_trace(agent_type: str, scenario: str, project_id: Optional[str], prompt_id: str, *, source: str, missing: bool = False) -> Dict[str, Any]:
+    return {
+        "agent_type": agent_type,
+        "scenario": scenario,
+        "project_id": project_id,
+        "template_id": None,
+        "template_scenario": None,
+        "config_id": None,
+        "prompt_ids": [] if missing else [prompt_id],
+        "skill_ids": [],
+        "writing_rule_ids": [],
+        "context_blocks": [],
+        "fallbacks_used": [] if source == "md_prompt_asset" else [source],
+        "deprecated_sources_used": [] if source == "md_prompt_asset" else [f"DirectorSystem.{source}"],
+        "missing_prompt_ids": [prompt_id] if missing else [],
+    }
+
+
 def _serialize_for_json(obj: Any) -> Any:
     """递归序列化对象，处理 UUID/datetime 等非 JSON 类型。"""
     if isinstance(obj, uuid.UUID):
@@ -34,8 +52,6 @@ def _serialize_for_json(obj: Any) -> Any:
 # from app.api.app import qdrant_db
 from app.models.character import Character, CharacterStatus
 from app.models.world import World
-# Removed to fix circular import: DirectorWorkflow will be imported lazily
-# from app.services.workflow import DirectorWorkflow
 
 logger = logging.getLogger(__name__)
 
@@ -551,27 +567,6 @@ class DirectorSystem:
             self.state_machine["phase"] = "narrative_generated"
             return narrative
         return {"success": False, "error": result.error}
-
-    async def run_workflow_cycle(
-        self,
-        speaker_id: str,
-        context: str,
-        present_characters: Optional[List[str]] = None,
-        intents: Optional[List[str]] = None,
-        environment: str = "",
-        character_moods: Optional[Dict[str, str]] = None,
-    ) -> Dict[str, Any]:
-        # Lazy import to avoid circular dependency
-        from app.services.workflow import DirectorWorkflow
-        workflow = DirectorWorkflow(self)
-        return await workflow.run_cycle(
-            speaker_id=speaker_id,
-            context=context,
-            present_characters=present_characters or [],
-            intents=intents,
-            environment=environment,
-            character_moods=character_moods,
-        )
 
     async def simulate_reader_feedback(
         self,
@@ -1534,6 +1529,10 @@ class DirectorSystem:
 
         # 启动新章节
         await self.start_chapter(title=chapter_title, goal=chapter_goal)
+        if self.current_chapter is not None:
+            self.current_chapter["project_id"] = active_project_id
+            self.current_chapter["chapter_num"] = chapter_num
+            self.current_chapter["chapter_outline_id"] = chapter_outline_id
 
         # 获取可用角色信息
         characters_info = []
@@ -1550,7 +1549,7 @@ class DirectorSystem:
         world_info = self._build_world_payload()
 
         # 构建写作提示
-        writing_prompt = self._build_auto_write_prompt(
+        writing_prompt, director_prompt_trace = self._build_auto_write_prompt(
             chapter_title=chapter_title,
             chapter_goal=chapter_goal,
             characters_info=characters_info,
@@ -1569,6 +1568,7 @@ class DirectorSystem:
             "word_count": target_word_count,
             "auto_write_mode": True,
             "writing_prompt": writing_prompt,
+            "director_prompt_render_trace": director_prompt_trace,
         })
 
         if result.success:
@@ -1581,13 +1581,23 @@ class DirectorSystem:
             return {
                 "success": True,
                 "chapter_id": self.current_chapter["id"],
+                "chapter_outline_id": chapter_outline_id,
+                "project_id": active_project_id,
+                "chapter_num": chapter_num,
                 "title": chapter_title,
                 "content": chapter_content,
                 "word_count": len(chapter_content),
                 "goal": chapter_goal,
+                "prompt_render_trace": result.metadata.get("prompt_render_trace") if result.metadata else None,
+                "director_prompt_render_trace": director_prompt_trace,
             }
 
-        return {"success": False, "error": result.error}
+        return {
+            "success": False,
+            "error": result.error,
+            "prompt_render_trace": result.metadata.get("prompt_render_trace") if result.metadata else None,
+            "director_prompt_render_trace": director_prompt_trace,
+        }
 
     # ==================== 全自动运行模式 ====================
 
@@ -2041,8 +2051,8 @@ class DirectorSystem:
         world_info: Dict[str, Any],
         target_word_count: int,
         style_reference: Optional[str],
-    ) -> str:
-        """构建自动写作提示"""
+    ) -> tuple[str, Dict[str, Any]]:
+        """构建自动写作提示，并返回 Director direct prompt trace。"""
         prompt_parts = [
             f"【章节标题】\n{chapter_title}",
             f"\n【章节目标/大纲】\n{chapter_goal}",
@@ -2065,12 +2075,16 @@ class DirectorSystem:
             prompt_parts.append(f"\n【风格参考】\n{style_reference[:500]}")
 
         prompt_parts.append("\n【写作要求】")
-        prompt_parts.append(self._load_prompt_asset(self.AUTO_WRITE_PROMPT_ID))
+        prompt_asset, trace = self._load_prompt_asset_with_trace(
+            self.AUTO_WRITE_PROMPT_ID,
+            scenario="director_auto_write",
+        )
+        prompt_parts.append(prompt_asset)
 
-        return "\n".join(prompt_parts)
+        return "\n".join(prompt_parts), trace
 
-    def _load_prompt_asset(self, prompt_id: str) -> str:
-        """读取 md prompt 资产内容；失败时保留极简兼容降级。"""
+    def _load_prompt_asset_with_trace(self, prompt_id: str, *, scenario: str) -> tuple[str, Dict[str, Any]]:
+        """读取 md prompt 资产内容，并让兼容降级可审计。"""
         try:
             prompt = get_md_file_service().get_prompt(prompt_id)
         except Exception as e:
@@ -2080,10 +2094,26 @@ class DirectorSystem:
         content = (prompt or {}).get("content") or (prompt or {}).get("raw_content") or ""
         content = str(content).strip()
         if content:
-            return content
+            return content, _prompt_trace("director", scenario, self.project_id, prompt_id, source="md_prompt_asset")
 
         logger.warning("Director 自动写作 Prompt 资产缺失: %s", prompt_id)
+        trace = _prompt_trace(
+            "director",
+            scenario,
+            self.project_id,
+            prompt_id,
+            source="director_auto_write_missing_prompt_asset",
+            missing=True,
+        )
+        if self.project_id:
+            raise RuntimeError(f"Director auto-write prompt asset is missing: {prompt_id}")
         return (
             "请根据章节目标生成完整章节正文；遵守已提供角色、世界观、风格参考和章节目标，"
-            "不要编造关键资源，不要越过当前章节阶段。"
+            "不要编造关键资源，不要越过当前章节阶段。",
+            trace,
         )
+
+    def _load_prompt_asset(self, prompt_id: str) -> str:
+        """兼容旧调用方：只返回 Prompt 内容。"""
+        content, _ = self._load_prompt_asset_with_trace(prompt_id, scenario="legacy_director_prompt_asset")
+        return content

@@ -596,7 +596,7 @@ async def test_writer_prompt_service_failure_records_observable_md_fallback_trac
 
 
 @pytest.mark.asyncio
-async def test_writer_missing_config_prompt_is_not_silent(monkeypatch):
+async def test_writer_missing_config_prompt_fails_closed_for_project_runtime(monkeypatch):
     from app.agents.director.writer import WriterAgent
 
     class EmptyPromptService:
@@ -610,9 +610,9 @@ async def test_writer_missing_config_prompt_is_not_silent(monkeypatch):
     monkeypatch.setattr(WriterAgent, "_build_md_writer_fallback_prompt", lambda self: "")
 
     writer = WriterAgent(project_id="project-1")
-    prompt = await writer._get_writer_config_prompt({"task_type": "character_voice_rewrite"})
+    with pytest.raises(Exception, match="Writer prompt configuration is missing"):
+        await writer._get_writer_config_prompt({"task_type": "character_voice_rewrite"})
 
-    assert prompt == ""
     assert writer._writer_config_prompt_source == "missing"
     trace = writer.get_system_prompt_render_trace()
     assert trace["scenario"] == "character_voice_rewrite"
@@ -2227,6 +2227,28 @@ def test_workflow_setting_agent_chapter_consistency_prompt_uses_md_asset(monkeyp
     assert "请检查以下章节内容与世界设定的一致性" not in prompt
     assert "力量体系使用是否一致" not in prompt
     assert "如果发现问题，列出具体问题并建议修改方案" not in prompt
+    trace = agent.get_system_prompt_render_trace()
+    assert trace["scenario"] == "chapter_consistency"
+    assert trace["prompt_ids"] == ["function_setting_chapter_consistency"]
+    assert trace["fallbacks_used"] == []
+    assert trace["missing_prompt_ids"] == []
+    assert_render_trace_contract(trace)
+
+
+def test_workflow_setting_agent_chapter_consistency_missing_asset_fails_closed_for_project(monkeypatch):
+    from app.agents.setting_agent import SettingAgent as WorkflowSettingAgent
+
+    agent = WorkflowSettingAgent(project_id="project-1")
+    monkeypatch.setattr(agent, "_load_md_prompt_content", lambda prompt_id: "")
+
+    with pytest.raises(Exception, match="Setting prompt asset is missing"):
+        agent._build_chapter_consistency_prompt("正文")
+
+    trace = agent.get_system_prompt_render_trace()
+    assert trace["scenario"] == "chapter_consistency"
+    assert trace["fallbacks_used"] == ["setting_missing_prompt_asset"]
+    assert trace["missing_prompt_ids"] == ["function_setting_chapter_consistency"]
+    assert_render_trace_contract(trace)
 
 
 def test_workflow_setting_agent_context_analysis_prompt_uses_md_asset_and_runtime_blocks(monkeypatch):
@@ -2264,6 +2286,12 @@ def test_workflow_setting_agent_context_analysis_prompt_uses_md_asset_and_runtim
     assert "你不是在泛泛整理世界观" not in prompt
     assert "不要自行脑补默认奇幻/冒险设定" not in prompt
     assert "输出尽量结构化" not in prompt
+    trace = agent.get_system_prompt_render_trace()
+    assert trace["scenario"] == "workflow_context"
+    assert trace["prompt_ids"] == ["function_setting_workflow_context_analysis"]
+    assert trace["fallbacks_used"] == []
+    assert trace["missing_prompt_ids"] == []
+    assert_render_trace_contract(trace)
 
 
 @pytest.mark.asyncio
@@ -4490,7 +4518,7 @@ async def test_evaluator_prompt_service_failure_records_observable_md_fallback_t
 
 
 @pytest.mark.asyncio
-async def test_evaluator_missing_config_prompt_is_not_silent(monkeypatch):
+async def test_evaluator_missing_config_prompt_fails_closed_for_project_runtime(monkeypatch):
     from app.agents.evaluator import EvaluatorAgent
 
     class EmptyPromptService:
@@ -4504,10 +4532,10 @@ async def test_evaluator_missing_config_prompt_is_not_silent(monkeypatch):
     monkeypatch.setattr(EvaluatorAgent, "_build_md_evaluator_fallback_prompt", lambda self: "")
 
     evaluator = EvaluatorAgent(project_id="project-1")
-    prompt = await evaluator._get_evaluator_config_prompt({"task_type": "ooc_review"})
+    with pytest.raises(Exception, match="Evaluator prompt configuration is missing"):
+        await evaluator._get_evaluator_config_prompt({"task_type": "ooc_review"})
 
     trace = evaluator.get_system_prompt_render_trace()
-    assert prompt == ""
     assert trace["scenario"] == "ooc_information_gate"
     assert trace["fallbacks_used"] == ["evaluator_missing_config_prompt"]
     assert trace["deprecated_sources_used"] == ["EvaluatorAgent._build_md_evaluator_fallback_prompt"]
@@ -4590,6 +4618,149 @@ async def test_evaluator_deterministic_role_performance_gate_survives_prompt_mig
     assert data["should_end"] is False
     assert any("正文采纳了角色私有演绎素材" in issue for issue in data["issues"])
     assert data["role_performance_gate_check"]["passed"] is False
+    assert_render_trace_contract(result.metadata["prompt_render_trace"])
+
+
+@pytest.mark.asyncio
+async def test_evaluator_deterministic_confirmed_prior_state_gate_ignores_rejected_changes(monkeypatch):
+    from app.agents.evaluator import EvaluatorAgent
+    from app.models.agent_output_schemas import EvaluatorChapterEndSchema
+
+    class FakePromptService:
+        async def build_agent_prompt_with_trace(self, **kwargs):
+            return {
+                "content": "Evaluator runtime prompt",
+                "trace": _trace("evaluator", kwargs["scenario"]),
+            }
+
+    monkeypatch.setattr(
+        "app.services.agent_prompt_service.get_agent_prompt_service",
+        lambda: FakePromptService(),
+    )
+
+    evaluator = EvaluatorAgent(project_id="project-1")
+
+    async def fake_call_structured(schema, messages, temperature=0.0, category=None):
+        assert schema is EvaluatorChapterEndSchema
+        prompt_text = messages[0].content
+        assert "已确认前文章节状态包" in prompt_text
+        assert "废弃设定不应进入状态包" not in prompt_text
+        return EvaluatorChapterEndSchema(
+            should_end=True,
+            quality_passed=True,
+            score=8.0,
+            reason="模型初判通过",
+            issues=[],
+            suggestions=[],
+            pacing_check={"is_appropriate": True, "note": "节奏可接受"},
+            long_term_check={"has_room_for_future": True, "note": "仍保留后续空间"},
+            world_consistency_check={"is_consistent": True, "issues": []},
+            scores={
+                "info_gain": 8.0,
+                "suspense": 7.0,
+                "pacing": 8.0,
+                "completeness": 8.0,
+                "world_consistency": 8.0,
+            },
+        )
+
+    monkeypatch.setattr(evaluator, "_call_structured", fake_call_structured)
+
+    result = await evaluator.execute(
+        {
+            "task_type": "chapter_end",
+            "chapter_content": "正文沿用一个已拒绝废弃设定，但没有否定任何已确认状态。",
+            "confirmed_prior_state_packet": {
+                "confirmed_state_changes": [],
+                "open_proposed_changes": [],
+            },
+        }
+    )
+
+    assert result.success is True
+    data = result.structured_data
+    assert data["quality_passed"] is True
+    assert data["should_end"] is True
+    assert data["confirmed_prior_state_check"]["passed"] is True
+    assert data["confirmed_prior_state_check"]["issues"] == []
+    assert_render_trace_contract(result.metadata["prompt_render_trace"])
+
+
+@pytest.mark.asyncio
+async def test_evaluator_deterministic_confirmed_prior_state_gate_blocks_continuity_conflict(monkeypatch):
+    from app.agents.evaluator import EvaluatorAgent
+    from app.models.agent_output_schemas import EvaluatorChapterEndSchema
+
+    class FakePromptService:
+        async def build_agent_prompt_with_trace(self, **kwargs):
+            return {
+                "content": "Evaluator runtime prompt",
+                "trace": _trace("evaluator", kwargs["scenario"]),
+            }
+
+    monkeypatch.setattr(
+        "app.services.agent_prompt_service.get_agent_prompt_service",
+        lambda: FakePromptService(),
+    )
+
+    evaluator = EvaluatorAgent(project_id="project-1")
+
+    async def fake_call_structured(schema, messages, temperature=0.0, category=None):
+        assert schema is EvaluatorChapterEndSchema
+        assert "已确认前文章节状态包" in messages[0].content
+        return EvaluatorChapterEndSchema(
+            should_end=True,
+            quality_passed=True,
+            score=8.0,
+            reason="模型初判通过",
+            issues=[],
+            suggestions=[],
+            pacing_check={"is_appropriate": True, "note": "节奏可接受"},
+            long_term_check={"has_room_for_future": True, "note": "仍保留后续空间"},
+            world_consistency_check={"is_consistent": True, "issues": []},
+            scores={
+                "info_gain": 8.0,
+                "suspense": 7.0,
+                "pacing": 8.0,
+                "completeness": 8.0,
+                "world_consistency": 8.0,
+            },
+        )
+
+    monkeypatch.setattr(evaluator, "_call_structured", fake_call_structured)
+
+    result = await evaluator.execute(
+        {
+            "task_type": "chapter_end",
+            "chapter_content": "正文却写主角没有获得星砂印记，并把星门失稳仍是待确认提示当成已经发生的正史。",
+            "confirmed_prior_state_packet": {
+                "confirmed_state_changes": [
+                    {
+                        "id": "state-applied",
+                        "status": "applied",
+                        "entity_type": "plot",
+                        "summary": "主角已获得星砂印记，这是下一章必须尊重的已确认剧情状态。",
+                    }
+                ],
+                "open_proposed_changes": [
+                    {
+                        "id": "state-proposed",
+                        "status": "proposed",
+                        "entity_type": "world",
+                        "summary": "星门失稳仍是待确认提示，下一章不得当作正史。",
+                    }
+                ],
+            },
+        }
+    )
+
+    assert result.success is True
+    data = result.structured_data
+    assert data["quality_passed"] is False
+    assert data["should_end"] is False
+    assert any("正文疑似否定已确认前文状态" in issue for issue in data["issues"])
+    assert data["confirmed_prior_state_check"]["passed"] is False
+    assert any("待确认状态" in issue for issue in data["upstream_context_usage_check"]["issues"])
     assert_render_trace_contract(result.metadata["prompt_render_trace"])
 
 
@@ -5004,8 +5175,8 @@ def test_director_auto_write_prompt_uses_md_asset(monkeypatch):
         lambda: FakeMdService(),
     )
 
-    director = DirectorSystem({"id": "world-1", "name": "测试世界", "description": "世界说明"})
-    prompt = director._build_auto_write_prompt(
+    director = DirectorSystem({"id": "world-1", "name": "测试世界", "description": "世界说明"}, project_id="project-1")
+    prompt, trace = director._build_auto_write_prompt(
         chapter_title="第一章",
         chapter_goal="完成局部冲突",
         characters_info=[{"name": "甲", "role": "主角", "description": "谨慎"}],
@@ -5018,6 +5189,37 @@ def test_director_auto_write_prompt_uses_md_asset(monkeypatch):
     assert "【章节标题】\n第一章" in prompt
     assert "【主要角色】" in prompt
     assert "展示而非告知 (Show, Don't Tell)" not in prompt
+    assert trace["agent_type"] == "director"
+    assert trace["scenario"] == "director_auto_write"
+    assert trace["project_id"] == "project-1"
+    assert trace["prompt_ids"] == ["function_director_auto_write"]
+    assert trace["fallbacks_used"] == []
+    assert trace["missing_prompt_ids"] == []
+    assert_render_trace_contract(trace)
+
+
+def test_director_auto_write_missing_prompt_asset_fails_closed_for_project(monkeypatch):
+    from app.services.director import DirectorSystem
+
+    class EmptyMdService:
+        def get_prompt(self, prompt_id):
+            return None
+
+    monkeypatch.setattr(
+        "app.services.director.get_md_file_service",
+        lambda: EmptyMdService(),
+    )
+
+    director = DirectorSystem({"id": "world-1", "name": "测试世界"}, project_id="project-1")
+    with pytest.raises(RuntimeError, match="Director auto-write prompt asset is missing"):
+        director._build_auto_write_prompt(
+            chapter_title="第一章",
+            chapter_goal="完成局部冲突",
+            characters_info=[],
+            world_info={"name": "测试世界"},
+            target_word_count=1200,
+            style_reference=None,
+        )
 
 
 @pytest.mark.asyncio

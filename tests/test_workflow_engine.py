@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import datetime, timedelta
 
 import pytest
@@ -12,9 +13,11 @@ from app.models.workflow_definition import (
     WorkflowDefinitionCreate,
 )
 from app.models.workflow_execution import WorkflowStatus, NodeExecutionState, WorkflowExecution
+from app.services.chapter_document_storage import ChapterDocumentStorage
 from app.services.workflow_engine import WorkflowEngine, WorkflowOperationError
+from app.services.workflow_replay_export_service import WorkflowReplayExportService
 
-from tests.workflow_test_fakes import FakeAgentResponse
+from tests.workflow_test_fakes import FakeAgentResponse, FakeDiscussionDB
 
 
 class TestWorkflowValidation:
@@ -98,6 +101,120 @@ class TestWorkflowValidation:
         result = self.engine.validate_workflow(workflow)
         assert result.valid is True
         assert len(result.errors) == 0
+
+
+@pytest.mark.asyncio
+async def test_load_agent_context_attaches_confirmed_prior_state_packet(monkeypatch):
+    engine = WorkflowEngine()
+    db = FakeDiscussionDB()
+    project_id = "00000000-0000-0000-0000-000000000001"
+    db.chapters.extend([
+        {"id": "chapter-1", "project_id": project_id, "status": "saved", "chapter_number": 1, "title": "第一章", "content_checksum": "aaa"},
+        {"id": "chapter-2", "project_id": project_id, "status": "saved", "chapter_number": 2, "title": "第二章", "content_checksum": "bbb"},
+        {"id": "chapter-completed", "project_id": project_id, "status": "completed", "chapter_number": 2, "title": "旧完成态"},
+        {"id": "chapter-3", "project_id": project_id, "status": "saved", "chapter_number": 3, "title": "第三章", "content_checksum": "ccc"},
+        {"id": "draft-2", "project_id": project_id, "status": "draft", "chapter_number": 2, "title": "草稿"},
+    ])
+    db.state_changes["state-applied"] = {
+        "id": "state-applied",
+        "project_id": project_id,
+        "status": "applied",
+        "entity_type": "character",
+        "entity_id": "char-linyan",
+        "entity_name": "林砚",
+        "change_type": "status_change",
+        "summary": "林砚已受伤",
+        "chapter_id": "chapter-1",
+        "after_state": {"status": "injured"},
+        "created_at": "2026-05-10T01:00:00",
+        "applied_at": "2026-05-10T01:05:00",
+    }
+    db.state_changes["state-applied-latest"] = {
+        "id": "state-applied-latest",
+        "project_id": project_id,
+        "status": "applied",
+        "entity_type": "character",
+        "entity_id": "char-linyan",
+        "entity_name": "林砚",
+        "change_type": "location_change",
+        "summary": "林砚已抵达潮汐门",
+        "chapter_id": "chapter-2",
+        "after_state": {"status": "injured", "location": "潮汐门"},
+        "created_at": "2026-05-10T02:00:00",
+        "applied_at": "2026-05-10T02:05:00",
+    }
+    db.state_changes["state-confirmed"] = {
+        "id": "state-confirmed",
+        "project_id": project_id,
+        "status": "confirmed",
+        "entity_type": "plot",
+        "entity_id": "plot-tide-key",
+        "entity_name": "潮汐门钥匙",
+        "change_type": "custom",
+        "summary": "林砚已获得潮汐门钥匙",
+        "chapter_id": "chapter-2",
+        "after_state": {"has_key": True},
+        "created_at": "2026-05-10T03:00:00",
+        "confirmed_at": "2026-05-10T03:05:00",
+    }
+    db.state_changes["state-proposed"] = {
+        "id": "state-proposed",
+        "project_id": project_id,
+        "status": "proposed",
+        "entity_type": "plot",
+        "change_type": "custom",
+        "summary": "潮汐门可能通向旧案",
+    }
+    db.state_changes["state-rejected"] = {
+        "id": "state-rejected",
+        "project_id": project_id,
+        "status": "rejected",
+        "entity_type": "world",
+        "change_type": "world_state_change",
+        "summary": "废弃设定不应进入状态包",
+    }
+    execution = WorkflowExecution(
+        workflow_id="wf-context-packet",
+        project_id=project_id,
+        status=WorkflowStatus.RUNNING,
+        context={"chapter_num": 3, "chapter_title": "第三章"},
+        node_states={},
+    )
+    events = []
+
+    async def capture_broadcast(execution_id, event_type, payload):
+        events.append((execution_id, event_type, payload))
+
+    monkeypatch.setattr(engine, "_broadcast_status", capture_broadcast)
+
+    context = await engine._load_agent_context("writer", execution, db)
+
+    packet = context["confirmed_prior_state_packet"]
+    assert [chapter["chapter_id"] for chapter in packet["prior_chapters"]] == ["chapter-1", "chapter-2"]
+    confirmed_ids = [change["id"] for change in packet["confirmed_state_changes"]]
+    assert confirmed_ids == ["state-confirmed", "state-applied-latest", "state-applied"]
+    assert packet["confirmed_state_changes"][1]["entity_key"] == "character:char-linyan"
+    assert packet["confirmed_state_changes"][1]["after_state"] == {"status": "injured", "location": "潮汐门"}
+    state_summary = {item["entity_key"]: item for item in packet["confirmed_state_summary"]}
+    assert state_summary["character:char-linyan"]["latest_change_id"] == "state-applied-latest"
+    assert state_summary["character:char-linyan"]["change_count"] == 2
+    assert state_summary["character:char-linyan"]["latest_after_state"] == {"status": "injured", "location": "潮汐门"}
+    assert state_summary["plot:plot-tide-key"]["latest_change_id"] == "state-confirmed"
+    assert packet["source"]["confirmed_state_total"] == 3
+    assert packet["source"]["confirmed_entity_count"] == 2
+    assert packet["open_proposed_changes"][0]["id"] == "state-proposed"
+    serialized_packet = json.dumps(packet, ensure_ascii=False)
+    assert "state-rejected" not in serialized_packet
+    assert "废弃设定" not in serialized_packet
+    assert "chapter-3" not in [chapter["chapter_id"] for chapter in packet["prior_chapters"]]
+    assert "draft-2" not in [chapter["chapter_id"] for chapter in packet["prior_chapters"]]
+    assert "chapter-completed" not in [chapter["chapter_id"] for chapter in packet["prior_chapters"]]
+    assert execution.context["confirmed_prior_state_packet"] == packet
+    assert execution.context["confirmed_prior_state_packet_provenance"]["confirmed_state_count"] == 3
+    assert execution.context["confirmed_prior_state_packet_provenance"]["open_proposed_count"] == 1
+    assert events[-1][1] == "chapter_state_handoff_loaded"
+    assert events[-1][2]["confirmed_state_count"] == 3
+    assert events[-1][2]["pending_count"] == 1
 
 
 class TestCycleDetection:
@@ -308,6 +425,103 @@ class TestWorkflowExecution:
         assert len(workflow.edges) == 1
 
     @pytest.mark.asyncio
+    async def test_writer_effective_input_and_saved_provenance_are_recorded(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "app.services.chapter_document_storage.chapter_document_storage",
+            ChapterDocumentStorage(str(tmp_path)),
+        )
+        node = WorkflowNode(id="writer", node_type=NodeType.AGENT, agent_type="writer", label="写作")
+        execution = WorkflowExecution(
+            id="exec-writer-provenance",
+            workflow_id="wf-writer-provenance",
+            project_id="00000000-0000-0000-0000-000000000001",
+            status=WorkflowStatus.RUNNING,
+            trace_id="trace-writer-provenance",
+            node_states={"writer": NodeExecutionState(node_id="writer", status=NodeStatus.RUNNING)},
+            context={
+                "chapter_num": 9,
+                "chapter_title": "第九章：实链",
+                "chapter_outline_id": "outline-writer-provenance",
+                "chapter_outline": {"id": "outline-writer-provenance", "target_word_count": 1200},
+                "target_word_count": 1200,
+                "characters": [{"name": "林岚"}],
+                "lore_entries": [{"title": "潮汐城"}],
+                "existing_hooks": [{"title": "铜铃"}],
+                "workflow_state": {"canonical_state": {"chapter_num": 9}},
+                "graph_context_summary": "核心人物关系已加载",
+            },
+        )
+        db = FakeDiscussionDB()
+
+        async def fake_save_workflow_execution(data):
+            return data.get("id")
+
+        db.save_workflow_execution = fake_save_workflow_execution
+        broadcasts = []
+
+        class FakeWriterAgent:
+            name = "fake-writer"
+            model = object()
+            _stream_callback = None
+
+            async def execute(self, context):
+                assert context["target_word_count"] == 1200
+                assert context["chapter_outline"]["id"] == "outline-writer-provenance"
+                return FakeAgentResponse(
+                    {
+                        "chapter_content": "真实链路正文",
+                        "word_count": 6,
+                        "metadata": {},
+                        "style_check": {"passed": True},
+                        "hooks_embedded": [],
+                        "future_setup": [],
+                    },
+                    contract_id="writer.workflow_output",
+                    schema_name="writer.workflow_output",
+                    metadata={
+                        "prompt_render_trace": {
+                            "template_id": "writer-template",
+                            "prompt_ids": ["function_writing"],
+                            "skill_ids": ["scene_pacing"],
+                            "writing_rule_ids": ["long_novel_core"],
+                            "prompt": "must not be persisted",
+                        }
+                    },
+                )
+
+        async def capture_broadcast(execution_id, event_type, payload):
+            broadcasts.append((execution_id, event_type, payload))
+
+        monkeypatch.setattr(self.engine, "_broadcast_status", capture_broadcast)
+        output, response, contract = await self.engine._run_agent_execution(FakeWriterAgent(), dict(execution.context), execution, node, db)
+        output, contract = self.engine._apply_node_output_contract(node, output, response=response)
+        output = self.engine._attach_prompt_render_trace_metadata(
+            output,
+            response.metadata.get("prompt_render_trace"),
+            response.metadata.get("config_prompt_source", "agent_template_runtime"),
+        )
+
+        assert output["chapter_content"] == "真实链路正文"
+        input_data = execution.node_states["writer"].input_data
+        assert input_data["target_word_count"] == 1200
+        assert input_data["chapter_outline"]["id"] == "outline-writer-provenance"
+        assert input_data["_effective_agent_input"]["resolved_agent_type"] == "writer"
+        assert input_data["_effective_agent_input"]["required_context_present"]["chapter_outline"] is True
+        assert input_data["_effective_agent_input"]["required_context_present"]["graph_context"] is True
+        saved_payload = broadcasts[-1][2]
+        assert broadcasts[-1][1] == "chapter_saved"
+        assert saved_payload["source_node_id"] == "writer"
+        assert saved_payload["resolved_agent_type"] == "writer"
+        assert saved_payload["source_output_contract_id"] == "writer.workflow_output"
+        assert saved_payload["source_output_schema_name"] == "writer.workflow_output"
+        assert saved_payload["source_trace_id"] == "trace-writer-provenance"
+        assert saved_payload["writer_prompt_trace"]["prompt_ids"] == ["function_writing"]
+        assert "prompt" not in saved_payload["writer_prompt_trace"]
+        assert "content" not in saved_payload
+        assert db.chapters[0]["content"] == ""
+        assert (tmp_path / db.chapters[0]["content_path"]).read_text(encoding="utf-8") == "真实链路正文"
+
+    @pytest.mark.asyncio
     async def test_pause_resume_workflow(self):
         """测试暂停和恢复"""
         # 创建模拟执行
@@ -427,6 +641,424 @@ class TestWorkflowExecution:
         assert "租约已过期" in execution.error
         assert execution.context["stale_execution_history"][0]["operation"] == "inspect"
         assert execution.resume_cursor["stale_operation"] == "inspect"
+
+    def test_inspect_execution_staleness_reports_safe_actions(self):
+        execution = WorkflowExecution(
+            workflow_id="test-wf",
+            project_id="test-project",
+            status=WorkflowStatus.RUNNING,
+            node_states={},
+            lease_expires_at=datetime.now() - timedelta(seconds=5),
+            last_heartbeat_at=datetime.now() - timedelta(seconds=65),
+        )
+
+        inspection = self.engine.inspect_execution_staleness(execution)
+
+        assert inspection["suspected_stale"] is True
+        assert inspection["active_task"] is False
+        assert "mark_failed" in inspection["safe_actions"]
+        assert inspection["lease"]["expired"] is True
+
+    @pytest.mark.asyncio
+    async def test_resolve_stale_execution_marks_failed_with_audit(self):
+        execution = WorkflowExecution(
+            workflow_id="test-wf",
+            project_id="test-project",
+            status=WorkflowStatus.RUNNING,
+            current_node="writer",
+            node_states={"writer": NodeExecutionState(node_id="writer", status=NodeStatus.RUNNING)},
+            lease_expires_at=datetime.now() - timedelta(seconds=5),
+            last_heartbeat_at=datetime.now() - timedelta(seconds=65),
+        )
+        self.engine._executions[execution.id] = execution
+        broadcasts = []
+
+        async def _fake_broadcast(execution_id, event_type, data):
+            broadcasts.append((execution_id, event_type, data))
+
+        self.engine._broadcast_status = _fake_broadcast
+
+        result = await self.engine.resolve_stale_execution(execution.id, action="mark_failed", reason="test stale cleanup")
+
+        assert result["success"] is True
+        assert execution.status == WorkflowStatus.FAILED
+        assert execution.node_states["writer"].status == NodeStatus.FAILED
+        assert execution.context["stale_execution_history"][0]["operation"] == "test stale cleanup"
+        assert broadcasts == []
+
+    @pytest.mark.asyncio
+    async def test_create_runtime_fixture_requires_debug_mode(self, monkeypatch):
+        monkeypatch.setattr("app.services.workflow_engine.settings.debug", False)
+
+        with pytest.raises(WorkflowOperationError) as exc_info:
+            await self.engine.create_runtime_fixture("test-project", object(), fixture_type="stale_running")
+
+        assert exc_info.value.code == "workflow_fixture_disabled"
+
+    @pytest.mark.asyncio
+    async def test_create_runtime_fixture_builds_isolated_stale_execution(self, monkeypatch):
+        monkeypatch.setattr("app.services.workflow_engine.settings.debug", True)
+        saved_workflows = []
+        saved_executions = []
+        events = []
+
+        class FixtureDB:
+            async def execute_write(self, query, params):
+                return None
+
+            async def save_workflow_execution(self, execution_data):
+                saved_executions.append(dict(execution_data))
+                return execution_data["id"]
+
+            async def append_workflow_execution_event(self, execution_id, event_type, event_data):
+                events.append((execution_id, event_type, event_data))
+                return len(events)
+
+        async def fake_save_workflow(workflow, db):
+            saved_workflows.append(workflow)
+
+        monkeypatch.setattr(self.engine, "_save_workflow_to_db", fake_save_workflow)
+
+        result = await self.engine.create_runtime_fixture("test-project", FixtureDB(), fixture_type="stale_running")
+
+        assert result["success"] is True
+        assert result["fixture_type"] == "stale_running"
+        assert result["workflow"]["variables"]["runtime_fixture"] is True
+        assert result["execution"]["context"]["runtime_fixture"] is True
+        assert result["inspection"]["suspected_stale"] is True
+        assert saved_workflows[0].id == result["workflow"]["id"]
+        assert saved_executions[0]["id"] == result["execution"]["id"]
+        assert events[0][1] == "workflow_runtime_fixture_created"
+
+    @pytest.mark.asyncio
+    async def test_create_runtime_fixture_builds_saved_chapter_handoff(self, tmp_path, monkeypatch):
+        from app.services.chapter_document_storage import ChapterDocumentStorage
+
+        monkeypatch.setattr("app.services.workflow_engine.settings.debug", True)
+        monkeypatch.setattr(
+            "app.services.chapter_document_storage.chapter_document_storage",
+            ChapterDocumentStorage(str(tmp_path)),
+        )
+        saved_workflows = []
+        saved_executions = []
+        saved_chapters = []
+        events = []
+        broadcast_events = []
+
+        async def capture_broadcast(execution_id, event_type, payload):
+            broadcast_events.append((execution_id, event_type, payload))
+
+        monkeypatch.setattr(self.engine, "_broadcast_status", capture_broadcast)
+
+        class FixtureDB:
+            async def execute_write(self, query, params):
+                return None
+
+            async def execute_query(self, query, params=None):
+                return []
+
+            async def save_workflow_execution(self, execution_data):
+                saved_executions.append(dict(execution_data))
+                return execution_data["id"]
+
+            async def save_chapter(self, chapter_data):
+                saved_chapters.append(dict(chapter_data))
+                return chapter_data["id"]
+
+            async def append_workflow_execution_event(self, execution_id, event_type, event_data):
+                events.append((execution_id, event_type, event_data))
+                return len(events)
+
+        async def fake_save_workflow(workflow, db):
+            saved_workflows.append(workflow)
+
+        monkeypatch.setattr(self.engine, "_save_workflow_to_db", fake_save_workflow)
+
+        result = await self.engine.create_runtime_fixture("00000000-0000-0000-0000-000000000001", FixtureDB(), fixture_type="saved_chapter", label="director-fixture-session")
+
+        execution = result["execution"]
+        assert result["success"] is True
+        assert result["fixture_type"] == "saved_chapter"
+        assert execution["status"] == "completed"
+        assert execution["director_session_id"] == "director-fixture-session"
+        assert execution["context"]["chapter_saved"] is True
+        assert execution["context"]["chapter_saved_payload"]["runtime_fixture"] is True
+        assert saved_chapters[0]["content"] == ""
+        assert saved_chapters[0]["content_storage"] == "filesystem"
+        assert (tmp_path / saved_chapters[0]["content_path"]).exists()
+        assert any(event[1] == "chapter_saved" for event in broadcast_events)
+        assert broadcast_events[-1][1] == "workflow_runtime_fixture_created"
+        assert len(saved_executions) >= 2
+        assert "chapter_id" not in saved_executions[0]["context"]
+        assert saved_executions[-1]["context"]["chapter_id"] == saved_chapters[0]["id"]
+
+    @pytest.mark.asyncio
+    async def test_create_runtime_fixture_builds_quality_gate_revision_handoff(self, tmp_path, monkeypatch):
+        from app.services.chapter_document_storage import ChapterDocumentStorage
+
+        monkeypatch.setattr("app.services.workflow_engine.settings.debug", True)
+        monkeypatch.setattr(
+            "app.services.chapter_document_storage.chapter_document_storage",
+            ChapterDocumentStorage(str(tmp_path)),
+        )
+        saved_chapters = []
+        broadcast_events = []
+
+        async def capture_broadcast(execution_id, event_type, payload):
+            broadcast_events.append((event_type, payload))
+
+        monkeypatch.setattr(self.engine, "_broadcast_status", capture_broadcast)
+
+        class FixtureDB:
+            async def execute_write(self, query, params):
+                return None
+
+            async def execute_query(self, query, params=None):
+                return []
+
+            async def save_workflow_execution(self, execution_data):
+                return execution_data["id"]
+
+            async def save_chapter(self, chapter_data):
+                saved_chapters.append(dict(chapter_data))
+                return chapter_data["id"]
+
+            async def append_workflow_execution_event(self, execution_id, event_type, event_data):
+                return 1
+
+        async def fake_save_workflow(workflow, db):
+            return None
+
+        monkeypatch.setattr(self.engine, "_save_workflow_to_db", fake_save_workflow)
+
+        result = await self.engine.create_runtime_fixture(
+            "00000000-0000-0000-0000-000000000001",
+            FixtureDB(),
+            fixture_type="quality_gate_revision",
+            label="quality-gate-fixture-session",
+        )
+
+        execution = result["execution"]
+        assert result["fixture_type"] == "quality_gate_revision"
+        assert execution["status"] == "completed"
+        assert execution["context"]["chapter_saved"] is True
+        assert execution["context"]["pending_chapter_save"] is False
+        assert execution["context"]["chapter_draft_attempt"] == 2
+        assert execution["context"]["quality_gate_status"] == "passed"
+        assert len(execution["context"]["quality_gate_history"]) == 2
+        assert len(execution["context"]["revision_history"]) == 1
+        assert execution["context"]["writer_retry_contexts"][0]["is_retry"] is True
+        assert execution["context"]["writer_retry_contexts"][0]["agent_scenario"] == "rewrite_by_review"
+        assert execution["context"]["chapter_saved_payload"]["quality_gate_passed"] is True
+        assert execution["context"]["chapter_saved_payload"]["quality_gate_attempts"] == 2
+        assert len(saved_chapters) == 1
+        assert (tmp_path / saved_chapters[0]["content_path"]).read_text(encoding="utf-8").startswith("质量门夹具第二版正文")
+        event_types = [event for event, _ in broadcast_events]
+        assert event_types.count("chapter_draft_ready") == 2
+        assert "quality_gate_failed" in event_types
+        assert "chapter_revision_requested" in event_types
+        assert "quality_gate_passed" in event_types
+        assert "chapter_finalized" in event_types
+        assert event_types.count("chapter_saved") == 1
+
+    @pytest.mark.asyncio
+    async def test_create_runtime_fixture_builds_state_handoff_context_packet(self, tmp_path, monkeypatch):
+        from app.services.chapter_document_storage import ChapterDocumentStorage
+
+        monkeypatch.setattr("app.services.workflow_engine.settings.debug", True)
+        monkeypatch.setattr(
+            "app.services.chapter_document_storage.chapter_document_storage",
+            ChapterDocumentStorage(str(tmp_path)),
+        )
+        db = FakeDiscussionDB()
+        broadcast_events = []
+        saved_executions = []
+
+        async def capture_broadcast(execution_id, event_type, payload):
+            broadcast_events.append((event_type, payload))
+
+        async def fake_save_workflow(workflow, db):
+            return None
+
+        async def save_workflow_execution(execution_data):
+            saved_executions.append(dict(execution_data))
+            return execution_data["id"]
+
+        async def append_workflow_execution_event(execution_id, event_type, event_data):
+            return 1
+
+        db.save_workflow_execution = save_workflow_execution
+        db.append_workflow_execution_event = append_workflow_execution_event
+        monkeypatch.setattr(self.engine, "_save_workflow_to_db", fake_save_workflow)
+        monkeypatch.setattr(self.engine, "_broadcast_status", capture_broadcast)
+
+        result = await self.engine.create_runtime_fixture(
+            "00000000-0000-0000-0000-000000000001",
+            db,
+            fixture_type="state_handoff_context",
+            label="state-handoff-fixture-session",
+        )
+
+        execution = result["execution"]
+        context = execution["context"]
+        writer_packet = context["fixture_writer_confirmed_prior_state_packet"]
+        evaluator_packet = context["fixture_evaluator_confirmed_prior_state_packet"]
+        prior_ids = set(context["fixture_prior_chapter_ids"])
+        draft_ids = set(context["fixture_excluded_draft_chapter_ids"])
+
+        assert result["fixture_type"] == "state_handoff_context"
+        assert context["chapter_num"] == 3
+        assert len(prior_ids) == 2
+        assert len(draft_ids) == 1
+        assert {chapter["chapter_id"] for chapter in writer_packet["prior_chapters"]} == prior_ids
+        assert not ({chapter["chapter_id"] for chapter in writer_packet["prior_chapters"]} & draft_ids)
+        assert evaluator_packet == writer_packet
+        assert writer_packet["source"]["prior_chapter_count"] == 2
+        assert writer_packet["source"]["confirmed_state_total"] == 3
+        assert writer_packet["source"]["confirmed_entity_count"] == 2
+        confirmed_ids = [change["id"] for change in writer_packet["confirmed_state_changes"]]
+        assert len(confirmed_ids) == 3
+        assert context["fixture_seeded_state_change_ids"][0] in confirmed_ids
+        assert context["fixture_seeded_state_change_ids"][1] in confirmed_ids
+        assert context["fixture_seeded_state_change_ids"][2] in confirmed_ids
+        assert context["fixture_seeded_state_change_ids"][3] not in confirmed_ids
+        assert context["fixture_seeded_state_change_ids"][4] not in confirmed_ids
+        assert all(change["status"] in {"applied", "confirmed"} for change in writer_packet["confirmed_state_changes"])
+        assert not any("废弃设定" in (change.get("summary") or "") for change in writer_packet["confirmed_state_changes"])
+        state_summary = {item["entity_key"]: item for item in writer_packet["confirmed_state_summary"]}
+        assert state_summary["character:00000000-0000-0000-0000-000000000101"]["latest_change_id"] == context["fixture_seeded_state_change_ids"][1]
+        assert state_summary["character:00000000-0000-0000-0000-000000000101"]["change_count"] == 2
+        assert state_summary["character:00000000-0000-0000-0000-000000000101"]["latest_after_state"] == {
+            "status": "recovering",
+            "location": "星门",
+            "traits": ["wounded", "steady", "focused"],
+            "notes": {"origin": "first-pass", "phase": "stable", "pace": "measured"},
+        }
+        assert state_summary["plot:fixture-plot-star-sand-mark"]["latest_status"] == "confirmed"
+        repeated_entity_summary = self.engine._build_confirmed_state_summary(
+            list(reversed([
+                change for change in db.state_changes.values() if change.get("entity_id") == "00000000-0000-0000-0000-000000000101"
+            ])),
+            limit=10,
+        )
+        assert repeated_entity_summary[0]["latest_after_state"] == state_summary["character:00000000-0000-0000-0000-000000000101"]["latest_after_state"]
+        assert writer_packet["open_proposed_changes"][0]["status"] == "proposed"
+        assert writer_packet["open_proposed_changes"][0]["summary"].startswith("星门失稳仍是待确认提示")
+        assert context["fixture_seeded_state_change_ids"][3] in [change["id"] for change in writer_packet["open_proposed_changes"]]
+        assert context["fixture_seeded_state_change_ids"][4] not in [change["id"] for change in writer_packet["open_proposed_changes"]]
+        assert context["fixture_writer_confirmed_prior_state_packet_provenance"]["prior_chapter_count"] == 2
+        assert context["fixture_writer_confirmed_prior_state_packet_provenance"]["confirmed_state_count"] == 3
+        assert context["fixture_writer_confirmed_prior_state_packet_provenance"]["open_proposed_count"] == 1
+        assert context["chapter_saved"] is True
+        assert context["state_writeback_counts"]["proposed"] == 1
+        assert len([chapter for chapter in db.chapters if chapter.get("status") == "draft"]) == 1
+        assert any(event_type == "chapter_state_handoff_loaded" for event_type, _ in broadcast_events)
+        assert any(event["context"].get("fixture_writer_confirmed_prior_state_packet") for event in saved_executions)
+
+    @pytest.mark.asyncio
+    async def test_cleanup_runtime_fixture_removes_saved_chapter_payload(self, tmp_path, monkeypatch):
+        from app.services.chapter_document_storage import ChapterDocumentStorage
+
+        monkeypatch.setattr("app.services.workflow_engine.settings.debug", True)
+        storage = ChapterDocumentStorage(str(tmp_path))
+        metadata = storage.write_chapter("00000000-0000-0000-0000-000000000099", "00000000-0000-0000-0000-000000000001", "夹具章节", "正文")
+        monkeypatch.setattr("app.services.chapter_document_storage.chapter_document_storage", storage)
+        deleted_chapter_ids = []
+        deleted_state_change_ids = []
+        execution = WorkflowExecution(
+            id="exec-fixture-saved",
+            workflow_id="wf-fixture-saved",
+            project_id="00000000-0000-0000-0000-000000000001",
+            status=WorkflowStatus.COMPLETED,
+            context={
+                "runtime_fixture": True,
+                "fixture_type": "saved_chapter",
+                "cleanup_token": "token",
+                "chapter_id": "00000000-0000-0000-0000-000000000099",
+                "chapter_content_path": metadata["content_path"],
+                "fixture_prior_chapter_ids": ["00000000-0000-0000-0000-000000000101"],
+                "fixture_excluded_draft_chapter_ids": ["00000000-0000-0000-0000-000000000102"],
+                "fixture_seeded_state_change_ids": ["00000000-0000-0000-0000-000000000103"],
+            },
+        )
+        workflow = WorkflowDefinition(
+            id="wf-fixture-saved",
+            project_id="00000000-0000-0000-0000-000000000001",
+            name="保存章节夹具",
+            nodes=[WorkflowNode(id="start", node_type=NodeType.START, label="开始"), WorkflowNode(id="end", node_type=NodeType.END, label="结束")],
+            edges=[WorkflowEdge(id="e1", source="start", target="end")],
+            variables={"runtime_fixture": True, "cleanup_token": "token"},
+        )
+        self.engine._executions[execution.id] = execution
+        self.engine._workflows[workflow.id] = workflow
+
+        class FixtureDB:
+            async def execute_write(self, query, params):
+                if "DELETE FROM chapters" in query:
+                    deleted_chapter_ids.append(params.get("id"))
+                if "DELETE FROM narrative_state_changes" in query:
+                    deleted_state_change_ids.append(params.get("id"))
+                return None
+
+        async def fake_delete_workflow(workflow_id, db):
+            return True
+
+        monkeypatch.setattr(self.engine, "_delete_workflow_from_db", fake_delete_workflow)
+
+        result = await self.engine.cleanup_runtime_fixture(execution.id, workflow.id, "token", FixtureDB())
+
+        assert result["success"] is True
+        assert deleted_chapter_ids == [
+            "00000000-0000-0000-0000-000000000099",
+            "00000000-0000-0000-0000-000000000101",
+            "00000000-0000-0000-0000-000000000102",
+        ]
+        assert deleted_state_change_ids == ["00000000-0000-0000-0000-000000000103"]
+        assert not (tmp_path / metadata["content_path"]).exists()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_runtime_fixture_rejects_non_fixture_data(self, monkeypatch):
+        monkeypatch.setattr("app.services.workflow_engine.settings.debug", True)
+        execution = WorkflowExecution(
+            id="exec-real",
+            workflow_id="wf-real",
+            project_id="test-project",
+            status=WorkflowStatus.FAILED,
+            context={},
+        )
+        workflow = WorkflowDefinition(
+            id="wf-real",
+            project_id="test-project",
+            name="真实工作流",
+            nodes=[WorkflowNode(id="start", node_type=NodeType.START, label="开始"), WorkflowNode(id="end", node_type=NodeType.END, label="结束")],
+            edges=[WorkflowEdge(id="e1", source="start", target="end")],
+            variables={},
+        )
+        self.engine._executions[execution.id] = execution
+        self.engine._workflows[workflow.id] = workflow
+
+        with pytest.raises(WorkflowOperationError) as exc_info:
+            await self.engine.cleanup_runtime_fixture("exec-real", "wf-real", "token", object())
+
+        assert exc_info.value.code == "workflow_fixture_guard_failed"
+
+    @pytest.mark.asyncio
+    async def test_resolve_stale_execution_rejects_unexpired_lease(self):
+        execution = WorkflowExecution(
+            workflow_id="test-wf",
+            project_id="test-project",
+            status=WorkflowStatus.RUNNING,
+            node_states={},
+            lease_expires_at=datetime.now() + timedelta(seconds=60),
+        )
+        self.engine._executions[execution.id] = execution
+
+        with pytest.raises(WorkflowOperationError) as exc_info:
+            await self.engine.resolve_stale_execution(execution.id, action="mark_failed")
+
+        assert exc_info.value.operation == "stale"
+        assert "尚未过期" in str(exc_info.value)
+        assert execution.status == WorkflowStatus.RUNNING
 
     @pytest.mark.asyncio
     async def test_operation_summary_reports_capabilities_and_audit_counts(self):
@@ -639,6 +1271,94 @@ class TestWorkflowExecution:
         assert started == [{"execution_id": execution.id, "workflow_id": workflow.id}]
 
     @pytest.mark.asyncio
+    async def test_recovered_workflow_preserves_saved_chapter_handoff(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "app.services.chapter_document_storage.chapter_document_storage",
+            ChapterDocumentStorage(str(tmp_path)),
+        )
+        workflow = WorkflowDefinition(
+            id="wf-recovered-save",
+            project_id="test-project",
+            name="恢复后保存章节",
+            nodes=[
+                WorkflowNode(id="start", node_type=NodeType.START, label="开始"),
+                WorkflowNode(id="writer", node_type=NodeType.AGENT, agent_type="writer", label="写作"),
+                WorkflowNode(id="end", node_type=NodeType.END, label="结束"),
+            ],
+            edges=[
+                WorkflowEdge(id="e1", source="start", target="writer"),
+                WorkflowEdge(id="e2", source="writer", target="end"),
+            ],
+        )
+        execution = WorkflowExecution(
+            id="exec-recovered-save",
+            workflow_id=workflow.id,
+            project_id="test-project",
+            status=WorkflowStatus.FAILED,
+            current_node="writer",
+            error="writer failed before save",
+            node_states={
+                "start": NodeExecutionState(node_id="start", status=NodeStatus.COMPLETED, output_data={"status": "started"}),
+                "writer": NodeExecutionState(node_id="writer", status=NodeStatus.FAILED, error="writer failed before save"),
+                "end": NodeExecutionState(node_id="end", status=NodeStatus.PENDING),
+            },
+            context={
+                "chapter_num": 9,
+                "chapter_title": "第九章：归线",
+                "chapter_outline_id": "outline-recovered-save",
+                "node_outputs": {"start": {"status": "started"}, "writer": {"draft": "bad"}},
+                "latest_node_output": {"node_id": "writer", "draft": "bad"},
+            },
+            trace_id="trace-recovered-save",
+        )
+        self.engine._executions[execution.id] = execution
+        db = FakeDiscussionDB()
+        broadcasts = []
+        started = []
+
+        async def _fake_get_workflow(workflow_id, db=None):
+            return workflow
+
+        async def _fake_broadcast(execution_id, event_type, data):
+            broadcasts.append({"execution_id": execution_id, "event_type": event_type, "data": data})
+
+        def _fake_start(execution_id, workflow_arg, db=None):
+            started.append({"execution_id": execution_id, "workflow_id": workflow_arg.id})
+
+        async def _fake_save_execution(execution_arg, db=None):
+            return None
+
+        self.engine.get_workflow = _fake_get_workflow
+        self.engine._broadcast_status = _fake_broadcast
+        self.engine._start_workflow_task = _fake_start
+        self.engine._save_execution_to_db = _fake_save_execution
+
+        result = await self.engine.recover_failed_workflow(execution.id, db=db, reason="retry_writer_after_fix")
+        await self.engine._save_chapter_from_writer(
+            execution,
+            {"chapter_content": "恢复后保存的正文", "word_count": 8},
+            db,
+        )
+
+        assert result["success"] is True
+        assert execution.context["recovery_history"][0]["reason"] == "retry_writer_after_fix"
+        assert execution.context["chapter_saved"] is True
+        assert execution.context["chapter_saved_payload"]["chapter_id"] == execution.context["chapter_id"]
+        assert execution.context["chapter_saved_payload"]["content_path"] == db.chapters[0]["content_path"]
+        assert execution.context["chapter_content_checksum"] == db.chapters[0]["content_checksum"]
+        assert "writer" not in execution.context["node_outputs"]
+        assert "latest_node_output" not in execution.context
+        assert [event["event_type"] for event in broadcasts] == ["workflow_recovery_started", "chapter_saved"]
+        saved_payload = broadcasts[-1]["data"]
+        assert saved_payload["execution_id"] == execution.id
+        assert saved_payload["workflow_id"] == workflow.id
+        assert saved_payload["chapter_id"] == execution.context["chapter_id"]
+        assert saved_payload["content_path"] == db.chapters[0]["content_path"]
+        assert saved_payload["content_checksum"] == db.chapters[0]["content_checksum"]
+        assert "content" not in saved_payload
+        assert started == [{"execution_id": execution.id, "workflow_id": workflow.id}]
+
+    @pytest.mark.asyncio
     async def test_diagnose_failed_workflow_node_classifies_missing_agent(self):
         workflow = WorkflowDefinition(
             id="wf-diagnosis",
@@ -728,15 +1448,376 @@ class TestWorkflowExecution:
         assert target_node.config["scenario"] == "workflow_output"
         assert execution.status == WorkflowStatus.RUNNING
         assert execution.current_node == "plotter_failure"
-        assert execution.context["remediation_history"][0]["reason"] == "fix_missing_agent"
-        assert execution.context["remediation_history"][0]["diff"]["after"]["agent_type"] == "plot_outline"
-        assert execution.context["remediation_history"][0]["diff"]["after"]["scenario"] == "workflow_output"
-        assert any(event["event_type"] == "workflow_node_remediated" for event in broadcasts)
+        remediation_entry = execution.context["remediation_history"][0]
+        assert remediation_entry["reason"] == "fix_missing_agent"
+        assert remediation_entry["started_at"]
+        assert remediation_entry["applied_at"] == remediation_entry["started_at"]
+        assert remediation_entry["previous_error"] == "无法获取 Agent: smoke_contract_failure"
+        assert remediation_entry["diff"]["after"]["agent_type"] == "plot_outline"
+        assert remediation_entry["diff"]["after"]["scenario"] == "workflow_output"
+        remediation_event = next(event for event in broadcasts if event["event_type"] == "workflow_node_remediated")
+        assert remediation_event["data"]["status"] == "failed"
+        assert remediation_event["data"]["current_node"] == "plotter_failure"
+        assert remediation_event["data"]["node_id"] == "plotter_failure"
+        assert remediation_event["data"]["previous_error"] == "无法获取 Agent: smoke_contract_failure"
+        assert remediation_event["data"]["diagnosis_category"] == "missing_agent"
+        assert remediation_event["data"]["remediation_entry"]["diff"]["after"]["agent_type"] == "plot_outline"
+        assert remediation_event["data"]["remediation_entry"]["started_at"]
+        assert remediation_event["data"]["remediation_entry"]["applied_at"] == remediation_event["data"]["remediation_entry"]["started_at"]
         assert any(event["event_type"] == "workflow_recovery_started" for event in broadcasts)
         assert saved_workflows and saved_workflows[0].nodes[1].agent_type == "plot_outline"
         assert [node.id for node in saved_workflows[0].nodes] == ["start", "plotter_failure", "end"]
         assert [(edge.source, edge.target) for edge in saved_workflows[0].edges] == [("start", "plotter_failure"), ("plotter_failure", "end")]
         assert started == [{"execution_id": execution.id, "workflow_id": workflow.id}]
+
+    def test_replay_export_includes_remediation_and_recovery_audit(self):
+        workflow = self._remediation_workflow()
+        execution = self._failed_remediation_execution(workflow.id)
+        execution.context["remediation_history"] = [
+            {
+                "attempt": 1,
+                "node_id": "plotter_failure",
+                "diagnosis_category": "missing_agent",
+                "reason": "fix_missing_agent",
+                "started_at": "2026-05-10T10:00:00",
+                "applied_at": "2026-05-10T10:00:01",
+                "previous_error": "无法获取 Agent: smoke_contract_failure",
+                "diff": {
+                    "before": {"agent_type": "smoke_contract_failure", "scenario": "broken"},
+                    "after": {"agent_type": "plot_outline", "scenario": "workflow_output"},
+                },
+                "prompt": "must not be rendered outside diff",
+            }
+        ]
+        execution.context["recovery_history"] = [
+            {
+                "attempt": 1,
+                "mode": "from_failed_node",
+                "target_node_id": "plotter_failure",
+                "reset_node_ids": ["plotter_failure", "end"],
+                "reason": "fix_missing_agent",
+                "started_at": "2026-05-10T10:00:02",
+                "previous_error": "无法获取 Agent: smoke_contract_failure",
+                "trace_id": "trace-remediation-fixture",
+                "status_at_start": "failed",
+                "prompt": "must not be rendered",
+            }
+        ]
+
+        markdown = WorkflowReplayExportService().export_markdown(execution, workflow)
+
+        assert "## 修复与恢复审计" in markdown
+        assert "### 修复记录" in markdown
+        assert "#### 修复尝试 1" in markdown
+        assert "- **节点 ID**: `plotter_failure`" in markdown
+        assert "- **诊断分类**: `missing_agent`" in markdown
+        assert "- **原因**: fix_missing_agent" in markdown
+        assert "- **原始错误**: 无法获取 Agent: smoke_contract_failure" in markdown
+        assert '"agent_type": "smoke_contract_failure"' in markdown
+        assert '"agent_type": "plot_outline"' in markdown
+        assert "### 恢复记录" in markdown
+        assert "#### 恢复尝试 1" in markdown
+        assert "- **模式**: `from_failed_node`" in markdown
+        assert "- **重置节点**: plotter_failure, end" in markdown
+        assert "- **Trace ID**: `trace-remediation-fixture`" in markdown
+        assert "- **开始状态**: `failed`" in markdown
+        assert markdown.index("## 修复与恢复审计") < markdown.index("## 节点复盘")
+        assert "must not be rendered" not in markdown
+
+    @pytest.mark.asyncio
+    async def test_writer_evaluator_condition_revision_loop_stages_then_finalizes(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "app.services.chapter_document_storage.chapter_document_storage",
+            ChapterDocumentStorage(str(tmp_path)),
+        )
+        workflow = WorkflowDefinition(
+            id="wf-quality-loop",
+            project_id="00000000-0000-0000-0000-000000000001",
+            name="质量门循环",
+            nodes=[
+                WorkflowNode(id="start", node_type=NodeType.START, label="开始"),
+                WorkflowNode(id="writer", node_type=NodeType.AGENT, agent_type="writer", label="写作", config={"quality_gate_enabled": True}),
+                WorkflowNode(id="evaluator", node_type=NodeType.AGENT, agent_type="evaluator", label="评估"),
+                WorkflowNode(id="gate", node_type=NodeType.CONDITION, label="质量门"),
+                WorkflowNode(id="end", node_type=NodeType.END, label="结束"),
+            ],
+            edges=[
+                WorkflowEdge(source="start", target="writer"),
+                WorkflowEdge(source="writer", target="evaluator"),
+                WorkflowEdge(source="evaluator", target="gate"),
+                WorkflowEdge(source="gate", target="end", condition={"result": "pass"}),
+                WorkflowEdge(source="gate", target="writer", condition={"result": "retry"}),
+            ],
+        )
+        self.engine._workflows[workflow.id] = workflow
+        db = FakeDiscussionDB()
+        db.outlines["outline-quality-loop"] = {
+            "id": "outline-quality-loop",
+            "project_id": workflow.project_id,
+            "chapter_number": 10,
+            "status": "approved",
+            "next_outline_id": None,
+        }
+
+        async def fake_save_workflow_execution(data):
+            db.executions.append(dict(data))
+            return data.get("id")
+
+        db.save_workflow_execution = fake_save_workflow_execution
+        broadcasts = []
+        writer_contexts = []
+        writer_attempts = {"count": 0}
+        evaluator_attempts = {"count": 0}
+
+        class FakeWriterAgent:
+            name = "fake-writer"
+            model = None
+            _stream_callback = None
+
+            async def execute(self, context):
+                writer_contexts.append(dict(context))
+                writer_attempts["count"] += 1
+                if writer_attempts["count"] == 1:
+                    return FakeAgentResponse({"chapter_content": "第一版正文", "word_count": 100, "hooks_embedded": [], "future_setup": [], "style_check": {"passed": True}}, contract_id="writer.workflow_output", schema_name="writer.workflow_output")
+                return FakeAgentResponse({"chapter_content": "第二版正文", "word_count": 100, "hooks_embedded": [], "future_setup": [], "style_check": {"passed": True}}, contract_id="writer.workflow_output", schema_name="writer.workflow_output")
+
+        class FakeEvaluatorAgent:
+            name = "fake-evaluator"
+            model = None
+            _stream_callback = None
+
+            async def execute(self, context):
+                evaluator_attempts["count"] += 1
+                if evaluator_attempts["count"] == 1:
+                    return FakeAgentResponse({"quality_passed": False, "score": 4, "issues": ["动机断裂"], "suggestions": ["重写动机"], "word_count_check": {"passed": True}})
+                return FakeAgentResponse({"quality_passed": True, "score": 8.5, "issues": [], "suggestions": ["可保存"], "word_count_check": {"passed": True}})
+
+        async def fake_provider(agent_type, project_id):
+            if agent_type == "writer":
+                return FakeWriterAgent()
+            if agent_type == "evaluator":
+                return FakeEvaluatorAgent()
+            raise AssertionError(agent_type)
+
+        async def capture_broadcast(execution_id, event_type, payload):
+            broadcasts.append((event_type, payload))
+
+        self.engine.set_agent_provider(fake_provider)
+        monkeypatch.setattr(self.engine, "_broadcast_status", capture_broadcast)
+        execution = WorkflowExecution(
+            workflow_id=workflow.id,
+            project_id=workflow.project_id,
+            status=WorkflowStatus.RUNNING,
+            context={
+                "chapter_num": 10,
+                "chapter_title": "第十章：复写",
+                "chapter_outline_id": "outline-quality-loop",
+                "target_word_count": 5,
+            },
+            node_states={node.id: NodeExecutionState(node_id=node.id, status=NodeStatus.PENDING) for node in workflow.nodes},
+        )
+        predecessors = self.engine._build_predecessor_graph(workflow)
+        completed_nodes = set()
+        for node_id in ["start", "writer", "evaluator", "gate", "writer", "evaluator", "gate", "end"]:
+            node = next(item for item in workflow.nodes if item.id == node_id)
+            await self.engine._execute_node_with_merge(execution, node, predecessors, workflow, db)
+            completed_nodes.add(node_id)
+            if node.node_type == NodeType.CONDITION:
+                next_node_id = self.engine._get_next_node(node_id, execution, workflow)
+                if next_node_id in completed_nodes:
+                    reset_nodes = self.engine._get_goto_reset_nodes(workflow, node_id, next_node_id)
+                    self.engine._reset_nodes_for_goto(execution, completed_nodes, reset_nodes, f"test goto: {node_id} -> {next_node_id}")
+
+        assert writer_attempts["count"] == 2
+        assert evaluator_attempts["count"] == 2
+        assert len(db.chapters) == 1
+        assert db.chapters[0]["content"] == ""
+        assert (tmp_path / db.chapters[0]["content_path"]).read_text(encoding="utf-8") == "第二版正文"
+        assert execution.context["chapter_saved"] is True
+        assert execution.context["pending_chapter_save"] is False
+        assert execution.context["chapter_draft_attempt"] == 2
+        assert execution.context["quality_gate_status"] == "passed"
+        assert len(execution.context["quality_gate_history"]) == 2
+        assert execution.context["quality_gate_history"][0]["passed"] is False
+        assert execution.context["quality_gate_history"][1]["passed"] is True
+        assert len(execution.context["revision_history"]) == 1
+        assert writer_contexts[1]["is_retry"] is True
+        assert writer_contexts[1]["task_type"] == "rewrite_by_review"
+        assert writer_contexts[1]["agent_scenario"] == "rewrite_by_review"
+        assert "evaluation_feedback" in writer_contexts[1]
+        assert [event for event, _ in broadcasts].count("chapter_draft_ready") == 2
+        assert [event for event, _ in broadcasts].count("chapter_saved") == 1
+        assert "quality_gate_failed" in [event for event, _ in broadcasts]
+        assert "chapter_revision_requested" in [event for event, _ in broadcasts]
+        assert "chapter_finalized" in [event for event, _ in broadcasts]
+        assert db.outlines["outline-quality-loop"]["status"] == "completed"
+
+    def test_replay_export_includes_quality_gate_audit_without_content(self):
+        workflow = WorkflowDefinition(
+            id="wf-quality-replay",
+            project_id="test-project",
+            name="质量门复盘",
+            nodes=[
+                WorkflowNode(id="writer", node_type=NodeType.AGENT, agent_type="writer", label="写作"),
+                WorkflowNode(id="evaluator", node_type=NodeType.AGENT, agent_type="evaluator", label="评估"),
+            ],
+            edges=[],
+        )
+        execution = WorkflowExecution(
+            id="exec-quality-replay",
+            workflow_id=workflow.id,
+            project_id="test-project",
+            status=WorkflowStatus.COMPLETED,
+            context={
+                "chapter_content": "SENTINEL_FULL_CHAPTER_CONTENT_SHOULD_NOT_RENDER",
+                "quality_gate": {"status": "passed", "passed": True, "score": 8.2, "draft_attempt": 2},
+                "quality_gate_history": [
+                    {
+                        "evaluator_node_id": "evaluator",
+                        "evaluator_node_label": "评估",
+                        "passed": False,
+                        "score": 4.0,
+                        "draft_attempt": 1,
+                        "content_chars": 1200,
+                        "content_checksum": "draft-one",
+                        "issues_count": 1,
+                        "suggestions_count": 1,
+                        "issues": ["动机断裂"],
+                        "suggestions": ["重写动机"],
+                        "evaluated_at": "2026-05-10T10:00:00",
+                        "content": "hidden",
+                    },
+                    {
+                        "evaluator_node_id": "evaluator",
+                        "evaluator_node_label": "评估",
+                        "passed": True,
+                        "score": 8.2,
+                        "draft_attempt": 2,
+                        "content_chars": 1320,
+                        "content_checksum": "draft-two",
+                        "issues_count": 0,
+                        "suggestions_count": 1,
+                        "issues": [],
+                        "suggestions": ["可保存"],
+                    },
+                ],
+                "revision_history": [
+                    {
+                        "condition_node_id": "gate",
+                        "condition_node_label": "质量门",
+                        "draft_attempt": 1,
+                        "content_checksum": "draft-one",
+                        "quality_gate_status": "failed",
+                        "quality_summary": {"issues_count": 1, "suggestions_count": 1},
+                        "retry_count": 0,
+                        "requested_at": "2026-05-10T10:01:00",
+                    }
+                ],
+                "chapter_draft_attempt": 2,
+                "chapter_draft_checksum": "draft-two",
+                "chapter_saved_payload": {
+                    "chapter_id": "chapter-quality",
+                    "status": "saved",
+                    "quality_gate_passed": True,
+                    "quality_gate_status": "passed",
+                    "quality_gate_score": 8.2,
+                    "quality_gate_attempts": 2,
+                    "revision_attempts": 1,
+                },
+            },
+        )
+
+        markdown = WorkflowReplayExportService().export_markdown(execution, workflow)
+        quality_section = markdown.split("## 质量门与修订审计", 1)[1].split("## 保存章节", 1)[0]
+        saved_section = markdown.split("## 保存章节", 1)[1].split("## 节点复盘", 1)[0]
+
+        assert "## 质量门与修订审计" in markdown
+        assert markdown.index("## 质量门与修订审计") < markdown.index("## 节点复盘")
+        assert "- **最终状态**: `passed`" in quality_section
+        assert "- **最终分数**: 8.2" in quality_section
+        assert "draft-one" in quality_section
+        assert "draft-two" in quality_section
+        assert "动机断裂" in quality_section
+        assert "### 修订请求记录" in quality_section
+        assert "- **质量门状态**: `passed`" in saved_section
+        assert "- **质量分数**: 8.2" in saved_section
+        assert "SENTINEL_FULL_CHAPTER_CONTENT_SHOULD_NOT_RENDER" not in markdown
+        assert "hidden" not in markdown
+
+    def test_replay_export_includes_saved_chapter_provenance(self):
+        workflow = WorkflowDefinition(
+            id="wf-saved-provenance",
+            project_id="test-project",
+            name="保存章节溯源",
+            nodes=[
+                WorkflowNode(id="start", node_type=NodeType.START, label="开始"),
+                WorkflowNode(id="writer", node_type=NodeType.AGENT, agent_type="writer", label="写作"),
+                WorkflowNode(id="end", node_type=NodeType.END, label="结束"),
+            ],
+            edges=[
+                WorkflowEdge(id="e1", source="start", target="writer"),
+                WorkflowEdge(id="e2", source="writer", target="end"),
+            ],
+        )
+        execution = WorkflowExecution(
+            id="exec-saved-provenance",
+            workflow_id=workflow.id,
+            project_id="test-project",
+            status=WorkflowStatus.COMPLETED,
+            trace_id="trace-saved-provenance",
+            node_states={
+                "writer": NodeExecutionState(
+                    node_id="writer",
+                    status=NodeStatus.COMPLETED,
+                    input_data={"chapter_outline": {"id": "outline-1"}},
+                    output_data={"chapter_content": "正文不应出现在保存章节段落", "word_count": 12},
+                )
+            },
+            context={
+                "chapter_saved_payload": {
+                    "chapter_id": "chapter-1",
+                    "chapter_title": "第一章",
+                    "chapter_number": 1,
+                    "chapter_outline_id": "outline-1",
+                    "status": "saved",
+                    "saved_at": "2026-05-10T10:00:00",
+                    "content_path": "projects/test/chapters/chapter-1.md",
+                    "content_size_bytes": 120,
+                    "content_checksum": "abc123",
+                    "content_chars": 12,
+                    "word_count": 12,
+                },
+                "chapter_writer_provenance": {
+                    "source_node_id": "writer",
+                    "source_node_label": "写作",
+                    "source_agent_type": "writer",
+                    "resolved_agent_type": "writer",
+                    "resolved_scenario": "workflow_chapter_generation",
+                    "source_trace_id": "trace-saved-provenance",
+                    "source_output_contract_id": "writer.workflow_output",
+                    "source_output_schema_name": "writer.workflow_output",
+                    "source_output_schema_version": "1.0.0",
+                    "writer_output_content_chars": 12,
+                    "writer_output_word_count": 12,
+                    "writer_prompt_trace": {"prompt_ids": ["function_writing"]},
+                },
+            },
+        )
+
+        markdown = WorkflowReplayExportService().export_markdown(execution, workflow)
+        saved_section = markdown.split("## 保存章节", 1)[1].split("## 节点复盘", 1)[0]
+
+        assert "## 保存章节" in markdown
+        assert markdown.index("## 保存章节") < markdown.index("## 节点复盘")
+        assert "- **章节 ID**: `chapter-1`" in saved_section
+        assert "- **存储路径**: `projects/test/chapters/chapter-1.md`" in saved_section
+        assert "- **内容校验和**: `abc123`" in saved_section
+        assert "- **来源节点**: `writer` / 写作" in saved_section
+        assert "- **Trace ID**: `trace-saved-provenance`" in saved_section
+        assert "- **输出契约**: `writer.workflow_output`" in saved_section
+        assert '"prompt_ids": [' in saved_section
+        assert "function_writing" in saved_section
+        assert "正文不应出现在保存章节段落" not in saved_section
 
     @pytest.mark.asyncio
     async def test_validate_failed_node_remediation_is_preview_only(self):
@@ -891,6 +1972,50 @@ class TestWorkflowExecution:
             )
 
         assert "受保护字段" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_recover_failed_workflow_rejects_saved_handoff_context_patch(self):
+        workflow = self._remediation_workflow()
+        execution = self._failed_remediation_execution(workflow.id)
+        self.engine._executions[execution.id] = execution
+
+        async def _fake_get_workflow(workflow_id, db=None):
+            return workflow
+
+        self.engine.get_workflow = _fake_get_workflow
+
+        with pytest.raises(ValueError) as exc_info:
+            await self.engine.recover_failed_workflow(
+                execution.id,
+                context_patch={"chapter_saved_payload": {"chapter_id": "forged"}},
+            )
+
+        assert "受保护字段" in str(exc_info.value)
+        assert "chapter_saved_payload" in str(exc_info.value)
+
+        with pytest.raises(ValueError) as provenance_exc:
+            await self.engine.recover_failed_workflow(
+                execution.id,
+                context_patch={"chapter_writer_provenance": {"source_node_id": "forged"}},
+            )
+
+        assert "受保护字段" in str(provenance_exc.value)
+        assert "chapter_writer_provenance" in str(provenance_exc.value)
+
+        for protected_key, forged_value in {
+            "quality_gate": {"status": "passed"},
+            "quality_gate_history": [{"passed": True}],
+            "revision_history": [{"attempt": 1}],
+            "chapter_draft_payload": {"draft_attempt": 99},
+            "pending_chapter_save": False,
+        }.items():
+            with pytest.raises(ValueError) as quality_exc:
+                await self.engine.recover_failed_workflow(
+                    execution.id,
+                    context_patch={protected_key: forged_value},
+                )
+            assert "受保护字段" in str(quality_exc.value)
+            assert protected_key in str(quality_exc.value)
 
     @pytest.mark.asyncio
     async def test_recover_failed_workflow_rejects_non_failed_execution(self):

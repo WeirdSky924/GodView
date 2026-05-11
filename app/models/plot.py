@@ -168,6 +168,7 @@ class Chapter(BaseModel):
     # 项目归属
     project_id: Optional[str] = Field(None, description="所属项目ID")
     world_id: Optional[str] = Field(None, description="所属世界 ID")
+    chapter_outline_id: Optional[str] = Field(None, description="章节大纲 ID")
 
     # 内容
     summary: Optional[str] = Field(None, description="章节摘要/期望内容")
@@ -220,6 +221,7 @@ class CreateChapterDTO(BaseModel):
     title: str = Field(..., description="章节标题")
     project_id: Optional[str] = Field(None, description="所属项目 ID")
     world_id: Optional[str] = Field(None, description="所属世界 ID")
+    chapter_outline_id: Optional[str] = Field(None, description="章节大纲 ID")
     summary: Optional[str] = Field(None, description="章节摘要/期望内容")
     content: Optional[str] = Field(default="", description="章节正文")
     status: ChapterStatus = Field(default=ChapterStatus.DRAFT, description="章节状态")
@@ -230,6 +232,7 @@ class UpdateChapterDTO(BaseModel):
 
     title: Optional[str] = Field(default=None, description="章节标题")
     world_id: Optional[str] = Field(default=None, description="所属世界 ID")
+    chapter_outline_id: Optional[str] = Field(default=None, description="章节大纲 ID")
     summary: Optional[str] = Field(default=None, description="章节摘要/期望内容")
     content: Optional[str] = Field(default=None, description="章节正文")
     status: Optional[ChapterStatus] = Field(default=None, description="章节状态")

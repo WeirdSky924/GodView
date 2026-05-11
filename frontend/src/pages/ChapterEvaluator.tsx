@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { Card, Button } from '@/components/ui'
 import PageLayout from '@/components/PageLayout'
 import { evaluateChapter, getChapters } from '@/api/chapters'
@@ -10,24 +11,36 @@ import { useProject } from '@/contexts/ProjectContext'
 export default function ChapterEvaluator() {
   const { theme } = useTheme()
   const { currentProject } = useProject()
+  const [searchParams] = useSearchParams()
   const isDark = theme === 'dark'
+  const queryChapterId = searchParams.get('chapter_id')
 
   const [chapters, setChapters] = useState<Chapter[]>([])
   const [selectedChapterId, setSelectedChapterId] = useState('')
   const [loading, setLoading] = useState(false)
   const [result, setResult] = useState<ChapterEvaluationResult | null>(null)
+  const [missingChapterId, setMissingChapterId] = useState<string | null>(null)
 
   useEffect(() => {
     loadChapters()
-  }, [currentProject])
+  }, [currentProject, queryChapterId])
 
   const loadChapters = async () => {
     try {
       const data = await getChapters(currentProject?.id)
       setChapters(data)
-      if (data.length > 0) {
+      const requestedChapter = queryChapterId ? data.find(chapter => chapter.id === queryChapterId) : null
+      if (requestedChapter?.id) {
+        setMissingChapterId(null)
+        setSelectedChapterId(requestedChapter.id)
+      } else if (queryChapterId) {
+        setMissingChapterId(queryChapterId)
+        setSelectedChapterId('')
+      } else if (data.length > 0) {
+        setMissingChapterId(null)
         setSelectedChapterId(data[0].id || '')
       } else {
+        setMissingChapterId(null)
         setSelectedChapterId('')
       }
     } catch (error) {
@@ -74,13 +87,26 @@ export default function ChapterEvaluator() {
       }
     >
       <div className="flex flex-col h-[calc(100vh-200px)]">
+        {missingChapterId && (
+          <Card className="mb-4 flex-shrink-0">
+            <div className={`text-sm ${isDark ? 'text-yellow-300' : 'text-yellow-700'}`}>
+              <div className="font-medium mb-1">章节交接链接未命中</div>
+              <div>章节不存在或不属于当前项目：<span className="font-mono break-all">{missingChapterId}</span></div>
+              <div className={`mt-1 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>请选择下方可用章节后再手动开始评估。</div>
+            </div>
+          </Card>
+        )}
+
         <Card className="mb-4 flex-shrink-0">
           <div className="flex items-center gap-4">
             <label className={`text-sm font-medium ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>选择章节：</label>
             <select
               className={`px-3 py-2 border rounded-lg flex-1 max-w-md ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
               value={selectedChapterId}
-              onChange={(e) => setSelectedChapterId(e.target.value)}
+              onChange={(e) => {
+                setMissingChapterId(null)
+                setSelectedChapterId(e.target.value)
+              }}
             >
               <option value="">请选择章节...</option>
               {chapters.map((chapter) => (

@@ -85,16 +85,33 @@ class NarrativeStateChangeService:
         entity_id: Optional[str] = None,
         status: Optional[str] = None,
         change_type: Optional[str] = None,
+        chapter_id: Optional[str] = None,
+        world_id: Optional[str] = None,
+        workflow_execution_id: Optional[str] = None,
         limit: int = 100,
     ) -> List[Dict[str, Any]]:
+        if status:
+            self._validate_enum_filter(status, NarrativeStateChangeStatus, "状态")
+        if entity_type:
+            self._validate_enum_filter(entity_type, NarrativeStateEntityType, "实体类型")
+        if change_type:
+            self._validate_enum_filter(change_type, NarrativeStateChangeType, "变更类型")
         return await self.db.list_narrative_state_changes(
             project_id=project_id,
             entity_type=entity_type,
             entity_id=entity_id,
             status=status,
             change_type=change_type,
+            chapter_id=chapter_id,
+            world_id=world_id,
+            workflow_execution_id=workflow_execution_id,
             limit=limit,
         )
+
+    def _validate_enum_filter(self, value: str, enum_cls: Any, label: str) -> None:
+        allowed = {item.value for item in enum_cls}
+        if value not in allowed:
+            raise ValueError(f"无效的剧情状态变更{label}: {value}")
 
     async def get_change(self, change_id: str) -> Dict[str, Any]:
         change = await self.db.get_narrative_state_change(change_id)

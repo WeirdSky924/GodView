@@ -1175,6 +1175,9 @@ class PostgresDatabase:
         entity_id: Optional[str] = None,
         status: Optional[str] = None,
         change_type: Optional[str] = None,
+        chapter_id: Optional[str] = None,
+        world_id: Optional[str] = None,
+        workflow_execution_id: Optional[str] = None,
         limit: int = 100,
     ) -> List[Dict[str, Any]]:
         """列出项目剧情状态变更。"""
@@ -1192,6 +1195,15 @@ class PostgresDatabase:
         if change_type:
             conditions.append("change_type = :change_type")
             params["change_type"] = change_type
+        if chapter_id:
+            conditions.append("chapter_id = CAST(:chapter_id AS UUID)")
+            params["chapter_id"] = chapter_id
+        if world_id:
+            conditions.append("world_id = CAST(:world_id AS UUID)")
+            params["world_id"] = world_id
+        if workflow_execution_id:
+            conditions.append("workflow_execution_id = :workflow_execution_id")
+            params["workflow_execution_id"] = workflow_execution_id
         query = f"""
         SELECT * FROM narrative_state_changes
         WHERE {' AND '.join(conditions)}

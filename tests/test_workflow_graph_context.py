@@ -2,7 +2,6 @@ import pytest
 
 from app.models.workflow_definition import DataInputSource, NodeInputConfig, NodeType, WorkflowNode
 from app.models.workflow_execution import WorkflowExecution, WorkflowStatus
-from app.services.agent_prompt_builder import AgentPromptBuilder
 from app.services.workflow_engine import WorkflowEngine
 
 
@@ -142,38 +141,40 @@ async def test_maybe_attach_graph_context_adds_compact_context_when_enabled():
     assert execution.context["graph_context_candidate"]["anchor"]["id"] == "char-1"
 
 
-def test_prompt_builder_renders_compact_graph_context_without_raw_properties():
-    builder = AgentPromptBuilder()
+def test_compact_graph_context_removes_raw_properties():
+    engine = WorkflowEngine()
 
-    prompt = builder._build_context_section(
+    compact = engine._compact_graph_context(
         {
-            "graph_context_summary": "林砚周边包含 2 个节点、1 条边。",
-            "graph_context_source": "postgres",
-            "graph_context": {
-                "source": "postgres",
-                "summary": "林砚周边包含 2 个节点、1 条边。",
-                "anchor": {"id": "char-1", "type": "character", "name": "林砚"},
-                "relationships": [
-                    {"target_id": "char-2", "target_name": "洛澜", "type": "盟友", "strength": 0.8}
-                ],
-                "nodes": [
-                    {"id": "char-1", "type": "character", "name": "林砚", "properties": {"secret": "不应渲染"}},
-                    {"id": "char-2", "type": "character", "name": "洛澜"},
-                ],
-                "warnings": ["fallback"],
-            },
+            "source": "postgres",
+            "summary": "林砚周边包含 2 个节点、1 条边。",
+            "anchor": {"id": "char-1", "type": "character", "name": "林砚", "private_note": "不应渲染"},
+            "relationships": [
+                {"target_id": "char-2", "target_name": "洛澜", "type": "盟友", "strength": 0.8, "private_note": "不应渲染"}
+            ],
+            "nodes": [
+                {"id": "char-1", "type": "character", "name": "林砚", "properties": {"secret": "不应渲染"}},
+                {"id": "char-2", "type": "character", "name": "洛澜"},
+            ],
+            "warnings": ["fallback"],
         }
     )
 
-    assert "### 关系图上下文（局部）" in prompt
-    assert "洛澜: 盟友" in prompt
-    assert "properties" not in prompt
-    assert "不应渲染" not in prompt
+    rendered = engine._format_context_for_prompt(compact)
+
+    assert compact["relationships"][0] == {
+        "target_id": "char-2",
+        "target_name": "洛澜",
+        "type": "盟友",
+        "strength": 0.8,
+    }
+    assert "洛澜" in rendered
+    assert "properties" not in rendered
+    assert "private_note" not in rendered
+    assert "不应渲染" not in rendered
 
 
-def test_prompt_builder_omits_graph_section_when_absent():
-    builder = AgentPromptBuilder()
+def test_compact_graph_context_omits_empty_context():
+    engine = WorkflowEngine()
 
-    prompt = builder._build_context_section({"characters": []})
-
-    assert "关系图上下文" not in prompt
+    assert engine._compact_graph_context({"nodes": [], "relationships": []}) == {}

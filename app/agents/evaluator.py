@@ -4,6 +4,7 @@
 
 import json
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from langchain_core.language_models import BaseLanguageModel
@@ -20,6 +21,14 @@ from app.models.token_usage import UsageCategory
 from app.services.structured_llm import StructuredOutputError
 
 logger = logging.getLogger(__name__)
+
+
+class PromptGovernanceError(RuntimeError):
+    """Raised when a production Evaluator task cannot resolve a governed prompt."""
+
+    def __init__(self, message: str, trace: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.trace = trace or {}
 
 
 class EvaluatorAgent(BaseAgent):
@@ -217,6 +226,11 @@ class EvaluatorAgent(BaseAgent):
         self._evaluator_config_prompt_source = "missing"
         self._system_prompt_render_trace = trace
         self.scenario = scenario
+        if self.project_id:
+            raise PromptGovernanceError(
+                f"Evaluator prompt configuration is missing for production scenario: {scenario}",
+                trace,
+            )
         return ""
 
     def _evaluator_chapter_end_output_schema(self, word_count: int, target_word_count: int) -> str:
@@ -494,6 +508,69 @@ class EvaluatorAgent(BaseAgent):
                         fragments.append({"agent": agent, "field": key, "value": text})
         return fragments
 
+    def _confirmed_prior_state_issues(self, input_data: Dict[str, Any]) -> Dict[str, List[str]]:
+        """对已确认前文状态做轻量确定性连续性预检。"""
+        content = str(input_data.get("chapter_content") or "")
+        packet = self._context_dict(input_data.get("confirmed_prior_state_packet"))
+        confirmed_changes = self._context_list(packet.get("confirmed_state_changes"))
+        proposed_changes = self._context_list(packet.get("open_proposed_changes"))
+        issues: List[str] = []
+        warnings: List[str] = []
+
+        contradiction_markers = [
+            "从未", "没有", "未曾", "并未", "不是", "不再", "从没有", "从未获得", "没有获得", "并未获得",
+            "never", "not", "without", "did not", "has not",
+        ]
+        state_verbs = "获得|取得|拿到|得到|拥有|抵达|进入|离开|失去|确认|知道|发现"
+
+        def summary_terms(summary: str) -> List[str]:
+            terms: List[str] = []
+            terms.extend(part.strip() for part in re.split(r"[，。；;,.!?！？\n]", summary) if len(part.strip()) >= 4)
+            terms.extend(token.strip() for token in re.split(r"[，。；;,.!?！？\s]+", summary) if len(token.strip()) >= 4)
+            for match in re.finditer(rf"(?:已|已经|曾经|成功)?(?:{state_verbs})([^，。；;,.!?！？\n]{{2,24}})", summary):
+                term = re.sub(r"^(?:了|过|到|至|向|从|于)", "", match.group(1).strip())
+                term = re.split(r"(?:这是|这将|这是|并且|而且|需要|必须|不得|不能|可以)", term, maxsplit=1)[0].strip()
+                if len(term) >= 2:
+                    terms.append(term)
+            return list(dict.fromkeys(term for term in terms if term))
+
+        def negates_term(term: str) -> bool:
+            start = 0
+            while term and content:
+                idx = content.find(term, start)
+                if idx == -1:
+                    return False
+                window = content[max(0, idx - 12): idx + len(term) + 8]
+                if any(marker in window for marker in contradiction_markers):
+                    return True
+                start = idx + len(term)
+
+        for change in confirmed_changes:
+            if not isinstance(change, dict):
+                continue
+            summary = str(change.get("summary") or "").strip()
+            if not summary:
+                continue
+            if any(marker in content for marker in contradiction_markers):
+                terms = summary_terms(summary)
+                if any(term in content for term in terms) or any(negates_term(term) for term in terms):
+                    issues.append(f"正文疑似否定已确认前文状态：{summary}")
+
+        for change in proposed_changes:
+            if not isinstance(change, dict):
+                continue
+            summary = str(change.get("summary") or "").strip()
+            if not summary:
+                continue
+            fragments = [part.strip() for part in re.split(r"[，。；;,.!?！？\n]", summary) if len(part.strip()) >= 6]
+            if any(fragment in content for fragment in fragments):
+                warnings.append(f"正文疑似把待确认状态当作正史：{summary}")
+
+        return {
+            "issues": list(dict.fromkeys(issues)),
+            "warnings": list(dict.fromkeys(warnings)),
+        }
+
     def _role_performance_gate_issues(self, input_data: Dict[str, Any]) -> Dict[str, List[str]]:
         """对正文做角色演绎 gate 确定性预检：只在正文采纳问题素材时阻断。"""
         content = str(input_data.get("chapter_content") or "")
@@ -618,6 +695,14 @@ class EvaluatorAgent(BaseAgent):
                 "continuity_notes": self._role_performance_value(input_data, "continuity_notes", []),
                 "performance_warnings": self._role_performance_value(input_data, "performance_warnings", []),
             }),
+            self._format_context_block("已确认前文章节状态包", {
+                "检查规则": [
+                    "当前章节必须尊重 confirmed/applied 前文状态。",
+                    "proposed/unapplied 状态只能作为待审提示，不能被正文当作已确认事实。",
+                    "严重连续性冲突应进入 issues/blockers，并影响 passed/score。",
+                ],
+                "packet": input_data.get("confirmed_prior_state_packet"),
+            }),
             self._format_context_block("地图/资产持久化状态", {
                 "map_persistence_state": input_data.get("map_persistence_state"),
                 "asset_persistence_state": input_data.get("asset_persistence_state"),
@@ -629,6 +714,7 @@ class EvaluatorAgent(BaseAgent):
         workflow_context = "\n\n".join(block for block in context_blocks if block)
         direct_character_issues = self._direct_character_constraint_issues(input_data)
         role_gate_check = self._role_performance_gate_issues(input_data)
+        prior_state_check = self._confirmed_prior_state_issues(input_data)
 
         evaluator_config_prompt = await self._get_evaluator_config_prompt({
             "task_type": "chapter_end",
@@ -652,6 +738,8 @@ class EvaluatorAgent(BaseAgent):
                     "deterministic_character_constraint_issues": direct_character_issues,
                     "deterministic_role_performance_gate_issues": role_gate_check["issues"],
                     "deterministic_role_performance_gate_warnings": role_gate_check["warnings"],
+                    "deterministic_prior_state_issues": prior_state_check["issues"],
+                    "deterministic_prior_state_warnings": prior_state_check["warnings"],
                     "chapter_content": chapter_content or "无",
                 }),
             ],
@@ -666,6 +754,7 @@ class EvaluatorAgent(BaseAgent):
                     "当前运行时目标：评估本章是否可收尾，并输出 EvaluatorChapterEndSchema。",
                     "确定性角色约束预检问题必须作为阻断问题写入 character_participation_check。",
                     "确定性 role_performance_gate 问题必须写入 character_participation_check 或 upstream_context_usage_check；若正文采纳 blocker 指向素材，quality_passed=false。",
+                    "确定性已确认前文状态问题必须写入 upstream_context_usage_check；若正文否定 confirmed/applied 状态，quality_passed=false。",
                 ],
             ),
             config_prompt=evaluator_config_prompt,
@@ -727,13 +816,29 @@ class EvaluatorAgent(BaseAgent):
                     if not isinstance(existing, list):
                         existing = [existing]
                     character_check["issues"] = [*existing, *deterministic_role_issues]
-            if deterministic_role_warnings:
+            prior_state_issues = prior_state_check["issues"]
+            prior_state_warnings = prior_state_check["warnings"]
+            if prior_state_issues:
+                parsed_data.setdefault("issues", [])
+                parsed_data["issues"].extend(issue for issue in prior_state_issues if issue not in parsed_data["issues"])
+                parsed_data["quality_passed"] = False
+                parsed_data["should_end"] = False
+                parsed_data["approved"] = False
+                parsed_data["pass"] = False
+            if deterministic_role_warnings or prior_state_issues or prior_state_warnings:
                 upstream_check = parsed_data.setdefault("upstream_context_usage_check", {})
                 if isinstance(upstream_check, dict):
                     existing = upstream_check.get("issues") or []
                     if not isinstance(existing, list):
                         existing = [existing]
-                    upstream_check["issues"] = [*existing, *deterministic_role_warnings]
+                    upstream_check["issues"] = [*existing, *deterministic_role_warnings, *prior_state_issues, *prior_state_warnings]
+                    if prior_state_issues:
+                        upstream_check["passed"] = False
+            parsed_data["confirmed_prior_state_check"] = {
+                "passed": not prior_state_issues,
+                "issues": prior_state_issues,
+                "warnings": prior_state_warnings,
+            }
             parsed_data.setdefault("role_performance_gate_check", {})
             parsed_data["role_performance_gate_check"] = {
                 "passed": not deterministic_role_issues,
@@ -747,6 +852,16 @@ class EvaluatorAgent(BaseAgent):
                 structured_data=parsed_data,
                 schema_name="evaluator.chapter_end",
                 metadata=self._get_evaluator_config_metadata(),
+            )
+        except PromptGovernanceError as e:
+            logger.error("Evaluator prompt governance failed: %s", e)
+            return AgentResponse(
+                success=False,
+                error=str(e),
+                metadata={
+                    "prompt_governance_error": True,
+                    "prompt_render_trace": e.trace,
+                },
             )
         except StructuredOutputError as e:
             logger.error(f"章节结束评估 structured 失败：{e}")
@@ -822,6 +937,16 @@ class EvaluatorAgent(BaseAgent):
                 schema_name="evaluator.reader_simulate",
                 metadata=self._get_evaluator_config_metadata(),
             )
+        except PromptGovernanceError as e:
+            logger.error("读者模拟 prompt governance 失败：%s", e)
+            return AgentResponse(
+                success=False,
+                error=str(e),
+                metadata={
+                    "prompt_governance_error": True,
+                    "prompt_render_trace": e.trace,
+                },
+            )
         except StructuredOutputError as e:
             logger.error(f"读者模拟评分 structured 失败：{e}")
             return AgentResponse(success=False, error=str(e))
@@ -880,6 +1005,16 @@ class EvaluatorAgent(BaseAgent):
                 structured_data=parsed.model_dump(),
                 schema_name="evaluator.ooc",
                 metadata=self._get_evaluator_config_metadata(),
+            )
+        except PromptGovernanceError as e:
+            logger.error("OOC 审查 prompt governance 失败：%s", e)
+            return AgentResponse(
+                success=False,
+                error=str(e),
+                metadata={
+                    "prompt_governance_error": True,
+                    "prompt_render_trace": e.trace,
+                },
             )
         except StructuredOutputError as e:
             logger.error(f"OOC 审查 structured 失败：{e}")

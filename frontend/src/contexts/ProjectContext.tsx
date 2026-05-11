@@ -21,9 +21,10 @@ export function ProjectProvider({ children }: { children: ReactNode }) {
       const data = await getProjects(undefined, { forceRefresh: options.forceRefresh })
       setProjects(data)
 
+      const urlProjectId = new URLSearchParams(window.location.search).get('project_id')
       const savedProjectId = localStorage.getItem('currentProjectId')
       setCurrentProject((current) => {
-        const selectedId = savedProjectId || current?.id
+        const selectedId = urlProjectId || savedProjectId || current?.id
         if (!selectedId) return null
 
         const selected = data.find(p => p.id === selectedId)

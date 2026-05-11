@@ -144,6 +144,36 @@ export interface WorkflowOperationEvent {
   data: Record<string, any>
 }
 
+export interface WorkflowStaleInspection {
+  execution_id: string
+  workflow_id: string
+  project_id: string
+  status: WorkflowStatus
+  active_task: boolean
+  suspected_stale: boolean
+  safe_actions: string[]
+  recommendation: string
+  lease: {
+    lease_expires_at?: string | null
+    last_heartbeat_at?: string | null
+    expired: boolean
+    seconds_remaining?: number | null
+  }
+  history: {
+    count: number
+    latest?: Record<string, any> | null
+  }
+}
+
+export interface WorkflowRuntimeFixture {
+  success: boolean
+  fixture_type: 'stale_running' | 'missing_agent_failed' | string
+  cleanup_token: string
+  workflow: WorkflowDefinition
+  execution: WorkflowExecution
+  inspection?: WorkflowStaleInspection
+}
+
 export interface WorkflowOperationSummary {
   execution_id: string
   workflow_id: string
@@ -180,6 +210,7 @@ export interface WorkflowOperationSummary {
     count: number
     latest?: Record<string, any> | null
   }
+  stale_inspection?: WorkflowStaleInspection
   attention: Array<{ type: string; severity: string; message: string }>
 }
 
@@ -603,6 +634,46 @@ export async function getExecutionOperationEvents(
     params: { limit },
   })
   return response.data.events || []
+}
+
+export async function inspectExecutionStaleness(executionId: string): Promise<WorkflowStaleInspection> {
+  const response = await axios.get(`${API_BASE}/workflows/executions/${executionId}/stale-inspection`)
+  return response.data.inspection
+}
+
+export async function resolveStaleExecution(
+  executionId: string,
+  action: 'inspect_only' | 'mark_failed' = 'mark_failed',
+  reason?: string,
+): Promise<{ success: boolean; action: string; inspection: WorkflowStaleInspection; execution?: WorkflowExecution | null }> {
+  const response = await axios.post(`${API_BASE}/workflows/executions/${executionId}/resolve-stale`, { action, reason })
+  return response.data
+}
+
+export async function createRuntimeFixture(
+  projectId: string,
+  fixtureType: 'stale_running' | 'missing_agent_failed' | 'saved_chapter' | 'quality_gate_revision' = 'stale_running',
+  label?: string,
+): Promise<WorkflowRuntimeFixture> {
+  const response = await axios.post(`${API_BASE}/workflows/runtime-fixtures`, {
+    project_id: projectId,
+    fixture_type: fixtureType,
+    label,
+  })
+  return response.data
+}
+
+export async function cleanupRuntimeFixture(
+  executionId: string,
+  workflowId: string,
+  cleanupToken: string,
+): Promise<{ success: boolean; deleted: { execution_id: string; workflow_id: string } }> {
+  const response = await axios.post(`${API_BASE}/workflows/runtime-fixtures/cleanup`, {
+    execution_id: executionId,
+    workflow_id: workflowId,
+    cleanup_token: cleanupToken,
+  })
+  return response.data
 }
 
 /**

@@ -12,6 +12,8 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from app.config import settings
+
 from app.models.workflow_definition import (
     WorkflowDefinition,
     WorkflowDefinitionCreate,
@@ -98,13 +100,54 @@ def _safe_event_data(raw_event_data: Any) -> Dict[str, Any]:
         "recovery_entry",
         "remediation_entry",
         "stale_entry",
+        "diagnosis_category",
         "previous_error",
         "trace_id",
         "operation_id",
         "request_id",
         "cancel_requested",
+        "chapter_num",
+        "chapter_number",
+        "chapter_outline_id",
+        "draft_attempt",
+        "quality_passed",
+        "passed",
+        "score",
+        "issues_count",
+        "suggestions_count",
+        "issues",
+        "suggestions",
+        "word_count_check",
+        "revision_attempt",
+        "attempt",
+        "content_chars",
+        "content_checksum",
+        "source_node_id",
+        "evaluator_node_id",
+        "condition_node_id",
+        "source_output_contract_id",
+        "source_output_schema_name",
+        "source_output_schema_version",
+        "chapter_id",
+        "workflow_id",
+        "execution_id",
+        "proposed_count",
+        "applied_count",
+        "pending_count",
+        "error_count",
+        "entity_type_counts",
+        "state_change_ids",
+        "prior_chapter_count",
+        "confirmed_state_count",
     }
     safe = {key: raw_event_data.get(key) for key in allowed_keys if key in raw_event_data}
+    if isinstance(safe.get("state_change_ids"), list):
+        safe["state_change_ids"] = [str(item) for item in safe["state_change_ids"][:20] if item]
+    if isinstance(safe.get("entity_type_counts"), dict):
+        safe["entity_type_counts"] = {
+            str(key)[:40]: int(value) if isinstance(value, (int, float)) else value
+            for key, value in list(safe["entity_type_counts"].items())[:20]
+        }
     if isinstance(safe.get("recovery_entry"), dict):
         entry = safe["recovery_entry"]
         safe["recovery_entry"] = {
@@ -116,7 +159,17 @@ def _safe_event_data(raw_event_data: Any) -> Dict[str, Any]:
         entry = safe["remediation_entry"]
         safe["remediation_entry"] = {
             key: entry.get(key)
-            for key in ["attempt", "node_id", "category", "diagnosis_category", "reason", "applied_at", "diff"]
+            for key in [
+                "attempt",
+                "node_id",
+                "category",
+                "diagnosis_category",
+                "reason",
+                "started_at",
+                "applied_at",
+                "previous_error",
+                "diff",
+            ]
             if key in entry
         }
     if isinstance(safe.get("stale_entry"), dict):
@@ -130,6 +183,24 @@ def _safe_event_data(raw_event_data: Any) -> Dict[str, Any]:
 
 
 def _operation_event_summary(event_type: str, data: Dict[str, Any]) -> str:
+    if event_type == "chapter_draft_ready":
+        return f"Writer 草稿已进入质量门：第 {data.get('chapter_number') or data.get('chapter_num') or '-'} 章，草稿尝试 {data.get('draft_attempt') or '-'}"
+    if event_type == "quality_gate_passed":
+        return f"质量门通过：分数 {data.get('score') if data.get('score') is not None else '-'}，草稿尝试 {data.get('draft_attempt') or '-'}"
+    if event_type == "quality_gate_failed":
+        return f"质量门未通过：{data.get('issues_count') or 0} 个问题，{data.get('suggestions_count') or 0} 条建议"
+    if event_type == "chapter_revision_requested":
+        return f"已请求章节修订：第 {data.get('attempt') or data.get('revision_attempt') or '-'} 次修订"
+    if event_type == "chapter_finalized":
+        return f"章节通过质量门并已保存：第 {data.get('chapter_number') or data.get('chapter_num') or '-'} 章"
+    if event_type == "chapter_state_writeback_proposed":
+        return f"章节状态写回已提案：{data.get('proposed_count') or 0} 条，待确认 {data.get('pending_count') or 0} 条"
+    if event_type == "chapter_state_writeback_applied":
+        return f"章节状态写回已应用：{data.get('applied_count') or 0} 条"
+    if event_type == "chapter_state_writeback_failed":
+        return f"章节状态写回异常：{data.get('error_count') or 0} 个错误"
+    if event_type == "chapter_state_handoff_loaded":
+        return f"已加载前文状态交接：前文章节 {data.get('prior_chapter_count') or 0}，确认状态 {data.get('confirmed_state_count') or 0}"
     if event_type == "workflow_recovery_started":
         return f"从 {data.get('recovered_node_id') or data.get('current_node') or '-'} 开始恢复"
     if event_type == "workflow_node_remediated":
@@ -165,6 +236,15 @@ _OPERATION_TIMELINE_EVENT_TYPES = {
     "workflow_node_remediated",
     "workflow_execution_stale",
     "node_failed",
+    "chapter_draft_ready",
+    "quality_gate_passed",
+    "quality_gate_failed",
+    "chapter_revision_requested",
+    "chapter_finalized",
+    "chapter_state_writeback_proposed",
+    "chapter_state_writeback_applied",
+    "chapter_state_writeback_failed",
+    "chapter_state_handoff_loaded",
 }
 
 
@@ -201,6 +281,29 @@ class WorkflowRemediationRequest(BaseModel):
     patch: WorkflowNodeRemediationPatch = Field(default_factory=WorkflowNodeRemediationPatch)
     context_patch: Dict[str, Any] = Field(default_factory=dict)
     reset_downstream: bool = True
+
+
+class WorkflowStaleResolutionRequest(BaseModel):
+    """陈旧执行治理请求。"""
+
+    action: str = "mark_failed"
+    reason: Optional[str] = None
+
+
+class WorkflowRuntimeFixtureRequest(BaseModel):
+    """开发/测试用受控运行时夹具请求。"""
+
+    project_id: str
+    fixture_type: str = "stale_running"
+    label: Optional[str] = None
+
+
+class WorkflowRuntimeFixtureCleanupRequest(BaseModel):
+    """开发/测试用受控运行时夹具清理请求。"""
+
+    execution_id: str
+    workflow_id: str
+    cleanup_token: str
 
 
 def _format_sse(event_name: str, payload: Dict[str, Any]) -> str:
@@ -343,6 +446,69 @@ async def get_execution_operation_summary(execution_id: str):
     return {"success": True, "summary": summary}
 
 
+@router.post("/runtime-fixtures", response_model=Dict[str, Any])
+async def create_runtime_fixture(request: WorkflowRuntimeFixtureRequest):
+    """创建 DEBUG-only 运行时夹具，用于隔离验证工作流治理链路。"""
+    if not settings.debug:
+        raise HTTPException(status_code=403, detail="运行时夹具只能在 DEBUG 模式下创建")
+    engine = get_workflow_engine()
+    db = get_db()
+    try:
+        return await engine.create_runtime_fixture(
+            request.project_id,
+            db,
+            fixture_type=request.fixture_type,
+            label=request.label,
+        )
+    except WorkflowOperationError as exc:
+        _raise_workflow_operation_http_error(exc)
+
+
+@router.post("/runtime-fixtures/cleanup", response_model=Dict[str, Any])
+async def cleanup_runtime_fixture(request: WorkflowRuntimeFixtureCleanupRequest):
+    """按 cleanup token 清理 DEBUG-only 运行时夹具，拒绝清理真实数据。"""
+    if not settings.debug:
+        raise HTTPException(status_code=403, detail="运行时夹具只能在 DEBUG 模式下清理")
+    engine = get_workflow_engine()
+    db = get_db()
+    try:
+        return await engine.cleanup_runtime_fixture(
+            request.execution_id,
+            request.workflow_id,
+            request.cleanup_token,
+            db,
+        )
+    except WorkflowOperationError as exc:
+        _raise_workflow_operation_http_error(exc)
+
+
+@router.get("/executions/{execution_id}/stale-inspection", response_model=Dict[str, Any])
+async def inspect_stale_execution(execution_id: str):
+    """检查执行是否疑似陈旧，仅读取状态，不改写执行。"""
+    engine = get_workflow_engine()
+    db = get_db()
+    inspection = await engine.inspect_execution_staleness_state(execution_id, db)
+    if not inspection:
+        raise HTTPException(status_code=404, detail="执行记录不存在")
+    return {"success": True, "inspection": inspection}
+
+
+@router.post("/executions/{execution_id}/resolve-stale", response_model=Dict[str, Any])
+async def resolve_stale_execution(execution_id: str, request: WorkflowStaleResolutionRequest):
+    """安全治理疑似陈旧的 running 执行。"""
+    engine = get_workflow_engine()
+    db = get_db()
+    try:
+        return await engine.resolve_stale_execution(
+            execution_id,
+            db,
+            action=request.action,
+            reason=request.reason,
+        )
+    except WorkflowOperationError as exc:
+        _raise_workflow_operation_http_error(exc)
+
+
 @router.get("/executions/{execution_id}/operation-events", response_model=Dict[str, Any])
 async def get_execution_operation_events(
     execution_id: str,
@@ -375,9 +541,9 @@ async def get_execution_operation_events(
             "event_type": event_type,
             "created_at": row.get("created_at"),
             "summary": _operation_event_summary(event_type, data),
-            "node_id": data.get("node_id") or data.get("failed_node_id") or data.get("recovered_node_id"),
+            "node_id": data.get("node_id") or data.get("failed_node_id") or data.get("recovered_node_id") or data.get("source_node_id") or data.get("evaluator_node_id") or data.get("condition_node_id"),
             "status": data.get("status"),
-            "severity": "error" if event_type in {"workflow_failed", "node_failed", "workflow_execution_stale"} else "info",
+            "severity": "error" if event_type in {"workflow_failed", "node_failed", "workflow_execution_stale"} else "warning" if event_type in {"quality_gate_failed", "chapter_revision_requested"} else "info",
             "data": data,
         }
         events.append(engine._serialize_for_json(event))
@@ -867,14 +1033,29 @@ async def execute_workflow(
         # 初始化 Agent provider
         await _setup_agent_provider_for_execution(project_id)
 
-        execution_id = await engine.execute_workflow(
-            workflow_id,
-            project_id,
-            initial_context or {},
-            db,
-            request_id=request_id,
-            force_new=force_new,
-        )
+        if hasattr(engine, "start_workflow_execution"):
+            start_result = await engine.start_workflow_execution(
+                workflow_id,
+                project_id,
+                initial_context or {},
+                db,
+                request_id=request_id,
+                force_new=force_new,
+            )
+            execution_id = start_result.execution_id
+            deduplicated = bool(start_result.deduplicated or start_result.replayed)
+            replayed = bool(start_result.replayed)
+        else:
+            execution_id = await engine.execute_workflow(
+                workflow_id,
+                project_id,
+                initial_context or {},
+                db,
+                request_id=request_id,
+                force_new=force_new,
+            )
+            deduplicated = False
+            replayed = False
         execution = await engine.get_execution_state(execution_id, db)
 
         return {
@@ -886,7 +1067,8 @@ async def execute_workflow(
             "status": execution.status.value if execution else None,
             "trace_id": execution.trace_id if execution else None,
             "world_id": (execution.context or {}).get("world_id") if execution else (initial_context or {}).get("world_id"),
-            "deduplicated": bool(execution and request_id and execution.request_id == request_id and execution.id == execution_id),
+            "deduplicated": deduplicated,
+            "replayed": replayed,
         }
     except ChapterReadinessBlockedError as e:
         raise HTTPException(status_code=409, detail=engine._serialize_for_json(e.payload))

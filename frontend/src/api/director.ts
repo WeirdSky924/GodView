@@ -1,10 +1,5 @@
 import { api } from './client'
 
-export interface WorkflowGraph {
-  nodes: Array<{ id: string; label: string }>
-  edges: Array<{ source: string; target: string }>
-}
-
 export interface SnapshotTreeNode {
   id: string
   name?: string
@@ -27,10 +22,6 @@ export interface DirectorRuntimeState {
   current_snapshot_id?: string | null
   state_machine: Record<string, any>
   regions: Array<Record<string, any>>
-}
-
-export async function getWorkflowGraph(sessionId: string) {
-  return await api.get<WorkflowGraph>(`/ws/workflow/${sessionId}`)
 }
 
 export async function getDirectorState(sessionId: string) {

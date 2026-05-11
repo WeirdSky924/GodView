@@ -9,6 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from app.models.workflow_definition import NodeType, WorkflowDefinition, WorkflowEdge, WorkflowNode
 from app.services.director import DirectorSystem, _serialize_for_json
 from app.services.workflow_engine import ChapterReadinessBlockedError, WorkflowEngine
 
@@ -19,9 +20,11 @@ REQUIREMENT_ID = "33333333-3333-3333-3333-333333333333"
 
 
 class _GateFakeDB:
-    def __init__(self, requirements=None):
+    def __init__(self, requirements=None, readiness_status=None):
         self.requirements = requirements or []
+        self.readiness_status = readiness_status
         self.readiness_calls = []
+        self.saved_executions = []
 
     async def get_outline_resource_requirements(self, **kwargs):
         requirements = list(self.requirements)
@@ -33,12 +36,38 @@ class _GateFakeDB:
 
     async def update_chapter_resource_readiness(self, **kwargs):
         self.readiness_calls.append(dict(kwargs))
+        unresolved_blocking = [
+            item for item in self.requirements
+            if item.get("outline_id") == kwargs.get("outline_id")
+            and item.get("chapter_num") == kwargs.get("chapter_num")
+            and item.get("severity") == "blocking"
+            and item.get("status") in {"pending", "in_progress"}
+        ]
         return {
             "project_id": kwargs["project_id"],
             "outline_id": kwargs.get("outline_id"),
             "chapter_num": kwargs["chapter_num"],
-            "readiness_status": "blocked",
+            "readiness_status": self.readiness_status or ("blocked" if unresolved_blocking else "ready"),
         }
+
+    async def get_world(self, world_id):
+        return None
+
+    async def get_default_world(self, project_id):
+        return None
+
+    async def get_operation_request_by_request_id(self, request_id):
+        return None
+
+    async def get_active_operation_request(self, **kwargs):
+        return None
+
+    async def save_operation_request(self, operation):
+        return "66666666-6666-6666-6666-666666666666"
+
+    async def save_workflow_execution(self, execution):
+        self.saved_executions.append(execution)
+        return execution["id"]
 
 
 class _NoopWriter:
@@ -225,6 +254,80 @@ async def test_readiness_gate_rejects_mismatched_outline_chapter(monkeypatch):
 
     assert exc_info.value.payload["block_reason"] == "outline_chapter_mismatch"
     assert exc_info.value.payload["chapter_num"] == 3
+
+
+@pytest.mark.asyncio
+async def test_workflow_start_allows_launch_after_blocking_requirement_is_resolved(monkeypatch):
+    _patch_plot_service(monkeypatch)
+    db = _GateFakeDB([
+        _blocking_requirement(status="resolved", matched_resource_id="character-1", resolution_method="bind_existing"),
+        _blocking_requirement(
+            id="55555555-5555-5555-5555-555555555555",
+            severity="advisory",
+            status="pending",
+            resource_name="可选地点",
+            requirement_type="location",
+        ),
+    ])
+    engine = WorkflowEngine()
+    workflow = WorkflowDefinition(
+        id="workflow-resource-closure",
+        project_id=PROJECT_ID,
+        name="资源闭环工作流",
+        nodes=[
+            WorkflowNode(id="start", node_type=NodeType.START, label="开始", position={"x": 0, "y": 0}),
+            WorkflowNode(id="end", node_type=NodeType.END, label="结束", position={"x": 120, "y": 0}),
+        ],
+        edges=[WorkflowEdge(id="edge_start_end", source="start", target="end")],
+    )
+    broadcasts = []
+
+    async def fake_get_workflow(workflow_id, db_arg=None):
+        return workflow
+
+    async def fake_trace(*args, **kwargs):
+        return None
+
+    async def fake_broadcast(execution_id, event_type, data):
+        broadcasts.append((event_type, data))
+
+    monkeypatch.setattr(engine, "get_workflow", fake_get_workflow)
+    monkeypatch.setattr(engine, "_broadcast_status", fake_broadcast)
+    monkeypatch.setattr(engine, "_start_workflow_task", lambda execution_id, workflow_arg, db_arg=None: None)
+    monkeypatch.setattr("app.services.workflow_engine.get_trace_service", lambda db_arg: SimpleNamespace(start_trace=fake_trace))
+
+    result = await engine.start_workflow_execution(
+        "workflow-resource-closure",
+        PROJECT_ID,
+        {
+            "director_session_id": "director-session-239",
+            "chapter_outline_id": OUTLINE_ID,
+            "chapter_num": 3,
+            "chapter_title": "前端传入标题应保留",
+            "target_word_count": 1800,
+            "style_reference": "冷峻克制",
+        },
+        db=db,
+        request_id="director:project:workflow:session:outline",
+    )
+
+    assert result.execution_id
+    assert db.readiness_calls == [{"project_id": PROJECT_ID, "outline_id": OUTLINE_ID, "chapter_num": 3}]
+    saved_context = db.saved_executions[0]["context"]
+    assert saved_context["director_session_id"] == "director-session-239"
+    assert saved_context["chapter_outline_id"] == OUTLINE_ID
+    assert saved_context["chapter_num"] == 3
+    assert saved_context["chapter_outline"]["id"] == OUTLINE_ID
+    assert saved_context["chapter_title"] == "前端传入标题应保留"
+    assert saved_context["target_word_count"] == 1800
+    assert saved_context["style_reference"] == "冷峻克制"
+    assert saved_context["chapter_outline_source"] == "selected_outline"
+    assert saved_context["chapter_resource_readiness"]["readiness_status"] == "ready"
+    assert saved_context["chapter_resource_readiness_warnings"][0]["requirement_type"] == "location"
+    started = [data for event_type, data in broadcasts if event_type == "workflow_started"][0]
+    assert started["director_session_id"] == "director-session-239"
+    assert started["chapter_number"] == 3
+    assert started["request_id"] == "director:project:workflow:session:outline"
 
 
 @pytest.mark.asyncio

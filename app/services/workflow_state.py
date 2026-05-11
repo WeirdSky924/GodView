@@ -73,6 +73,40 @@ RUNTIME_STATE_KEYS = {
     "latest_role_delta_resource_requirements",
 }
 
+SAVED_CHAPTER_HANDOFF_KEYS = {
+    "chapter_id",
+    "chapter_saved",
+    "chapter_saved_at",
+    "chapter_saved_payload",
+    "chapter_writer_provenance",
+    "chapter_content_storage",
+    "chapter_content_path",
+    "chapter_content_size_bytes",
+    "chapter_content_checksum",
+}
+
+QUALITY_GATE_HANDOFF_KEYS = {
+    "chapter_draft_payload",
+    "chapter_draft_provenance",
+    "chapter_draft_attempt",
+    "chapter_draft_word_count",
+    "chapter_draft_checksum",
+    "pending_chapter_save",
+    "quality_gate",
+    "quality_gate_history",
+    "quality_gate_status",
+    "revision_history",
+}
+
+STATE_WRITEBACK_HANDOFF_KEYS = {
+    "saved_chapter_state_writeback",
+    "state_writeback_status",
+    "state_writeback_counts",
+    "state_writeback_error",
+    "confirmed_prior_state_packet",
+    "confirmed_prior_state_packet_provenance",
+}
+
 ASSET_STATE_KEYS = {
     "saved_chapter_id",
     "saved_region_ids",
@@ -89,7 +123,13 @@ ASSET_STATE_KEYS = {
     "persisted_asset_refs",
 }
 
-PROTECTED_CONTEXT_KEYS = CANONICAL_STATE_KEYS | RETRIEVED_STATE_KEYS
+PROTECTED_CONTEXT_KEYS = (
+    CANONICAL_STATE_KEYS
+    | RETRIEVED_STATE_KEYS
+    | SAVED_CHAPTER_HANDOFF_KEYS
+    | QUALITY_GATE_HANDOFF_KEYS
+    | STATE_WRITEBACK_HANDOFF_KEYS
+)
 
 CANONICAL_WRITE_SOURCES = {
     "workflow_initial_context",

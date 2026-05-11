@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { Card, Button, Modal, TextArea } from '@/components/ui'
 import PageLayout from '@/components/PageLayout'
 import { getChapters } from '@/api/chapters'
@@ -49,6 +50,9 @@ export default function DiffTool() {
   const { theme } = useTheme()
   const isDark = theme === 'dark'
   const { currentProject } = useProject()
+  const [searchParams] = useSearchParams()
+  const leftChapterId = searchParams.get('left_chapter_id')
+  const rightChapterId = searchParams.get('right_chapter_id')
 
   const [chapters, setChapters] = useState<Chapter[]>([])
   const [worlds, setWorlds] = useState<World[]>([])
@@ -62,16 +66,42 @@ export default function DiffTool() {
   const [showCustomModal, setShowCustomModal] = useState(false)
   const [customLeft, setCustomLeft] = useState('')
   const [customRight, setCustomRight] = useState('')
+  const [missingChapterLinks, setMissingChapterLinks] = useState<{ left?: string; right?: string }>({})
 
   useEffect(() => {
     loadChapters()
     loadWorlds()
-  }, [currentProject?.id])
+  }, [currentProject?.id, leftChapterId, rightChapterId])
 
   const loadChapters = async () => {
     try {
       const data = await getChapters(currentProject?.id)
       setChapters(data)
+      if (leftChapterId || rightChapterId) {
+        setCompareType('chapter')
+        const nextMissing: { left?: string; right?: string } = {}
+        const leftChapter = leftChapterId ? data.find(chapter => chapter.id === leftChapterId) : null
+        const rightChapter = rightChapterId ? data.find(chapter => chapter.id === rightChapterId) : null
+        if (leftChapterId && leftChapter) {
+          setLeftVersion(leftChapterId)
+          setLeftContent(leftChapter.content || '')
+        } else if (leftChapterId) {
+          nextMissing.left = leftChapterId
+          setLeftVersion('')
+          setLeftContent('')
+        }
+        if (rightChapterId && rightChapter) {
+          setRightVersion(rightChapterId)
+          setRightContent(rightChapter.content || '')
+        } else if (rightChapterId) {
+          nextMissing.right = rightChapterId
+          setRightVersion('')
+          setRightContent('')
+        }
+        setMissingChapterLinks(nextMissing)
+      } else {
+        setMissingChapterLinks({})
+      }
     } catch (error) {
       console.error('Failed to load chapters:', error)
     }
@@ -156,6 +186,17 @@ export default function DiffTool() {
         </Button>
       }
     >
+      {(missingChapterLinks.left || missingChapterLinks.right) && (
+        <Card className="mb-4">
+          <div className={`text-sm ${isDark ? 'text-yellow-300' : 'text-yellow-700'}`}>
+            <div className="font-medium mb-1">章节交接链接未命中</div>
+            {missingChapterLinks.left && <div>左侧章节不存在或不属于当前项目：<span className="font-mono break-all">{missingChapterLinks.left}</span></div>}
+            {missingChapterLinks.right && <div>右侧章节不存在或不属于当前项目：<span className="font-mono break-all">{missingChapterLinks.right}</span></div>}
+            <div className={`mt-1 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>请选择下方可用版本继续对比。</div>
+          </div>
+        </Card>
+      )}
+
       <div className="mb-6 flex gap-4 flex-wrap">
         <button onClick={() => setCompareType('chapter')} className={`px-4 py-2 rounded-lg font-medium ${compareType === 'chapter' ? 'bg-blue-500 text-white' : isDark ? 'bg-gray-800 text-gray-300' : 'bg-gray-100 text-gray-600'}`}>
           <FileText size={18} className="inline mr-2" />章节对比
@@ -176,6 +217,10 @@ export default function DiffTool() {
                 className={`w-full px-3 py-2 border rounded-lg ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
                 value={panel.value}
                 onChange={(e) => {
+                  setMissingChapterLinks(prev => ({
+                    ...prev,
+                    [panel.side]: undefined,
+                  }))
                   panel.setValue(e.target.value)
                   panel.setContent(resolveContent(e.target.value))
                 }}

@@ -30,6 +30,15 @@ from app.services.writing_rule_rag import get_writing_rule_rag_service
 
 logger = logging.getLogger(__name__)
 
+
+class PromptGovernanceError(RuntimeError):
+    """Raised when a production Writer task cannot resolve a governed prompt."""
+
+    def __init__(self, message: str, trace: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.trace = trace or {}
+
+
 # 分段生成的阈值配置
 SEGMENT_THRESHOLD = 1500  # 超过此字数时采用分段生成
 SEGMENT_SIZE = 800  # 每段目标字数
@@ -498,6 +507,16 @@ class WriterAgent(BaseAgent):
                 data=result,
             )
 
+        except PromptGovernanceError as e:
+            logger.error("WriterAgent prompt governance failed: %s", e)
+            return AgentResponse(
+                success=False,
+                error=str(e),
+                metadata={
+                    "prompt_governance_error": True,
+                    "prompt_render_trace": e.trace,
+                },
+            )
         except Exception as e:
             logger.error(f"WriterAgent 执行失败：{e}", exc_info=True)
             return AgentResponse(success=False, error=str(e))
@@ -636,6 +655,11 @@ class WriterAgent(BaseAgent):
         self._writer_config_prompt_source = "missing"
         self._system_prompt_render_trace = trace
         self.scenario = scenario
+        if self.project_id:
+            raise PromptGovernanceError(
+                f"Writer prompt configuration is missing for production scenario: {scenario}",
+                trace,
+            )
         return ""
 
     def _format_task_context_block(self, title: str, value: Any) -> str:
@@ -1378,6 +1402,14 @@ class WriterAgent(BaseAgent):
                 "continuity_notes": workflow_context.get("continuity_notes"),
                 "performance_warnings": workflow_context.get("performance_warnings"),
             }),
+            ("已确认前文状态", {
+                "使用规则": [
+                    "confirmed/applied 状态是已确认正史，必须遵守。",
+                    "proposed/unapplied 状态只是待审提示，不得当作已发生事实。",
+                    "若已确认状态与当前大纲冲突，在输出 metadata 中标记 conflict，不要擅自重写正史。",
+                ],
+                "packet": workflow_context.get("confirmed_prior_state_packet"),
+            }),
             ("总编剧写作计划", workflow_context.get("writing_plan") or workflow_context.get("plot_guidance")),
             ("次要角色辅助计划", workflow_context.get("supporting_character_plan")),
             ("已确认/待使用次要角色", workflow_context.get("plotter_created_characters") or workflow_context.get("character_candidates")),
@@ -1654,6 +1686,16 @@ class WriterAgent(BaseAgent):
                 metadata={"surface": "scene_description"},
                 data=result,
             )
+        except PromptGovernanceError as e:
+            logger.error("场景描写 prompt governance 失败：%s", e)
+            return AgentResponse(
+                success=False,
+                error=str(e),
+                metadata={
+                    "prompt_governance_error": True,
+                    "prompt_render_trace": e.trace,
+                },
+            )
         except StructuredOutputError as e:
             logger.error(f"场景描写 structured 失败：{e}")
             return AgentResponse(success=False, error=str(e))
@@ -1715,6 +1757,16 @@ class WriterAgent(BaseAgent):
                 structured_data=result,
                 metadata={"surface": "character_voice_rewrite"},
                 data=result,
+            )
+        except PromptGovernanceError as e:
+            logger.error("角色声音重写 prompt governance 失败：%s", e)
+            return AgentResponse(
+                success=False,
+                error=str(e),
+                metadata={
+                    "prompt_governance_error": True,
+                    "prompt_render_trace": e.trace,
+                },
             )
         except StructuredOutputError as e:
             logger.error(f"角色声音改写 structured 失败：{e}")

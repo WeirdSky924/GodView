@@ -80,6 +80,9 @@ class _FakeStateChangeDB:
         entity_id=None,
         status=None,
         change_type=None,
+        chapter_id=None,
+        world_id=None,
+        workflow_execution_id=None,
         limit=100,
     ):
         changes = [change for change in self.state_changes.values() if change.get("project_id") == project_id]
@@ -91,6 +94,12 @@ class _FakeStateChangeDB:
             changes = [change for change in changes if change.get("status") == status]
         if change_type:
             changes = [change for change in changes if change.get("change_type") == change_type]
+        if chapter_id:
+            changes = [change for change in changes if change.get("chapter_id") == chapter_id]
+        if world_id:
+            changes = [change for change in changes if change.get("world_id") == world_id]
+        if workflow_execution_id:
+            changes = [change for change in changes if change.get("workflow_execution_id") == workflow_execution_id]
         return [dict(change) for change in changes[:limit]]
 
     async def update_narrative_state_change_status(self, change_id, status, timestamp_field=None):
@@ -147,6 +156,48 @@ async def test_create_change_loads_before_state_and_lists_with_filters():
 
 
 @pytest.mark.asyncio
+async def test_list_changes_validates_filters_and_supports_owner_scope_filters():
+    db = _FakeStateChangeDB()
+    service = NarrativeStateChangeService(db)
+    first = await service.create_change(
+        {
+            "project_id": PROJECT_ID,
+            "world_id": "22222222-2222-2222-2222-222222222222",
+            "entity_type": "plot",
+            "change_type": "custom",
+            "title": "第一章状态",
+            "chapter_id": "33333333-3333-3333-3333-333333333333",
+            "workflow_execution_id": "exec-owner-1",
+        }
+    )
+    await service.create_change(
+        {
+            "project_id": PROJECT_ID,
+            "world_id": "44444444-4444-4444-4444-444444444444",
+            "entity_type": "world",
+            "change_type": "world_state_change",
+            "title": "第二章状态",
+            "chapter_id": "55555555-5555-5555-5555-555555555555",
+            "workflow_execution_id": "exec-owner-2",
+        }
+    )
+
+    chapter_filtered = await service.list_changes(PROJECT_ID, chapter_id="33333333-3333-3333-3333-333333333333")
+    world_filtered = await service.list_changes(PROJECT_ID, world_id="22222222-2222-2222-2222-222222222222")
+    execution_filtered = await service.list_changes(PROJECT_ID, workflow_execution_id="exec-owner-1")
+
+    assert [item["id"] for item in chapter_filtered] == [first["id"]]
+    assert [item["id"] for item in world_filtered] == [first["id"]]
+    assert [item["id"] for item in execution_filtered] == [first["id"]]
+    with pytest.raises(ValueError, match="无效的剧情状态变更状态"):
+        await service.list_changes(PROJECT_ID, status="unknown")
+    with pytest.raises(ValueError, match="无效的剧情状态变更实体类型"):
+        await service.list_changes(PROJECT_ID, entity_type="artifact")
+    with pytest.raises(ValueError, match="无效的剧情状态变更变更类型"):
+        await service.list_changes(PROJECT_ID, change_type="teleport")
+
+
+@pytest.mark.asyncio
 async def test_create_change_is_idempotent_by_generated_fingerprint():
     db = _FakeStateChangeDB()
     service = NarrativeStateChangeService(db)
@@ -189,6 +240,73 @@ async def test_proposed_change_requires_confirmation_and_does_not_project():
 
     assert db.characters["char-1"]["status"] == "active"
     assert db.state_changes[change["id"]]["status"] == NarrativeStateChangeStatus.PROPOSED.value
+
+
+@pytest.mark.asyncio
+async def test_rejected_change_cannot_confirm_or_apply():
+    db = _FakeStateChangeDB()
+    service = NarrativeStateChangeService(db)
+    change = await service.create_change(
+        {
+            "project_id": PROJECT_ID,
+            "entity_type": "plot",
+            "change_type": "custom",
+            "title": "待拒绝状态",
+        }
+    )
+
+    rejected = await service.reject_change(change["id"])
+
+    assert rejected["status"] == NarrativeStateChangeStatus.REJECTED.value
+    with pytest.raises(ValueError, match="不能确认"):
+        await service.confirm_change(change["id"])
+    with pytest.raises(ValueError, match="不能应用"):
+        await service.apply_change(change["id"])
+
+
+@pytest.mark.asyncio
+async def test_already_applied_change_apply_is_idempotent():
+    db = _FakeStateChangeDB()
+    service = NarrativeStateChangeService(db)
+    change = await service.create_change(
+        {
+            "project_id": PROJECT_ID,
+            "entity_type": "custom",
+            "change_type": "custom",
+            "title": "审计状态",
+            "after_state": {"canon": True},
+        }
+    )
+
+    await service.confirm_change(change["id"])
+    first = await service.apply_change(change["id"])
+    second = await service.apply_change(change["id"])
+
+    assert first["applied"] is True
+    assert second["success"] is True
+    assert second["applied"] is False
+    assert second["message"] == "剧情状态变更已应用"
+
+
+@pytest.mark.asyncio
+async def test_confirmed_change_can_be_rejected_before_apply():
+    db = _FakeStateChangeDB()
+    service = NarrativeStateChangeService(db)
+    change = await service.create_change(
+        {
+            "project_id": PROJECT_ID,
+            "entity_type": "world",
+            "change_type": "world_state_change",
+            "title": "待确认世界状态",
+        }
+    )
+
+    await service.confirm_change(change["id"])
+    rejected = await service.reject_change(change["id"])
+
+    assert rejected["status"] == NarrativeStateChangeStatus.REJECTED.value
+    with pytest.raises(ValueError, match="不能应用"):
+        await service.apply_change(change["id"])
 
 
 @pytest.mark.asyncio

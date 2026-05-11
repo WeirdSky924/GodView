@@ -314,7 +314,16 @@ class AgentPromptService:
         except Exception as e:
             logger.warning(f"从 SkillService 加载 Skills 失败: {e}，使用默认 Skills")
             default_skills = self._get_default_skills_for_agent(agent_type)
-            return [(s, {}) for s in default_skills]
+            return [
+                (
+                    s,
+                    {
+                        "__skill_source_fallback": "skill_service_default_skills_fallback",
+                        "__skill_source_error": str(e),
+                    },
+                )
+                for s in default_skills
+            ]
 
     async def _intelligent_skill_retrieval(
         self,
@@ -992,6 +1001,18 @@ class AgentPromptService:
         scope = self._build_skill_scope(agent_type, scenario, context_scene)
         source = "template_skill_slots" if template and template.skill_slots else "skill_assignments_or_retrieval"
         fallbacks_used: List[str] = []
+        deprecated_sources_used: List[str] = []
+        source_errors: List[str] = []
+        for _, params in skills_with_params:
+            if not isinstance(params, dict):
+                continue
+            fallback_marker = params.get("__skill_source_fallback")
+            if fallback_marker and fallback_marker not in fallbacks_used:
+                fallbacks_used.append(fallback_marker)
+                deprecated_sources_used.append("AgentPromptService._get_default_skills_for_agent")
+            source_error = params.get("__skill_source_error")
+            if source_error and source_error not in source_errors:
+                source_errors.append(source_error)
         if source == "skill_assignments_or_retrieval" and scenario and scenario != "default":
             fallbacks_used.append("skill_assignment_default_fallback_possible")
 
@@ -1003,7 +1024,8 @@ class AgentPromptService:
                 "source": source,
                 "scope": scope,
                 "fallbacks_used": fallbacks_used,
-                "deprecated_sources_used": [],
+                "deprecated_sources_used": deprecated_sources_used,
+                "source_errors": source_errors,
             },
         }
 

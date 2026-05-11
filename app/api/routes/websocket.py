@@ -15,7 +15,6 @@ from app.config import settings
 from app.models.agent_template import AgentType
 from app.services.director import DirectorSystem
 from app.services.model_router import create_model_factory
-from app.services.workflow import DirectorWorkflow
 from app.services.workflow_node_registry import (
     get_workflow_node_profile,
     normalize_workflow_agent_type,
@@ -631,7 +630,12 @@ async def websocket_connect(websocket: WebSocket, client_id: str):
                 elif message_type == "agent_command":
                     await handle_agent_command(websocket, message, client_id)
                 elif message_type == "workflow_cycle":
-                    await handle_workflow_cycle(websocket, message, client_id)
+                    await websocket.send_json({
+                        "type": "workflow_cycle_result",
+                        "status": "error",
+                        "code": "legacy_workflow_cycle_removed",
+                        "message": "Legacy workflow_cycle has been removed. Use workflow_start or REST workflow execution.",
+                    })
                 elif message_type == "generate_region":
                     await handle_create_snapshot(websocket, message, client_id)
                 elif message_type == "rollback_snapshot":
@@ -686,11 +690,13 @@ async def websocket_connect(websocket: WebSocket, client_id: str):
 
 @router.get("/workflow/{client_id}")
 async def get_workflow_graph(client_id: str):
-    director = manager.director_sessions.get(client_id)
-    if not director:
-        return {"nodes": [], "edges": []}
-    workflow = DirectorWorkflow(director)
-    return workflow.describe_graph()
+    return {
+        "nodes": [],
+        "edges": [],
+        "deprecated": True,
+        "removed": True,
+        "message": "Legacy DirectorWorkflow graph has been removed. Use /api/workflows for workflow definitions and /api/workflows/executions/{execution_id}/events for execution state.",
+    }
 
 
 @router.get("/snapshots/{client_id}")
@@ -981,38 +987,6 @@ async def handle_agent_command(websocket: WebSocket, message: dict, client_id: s
         "data": {"agent": agent, "command": command, "result": "指令执行成功"},
     })
     await send_agent_update(websocket, agent, "completed", "手动指令执行完成", 100)
-
-
-async def handle_workflow_cycle(websocket: WebSocket, message: dict, client_id: str):
-    from app.api.app import postgres_db
-
-    director = get_or_create_director(client_id)
-
-    # 检查导演系统是否已初始化
-    if not director.writer:
-        await websocket.send_json({
-            "type": "error",
-            "status": "error",
-            "message": "导演系统未初始化，请先启动会话",
-            "hint": "请先点击'启动会话'按钮初始化导演系统",
-        })
-        return
-
-    await send_agent_update(websocket, "DirectorWorkflow", "working", "正在执行编排工作流", 25)
-    result = await director.run_workflow_cycle(
-        speaker_id=message.get("speaker_id", "narrator"),
-        context=message.get("context", "当前场景推进中"),
-        present_characters=message.get("present_characters", []),
-        intents=message.get("intents", ["推进剧情"]),
-        environment=message.get("environment", ""),
-        character_moods=message.get("character_moods", {}),
-    )
-    await _persist_runtime_state(director)
-    snapshot = result.get("snapshot")
-    if snapshot and postgres_db:
-        await postgres_db.save_snapshot(snapshot)
-    await websocket.send_json({"type": "workflow_cycle_result", "status": "success", "data": result})
-    await send_agent_update(websocket, "DirectorWorkflow", "completed", "编排工作流执行完成", 100)
 
 
 async def handle_create_snapshot(websocket: WebSocket, message: dict, client_id: str):

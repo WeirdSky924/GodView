@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { Card, Button, Input, Modal, TextArea } from '@/components/ui'
 import PageLayout from '@/components/PageLayout'
 import {
@@ -14,7 +15,9 @@ import { useTheme } from '@/contexts/ThemeContext'
 export default function NovelView() {
   const { currentProject } = useProject()
   const { theme } = useTheme()
+  const [searchParams] = useSearchParams()
   const isDark = theme === 'dark'
+  const selectedChapterId = searchParams.get('chapter_id')
 
   const [chapters, setChapters] = useState<Chapter[]>([])
   const [currentChapterIndex, setCurrentChapterIndex] = useState(-1)
@@ -26,6 +29,7 @@ export default function NovelView() {
   const [newChapterSummary, setNewChapterSummary] = useState('')
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saved' | 'saving'>('idle')
   const [showSummary, setShowSummary] = useState(true)
+  const [missingChapterId, setMissingChapterId] = useState<string | null>(null)
 
   const currentChapter = currentChapterIndex >= 0 ? chapters[currentChapterIndex] : null
 
@@ -40,15 +44,25 @@ export default function NovelView() {
     try {
       const data = await getChapters(currentProject.id)
       setChapters(data)
-      if (data.length > 0 && currentChapterIndex === -1) {
+      const requestedIndex = selectedChapterId ? data.findIndex(chapter => chapter.id === selectedChapterId) : -1
+      if (requestedIndex >= 0) {
+        setMissingChapterId(null)
+        setCurrentChapterIndex(requestedIndex)
+      } else if (selectedChapterId) {
+        setMissingChapterId(selectedChapterId)
+        setCurrentChapterIndex(-1)
+      } else if (data.length > 0 && currentChapterIndex === -1) {
+        setMissingChapterId(null)
         setCurrentChapterIndex(0)
+      } else {
+        setMissingChapterId(null)
       }
     } catch (error) {
       console.error('Failed to load chapters:', error)
     } finally {
       setLoading(false)
     }
-  }, [currentProject, currentChapterIndex])
+  }, [currentProject, currentChapterIndex, selectedChapterId])
 
   useEffect(() => {
     loadChapters()
@@ -289,7 +303,10 @@ export default function NovelView() {
                 chapters.map((chapter, index) => (
                   <div
                     key={chapter.id || index}
-                    onClick={() => setCurrentChapterIndex(index)}
+                    onClick={() => {
+                      setMissingChapterId(null)
+                      setCurrentChapterIndex(index)
+                    }}
                     className={`p-3 rounded-lg cursor-pointer transition-colors group ${
                       index === currentChapterIndex
                         ? isDark ? 'bg-blue-900/30 border-l-4 border-blue-500' : 'bg-blue-50 border-l-4 border-blue-500'
@@ -327,9 +344,17 @@ export default function NovelView() {
           {/* 编辑/预览区 */}
           <Card className="lg:col-span-3 h-[calc(100vh-200px)] flex flex-col overflow-hidden" noPadding>
             {!currentChapter ? (
-              <div className={`flex-1 flex flex-col items-center justify-center ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+              <div className={`flex-1 flex flex-col items-center justify-center px-6 text-center ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
                 <FileText size={48} className="mb-4" />
-                <p className="text-lg">选择或创建一个章节开始编辑</p>
+                {missingChapterId ? (
+                  <>
+                    <p className="text-lg">链接中的章节不存在或不属于当前项目</p>
+                    <p className="text-sm mt-2 font-mono break-all">{missingChapterId}</p>
+                    <p className="text-sm mt-3">请从左侧目录手动选择可用章节。</p>
+                  </>
+                ) : (
+                  <p className="text-lg">选择或创建一个章节开始编辑</p>
+                )}
               </div>
             ) : (
               <>
