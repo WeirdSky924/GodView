@@ -33,7 +33,14 @@ class SettingAgent:
         self.llm_max_tokens = llm_config.get("max_tokens", 4096)
         self._sessions: Dict[str, BootstrapSession] = {}
 
-    async def process_message(self, session_id: str, message: str, project_id: Optional[str] = None) -> Dict[str, Any]:
+    async def process_message(
+        self,
+        session_id: str,
+        message: str,
+        project_id: Optional[str] = None,
+        assistant_session_id: Optional[str] = None,
+        request_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         处理用户消息，与用户多轮对话并提炼设定
 
@@ -41,6 +48,8 @@ class SettingAgent:
             session_id: Bootstrap 会话 ID
             message: 用户消息
             project_id: 项目 ID（可选，用于会话恢复）
+            assistant_session_id: Assistant Context 会话 ID（可选）
+            request_id: 幂等请求 ID（可选）
 
         Returns:
             Dict: Agent 响应
@@ -76,9 +85,16 @@ class SettingAgent:
         )
         session.setting_agent_history.append(user_msg.model_dump(mode="json"))
 
-        # 构建提示词
+        # 构建提示词：项目上下文和有界会话窗口由 Assistant Context Fabric 统一提供
         system_prompt = self._build_system_prompt(session)
-        conversation_context = self._build_conversation_context(session)
+        context_packet = await self._build_bootstrap_context_packet(
+            session=session,
+            task_type="chat",
+            assistant_session_id=assistant_session_id,
+            request_id=request_id,
+            user_message=message,
+        )
+        conversation_context = self._build_conversation_context(session, context_packet=context_packet)
 
         # 调用 LLM
         response_content = await self._call_llm(
@@ -95,8 +111,14 @@ class SettingAgent:
         )
         session.setting_agent_history.append(assistant_msg.model_dump(mode="json"))
 
+        await self._append_bootstrap_assistant_response(
+            context_packet=context_packet,
+            response=response_content,
+            request_id=request_id,
+        )
+
         # 检查是否需要提取 seed
-        seed_extracted = await self._check_and_extract_seed(session)
+        seed_extracted = await self._check_and_extract_seed(session, context_packet=context_packet)
         await orchestrator._persist_session(session)
 
         return {
@@ -105,6 +127,8 @@ class SettingAgent:
             "stage": session.current_stage.value,
             "seed_extracted": seed_extracted,
             "seed_data": session.extracted_seed if seed_extracted else None,
+            "assistant_session_id": context_packet.get("session_id") if context_packet else None,
+            "context_packet": self._context_packet_metadata(context_packet),
         }
 
     def _build_system_prompt(self, session: BootstrapSession) -> str:
@@ -133,8 +157,19 @@ class SettingAgent:
         logger.warning("Setting Prompt 资产缺失: %s", prompt_id)
         return fallback
 
-    def _build_conversation_context(self, session: BootstrapSession) -> str:
-        """构建对话上下文"""
+    def _build_conversation_context(
+        self,
+        session: BootstrapSession,
+        context_packet: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """构建对话上下文。"""
+        if context_packet:
+            seed_state = self._bootstrap_seed_state_text(session)
+            prompt_context = context_packet.get("prompt_context") or ""
+            if seed_state:
+                return f"{prompt_context}\n\n## Bootstrap Seed State\n{seed_state}".strip()
+            return prompt_context
+
         if not session.setting_agent_history:
             return "这是对话的开始，用户将向你介绍他们的故事设定。"
 
@@ -254,7 +289,11 @@ class SettingAgent:
 
         return f"我收到了你的消息：'{last_user_msg}'。\n\n为了继续完善故事设定，请告诉我更多关于：\n- 故事的背景时代\n- 主要角色的性格特点\n- 你希望故事传达的主题"
 
-    async def _check_and_extract_seed(self, session: BootstrapSession) -> bool:
+    async def _check_and_extract_seed(
+        self,
+        session: BootstrapSession,
+        context_packet: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         """
         检查是否需要提取 seed
 
@@ -269,7 +308,7 @@ class SettingAgent:
         # 对话超过 3 轮且尚未提取 seed，可以尝试提取
         if user_message_count >= 3 and not session.extracted_seed:
             # 尝试从历史对话中提取 seed
-            extracted = await self.extract_seed_from_history(session)
+            extracted = await self.extract_seed_from_history(session, context_packet=context_packet)
             if extracted:
                 session.extracted_seed = extracted
                 session.current_stage = BootstrapStage.SEED_EXTRACTED
@@ -278,7 +317,13 @@ class SettingAgent:
 
         return False
 
-    async def extract_seed_from_history(self, session: BootstrapSession) -> Optional[Dict[str, Any]]:
+    async def extract_seed_from_history(
+        self,
+        session: BootstrapSession,
+        context_packet: Optional[Dict[str, Any]] = None,
+        assistant_session_id: Optional[str] = None,
+        request_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
         从对话历史中提取结构化 seed（公共方法）
 
@@ -288,13 +333,25 @@ class SettingAgent:
         Returns:
             Optional[Dict]: 提取的 seed 数据，失败返回 None
         """
-        # 构建提取 prompt
-        history_text = "\n".join([
-            f"{msg['role']}: {msg['content']}"
-            for msg in session.setting_agent_history
-        ])
+        if not context_packet:
+            context_packet = await self._build_bootstrap_context_packet(
+                session=session,
+                task_type="seed_extraction",
+                assistant_session_id=assistant_session_id,
+                request_id=request_id,
+                user_message="结束设定阶段并提取结构化项目 seed",
+            )
 
-        extraction_prompt = f"## 对话历史\n{history_text}".strip()
+        if context_packet:
+            context_text = self._build_conversation_context(session, context_packet=context_packet)
+        else:
+            history_text = "\n".join([
+                f"{msg['role']}: {msg['content']}"
+                for msg in session.setting_agent_history[-12:]
+            ])
+            context_text = f"## 有界对话窗口\n{history_text}".strip()
+
+        extraction_prompt = f"## 对话历史\n请基于下列有界会话窗口、会话摘要、项目快照和当前 Bootstrap Seed 状态提取结构化项目 seed。\n\n{context_text}".strip()
 
         try:
             response = await self._call_llm(
@@ -319,6 +376,99 @@ class SettingAgent:
         except (json.JSONDecodeError, Exception) as e:
             logger.error(f"提取 seed 失败：{e}")
             return None
+
+    async def _build_bootstrap_context_packet(
+        self,
+        *,
+        session: BootstrapSession,
+        task_type: str,
+        assistant_session_id: Optional[str] = None,
+        request_id: Optional[str] = None,
+        user_message: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            from app.api.app import postgres_db
+            if not postgres_db:
+                return None
+            from app.services.assistant_context import get_assistant_context_fabric
+
+            scope = {
+                "bootstrap_session_id": session.id,
+                "bootstrap_stage": session.current_stage.value if hasattr(session.current_stage, "value") else str(session.current_stage),
+                "surface_entry": "bootstrap",
+                "needs": ["project_brief", "world", "lore", "characters", "plot_hooks", "chapter_outlines", "recent_deltas"],
+            }
+            packet = await get_assistant_context_fabric(postgres_db).build_packet(
+                project_id=session.project_id,
+                assistant_surface="bootstrap_setting_agent",
+                task_type=task_type,
+                session_id=assistant_session_id,
+                mode=f"bootstrap:{session.id}",
+                request_id=request_id,
+                scope=scope,
+                user_message=user_message,
+            )
+            logger.info(
+                "[BootstrapSettingAgent] 使用 Assistant Context Fabric packet=%s snapshot=v%s tokens=%s",
+                packet.get("packet_id"),
+                packet.get("snapshot_version"),
+                packet.get("metadata", {}).get("token_estimate"),
+            )
+            return packet
+        except Exception:
+            logger.warning("构建 Bootstrap Assistant Context packet 失败，使用有界历史窗口", exc_info=True)
+            return None
+
+    def _context_packet_metadata(self, context_packet: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not context_packet:
+            return None
+        return {
+            "packet_id": context_packet.get("packet_id"),
+            "snapshot_id": context_packet.get("snapshot_id"),
+            "snapshot_version": context_packet.get("snapshot_version"),
+            **(context_packet.get("metadata") or {}),
+        }
+
+    async def _append_bootstrap_assistant_response(
+        self,
+        *,
+        context_packet: Optional[Dict[str, Any]],
+        response: str,
+        request_id: Optional[str],
+    ) -> None:
+        if not context_packet:
+            return
+        try:
+            from app.api.app import postgres_db
+            if not postgres_db:
+                return
+            assistant_session_id = context_packet.get("session_id")
+            assistant_session = await postgres_db.get_assistant_session(assistant_session_id) if assistant_session_id else None
+            if not assistant_session:
+                return
+            from app.services.assistant_context import get_assistant_context_fabric
+
+            await get_assistant_context_fabric(postgres_db).sessions.append_message(
+                session=assistant_session,
+                role="assistant",
+                content=response,
+                request_id=request_id,
+                metadata={"context_packet_id": context_packet.get("packet_id"), "surface_entry": "bootstrap"},
+                packet_id=context_packet.get("packet_id"),
+                snapshot_id=context_packet.get("snapshot_id"),
+            )
+        except Exception:
+            logger.warning("记录 Bootstrap Assistant Context 助手回复失败", exc_info=True)
+
+    def _bootstrap_seed_state_text(self, session: BootstrapSession) -> str:
+        state = {
+            "bootstrap_session_id": session.id,
+            "stage": session.current_stage.value if hasattr(session.current_stage, "value") else str(session.current_stage),
+            "progress": session.progress,
+            "extracted_seed": session.extracted_seed or {},
+            "confirmed_seed": session.confirmed_seed or {},
+        }
+        return json.dumps(state, ensure_ascii=False, default=str)
 
     async def create_session(self, project_id: str, initial_message: Optional[str] = None) -> BootstrapSession:
         """

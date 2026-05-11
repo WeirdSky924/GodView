@@ -1,4 +1,5 @@
 import { client } from './client'
+import type { AssistantContextSummary } from './assistantContext'
 
 // ==================== 类型定义 ====================
 
@@ -71,11 +72,29 @@ export async function getBootstrapStatus(sessionId: string): Promise<BootstrapSt
   return client.get(`/bootstrap/${sessionId}/status`)
 }
 
-export async function sendBootstrapMessage(sessionId: string, message: string, projectId?: string): Promise<any> {
+export async function sendBootstrapMessage(
+  sessionId: string,
+  message: string,
+  projectId?: string,
+  options?: { assistantSessionId?: string; requestId?: string },
+): Promise<{
+  success: boolean
+  response: {
+    response: string
+    session_id: string
+    stage: string
+    seed_extracted: boolean
+    seed_data?: SeedData | null
+    assistant_session_id?: string | null
+    context_packet?: AssistantContextSummary | null
+  }
+}> {
   return client.post('/bootstrap/message', {
     session_id: sessionId,
     message,
     project_id: projectId,
+    assistant_session_id: options?.assistantSessionId,
+    request_id: options?.requestId,
   })
 }
 
@@ -123,11 +142,19 @@ export async function getBootstrapMessages(sessionId: string, limit: number = 50
  * 结束设定阶段并强制提取 Seed
  * 不依赖对话轮数阈值，直接从当前对话历史中提取结构化 seed
  */
-export async function finalizeSetting(sessionId: string): Promise<{
+export async function finalizeSetting(
+  sessionId: string,
+  options?: { assistantSessionId?: string; requestId?: string },
+): Promise<{
   success: boolean
   message: string
   seed_data: SeedData
   session: BootstrapSession
+  assistant_session_id?: string | null
+  context_packet?: AssistantContextSummary | null
 }> {
-  return client.post(`/bootstrap/${sessionId}/finalize-setting`)
+  return client.post(`/bootstrap/${sessionId}/finalize-setting`, {
+    assistant_session_id: options?.assistantSessionId,
+    request_id: options?.requestId,
+  })
 }

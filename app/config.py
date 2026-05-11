@@ -29,7 +29,7 @@ class Settings(BaseSettings):
 
     # 应用基本信息
     app_name: str = "Godview"
-    app_version: str = "1.3.149"
+    app_version: str = "1.7.0"
     debug: bool = os.getenv("DEBUG", "false").lower() in {"1", "true", "yes", "on"}
     log_level: str = "INFO"
 
@@ -73,6 +73,24 @@ class Settings(BaseSettings):
     workflow_event_retention_seconds: int = Field(
         default=int(os.getenv("WORKFLOW_EVENT_RETENTION_SECONDS", "604800")),
         description="工作流事件缓存保留时间（秒）",
+    )
+
+    # Assistant Context Fabric 配置
+    assistant_context_fabric_enabled: bool = Field(
+        default=os.getenv("ASSISTANT_CONTEXT_FABRIC_ENABLED", "true").lower() in {"1", "true", "yes", "on"},
+        description="是否启用统一助手上下文织网",
+    )
+    assistant_context_force_fresh_on_user_reread: bool = Field(
+        default=os.getenv("ASSISTANT_CONTEXT_FORCE_FRESH_ON_USER_REREAD", "true").lower() in {"1", "true", "yes", "on"},
+        description="用户手动重新读取项目时是否强制使用新快照",
+    )
+    assistant_context_trace_packets: bool = Field(
+        default=os.getenv("ASSISTANT_CONTEXT_TRACE_PACKETS", "true").lower() in {"1", "true", "yes", "on"},
+        description="是否记录助手上下文包 trace 元数据",
+    )
+    assistant_context_async_rebuild_threshold_tokens: int = Field(
+        default=int(os.getenv("ASSISTANT_CONTEXT_ASYNC_REBUILD_THRESHOLD_TOKENS", "50000")),
+        description="超过该 token 估算后可转入异步重建",
     )
 
     # 业务级执行 Trace 配置

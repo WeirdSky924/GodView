@@ -306,6 +306,8 @@ class BootstrapOrchestrator:
     async def finalize_setting(
         self,
         session_id: str,
+        assistant_session_id: Optional[str] = None,
+        request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         结束设定阶段并强制提取 Seed
@@ -330,8 +332,21 @@ class BootstrapOrchestrator:
         from app.services.setting_agent import get_setting_agent
         agent = get_setting_agent()
 
-        # 从历史提取 seed
-        seed_data = await agent.extract_seed_from_history(session)
+        context_packet = await agent._build_bootstrap_context_packet(
+            session=session,
+            task_type="finalize_seed",
+            assistant_session_id=assistant_session_id,
+            request_id=request_id,
+            user_message="结束设定阶段并提取结构化项目 seed",
+        )
+
+        # 从有界会话窗口、摘要和项目快照提取 seed
+        seed_data = await agent.extract_seed_from_history(
+            session,
+            context_packet=context_packet,
+            assistant_session_id=assistant_session_id,
+            request_id=request_id,
+        )
 
         if not seed_data:
             # 如果提取失败，尝试生成一个基础 seed
@@ -348,6 +363,8 @@ class BootstrapOrchestrator:
         return {
             "seed_data": seed_data,
             "session": session.model_dump(mode="json"),
+            "assistant_session_id": context_packet.get("session_id") if context_packet else assistant_session_id,
+            "context_packet": agent._context_packet_metadata(context_packet),
         }
 
     async def _generate_minimal_seed(self, session: BootstrapSession) -> Dict[str, Any]:

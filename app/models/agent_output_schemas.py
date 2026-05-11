@@ -9,7 +9,7 @@ Schema 通过 ``AgentOutputContract.schema_ref`` 以 dotted-path 字符串引用
 
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # ============================================================
@@ -40,6 +40,12 @@ class _ChapterEndScores(BaseModel):
     world_consistency: float = 0.0
 
 
+class _DeAIStyleCheck(BaseModel):
+    passed: bool = True
+    issues: List[str] = Field(default_factory=list)
+    rewrite_focus: List[str] = Field(default_factory=list)
+
+
 class EvaluatorChapterEndSchema(BaseModel):
     """章节结束判定输出。"""
 
@@ -62,6 +68,7 @@ class EvaluatorChapterEndSchema(BaseModel):
     word_count_check: Dict[str, Any] = Field(default_factory=dict)
     upstream_context_usage_check: Dict[str, Any] = Field(default_factory=dict)
     asset_persistence_check: Dict[str, Any] = Field(default_factory=dict)
+    de_ai_style_check: _DeAIStyleCheck = Field(default_factory=_DeAIStyleCheck)
 
     model_config = {"extra": "allow"}
 
@@ -142,6 +149,37 @@ class WorldMapOverviewSchema(BaseModel):
 
     overview: str = ""
     regions: List[WorldMapRegionItem] = Field(default_factory=list)
+    suggested_starting_location: str = ""
+
+    model_config = _PERMISSIVE_CONFIG
+
+
+class WorldMapDraftRegionSchema(BaseModel):
+    """地图管理页 Agent 生成的可编辑区域草稿。"""
+
+    region_name: str = ""
+    region_type: str = "custom"
+    terrain_type: str = "custom"
+    description: str = ""
+    atmosphere: str = ""
+    importance: str = ""
+    coordinates: Dict[str, float] = Field(default_factory=dict)
+    terrain_features: List[Dict[str, Any]] = Field(default_factory=list)
+    landmarks: List[Dict[str, Any]] = Field(default_factory=list)
+    encounters: List[Dict[str, Any]] = Field(default_factory=list)
+    suggested_connections: List[str] = Field(default_factory=list)
+    local_rules: List[str] = Field(default_factory=list)
+    validation_notes: List[str] = Field(default_factory=list)
+    validation_warnings: List[str] = Field(default_factory=list)
+
+    model_config = _PERMISSIVE_CONFIG
+
+
+class WorldMapDraftGenerationSchema(BaseModel):
+    """地图管理页 Agent 区域草稿生成输出。"""
+
+    overview: str = ""
+    regions: List[WorldMapDraftRegionSchema] = Field(default_factory=list)
     suggested_starting_location: str = ""
 
     model_config = _PERMISSIVE_CONFIG
@@ -647,6 +685,18 @@ class _SettingSuggestionItem(BaseModel):
     issue: str = ""
     suggestion: str = ""
     suggested_content: Optional[str] = None
+    suggested_title: Optional[str] = None
+    summary: Optional[str] = None
+    category: Optional[str] = None
+    new_priority: Optional[str] = None
+    keywords: List[str] = Field(default_factory=list)
+    tags: List[str] = Field(default_factory=list)
+    constraints: List[str] = Field(default_factory=list)
+    related_characters: List[str] = Field(default_factory=list)
+    related_locations: List[str] = Field(default_factory=list)
+    related_items: List[str] = Field(default_factory=list)
+    related_entities: List[str] = Field(default_factory=list)
+    update_payload: Dict[str, Any] = Field(default_factory=dict)
     priority: str = "medium"
     reason: str = ""
 
@@ -690,6 +740,27 @@ class SettingPendingCharactersExtractionSchema(BaseModel):
     """对话中提取的待确认角色列表。"""
 
     characters: List[_SettingCharacterItem] = Field(default_factory=list)
+
+    @field_validator("characters", mode="before")
+    @classmethod
+    def _coerce_characters(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            import json
+
+            stripped = value.strip()
+            if not stripped:
+                return []
+            try:
+                return json.loads(stripped)
+            except Exception:
+                return []
+        if isinstance(value, dict):
+            for key in ("characters", "items", "data"):
+                nested = value.get(key)
+                if nested is not None:
+                    return nested
+            return list(value.values())
+        return value
 
     model_config = _PERMISSIVE_CONFIG
 

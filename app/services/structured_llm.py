@@ -173,7 +173,7 @@ class StructuredLLMRunner:
             last_error = parse_error
             if parsed is not None and parse_error is None:
                 return parsed, raw_text
-            logger.warning(
+            logger.info(
                 "structured output repair attempt %s failed: %s", attempt + 1, parse_error
             )
 

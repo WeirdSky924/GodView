@@ -15,11 +15,44 @@ import {
   completeVolume,
   VolumeOutline,
   EmotionArcPoint,
+  VolumePlanResponse,
 } from '../api/volumes';
 
 interface VolumePlannerProps {
   projectId: string;
 }
+
+const volumePlanToOutline = (
+  result: VolumePlanResponse,
+  projectId: string,
+  volumeNumber: number,
+  theme?: string,
+): VolumeOutline => {
+  const info = result.volume_info || {};
+  const chapterPlan = result.chapter_plan || [];
+  const climaxDesign = result.climax_design || {};
+  return {
+    id: String(info.id || `planned_volume_${volumeNumber}`),
+    project_id: projectId,
+    volume_number: Number(info.volume_number || volumeNumber),
+    title: String(info.title || `第${volumeNumber}卷`),
+    theme: String(info.theme || theme || ''),
+    summary: String(info.summary || ''),
+    start_chapter: Number(info.start_chapter || chapterPlan[0]?.chapter || 1),
+    end_chapter: Number(info.end_chapter || chapterPlan[chapterPlan.length - 1]?.chapter || 1),
+    target_word_count: Number(info.target_word_count || info.target_words || 50000),
+    climax_description: String(climaxDesign.description || climaxDesign.climax_description || ''),
+    climax_chapter: climaxDesign.chapter || climaxDesign.climax_chapter || null,
+    emotional_arc: Array.isArray(result.emotional_arc) ? result.emotional_arc : [],
+    key_events: chapterPlan.map((item, index) => ({
+      chapter: Number(item.chapter || index + 1),
+      event: String(item.event || item.summary || item.title || ''),
+      type: String(item.type || 'plot'),
+    })),
+    status: 'planning',
+    created_at: new Date().toISOString(),
+  };
+};
 
 const VolumePlanner: React.FC<VolumePlannerProps> = ({ projectId }) => {
   const [loading, setLoading] = useState(false);
@@ -63,11 +96,12 @@ const VolumePlanner: React.FC<VolumePlannerProps> = ({ projectId }) => {
     setLoading(true);
     setError(null);
     try {
-      const newVolume = await planVolume({
+      const result = await planVolume({
         project_id: projectId,
         volume_number: newVolumeNumber,
         theme: newVolumeTheme || undefined,
       });
+      const newVolume = volumePlanToOutline(result, projectId, newVolumeNumber, newVolumeTheme || undefined);
       setVolumes([...volumes, newVolume]);
       setSelectedVolume(newVolume);
       setShowCreateModal(false);
@@ -101,9 +135,16 @@ const VolumePlanner: React.FC<VolumePlannerProps> = ({ projectId }) => {
       const result = await designClimax({
         project_id: projectId,
         volume_number: selectedVolume.volume_number,
+        volume_id: selectedVolume.id,
+        climax_event: selectedVolume.climax_description || selectedVolume.summary || selectedVolume.title,
+        emotional_peak: '高潮',
       });
       // 更新选中的卷
-      const updated = { ...selectedVolume, ...result };
+      const updated = {
+        ...selectedVolume,
+        climax_description: result.climax_description,
+        climax_chapter: result.climax_chapter,
+      };
       setSelectedVolume(updated);
       setVolumes(volumes.map(v => v.volume_number === updated.volume_number ? updated : v));
     } catch (err: any) {

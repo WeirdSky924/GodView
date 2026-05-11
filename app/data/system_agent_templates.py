@@ -414,6 +414,14 @@ DIRECTOR_WRITER = AgentTemplate(
             is_required=True,  # 强制要求
             priority=92,
         ),
+        SkillSlot(
+            slot_name="de_ai",
+            description="去AI感自然化写作",
+            skill_id="skill_de_ai_if_y",
+            is_enabled=True,
+            is_required=True,
+            priority=91,
+        ),
         # 作家专属技能
         SkillSlot(
             slot_name="primary",
@@ -498,7 +506,7 @@ DIRECTOR_WRITER = AgentTemplate(
             priority=65,
         ),
     ],
-    default_skill_order=["context", "character_stance", "world", "primary", "planning", "cool_check", "sensitive", "golden_lines", "hook", "scene", "title", "analysis", "postprocessing"],
+    default_skill_order=["context", "character_stance", "de_ai", "world", "primary", "planning", "cool_check", "sensitive", "golden_lines", "hook", "scene", "title", "analysis", "postprocessing"],
     is_system=True,
 )
 
@@ -1540,6 +1548,25 @@ PLOT_OUTLINE_PROPOSE_REVISION = PLOT_OUTLINE.model_copy(
     },
 )
 
+WORLD_MAP_MANAGER_DRAFT = _template_with_prompt_slots(
+    WORLD_MAP_MANAGER,
+    template_id="world_map_manager_draft",
+    name="世界地图管理 Agent 草稿模板",
+    description="WorldMapManager 在地图管理页根据用户自然语言生成可编辑区域草稿的场景模板",
+    scenario="world_map_draft_generation",
+    tags=["map", "world", "geography", "draft", "location"],
+    slots=[
+        PromptSlot(
+            slot_name="map_draft_request",
+            description="地图草稿生成：用户请求、现有区域、选中区域和草稿输出边界",
+            prompt_template_id="function_map_draft_generation",
+            required=True,
+            priority=82,
+        ),
+    ],
+    order=["originality", "role_definition", "function_spec", "map_draft_request", "writing_rules", "output_format"],
+)
+
 
 MASTER_PLOTTER_WORKFLOW_DISCUSSION_OPENING = _template_with_prompt_slots(
     DIRECTOR_MASTER_PLOTTER,
@@ -1849,6 +1876,7 @@ SYSTEM_AGENT_TEMPLATES = [
     EVENT_GENERATOR,
     DUNGEON_GENERATOR,
     WORLD_MAP_MANAGER,
+    WORLD_MAP_MANAGER_DRAFT,
 ]
 
 # 按 Agent 类型映射

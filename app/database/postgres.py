@@ -222,6 +222,11 @@ class PostgresDatabase:
                 'cached_context_sections', 'payload', 'setting_agent_history', 'extracted_seed', 'confirmed_seed',
                 'root_input_summary', 'metadata', 'attributes', 'content',
                 'suggested_payload',
+                # assistant context fabric
+                'structured_index', 'entity_index', 'retrieval_manifest', 'structured_payload',
+                'entity_refs', 'payload_summary', 'history_window', 'session_state',
+                'pending_items', 'context_cursor', 'packet_scope', 'budget',
+                'selected_sections', 'delta_ids',
             ]
 
             for row in rows:
@@ -3084,6 +3089,127 @@ class PostgresDatabase:
             );
             CREATE INDEX IF NOT EXISTS idx_setting_agent_pending_items_session ON setting_agent_pending_items(session_id, status);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_setting_agent_pending_items_fingerprint ON setting_agent_pending_items(session_id, item_type, fingerprint);
+            CREATE TABLE IF NOT EXISTS assistant_project_snapshots (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+                snapshot_version BIGINT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'ready',
+                source_revision_hash TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                summary TEXT,
+                structured_index JSONB DEFAULT '{}',
+                entity_index JSONB DEFAULT '{}',
+                retrieval_manifest JSONB DEFAULT '{}',
+                token_estimate INTEGER DEFAULT 0,
+                build_reason TEXT DEFAULT 'initial',
+                forced_by_user_id TEXT,
+                force_rebuild_request_id TEXT,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                built_at TIMESTAMP WITH TIME ZONE,
+                error_message TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_assistant_snapshots_project_version ON assistant_project_snapshots(project_id, snapshot_version DESC);
+            CREATE INDEX IF NOT EXISTS idx_assistant_snapshots_project_status ON assistant_project_snapshots(project_id, status);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_snapshots_project_request ON assistant_project_snapshots(project_id, force_rebuild_request_id) WHERE force_rebuild_request_id IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS assistant_snapshot_sections (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                snapshot_id UUID REFERENCES assistant_project_snapshots(id) ON DELETE CASCADE,
+                project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+                section_type TEXT NOT NULL,
+                scope_key TEXT,
+                title TEXT,
+                content TEXT NOT NULL DEFAULT '',
+                structured_payload JSONB DEFAULT '{}',
+                entity_refs JSONB DEFAULT '[]',
+                priority INTEGER DEFAULT 100,
+                content_hash TEXT NOT NULL,
+                token_estimate INTEGER DEFAULT 0,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_assistant_sections_project_type ON assistant_snapshot_sections(project_id, section_type);
+            CREATE INDEX IF NOT EXISTS idx_assistant_sections_snapshot_type ON assistant_snapshot_sections(snapshot_id, section_type);
+            CREATE INDEX IF NOT EXISTS idx_assistant_sections_content_hash ON assistant_snapshot_sections(content_hash);
+            CREATE TABLE IF NOT EXISTS assistant_context_deltas (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+                entity_type TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                before_hash TEXT,
+                after_hash TEXT,
+                payload_summary JSONB DEFAULT '{}',
+                source_table TEXT,
+                source_updated_at TIMESTAMP WITH TIME ZONE,
+                consumed_by_snapshot_id UUID REFERENCES assistant_project_snapshots(id) ON DELETE SET NULL,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_assistant_deltas_project_created ON assistant_context_deltas(project_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_assistant_deltas_project_entity ON assistant_context_deltas(project_id, entity_type, entity_id);
+            CREATE TABLE IF NOT EXISTS assistant_sessions (
+                id TEXT PRIMARY KEY,
+                project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+                assistant_surface TEXT NOT NULL,
+                mode TEXT NOT NULL DEFAULT 'default',
+                status TEXT DEFAULT 'active',
+                snapshot_id UUID REFERENCES assistant_project_snapshots(id) ON DELETE SET NULL,
+                snapshot_version BIGINT,
+                history_window JSONB DEFAULT '[]',
+                history_summary TEXT DEFAULT '',
+                history_summary_hash TEXT,
+                session_state JSONB DEFAULT '{}',
+                pending_items JSONB DEFAULT '[]',
+                context_cursor JSONB DEFAULT '{}',
+                last_packet_id UUID,
+                last_activity_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                reset_at TIMESTAMP WITH TIME ZONE,
+                reset_reason TEXT,
+                force_reread_after TIMESTAMP WITH TIME ZONE,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_assistant_sessions_project_surface ON assistant_sessions(project_id, assistant_surface, status);
+            CREATE INDEX IF NOT EXISTS idx_assistant_sessions_project_activity ON assistant_sessions(project_id, last_activity_at DESC);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_sessions_active_surface_mode ON assistant_sessions(project_id, assistant_surface, mode) WHERE status = 'active';
+            CREATE TABLE IF NOT EXISTS assistant_messages (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                session_id TEXT REFERENCES assistant_sessions(id) ON DELETE CASCADE,
+                project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+                request_id TEXT,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                metadata JSONB DEFAULT '{}',
+                packet_id UUID,
+                snapshot_id UUID REFERENCES assistant_project_snapshots(id) ON DELETE SET NULL,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_assistant_messages_session_created ON assistant_messages(session_id, created_at);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_messages_request_role ON assistant_messages(session_id, request_id, role) WHERE request_id IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS assistant_context_packets (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
+                session_id TEXT REFERENCES assistant_sessions(id) ON DELETE SET NULL,
+                assistant_surface TEXT NOT NULL,
+                request_id TEXT,
+                snapshot_id UUID REFERENCES assistant_project_snapshots(id) ON DELETE SET NULL,
+                snapshot_version BIGINT,
+                packet_scope JSONB NOT NULL DEFAULT '{}',
+                budget JSONB NOT NULL DEFAULT '{}',
+                selected_sections JSONB NOT NULL DEFAULT '[]',
+                delta_ids JSONB DEFAULT '[]',
+                retrieval_manifest JSONB DEFAULT '{}',
+                token_estimate INTEGER DEFAULT 0,
+                truncated BOOLEAN DEFAULT FALSE,
+                invalidation_state TEXT DEFAULT 'fresh',
+                force_reread BOOLEAN DEFAULT FALSE,
+                history_reset_applied BOOLEAN DEFAULT FALSE,
+                metadata JSONB DEFAULT '{}',
+                content_hash TEXT,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_assistant_packets_session_surface_created ON assistant_context_packets(session_id, assistant_surface, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_assistant_packets_project_surface_created ON assistant_context_packets(project_id, assistant_surface, created_at DESC);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_packets_request ON assistant_context_packets(session_id, request_id, assistant_surface) WHERE request_id IS NOT NULL;
             """
             for statement in event_and_session_schema_sql.split(';'):
                 if statement.strip():
@@ -5000,6 +5126,393 @@ class PostgresDatabase:
         query = f"SELECT * FROM workflow_executions {where_clause} ORDER BY started_at DESC LIMIT :limit"
 
         return await self.execute_query(query, params)
+
+    async def save_assistant_snapshot(self, snapshot_data: Dict[str, Any], sections: Optional[List[Dict[str, Any]]] = None) -> str:
+        """保存 Assistant Context 项目快照及其分段。"""
+        data = dict(snapshot_data)
+        data["project_id"] = _validate_uuid(data.get("project_id"))
+        if not data["project_id"]:
+            raise ValueError("assistant snapshot 缺少有效 project_id")
+        for field in ["structured_index", "entity_index", "retrieval_manifest"]:
+            value = data.get(field) or {}
+            data[field] = json.dumps(value, default=str) if isinstance(value, (dict, list)) else value
+        data.setdefault("id", str(uuid_module.uuid4()))
+        data.setdefault("snapshot_version", 1)
+        data.setdefault("status", "ready")
+        data.setdefault("source_revision_hash", "")
+        data.setdefault("content_hash", "")
+        data.setdefault("summary", "")
+        data.setdefault("token_estimate", 0)
+        data.setdefault("build_reason", "initial")
+        data.setdefault("forced_by_user_id", None)
+        data.setdefault("force_rebuild_request_id", None)
+        data.setdefault("built_at", datetime.utcnow())
+        data.setdefault("error_message", None)
+        query = """
+        INSERT INTO assistant_project_snapshots (
+            id, project_id, snapshot_version, status, source_revision_hash, content_hash,
+            summary, structured_index, entity_index, retrieval_manifest, token_estimate,
+            build_reason, forced_by_user_id, force_rebuild_request_id, built_at, error_message
+        )
+        VALUES (
+            CAST(:id AS UUID), CAST(:project_id AS UUID), :snapshot_version, :status,
+            :source_revision_hash, :content_hash, :summary, CAST(:structured_index AS jsonb),
+            CAST(:entity_index AS jsonb), CAST(:retrieval_manifest AS jsonb), :token_estimate,
+            :build_reason, :forced_by_user_id, :force_rebuild_request_id, :built_at, :error_message
+        )
+        ON CONFLICT (id) DO UPDATE SET
+            status = EXCLUDED.status,
+            source_revision_hash = EXCLUDED.source_revision_hash,
+            content_hash = EXCLUDED.content_hash,
+            summary = EXCLUDED.summary,
+            structured_index = EXCLUDED.structured_index,
+            entity_index = EXCLUDED.entity_index,
+            retrieval_manifest = EXCLUDED.retrieval_manifest,
+            token_estimate = EXCLUDED.token_estimate,
+            build_reason = EXCLUDED.build_reason,
+            built_at = EXCLUDED.built_at,
+            error_message = EXCLUDED.error_message,
+            updated_at = CURRENT_TIMESTAMP
+        RETURNING id
+        """
+        rows = await self.execute_query(query, data)
+        snapshot_id = str(rows[0]["id"]) if rows else str(data["id"])
+        if sections is not None:
+            await self.execute_write(
+                "DELETE FROM assistant_snapshot_sections WHERE snapshot_id = CAST(:snapshot_id AS UUID)",
+                {"snapshot_id": snapshot_id},
+            )
+            for section in sections:
+                await self.save_assistant_snapshot_section(snapshot_id, data["project_id"], section)
+        return snapshot_id
+
+    async def save_assistant_snapshot_section(self, snapshot_id: str, project_id: str, section: Dict[str, Any]) -> str:
+        """保存 Assistant Context 快照分段。"""
+        data = dict(section)
+        data.setdefault("id", str(uuid_module.uuid4()))
+        data["snapshot_id"] = _validate_uuid(snapshot_id)
+        data["project_id"] = _validate_uuid(project_id)
+        for field, default in [("structured_payload", {}), ("entity_refs", [])]:
+            value = data.get(field, default)
+            data[field] = json.dumps(value, default=str) if isinstance(value, (dict, list)) else value
+        data.setdefault("scope_key", None)
+        data.setdefault("title", "")
+        data.setdefault("content", "")
+        data.setdefault("priority", 100)
+        data.setdefault("content_hash", "")
+        data.setdefault("token_estimate", 0)
+        query = """
+        INSERT INTO assistant_snapshot_sections (
+            id, snapshot_id, project_id, section_type, scope_key, title, content,
+            structured_payload, entity_refs, priority, content_hash, token_estimate
+        )
+        VALUES (
+            CAST(:id AS UUID), CAST(:snapshot_id AS UUID), CAST(:project_id AS UUID),
+            :section_type, :scope_key, :title, :content, CAST(:structured_payload AS jsonb),
+            CAST(:entity_refs AS jsonb), :priority, :content_hash, :token_estimate
+        )
+        RETURNING id
+        """
+        rows = await self.execute_query(query, data)
+        return str(rows[0]["id"]) if rows else str(data["id"])
+
+    async def get_latest_assistant_snapshot(self, project_id: str, status: Optional[str] = "ready") -> Optional[Dict[str, Any]]:
+        """获取项目最新 Assistant Context 快照。"""
+        conditions = ["project_id = CAST(:project_id AS UUID)"]
+        params: Dict[str, Any] = {"project_id": project_id}
+        if status:
+            conditions.append("status = :status")
+            params["status"] = status
+        rows = await self.execute_query(
+            f"""
+            SELECT * FROM assistant_project_snapshots
+            WHERE {' AND '.join(conditions)}
+            ORDER BY snapshot_version DESC, built_at DESC NULLS LAST, created_at DESC
+            LIMIT 1
+            """,
+            params,
+        )
+        return rows[0] if rows else None
+
+    async def get_assistant_snapshot_sections(self, snapshot_id: str) -> List[Dict[str, Any]]:
+        """获取快照分段。"""
+        return await self.execute_query(
+            """
+            SELECT * FROM assistant_snapshot_sections
+            WHERE snapshot_id = CAST(:snapshot_id AS UUID)
+            ORDER BY priority ASC, section_type ASC, title ASC
+            """,
+            {"snapshot_id": snapshot_id},
+        )
+
+    async def mark_assistant_snapshots_stale(self, project_id: str, except_snapshot_id: Optional[str] = None) -> int:
+        """将项目旧快照标记为 stale。"""
+        params: Dict[str, Any] = {"project_id": project_id, "except_snapshot_id": _validate_uuid(except_snapshot_id)}
+        extra = "AND id != CAST(:except_snapshot_id AS UUID)" if params["except_snapshot_id"] else ""
+        return await self.execute_write(
+            f"""
+            UPDATE assistant_project_snapshots
+            SET status = 'stale', updated_at = CURRENT_TIMESTAMP
+            WHERE project_id = CAST(:project_id AS UUID) AND status = 'ready' {extra}
+            """,
+            params,
+        )
+
+    async def save_assistant_delta(self, delta_data: Dict[str, Any]) -> str:
+        """记录 Assistant Context 增量。"""
+        data = dict(delta_data)
+        data.setdefault("id", str(uuid_module.uuid4()))
+        data["project_id"] = _validate_uuid(data.get("project_id"))
+        data["payload_summary"] = json.dumps(data.get("payload_summary") or {}, default=str)
+        data.setdefault("before_hash", None)
+        data.setdefault("after_hash", None)
+        data.setdefault("source_table", None)
+        data.setdefault("source_updated_at", None)
+        data.setdefault("consumed_by_snapshot_id", None)
+        query = """
+        INSERT INTO assistant_context_deltas (
+            id, project_id, entity_type, entity_id, operation, before_hash, after_hash,
+            payload_summary, source_table, source_updated_at, consumed_by_snapshot_id
+        )
+        VALUES (
+            CAST(:id AS UUID), CAST(:project_id AS UUID), :entity_type, :entity_id, :operation,
+            :before_hash, :after_hash, CAST(:payload_summary AS jsonb), :source_table,
+            :source_updated_at, CAST(:consumed_by_snapshot_id AS UUID)
+        )
+        RETURNING id
+        """
+        rows = await self.execute_query(query, data)
+        return str(rows[0]["id"]) if rows else str(data["id"])
+
+    async def get_assistant_deltas(self, project_id: str, limit: int = 100, consumed: Optional[bool] = None) -> List[Dict[str, Any]]:
+        """查询 Assistant Context 增量。"""
+        conditions = ["project_id = CAST(:project_id AS UUID)"]
+        params: Dict[str, Any] = {"project_id": project_id, "limit": limit}
+        if consumed is True:
+            conditions.append("consumed_by_snapshot_id IS NOT NULL")
+        elif consumed is False:
+            conditions.append("consumed_by_snapshot_id IS NULL")
+        return await self.execute_query(
+            f"""
+            SELECT * FROM assistant_context_deltas
+            WHERE {' AND '.join(conditions)}
+            ORDER BY created_at DESC
+            LIMIT :limit
+            """,
+            params,
+        )
+
+    async def save_assistant_session(self, session_data: Dict[str, Any]) -> str:
+        """保存 Assistant 通用会话。"""
+        data = dict(session_data)
+        data["project_id"] = _validate_uuid(data.get("project_id"))
+        data["snapshot_id"] = _validate_uuid(data.get("snapshot_id"))
+        for field, default in [("history_window", []), ("session_state", {}), ("pending_items", []), ("context_cursor", {})]:
+            value = data.get(field, default)
+            data[field] = json.dumps(value, default=str) if isinstance(value, (dict, list)) else value
+        data.setdefault("id", f"as_{uuid_module.uuid4().hex[:12]}")
+        data.setdefault("mode", "default")
+        data.setdefault("status", "active")
+        data.setdefault("snapshot_version", None)
+        data.setdefault("history_summary", "")
+        data.setdefault("history_summary_hash", None)
+        data.setdefault("last_packet_id", None)
+        data.setdefault("last_activity_at", datetime.utcnow())
+        data.setdefault("reset_at", None)
+        data.setdefault("reset_reason", None)
+        data.setdefault("force_reread_after", None)
+        query = """
+        INSERT INTO assistant_sessions (
+            id, project_id, assistant_surface, mode, status, snapshot_id, snapshot_version,
+            history_window, history_summary, history_summary_hash, session_state, pending_items,
+            context_cursor, last_packet_id, last_activity_at, reset_at, reset_reason, force_reread_after
+        )
+        VALUES (
+            :id, CAST(:project_id AS UUID), :assistant_surface, :mode, :status,
+            CAST(:snapshot_id AS UUID), :snapshot_version, CAST(:history_window AS jsonb),
+            :history_summary, :history_summary_hash, CAST(:session_state AS jsonb),
+            CAST(:pending_items AS jsonb), CAST(:context_cursor AS jsonb),
+            CAST(:last_packet_id AS UUID), :last_activity_at, :reset_at, :reset_reason, :force_reread_after
+        )
+        ON CONFLICT (id) DO UPDATE SET
+            status = EXCLUDED.status,
+            snapshot_id = EXCLUDED.snapshot_id,
+            snapshot_version = EXCLUDED.snapshot_version,
+            history_window = EXCLUDED.history_window,
+            history_summary = EXCLUDED.history_summary,
+            history_summary_hash = EXCLUDED.history_summary_hash,
+            session_state = EXCLUDED.session_state,
+            pending_items = EXCLUDED.pending_items,
+            context_cursor = EXCLUDED.context_cursor,
+            last_packet_id = EXCLUDED.last_packet_id,
+            last_activity_at = EXCLUDED.last_activity_at,
+            reset_at = EXCLUDED.reset_at,
+            reset_reason = EXCLUDED.reset_reason,
+            force_reread_after = EXCLUDED.force_reread_after,
+            updated_at = CURRENT_TIMESTAMP
+        RETURNING id
+        """
+        rows = await self.execute_query(query, data)
+        return str(rows[0]["id"]) if rows else str(data["id"])
+
+    async def get_assistant_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """按 ID 获取 Assistant 通用会话。"""
+        rows = await self.execute_query("SELECT * FROM assistant_sessions WHERE id = :id", {"id": session_id})
+        return rows[0] if rows else None
+
+    async def get_active_assistant_session(self, project_id: str, assistant_surface: str, mode: str = "default") -> Optional[Dict[str, Any]]:
+        """获取项目指定助手 surface/mode 的活跃会话。"""
+        rows = await self.execute_query(
+            """
+            SELECT * FROM assistant_sessions
+            WHERE project_id = CAST(:project_id AS UUID)
+              AND assistant_surface = :assistant_surface
+              AND mode = :mode
+              AND status = 'active'
+            ORDER BY last_activity_at DESC NULLS LAST, created_at DESC
+            LIMIT 1
+            """,
+            {"project_id": project_id, "assistant_surface": assistant_surface, "mode": mode},
+        )
+        return rows[0] if rows else None
+
+    async def reset_assistant_session(self, session_id: str, reason: str = "user_requested") -> int:
+        """将 Assistant 会话标记为 reset。"""
+        return await self.execute_write(
+            """
+            UPDATE assistant_sessions
+            SET status = 'reset', reset_at = CURRENT_TIMESTAMP, reset_reason = :reason, updated_at = CURRENT_TIMESTAMP
+            WHERE id = :session_id
+            """,
+            {"session_id": session_id, "reason": reason},
+        )
+
+    async def append_assistant_message(
+        self,
+        session_id: str,
+        project_id: str,
+        role: str,
+        content: str,
+        request_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        packet_id: Optional[str] = None,
+        snapshot_id: Optional[str] = None,
+    ) -> str:
+        """追加 Assistant 通用消息；带 request_id 时按角色幂等。"""
+        payload = json.dumps(metadata or {}, default=str)
+        rows = await self.execute_query(
+            """
+            INSERT INTO assistant_messages (session_id, project_id, request_id, role, content, metadata, packet_id, snapshot_id)
+            VALUES (:session_id, CAST(:project_id AS UUID), :request_id, :role, :content, CAST(:metadata AS jsonb), CAST(:packet_id AS UUID), CAST(:snapshot_id AS UUID))
+            ON CONFLICT (session_id, request_id, role) WHERE request_id IS NOT NULL DO UPDATE SET
+                content = EXCLUDED.content,
+                metadata = EXCLUDED.metadata,
+                packet_id = EXCLUDED.packet_id,
+                snapshot_id = EXCLUDED.snapshot_id
+            RETURNING id
+            """,
+            {
+                "session_id": session_id,
+                "project_id": project_id,
+                "request_id": request_id,
+                "role": role,
+                "content": content,
+                "metadata": payload,
+                "packet_id": _validate_uuid(packet_id),
+                "snapshot_id": _validate_uuid(snapshot_id),
+            },
+        )
+        return str(rows[0]["id"]) if rows else ""
+
+    async def get_assistant_messages(self, session_id: str, limit: int = 200) -> List[Dict[str, Any]]:
+        """获取 Assistant 通用消息。"""
+        return await self.execute_query(
+            """
+            SELECT * FROM assistant_messages
+            WHERE session_id = :session_id
+            ORDER BY created_at ASC
+            LIMIT :limit
+            """,
+            {"session_id": session_id, "limit": limit},
+        )
+
+    async def delete_assistant_messages(self, session_id: str) -> int:
+        """删除 Assistant 通用消息记录。"""
+        return await self.execute_write("DELETE FROM assistant_messages WHERE session_id = :session_id", {"session_id": session_id})
+
+    async def save_assistant_packet(self, packet_data: Dict[str, Any]) -> str:
+        """保存 Assistant Context Packet。"""
+        data = dict(packet_data)
+        data.setdefault("id", str(uuid_module.uuid4()))
+        data["project_id"] = _validate_uuid(data.get("project_id"))
+        data["session_id"] = data.get("session_id")
+        data["snapshot_id"] = _validate_uuid(data.get("snapshot_id"))
+        for field, default in [
+            ("packet_scope", {}), ("budget", {}), ("selected_sections", []),
+            ("delta_ids", []), ("retrieval_manifest", {}), ("metadata", {}),
+        ]:
+            value = data.get(field, default)
+            data[field] = json.dumps(value, default=str) if isinstance(value, (dict, list)) else value
+        data.setdefault("request_id", None)
+        data.setdefault("snapshot_version", None)
+        data.setdefault("token_estimate", 0)
+        data.setdefault("truncated", False)
+        data.setdefault("invalidation_state", "fresh")
+        data.setdefault("force_reread", False)
+        data.setdefault("history_reset_applied", False)
+        data.setdefault("content_hash", None)
+        rows = await self.execute_query(
+            """
+            INSERT INTO assistant_context_packets (
+                id, project_id, session_id, assistant_surface, request_id, snapshot_id, snapshot_version,
+                packet_scope, budget, selected_sections, delta_ids, retrieval_manifest, token_estimate,
+                truncated, invalidation_state, force_reread, history_reset_applied, metadata, content_hash
+            )
+            VALUES (
+                CAST(:id AS UUID), CAST(:project_id AS UUID), :session_id, :assistant_surface,
+                :request_id, CAST(:snapshot_id AS UUID), :snapshot_version, CAST(:packet_scope AS jsonb),
+                CAST(:budget AS jsonb), CAST(:selected_sections AS jsonb), CAST(:delta_ids AS jsonb),
+                CAST(:retrieval_manifest AS jsonb), :token_estimate, :truncated, :invalidation_state,
+                :force_reread, :history_reset_applied, CAST(:metadata AS jsonb), :content_hash
+            )
+            ON CONFLICT (session_id, request_id, assistant_surface) WHERE request_id IS NOT NULL DO UPDATE SET
+                snapshot_id = EXCLUDED.snapshot_id,
+                snapshot_version = EXCLUDED.snapshot_version,
+                packet_scope = EXCLUDED.packet_scope,
+                budget = EXCLUDED.budget,
+                selected_sections = EXCLUDED.selected_sections,
+                delta_ids = EXCLUDED.delta_ids,
+                retrieval_manifest = EXCLUDED.retrieval_manifest,
+                token_estimate = EXCLUDED.token_estimate,
+                truncated = EXCLUDED.truncated,
+                invalidation_state = EXCLUDED.invalidation_state,
+                force_reread = EXCLUDED.force_reread,
+                history_reset_applied = EXCLUDED.history_reset_applied,
+                metadata = EXCLUDED.metadata,
+                content_hash = EXCLUDED.content_hash
+            RETURNING id
+            """,
+            data,
+        )
+        packet_id = str(rows[0]["id"]) if rows else str(data["id"])
+        if data.get("session_id"):
+            await self.execute_write(
+                """
+                UPDATE assistant_sessions
+                SET last_packet_id = CAST(:packet_id AS UUID), last_activity_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                WHERE id = :session_id
+                """,
+                {"packet_id": packet_id, "session_id": data["session_id"]},
+            )
+        return packet_id
+
+    async def get_assistant_packet(self, packet_id: str) -> Optional[Dict[str, Any]]:
+        """获取 Assistant Context Packet。"""
+        rows = await self.execute_query(
+            "SELECT * FROM assistant_context_packets WHERE id = CAST(:id AS UUID)",
+            {"id": packet_id},
+        )
+        return rows[0] if rows else None
 
     async def save_v8_intervention_log(self, log_data: Dict[str, Any]) -> str:
         """

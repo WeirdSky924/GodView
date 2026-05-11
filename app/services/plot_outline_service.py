@@ -1203,6 +1203,38 @@ class PlotOutlineService:
         self._loaded_outline_projects.discard(project_id)
         self._invalidate_project_caches(project_id, chapter_number)
 
+    async def _record_outline_delta(
+        self,
+        *,
+        project_id: str,
+        outline: ChapterOutline,
+        operation: str,
+        before: Optional[Dict[str, Any]] = None,
+        source_table: str = "chapter_outlines",
+    ) -> None:
+        if not self._db:
+            return
+        try:
+            from app.services.assistant_context import get_assistant_context_fabric
+
+            await get_assistant_context_fabric(self._db).deltas.record_entity_change(
+                project_id=project_id,
+                entity_type="chapter_outline",
+                entity_id=outline.id,
+                operation=operation,
+                before=before,
+                after=outline.model_dump(mode="json"),
+                payload_summary={
+                    "title": outline.title,
+                    "chapter_number": outline.chapter_number,
+                    "status": outline.status.value if hasattr(outline.status, "value") else str(outline.status),
+                },
+                source_table=source_table,
+                source_updated_at=outline.updated_at,
+            )
+        except Exception:
+            logger.warning("记录 Assistant Context 大纲 delta 失败", exc_info=True)
+
     def invalidate_project_context(self, project_id: str):
         """清理指定项目的 Plot Outline 上下文缓存"""
         self._invalidate_project_caches(project_id)
@@ -1301,6 +1333,7 @@ class PlotOutlineService:
 
         self._merge_outline_into_list(outline)
         self._mark_outline_project_dirty(outline.project_id, outline.chapter_number)
+        await self._record_outline_delta(project_id=outline.project_id, outline=outline, operation="create")
         await self._persist_outline_resource_audit(outline)
         return outline
 
@@ -1444,9 +1477,16 @@ class PlotOutlineService:
 
             self._merge_outline_into_list(revision)
             self._mark_outline_project_dirty(revision.project_id, revision.chapter_number)
+            await self._record_outline_delta(
+                project_id=revision.project_id,
+                outline=revision,
+                operation="create",
+                before=outline.model_dump(mode="json"),
+            )
             await self._persist_outline_resource_audit(revision)
             return revision
 
+        before_outline = outline.model_dump(mode="json")
         for key in dto.model_fields_set:
             value = getattr(dto, key)
             if value is not None:
@@ -1484,6 +1524,12 @@ class PlotOutlineService:
                 logger.error(f"更新章节大纲失败: {e}")
 
         self._mark_outline_project_dirty(outline.project_id, outline.chapter_number)
+        await self._record_outline_delta(
+            project_id=outline.project_id,
+            outline=outline,
+            operation="update",
+            before=before_outline,
+        )
         await self._persist_outline_resource_audit(outline)
         return outline
 
@@ -1496,6 +1542,8 @@ class PlotOutlineService:
         characters: Optional[List[Dict]] = None,
         world_info: Optional[Dict] = None,
         existing_hooks: Optional[List[Dict]] = None,
+        session_id: Optional[str] = None,
+        request_id: Optional[str] = None,
     ) -> GenerateOutlineResponse:
         """
         生成章节大纲
@@ -1517,7 +1565,18 @@ class PlotOutlineService:
         # 判断是否为黄金三章（1-3章）
         is_golden_three = 1 <= chapter_number <= 3
 
-        # 获取完整项目上下文
+        context_packet = await self._build_outline_context_packet(
+            project_id=project_id,
+            chapter_number=chapter_number,
+            task_type="generate",
+            session_id=session_id,
+            request_id=request_id,
+            user_message=context or previous_events or f"生成第{chapter_number}章大纲",
+            extra_scope={"previous_events": bool(previous_events), "special_context": bool(context)},
+        )
+        context_packet_metadata = self._context_packet_metadata(context_packet)
+
+        # 获取完整项目上下文用于结构化一致性检查和资源名映射；LLM prompt 的权威项目上下文来自 Assistant Context Fabric packet
         full_context = await self.get_full_project_context(project_id, chapter_number)
 
         # 如果调用者没有提供特定信息，使用自动获取的上下文
@@ -1543,6 +1602,7 @@ class PlotOutlineService:
             world_info=world_info,
             existing_hooks=existing_hooks,
             full_context=full_context,
+            context_packet=context_packet,
         )
 
         # 尝试使用 Skill
@@ -1555,7 +1615,7 @@ class PlotOutlineService:
                     parameters={
                         "prompt": prompt,
                         "chapter_number": chapter_number,
-                        "story_context": self.format_context_for_prompt(full_context),
+                        "story_context": context_packet.get("prompt_context") if context_packet else self.format_context_for_prompt(full_context),
                         "is_golden_three": is_golden_three,
                     }
                 ))
@@ -1570,6 +1630,7 @@ class PlotOutlineService:
                         suggestions=data.get("suggestions", []),
                         warnings=warnings,
                         prompt_render_trace=outline.quality_metrics.get("prompt_render_trace"),
+                        context_packet=context_packet_metadata,
                     )
             except Exception as e:
                 logger.warning(f"使用 Skill 生成大纲失败，fallback 到直接生成: {e}")
@@ -1580,6 +1641,7 @@ class PlotOutlineService:
             chapter_number=chapter_number,
             prompt=prompt,
             full_context=full_context,
+            context_packet=context_packet,
         )
 
         return GenerateOutlineResponse(
@@ -1587,6 +1649,7 @@ class PlotOutlineService:
             suggestions=["大纲已生成，建议人工审核后使用"],
             warnings=[],
             prompt_render_trace=outline.quality_metrics.get("prompt_render_trace"),
+            context_packet=context_packet_metadata,
         )
 
     def _build_generation_prompt(
@@ -1598,6 +1661,7 @@ class PlotOutlineService:
         world_info: Optional[Dict],
         existing_hooks: Optional[List[Dict]],
         full_context: Optional[Dict[str, Any]] = None,
+        context_packet: Optional[Dict[str, Any]] = None,
     ) -> str:
         """构建大纲生成 Prompt，稳定输出合同来自 md prompt 资产。"""
         output_format_prompt = self._get_output_format_prompt()
@@ -1606,8 +1670,9 @@ class PlotOutlineService:
             "",
         ]
 
-        # 如果有完整上下文，优先使用
-        if full_context:
+        if context_packet:
+            prompt_parts.append(context_packet.get("prompt_context") or "")
+        elif full_context:
             context_str = self.format_context_for_prompt(full_context)
             if context_str:
                 prompt_parts.append(context_str)
@@ -1737,6 +1802,7 @@ class PlotOutlineService:
         chapter_number: int,
         prompt: str,
         full_context: Optional[Dict[str, Any]] = None,
+        context_packet: Optional[Dict[str, Any]] = None,
     ) -> ChapterOutline:
         """直接调用 LLM 生成大纲（Skill 失败时的 fallback）"""
         from app.config import settings
@@ -1764,7 +1830,7 @@ class PlotOutlineService:
             response = await self._call_llm_for_chat(
                 system_prompt=system_prompt,
                 user_message=prompt,
-                context="",
+                context=context_packet.get("prompt_context") if context_packet else "",
                 llm_config=llm_config,
             )
 
@@ -1782,7 +1848,7 @@ class PlotOutlineService:
                         message=prompt,
                         full_context=full_context,
                         system_prompt=system_prompt,
-                        combined_context="",
+                        combined_context=context_packet.get("prompt_context") if context_packet else "",
                         llm_config=llm_config,
                         consistency=consistency,
                     )
@@ -1961,6 +2027,12 @@ class PlotOutlineService:
 
         if outline:
             self._mark_outline_project_dirty(outline.project_id, outline.chapter_number)
+            await self._record_outline_delta(
+                project_id=outline.project_id,
+                outline=outline,
+                operation="delete",
+                before=outline.model_dump(mode="json"),
+            )
 
         return {"success": True, "soft_deleted_chapters": soft_deleted_chapters}
 
@@ -1981,6 +2053,7 @@ class PlotOutlineService:
         if outline.status == ChapterOutlineStatus.REJECTED:
             return None
 
+        before_outline = outline.model_dump(mode="json")
         previous_outline_id = outline.previous_outline_id
         outline.status = ChapterOutlineStatus.APPROVED
         outline.approved_at = datetime.now()
@@ -2028,6 +2101,12 @@ class PlotOutlineService:
             previous_outline.updated_at = outline.updated_at
 
         self._mark_outline_project_dirty(outline.project_id, outline.chapter_number)
+        await self._record_outline_delta(
+            project_id=outline.project_id,
+            outline=outline,
+            operation="update",
+            before=before_outline,
+        )
         await self._persist_outline_resource_audit(outline)
         return outline
 
@@ -2037,6 +2116,7 @@ class PlotOutlineService:
         if not outline or outline.status != ChapterOutlineStatus.REVISION:
             return None
 
+        before_outline = outline.model_dump(mode="json")
         outline.status = ChapterOutlineStatus.REJECTED
         outline.updated_at = datetime.now()
 
@@ -2060,6 +2140,12 @@ class PlotOutlineService:
                 return None
 
         self._mark_outline_project_dirty(outline.project_id, outline.chapter_number)
+        await self._record_outline_delta(
+            project_id=outline.project_id,
+            outline=outline,
+            operation="update",
+            before=before_outline,
+        )
         return outline
 
     async def get_outline_statistics(self, project_id: str) -> Dict[str, Any]:
@@ -2432,6 +2518,8 @@ class PlotOutlineService:
         message: str,
         existing_outline: Optional[ChapterOutline] = None,
         context: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+        request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         与 Plot Outline Agent 聊天
@@ -2451,8 +2539,17 @@ class PlotOutlineService:
         from app.config import settings
 
         try:
+            context_packet = await self._build_outline_context_packet(
+                project_id=project_id,
+                chapter_number=chapter_number,
+                task_type="chat",
+                session_id=session_id,
+                request_id=request_id,
+                user_message=message,
+                extra_scope=context or {},
+            )
             full_context = await self._get_cached_project_context(project_id, chapter_number)
-            context_str = self._get_cached_formatted_context(project_id, chapter_number, full_context)
+            context_str = context_packet.get("prompt_context") if context_packet else self._get_cached_formatted_context(project_id, chapter_number, full_context)
             prompt_data = await self._get_cached_system_prompt_with_trace(project_id, chapter_number, full_context)
             base_system_prompt = prompt_data.get("content", "")
             prompt_render_trace = prompt_data.get("trace")
@@ -2515,18 +2612,26 @@ class PlotOutlineService:
                 except Exception as e:
                     logger.error(f"自动保存草稿失败: {e}")
 
+            context_packet_metadata = self._context_packet_metadata(context_packet)
             result = {
                 "message": response,
                 "outline_updates": outline_updates,
                 "suggestions": self._extract_suggestions(response),
                 "saved_outline": self._outline_saved_response(saved_outline),
                 "prompt_render_trace": prompt_render_trace,
+                "assistant_session_id": context_packet.get("session_id") if context_packet else None,
+                "context_packet": context_packet_metadata,
             }
             if consistency_warnings:
                 result["warnings"] = consistency_warnings
             if saved_outlines:
                 result["saved_outlines"] = self._outlines_saved_response(saved_outlines)
 
+            await self._append_outline_assistant_response(
+                context_packet=context_packet,
+                response=response,
+                request_id=request_id,
+            )
             return result
         except Exception as e:
             logger.error(f"Agent 聊天失败: {e}")
@@ -2603,6 +2708,83 @@ class PlotOutlineService:
     def _build_fallback_prompt(self) -> str:
         """构建备用 prompt（优先使用 prompts/**/*.md 资产）。"""
         return self._build_fallback_prompt_with_trace(None)["content"]
+
+    async def _build_outline_context_packet(
+        self,
+        *,
+        project_id: str,
+        chapter_number: int,
+        task_type: str,
+        session_id: Optional[str] = None,
+        request_id: Optional[str] = None,
+        user_message: Optional[str] = None,
+        extra_scope: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if not self._db:
+            return None
+        from app.services.assistant_context import get_assistant_context_fabric
+
+        scope = {
+            "chapter_number": chapter_number,
+            "surface_entry": "outlines",
+            "needs": ["chapter_outlines", "plot_hooks", "characters", "lore", "world", "recent_deltas"],
+        }
+        if extra_scope:
+            scope.update(extra_scope)
+        packet = await get_assistant_context_fabric(self._db).build_packet(
+            project_id=project_id,
+            assistant_surface="plot_outline_agent",
+            task_type=task_type,
+            session_id=session_id,
+            mode=f"chapter:{chapter_number}",
+            request_id=request_id,
+            scope=scope,
+            user_message=user_message,
+        )
+        logger.info(
+            "[PlotOutline] 使用 Assistant Context Fabric packet=%s snapshot=v%s tokens=%s",
+            packet.get("packet_id"),
+            packet.get("snapshot_version"),
+            packet.get("metadata", {}).get("token_estimate"),
+        )
+        return packet
+
+    def _context_packet_metadata(self, context_packet: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not context_packet:
+            return None
+        return {
+            "packet_id": context_packet.get("packet_id"),
+            "snapshot_id": context_packet.get("snapshot_id"),
+            "snapshot_version": context_packet.get("snapshot_version"),
+            **(context_packet.get("metadata") or {}),
+        }
+
+    async def _append_outline_assistant_response(
+        self,
+        *,
+        context_packet: Optional[Dict[str, Any]],
+        response: str,
+        request_id: Optional[str],
+    ) -> None:
+        if not context_packet or not self._db:
+            return
+        packet_id = context_packet.get("packet_id")
+        snapshot_id = context_packet.get("snapshot_id")
+        assistant_session_id = context_packet.get("session_id")
+        assistant_session = await self._db.get_assistant_session(assistant_session_id) if assistant_session_id else None
+        if not assistant_session:
+            return
+        from app.services.assistant_context import get_assistant_context_fabric
+
+        await get_assistant_context_fabric(self._db).sessions.append_message(
+            session=assistant_session,
+            role="assistant",
+            content=response,
+            request_id=request_id,
+            metadata={"context_packet_id": packet_id, "surface_entry": "outlines"},
+            packet_id=packet_id,
+            snapshot_id=snapshot_id,
+        )
 
     async def _build_chat_user_context(
         self,

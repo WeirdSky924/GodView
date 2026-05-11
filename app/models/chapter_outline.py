@@ -313,6 +313,7 @@ class GenerateOutlineResponse(BaseModel):
     suggestions: List[str] = Field(default_factory=list, description="写作建议")
     warnings: List[str] = Field(default_factory=list, description="注意事项")
     prompt_render_trace: Optional[Dict[str, Any]] = Field(None, description="运行时 prompt 渲染 trace")
+    context_packet: Optional[Dict[str, Any]] = Field(None, description="Assistant Context Fabric 上下文包元数据")
 
 
 class ValidateOutlineRequest(BaseModel):

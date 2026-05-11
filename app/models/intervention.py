@@ -64,6 +64,8 @@ class InterventionCreate(BaseModel):
     agent_type: str = Field(..., description="Agent类型")
     message: str = Field(..., description="干预消息", min_length=1)
     intervention_type: InterventionType = Field(default=InterventionType.GUIDANCE, description="干预类型")
+    assistant_session_id: Optional[str] = Field(None, description="Assistant Context 会话ID")
+    request_id: Optional[str] = Field(None, description="幂等请求ID")
 
 
 class InterventionQuery(BaseModel):

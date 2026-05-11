@@ -19,7 +19,7 @@ from langchain_core.language_models import BaseLanguageModel
 from langchain_core.messages import HumanMessage
 
 from app.agents.base import BaseAgent, AgentResponse
-from app.models.agent_output_schemas import WorldMapOverviewSchema
+from app.models.agent_output_schemas import WorldMapDraftGenerationSchema, WorldMapOverviewSchema
 from app.models.agent_template import AgentType
 from app.models.token_usage import UsageCategory
 from app.services.structured_llm import StructuredOutputError
@@ -40,17 +40,21 @@ class WorldMapManagerAgent(BaseAgent):
         project_id: Optional[str] = None,
         system_prompt: Optional[str] = None,
         agent_id: Optional[str] = None,
+        scenario: Optional[str] = None,
     ):
         legacy_trace = None
         if not system_prompt and not project_id:
             system_prompt = self._build_system_prompt()
             legacy_trace = getattr(self, "_legacy_fallback_trace", None)
 
+        runtime_config = dict(config or {})
+        if scenario:
+            runtime_config.setdefault("scenario", scenario)
         super().__init__(
             name="WorldMapManagerAgent",
             model=model,
             system_prompt=system_prompt,
-            config=config,
+            config=runtime_config,
             project_id=project_id,
             agent_id=agent_id or "world_map_manager",
         )
@@ -66,6 +70,7 @@ class WorldMapManagerAgent(BaseAgent):
         return {
             "agent_role": "地图管理员",
             "task_description": "管理世界地图、区域和角色位置",
+            "scenario": self.scenario or self.DEFAULT_SCENARIO,
         }
 
     def _load_md_prompt_content(self, prompt_id: str) -> str:
@@ -137,6 +142,8 @@ class WorldMapManagerAgent(BaseAgent):
                 variables=self._get_default_variables(),
                 scenario=self.scenario,
                 context_query="地图管理 地点匹配 区域生成 空间连续性 章节场景",
+                use_intelligent_retrieval=False,
+                use_project_config=True,
             )
             prompt = prompt_data.get("content", "")
             self._system_prompt_render_trace = prompt_data.get("trace", {}) or {}
@@ -211,8 +218,9 @@ class WorldMapManagerAgent(BaseAgent):
 
             elif task == "match_or_generate":
                 return await self._match_or_generate_regions(world_info, existing_regions)
-                # 移动角色
-                return await self._handle_character_move(character_id, direction)
+
+            elif task == "create_draft":
+                return await self._generate_region_drafts(world_info, existing_regions)
 
             elif task == "create" and region_data:
                 # 创建新区域
@@ -298,6 +306,86 @@ class WorldMapManagerAgent(BaseAgent):
                 return AgentResponse(success=False, error=str(e))
 
         return await self._generate_map_overview(world_info)
+
+    async def _generate_region_drafts(
+        self,
+        world_info: Dict[str, Any],
+        existing_regions: List[Dict[str, Any]],
+    ) -> AgentResponse:
+        """生成地图管理页可编辑区域草稿，不直接持久化。"""
+        world_name = world_info.get("name") or "未命名世界"
+        world_description = world_info.get("description") or world_info.get("world_type") or "未提供"
+        user_request = world_info.get("user_request") or world_info.get("chapter_outline") or world_info.get("plot_focus") or "未提供"
+        requested_count = world_info.get("requested_region_count") or world_info.get("generation_count") or 3
+        selected_region = world_info.get("selected_region") or {}
+        assistant_context = str(world_info.get("assistant_context") or "").strip()
+
+        region_summaries = []
+        for region in existing_regions[:30]:
+            if not isinstance(region, dict):
+                continue
+            name = region.get("name") or region.get("region_name") or "未命名区域"
+            region_type = region.get("region_type") or "custom"
+            terrain_type = region.get("terrain_type") or "custom"
+            description = region.get("description") or ""
+            region_summaries.append(f"- {region.get('id', '')}｜{name}｜{region_type}/{terrain_type}｜{description[:160]}")
+
+        selected_region_text = "未选择"
+        if isinstance(selected_region, dict) and selected_region:
+            selected_region_text = (
+                f"{selected_region.get('id', '')}｜{selected_region.get('name', '未命名区域')}｜"
+                f"{selected_region.get('region_type', 'custom')}/{selected_region.get('terrain_type', 'custom')}｜"
+                f"{(selected_region.get('description') or '')[:240]}"
+            )
+
+        map_instruction = self._load_md_prompt_content("function_map_draft_generation") or self._load_md_prompt_content("function_map_management") or "请遵循地图管理原则，生成与世界观和当前剧情匹配的区域草稿。"
+        prompt = f"""{map_instruction}
+
+【当前子任务参数】
+- task_mode: world_map_region_draft_generation
+- output_schema: WorldMapDraftGenerationSchema
+- requested_region_count: {requested_count}
+- persistence_policy: 只生成草稿，不要声称已经写入数据库
+
+【世界信息】
+- 名称：{world_name}
+- 描述/类型：{world_description}
+
+【用户地图需求】
+{user_request}
+
+【当前选中区域】
+{selected_region_text}
+
+【Assistant Context Fabric 项目上下文包】
+{assistant_context or '未提供'}
+
+【现有地图区域（兼容摘要，权威项目上下文以上方 context packet 为准）】
+{chr(10).join(region_summaries) if region_summaries else '暂无现有区域'}
+
+【输出要求】
+- regions 数量不要超过 requested_region_count
+- 每个区域必须适合作为用户可编辑草稿
+- region_type 使用 city/village/wilderness/dungeon/building/water/mountain/forest/custom 之一
+- terrain_type 使用 plain/hill/mountain/desert/swamp/ice/volcano/custom 之一
+- suggested_connections 优先填写现有区域 ID 或精确名称；不确定则留空并写入 validation_notes
+- 不要生成空泛的百科条目，要给出能支持剧情使用的地点特征、地标和氛围"""
+
+        try:
+            parsed = await self._call_structured(
+                WorldMapDraftGenerationSchema,
+                messages=[HumanMessage(content=prompt)],
+                category=UsageCategory.WORLD,
+            )
+            draft_data = parsed.model_dump()
+            return AgentResponse(
+                success=True,
+                data={**draft_data, "existing_region_count": len(existing_regions)},
+                metadata=self._get_runtime_trace_metadata(),
+            )
+        except StructuredOutputError as e:
+            logger.error(f"地图区域草稿 structured 失败: {e}")
+            return AgentResponse(success=False, error=str(e))
 
     async def _handle_character_move(
         self,

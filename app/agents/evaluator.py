@@ -250,6 +250,7 @@ class EvaluatorAgent(BaseAgent):
   "word_count_check": {{"passed": true/false, "actual": {word_count}, "target": {target_word_count}, "min_required": {int(target_word_count * 0.8) if target_word_count else 0}, "max_allowed": {int(target_word_count * 1.25) if target_word_count else 0}}},
   "upstream_context_usage_check": {{"passed": true/false, "used_context": ["已使用的上游状态"], "missing_context": ["缺失上下文"]}},
   "asset_persistence_check": {{"passed": true/false, "issues": ["地图/伏笔/设定持久化问题"]}},
+  "de_ai_style_check": {{"passed": true/false, "issues": ["AI感/模板化/解释腔问题"], "rewrite_focus": ["去AI感重写焦点"]}},
   "pacing_check": {{"is_appropriate": true/false, "note": "节奏是否适合当前章节位置"}},
   "long_term_check": {{"has_room_for_future": true/false, "note": "是否为后续剧情留有余地"}},
   "world_consistency_check": {{"is_consistent": true/false, "issues": ["世界观一致性问题"]}},

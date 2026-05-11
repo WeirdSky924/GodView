@@ -5,6 +5,7 @@
 
 import { api } from './client'
 import { getCachedQuery, invalidateQueryCache, type QueryCacheOptions } from './queryCache'
+import type { AssistantContextSummary } from './assistantContext'
 
 const API_BASE = '/outlines'
 
@@ -126,12 +127,15 @@ export interface GenerateOutlineRequest {
   context?: string
   previous_events?: string
   special_requirements?: string[]
+  session_id?: string
+  request_id?: string
 }
 
 export interface GenerateOutlineResponse {
   outline: ChapterOutline
   suggestions: string[]
   warnings: string[]
+  context_packet?: AssistantContextSummary
 }
 
 export interface ValidateOutlineResponse {
@@ -152,6 +156,8 @@ export interface ChatRequest {
   chapter_number: number
   message: string
   context?: Record<string, any>
+  session_id?: string
+  request_id?: string
 }
 
 export interface PendingOutline {
@@ -208,6 +214,8 @@ export interface ChatResponse {
   pending_outlines?: PendingOutline[]
   saved_outline?: ChapterOutline
   saved_outlines?: ChapterOutline[]  // 多章大纲保存
+  assistant_session_id?: string
+  context_packet?: AssistantContextSummary
 }
 
 export type ResourceRequirementSeverity = 'blocking' | 'advisory' | 'optional'
@@ -434,11 +442,15 @@ export async function chatWithAgent(
   projectId: string,
   chapterNumber: number,
   message: string,
-  context?: Record<string, any>
+  context?: Record<string, any>,
+  sessionId?: string,
+  requestId?: string,
 ): Promise<ChatResponse> {
   return await api.post(`${API_BASE}/${chapterNumber}/chat?project_id=${projectId}`, {
     message,
     context,
+    session_id: sessionId,
+    request_id: requestId,
   })
 }
 

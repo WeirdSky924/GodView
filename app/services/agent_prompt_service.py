@@ -46,6 +46,19 @@ class AgentPromptService:
         "validate_long_novel_pacing",
     }
     LONG_NOVEL_RULE_AGENT_TYPES: Set[str] = {"writer", "evaluator", "plot_outline"}
+    SHARED_DE_AI_RULE_IDS: Set[str] = {"style_de_ai_natural_prose"}
+    DE_AI_RULE_SCENARIOS: Set[str] = {
+        "workflow_chapter_generation",
+        "rewrite_by_review",
+        "style_consistency_check",
+        "scene_description",
+        "character_voice_rewrite",
+        "chapter_quality_review",
+        "reader_simulation",
+        "ooc_information_gate",
+        "ooc_review",
+    }
+    DE_AI_RULE_AGENT_TYPES: Set[str] = {"writer", "evaluator"}
 
     def __init__(self, prompt_template_service=None, agent_template_service=None):
         self._prompt_template_service = prompt_template_service
@@ -89,8 +102,10 @@ class AgentPromptService:
         """构建 Agent 模板缓存"""
         for template in SYSTEM_AGENT_TEMPLATES:
             self._template_cache[template.id] = template
-            # 同时按 agent_type 索引
-            self._template_cache[template.agent_type] = template
+            agent_type_value = template.agent_type.value if hasattr(template.agent_type, "value") else str(template.agent_type)
+            # 同时按枚举值字符串索引，保证运行时传入 str/Enum 都能命中；同类型多场景保留第一个默认模板。
+            self._template_cache.setdefault(agent_type_value, template)
+            self._template_cache.setdefault(str(template.agent_type), template)
 
     async def _resolve_template_for_agent(
         self,
@@ -112,11 +127,14 @@ class AgentPromptService:
                     return template
 
             template_service = self._agent_template_service or get_agent_template_service()
-            return await template_service.get_template_by_type(AgentTypeEnum(agent_type), scenario)
+            template = await template_service.get_template_by_type(AgentTypeEnum(agent_type), scenario)
+            if template:
+                return template
         except Exception as e:
             logger.debug(f"解析 AgentTemplate 失败: agent={agent_type}, project={project_id}, scenario={scenario}, error={e}")
 
-        return self.get_agent_template(agent_type)
+        normalized_agent_type = agent_type.value if hasattr(agent_type, "value") else str(agent_type)
+        return self.get_agent_template(normalized_agent_type)
 
     def _build_skill_scope(
         self,
@@ -1285,6 +1303,12 @@ class AgentPromptService:
         scenario = str(payload.get("scenario") or payload.get("context_scene") or payload.get("scene") or "").strip()
         return agent_type in self.LONG_NOVEL_RULE_AGENT_TYPES and scenario in self.LONG_NOVEL_RULE_SCENARIOS
 
+    def _requires_shared_de_ai_rules(self, context: Optional[Dict[str, Any]] = None) -> bool:
+        payload = context or {}
+        agent_type = str(payload.get("agent_type") or "").strip()
+        scenario = str(payload.get("scenario") or payload.get("context_scene") or payload.get("scene") or "").strip()
+        return agent_type in self.DE_AI_RULE_AGENT_TYPES and scenario in self.DE_AI_RULE_SCENARIOS
+
     async def _resolve_missing_shared_long_novel_rules(
         self,
         writing_rule_service,
@@ -1315,6 +1339,41 @@ class AgentPromptService:
         return rules, unresolved_ids
 
     def _serialize_forced_long_novel_rule(self, writing_rule_service, rule: Any) -> Dict[str, Any]:
+        return self._serialize_forced_rule(writing_rule_service, rule, reason="shared_long_novel_core")
+
+    async def _resolve_missing_shared_de_ai_rules(
+        self,
+        writing_rule_service,
+        retrieved_rules: List[Dict[str, Any]],
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[List[Any], List[str]]:
+        """补齐 Writer/Evaluator 必须共用的去AI感自然文风规则。"""
+        if not self._requires_shared_de_ai_rules(context):
+            return [], []
+
+        present_ids = {str(rule.get("id")) for rule in retrieved_rules if rule.get("id")}
+        missing_ids = [
+            rule_id for rule_id in sorted(self.SHARED_DE_AI_RULE_IDS)
+            if rule_id not in present_ids
+        ]
+        if not missing_ids:
+            return [], []
+
+        rules = []
+        unresolved_ids = []
+        for rule_id in missing_ids:
+            rule = await writing_rule_service.get_rule_merged(rule_id)
+            if not rule:
+                unresolved_ids.append(rule_id)
+                continue
+            if writing_rule_service._rule_matches_runtime_context(rule, context):
+                rules.append(rule)
+        return rules, unresolved_ids
+
+    def _serialize_forced_de_ai_rule(self, writing_rule_service, rule: Any) -> Dict[str, Any]:
+        return self._serialize_forced_rule(writing_rule_service, rule, reason="shared_de_ai_core")
+
+    def _serialize_forced_rule(self, writing_rule_service, rule: Any, *, reason: str) -> Dict[str, Any]:
         return {
             "id": rule.id,
             "name": rule.name,
@@ -1323,7 +1382,7 @@ class AgentPromptService:
             "score": 1.0,
             "summary": writing_rule_service._clip_text(rule.content, 180),
             "tags": rule.tags,
-            "reason": "shared_long_novel_core",
+            "reason": reason,
         }
 
     async def build_writing_rules_prompt(
@@ -1423,19 +1482,29 @@ class AgentPromptService:
                 retrieved_rules,
                 context,
             )
+            de_ai_rules, missing_de_ai_rule_ids = await self._resolve_missing_shared_de_ai_rules(
+                writing_rule_service,
+                retrieved_rules,
+                context,
+            )
             forced_rule_payloads = [self._serialize_forced_long_novel_rule(writing_rule_service, rule) for rule in forced_rules]
-            if forced_rule_payloads:
+            de_ai_rule_payloads = [self._serialize_forced_de_ai_rule(writing_rule_service, rule) for rule in de_ai_rules]
+            if forced_rule_payloads or de_ai_rule_payloads:
                 retrieved_ids = {rule.get("id") for rule in retrieved_rules if rule.get("id")}
-                retrieved_rules = [
-                    *retrieved_rules,
-                    *[rule for rule in forced_rule_payloads if rule.get("id") not in retrieved_ids],
-                ]
+                missing_payloads = []
+                for rule in [*forced_rule_payloads, *de_ai_rule_payloads]:
+                    if rule.get("id") not in retrieved_ids:
+                        retrieved_ids.add(rule.get("id"))
+                        missing_payloads.append(rule)
+                retrieved_rules = [*retrieved_rules, *missing_payloads]
             always_rule_ids = retrieval.get("always_rules", [])
             trace.update({
                 "writing_rule_ids": [rule.get("id") for rule in retrieved_rules if rule.get("id")],
                 "always_rule_ids": always_rule_ids,
                 "shared_long_novel_rule_ids": [rule.id for rule in forced_rules],
                 "missing_shared_long_novel_rule_ids": missing_shared_rule_ids,
+                "shared_de_ai_rule_ids": [rule.id for rule in de_ai_rules],
+                "missing_shared_de_ai_rule_ids": missing_de_ai_rule_ids,
                 "retrieved_rules": [
                     {
                         "id": rule.get("id"),
@@ -1466,6 +1535,12 @@ class AgentPromptService:
                 if long_novel_guidance:
                     lines.append("\n## 共享长篇网文核心规则")
                     lines.append(long_novel_guidance)
+
+            if de_ai_rules:
+                de_ai_guidance = writing_rule_service.build_always_rule_guidance(de_ai_rules)
+                if de_ai_guidance:
+                    lines.append("\n## 共享去AI感自然文风规则")
+                    lines.append(de_ai_guidance)
 
             return {"content": "\n".join(lines), "trace": trace}
         except Exception as e:

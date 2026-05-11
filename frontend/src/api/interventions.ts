@@ -1,4 +1,5 @@
 import { api } from './client'
+import type { AssistantContextSummary } from './assistantContext'
 
 // ==================== Legacy Types (保留旧接口) ====================
 
@@ -69,6 +70,8 @@ export interface V8InterventionCreate {
   node_id?: string
   agent_type: string
   message: string
+  assistant_session_id?: string
+  request_id?: string
 }
 
 export interface V8InterventionQuery {
@@ -148,6 +151,8 @@ export async function sendV8Intervention(
   response_time_ms?: number
   intervention_id?: string
   intervention_type?: V8InterventionType
+  assistant_session_id?: string | null
+  context_packet?: AssistantContextSummary | null
 }> {
   return await api.post('/interventions', data)
 }
@@ -207,9 +212,13 @@ export async function getMessageHistory(
 ): Promise<Array<{
   id: string
   agent_type: string
-  message: string
+  message?: string
+  user_message?: string
   response?: string
+  agent_response?: string
   timestamp: string
+  assistant_session_id?: string | null
+  context_packet?: AssistantContextSummary | null
 }>> {
   return await api.get(`/interventions/history/${executionId}`, {
     params: { agent_type: agentType },

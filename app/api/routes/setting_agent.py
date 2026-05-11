@@ -333,26 +333,6 @@ async def get_lore_summary(project_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/{project_id}/history")
-async def get_conversation_history(project_id: str, limit: int = 50):
-    """
-    获取 Setting Agent 对话历史
-    """
-    service = get_setting_agent_service()
-
-    try:
-        session = await service.get_or_create_session(project_id)
-        history = session.conversation_history[-limit:]
-        return {
-            "project_id": project_id,
-            "session_id": session.id,
-            "history": history,
-            "total": len(session.conversation_history),
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @router.get("/{project_id}/conflicts")
 async def get_pending_conflicts(project_id: str):
     """
@@ -367,26 +347,6 @@ async def get_pending_conflicts(project_id: str):
             "pending_conflicts": [c.model_dump() for c in session.pending_conflicts],
             "count": len(session.pending_conflicts),
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/{project_id}/session")
-async def create_or_get_session(project_id: str, mode: str = "management"):
-    """
-    创建或获取 Setting Agent 会话
-    """
-    service = get_setting_agent_service()
-
-    try:
-        agent_mode = SettingAgentMode(mode)
-        session = await service.get_or_create_session(project_id, agent_mode)
-        return {
-            "success": True,
-            "session": session.model_dump(),
-        }
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid mode: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

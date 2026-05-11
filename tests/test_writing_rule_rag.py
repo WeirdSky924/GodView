@@ -43,6 +43,9 @@ class _FakeRuleService:
     def has_meaningful_retrieval_context(self, context=None) -> bool:
         return True
 
+    def _filter_rules_by_runtime_context(self, rules, context=None):
+        return list(rules)
+
     def build_always_rule_guidance(self, rules):
         return ""
 

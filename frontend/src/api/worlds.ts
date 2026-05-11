@@ -1,4 +1,5 @@
 import { api } from './client'
+import type { AssistantContextSummary } from './assistantContext'
 
 export interface World {
   id?: string
@@ -98,6 +99,36 @@ export type UpdateRegionDTO = Partial<CreateRegionDTO> & {
   name: string
 }
 
+export interface WorldMapAgentGenerateRequest {
+  project_id: string
+  world_id: string
+  message: string
+  task?: 'create_draft' | 'match_or_generate' | 'query' | 'overview'
+  selected_region_id?: string
+  generation_count?: number
+  include_existing_regions?: boolean
+  assistant_session_id?: string
+  request_id?: string
+}
+
+export interface WorldMapAgentDraftRegion extends CreateRegionDTO {
+  client_id: string
+  importance?: string
+  validation_warnings?: string[]
+}
+
+export interface WorldMapAgentGenerateResponse {
+  success: boolean
+  message?: string
+  overview?: string
+  suggested_starting_location?: string
+  draft_regions: WorldMapAgentDraftRegion[]
+  matched_existing_region_ids?: string[]
+  assistant_session_id?: string | null
+  context_packet?: AssistantContextSummary | null
+  metadata?: Record<string, unknown>
+}
+
 export async function getWorlds(projectId?: string) {
   const params = projectId ? { project_id: projectId } : {}
   return await api.get<World[]>('/worlds', { params })
@@ -137,4 +168,8 @@ export async function updateRegion(worldId: string, regionId: string, data: Upda
 
 export async function deleteRegion(worldId: string, regionId: string) {
   return await api.delete<{ success: boolean; id: string; message: string }>(`/worlds/${worldId}/regions/${regionId}`)
+}
+
+export async function generateWorldMapDrafts(worldId: string, data: WorldMapAgentGenerateRequest) {
+  return await api.post<WorldMapAgentGenerateResponse>(`/worlds/${worldId}/agent/generate`, data)
 }

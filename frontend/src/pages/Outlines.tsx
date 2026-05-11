@@ -6,6 +6,8 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Card, Button, Input } from '@/components/ui'
 import PageLayout from '@/components/PageLayout'
+import AssistantContextControls from '@/components/assistant/AssistantContextControls'
+import { createAssistantSession, getAssistantHistory, type AssistantContextSummary } from '@/api/assistantContext'
 import { getCharacters, type Character } from '@/api/characters'
 import { getLoreList, type LoreEntry } from '@/api/lore'
 import { getRegions, getWorlds, type Region } from '@/api/worlds'
@@ -118,6 +120,8 @@ export default function Outlines() {
   const [chatMessages, setChatMessages] = useState<Array<{ role: 'user' | 'assistant'; content: string }>>([])
   const [chatInput, setChatInput] = useState('')
   const [sendingMessage, setSendingMessage] = useState(false)
+  const [assistantSessionId, setAssistantSessionId] = useState<string | null>(null)
+  const [contextPacket, setContextPacket] = useState<AssistantContextSummary | null>(null)
 
   // 编辑状态
   const [showSceneEditor, setShowSceneEditor] = useState(false)
@@ -218,6 +222,7 @@ export default function Outlines() {
       setRevisionNotice(null)
       await loadResourceStatus(outline.chapter_number, outline.id)
       await loadOutlineVersions(outline.chapter_number)
+      await loadOutlineAssistantSession(outline.chapter_number)
     } catch (error) {
       console.error('Failed to load outline version:', error)
       alert('加载大纲版本失败')
@@ -241,6 +246,28 @@ export default function Outlines() {
       loadOutlines()
     }
   }, [currentProject?.id])
+
+  const loadOutlineAssistantSession = async (chapterNumber: number) => {
+    if (!currentProject?.id) return
+    const storageKey = `plotOutlineAgentSession:${currentProject.id}:${chapterNumber}`
+    const storedSessionId = localStorage.getItem(storageKey) || undefined
+    try {
+      const session = await createAssistantSession(currentProject.id, {
+        assistant_surface: 'plot_outline_agent',
+        mode: `chapter:${chapterNumber}`,
+        session_id: storedSessionId,
+        scope: { chapter_number: chapterNumber, entry: 'outlines' },
+      })
+      setAssistantSessionId(session.session_id)
+      localStorage.setItem(storageKey, session.session_id)
+      const history = await getAssistantHistory(currentProject.id, session.session_id, 80)
+      setChatMessages(history.messages
+        .filter(message => message.role === 'user' || message.role === 'assistant')
+        .map(message => ({ role: message.role as 'user' | 'assistant', content: message.content })))
+    } catch (error) {
+      console.error('Failed to load outline assistant session:', error)
+    }
+  }
 
   const loadOutlines = async () => {
     if (!currentProject?.id) return
@@ -563,7 +590,13 @@ export default function Outlines() {
     setChatMessages(prev => [...prev, { role: 'user' as const, content: message }])
 
     try {
-      const response = await chatWithAgent(currentProject.id, chapterNumber, message)
+      const requestId = `outline_chat_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+      const response = await chatWithAgent(currentProject.id, chapterNumber, message, undefined, assistantSessionId || undefined, requestId)
+      if (response.assistant_session_id) {
+        setAssistantSessionId(response.assistant_session_id)
+        localStorage.setItem(`plotOutlineAgentSession:${currentProject.id}:${chapterNumber}`, response.assistant_session_id)
+      }
+      if (response.context_packet) setContextPacket(response.context_packet)
       setChatMessages(prev => [...prev, { role: 'assistant' as const, content: response.message }])
 
       // 处理多章大纲保存
@@ -1392,6 +1425,28 @@ export default function Outlines() {
                 <X className="w-4 h-4" />
               </Button>
             </div>
+
+            {currentProject?.id && (
+              <div className={`p-3 border-b ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+                <AssistantContextControls
+                  projectId={currentProject.id}
+                  sessionId={assistantSessionId}
+                  assistantSurface="plot_outline_agent"
+                  mode={`chapter:${selectedChapter || 1}`}
+                  scope={{ chapter_number: selectedChapter || 1, entry: 'outlines' }}
+                  contextPacket={contextPacket}
+                  compact
+                  onHistoryReset={(newSessionId) => {
+                    setAssistantSessionId(newSessionId)
+                    setChatMessages([])
+                    if (selectedChapter) {
+                      localStorage.setItem(`plotOutlineAgentSession:${currentProject.id}:${selectedChapter}`, newSessionId)
+                    }
+                  }}
+                  onRereadComplete={(response) => setContextPacket(response.packet_metadata)}
+                />
+              </div>
+            )}
 
             {/* 快捷命令 */}
             <div className={`p-3 border-b ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>

@@ -8,6 +8,8 @@ import { useParams, useNavigate } from 'react-router-dom'
 import { Bot, FileText, Upload, CheckCircle, AlertCircle, Loader, MessageSquare, Globe } from 'lucide-react'
 import { startBootstrap, getBootstrapSession, sendBootstrapMessage, uploadOutline, confirmSeed, runBootstrap, getBootstrapStatus, finalizeSetting, type BootstrapSession, type SeedData } from '@/api/bootstrap'
 import { getProjects, createProject, type Project } from '@/api/projects'
+import { createAssistantSession, getAssistantHistory, type AssistantContextSummary } from '@/api/assistantContext'
+import AssistantContextControls from '@/components/assistant/AssistantContextControls'
 import SeedConfirmDialog from '@/components/bootstrap/SeedConfirmDialog'
 
 type BootstrapStage = 'project_select' | 'setting_agent' | 'outline_input' | 'seed_confirmation' | 'running' | 'completed'
@@ -15,6 +17,7 @@ type BootstrapStage = 'project_select' | 'setting_agent' | 'outline_input' | 'se
 const bootstrapSessionStorageKey = (projectId: string) => `bootstrapSession:${projectId}`
 const bootstrapStartRequestStorageKey = (projectId: string) => `bootstrapRequest:${projectId}:start`
 const bootstrapRunRequestStorageKey = (sessionId: string) => `bootstrapRequest:${sessionId}:run`
+const bootstrapAssistantSessionStorageKey = (projectId: string, sessionId: string) => `bootstrapAssistantSession:${projectId}:${sessionId}`
 const createRequestId = (prefix: string) => `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`
 
 export default function BootstrapPage() {
@@ -38,6 +41,8 @@ export default function BootstrapPage() {
 
   const [showSeedConfirm, setShowSeedConfirm] = useState(false)
   const [seedData, setSeedData] = useState<SeedData | null>(null)
+  const [assistantSessionId, setAssistantSessionId] = useState<string | null>(null)
+  const [contextPacket, setContextPacket] = useState<AssistantContextSummary | null>(null)
 
   // 加载项目列表
   useEffect(() => {
@@ -67,11 +72,40 @@ export default function BootstrapPage() {
       const sessionData = await getBootstrapSession(id)
       setSession(sessionData)
       updateStageFromSession(sessionData)
+      await loadBootstrapAssistantSession(sessionData)
     } catch (err) {
       console.error('Failed to load session:', err)
       setError('加载会话失败')
     } finally {
       setLoading(false)
+    }
+  }
+
+  const loadBootstrapAssistantSession = async (sessionData: BootstrapSession) => {
+    const storageKey = bootstrapAssistantSessionStorageKey(sessionData.project_id, sessionData.id)
+    const storedSessionId = localStorage.getItem(storageKey) || undefined
+    try {
+      const assistantSession = await createAssistantSession(sessionData.project_id, {
+        assistant_surface: 'bootstrap_setting_agent',
+        mode: `bootstrap:${sessionData.id}`,
+        session_id: storedSessionId,
+        scope: { bootstrap_session_id: sessionData.id, entry: 'bootstrap' },
+      })
+      setAssistantSessionId(assistantSession.session_id)
+      localStorage.setItem(storageKey, assistantSession.session_id)
+
+      const history = await getAssistantHistory(sessionData.project_id, assistantSession.session_id, 80)
+      const assistantMessages = history.messages
+        .filter((message) => message.role === 'user' || message.role === 'assistant')
+        .map((message) => ({ role: message.role, content: message.content, timestamp: message.created_at, metadata: message.metadata }))
+      if (assistantMessages.length > 0) {
+        setSession((current) => current && current.id === sessionData.id
+          ? { ...current, setting_agent_history: assistantMessages }
+          : current)
+      }
+      if (history.context_packet) setContextPacket(history.context_packet)
+    } catch (err) {
+      console.error('Failed to load bootstrap assistant session:', err)
     }
   }
 
@@ -100,6 +134,7 @@ export default function BootstrapPage() {
       const sessionData = await getBootstrapSession(storedSessionId)
       setSession(sessionData)
       updateStageFromSession(sessionData)
+      await loadBootstrapAssistantSession(sessionData)
       return sessionData
     } catch (err) {
       localStorage.removeItem(bootstrapSessionStorageKey(projectId))
@@ -122,6 +157,7 @@ export default function BootstrapPage() {
     const newSession = result.session
     localStorage.setItem(bootstrapSessionStorageKey(projectId), newSession.id)
     setSession(newSession)
+    await loadBootstrapAssistantSession(newSession)
     setStage('setting_agent')
     navigate(`/bootstrap/${newSession.id}`)
     return newSession
@@ -176,7 +212,17 @@ export default function BootstrapPage() {
 
     setLoading(true)
     try {
-      await sendBootstrapMessage(session.id, userMessage, session.project_id)
+      const requestId = createRequestId('bootstrap_chat')
+      const result = await sendBootstrapMessage(session.id, userMessage, session.project_id, {
+        assistantSessionId: assistantSessionId || undefined,
+        requestId,
+      })
+      const response = result.response
+      if (response.assistant_session_id) {
+        setAssistantSessionId(response.assistant_session_id)
+        localStorage.setItem(bootstrapAssistantSessionStorageKey(session.project_id, session.id), response.assistant_session_id)
+      }
+      if (response.context_packet) setContextPacket(response.context_packet)
       const updatedSession = await getBootstrapSession(session.id)
       setSession(updatedSession)
       setUserMessage('')
@@ -290,7 +336,15 @@ export default function BootstrapPage() {
 
     setLoading(true)
     try {
-      const result = await finalizeSetting(session.id)
+      const result = await finalizeSetting(session.id, {
+        assistantSessionId: assistantSessionId || undefined,
+        requestId: createRequestId('bootstrap_finalize'),
+      })
+      if (result.assistant_session_id) {
+        setAssistantSessionId(result.assistant_session_id)
+        localStorage.setItem(bootstrapAssistantSessionStorageKey(session.project_id, session.id), result.assistant_session_id)
+      }
+      if (result.context_packet) setContextPacket(result.context_packet)
       if (result.success && result.seed_data) {
         setSeedData(result.seed_data)
         setSession(result.session)
@@ -395,6 +449,27 @@ export default function BootstrapPage() {
           <MessageSquare className="w-5 h-5 text-gray-500" />
           <h2 className="font-medium text-gray-800">与设定 Agent 对话</h2>
         </div>
+
+        {session && (
+          <div className="mb-4">
+            <AssistantContextControls
+              projectId={session.project_id}
+              sessionId={assistantSessionId}
+              assistantSurface="bootstrap_setting_agent"
+              mode={`bootstrap:${session.id}`}
+              scope={{ bootstrap_session_id: session.id, entry: 'bootstrap' }}
+              contextPacket={contextPacket}
+              compact
+              onHistoryReset={(newSessionId) => {
+                setAssistantSessionId(newSessionId)
+                setContextPacket(null)
+                setSession((current) => current ? { ...current, setting_agent_history: [] } : current)
+                localStorage.setItem(bootstrapAssistantSessionStorageKey(session.project_id, session.id), newSessionId)
+              }}
+              onRereadComplete={(response) => setContextPacket(response.packet_metadata)}
+            />
+          </div>
+        )}
 
         <div className="mb-6 p-4 bg-gray-50 rounded-lg border border-gray-200">
           <div className="text-sm text-gray-600 mb-2">Agent 提示：</div>

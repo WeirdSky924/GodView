@@ -4,6 +4,7 @@
  */
 
 import { api as apiClient } from './client';
+import type { AssistantContextSummary } from './assistantContext';
 
 // ==================== 类型定义 ====================
 
@@ -62,14 +63,46 @@ export interface PlanVolumeRequest {
   theme?: string;
   total_chapters?: number;
   genre?: string;
+  book_outline?: string;
+  previous_volume_summary?: string;
+  target_words?: number;
+  assistant_session_id?: string;
+  request_id?: string;
 }
 
 export interface DesignClimaxRequest {
   project_id: string;
   volume_number: number;
-  emotional_peak?: number;
+  volume_id?: string;
+  climax_event?: string;
+  emotional_peak?: string | number;
   key_characters?: string[];
+  participating_characters?: string[];
   conflict_resolution?: string;
+  assistant_session_id?: string;
+  request_id?: string;
+}
+
+export interface VolumePlanResponse {
+  success: boolean;
+  volume_info: Record<string, any>;
+  emotional_arc: Record<string, any>;
+  climax_design: Record<string, any>;
+  chapter_plan: Array<Record<string, any>>;
+  transitions: Record<string, any>;
+  word_distribution: Record<string, any>;
+  assistant_session_id?: string | null;
+  context_packet?: AssistantContextSummary | null;
+}
+
+export interface ClimaxDesignResponse {
+  success: boolean;
+  climax_chapter: number;
+  climax_description: string;
+  buildup_scenes: Array<Record<string, any>>;
+  aftermath_scenes: Array<Record<string, any>>;
+  assistant_session_id?: string | null;
+  context_packet?: AssistantContextSummary | null;
 }
 
 // ==================== API 函数 ====================
@@ -95,7 +128,7 @@ export async function createVolume(data: CreateVolumeRequest): Promise<VolumeOut
 /**
  * AI 规划卷大纲
  */
-export async function planVolume(data: PlanVolumeRequest): Promise<VolumeOutline> {
+export async function planVolume(data: PlanVolumeRequest): Promise<VolumePlanResponse> {
   const response = await apiClient.post('/volumes/plan', data);
   return response.data;
 }
@@ -124,13 +157,13 @@ export async function updateVolume(volumeNumber: number, projectId: string, data
 /**
  * 设计卷高潮
  */
-export async function designClimax(data: DesignClimaxRequest): Promise<{
-  climax_description: string;
-  climax_chapter: number;
-  emotional_arc: EmotionArcPoint[];
-  key_events: KeyEvent[];
-}> {
-  const response = await apiClient.post(`/volumes/${data.volume_number}/climax`, data);
+export async function designClimax(data: DesignClimaxRequest): Promise<ClimaxDesignResponse> {
+  const response = await apiClient.post(`/volumes/${data.volume_number}/climax`, {
+    ...data,
+    volume_id: data.volume_id || `volume_${data.volume_number}`,
+    climax_event: data.climax_event || data.conflict_resolution || '',
+    participating_characters: data.participating_characters || data.key_characters || [],
+  });
   return response.data;
 }
 

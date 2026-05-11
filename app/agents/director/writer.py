@@ -26,7 +26,6 @@ from app.models.agent_output_schemas import (
 from app.models.agent_template import AgentType
 from app.models.token_usage import UsageCategory
 from app.services.structured_llm import StructuredOutputError
-from app.services.writing_rule_rag import get_writing_rule_rag_service
 
 logger = logging.getLogger(__name__)
 
@@ -354,12 +353,19 @@ class WriterAgent(BaseAgent):
             return ""
 
         try:
-            result = await get_writing_rule_rag_service().retrieve_for_project(
+            from app.services.agent_prompt_service import get_agent_prompt_service
+
+            rule_context = dict(context or {})
+            scenario = str(rule_context.get("scenario") or "workflow_chapter_generation")
+            rule_context.setdefault("agent_type", self.AGENT_TYPE.value if hasattr(self.AGENT_TYPE, "value") else str(self.AGENT_TYPE))
+            rule_context.setdefault("scenario", scenario)
+            result = await get_agent_prompt_service().build_writing_rules_prompt_with_trace(
                 project_id=self.project_id,
-                context=context or {},
-                limit=limit,
+                context=rule_context,
+                agent_type=rule_context.get("agent_type"),
+                scenario=scenario,
             )
-            return (result.get("rendered_guidance") or "").strip()
+            return (result.get("content") or "").strip()
         except Exception as e:
             logger.warning(f"写作规则检索失败: {e}")
             return ""

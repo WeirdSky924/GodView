@@ -1,9 +1,10 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { Edit2, Link2, MapPin, Plus, Search, Trash2, Users } from 'lucide-react'
+import { Bot, Edit2, Link2, MapPin, Plus, Search, Trash2, Users } from 'lucide-react'
 
 import PageLayout from '@/components/PageLayout'
 import MapView from '@/components/world/MapView'
+import WorldMapAgentDrawer from '@/components/world/WorldMapAgentDrawer'
 import { useProject } from '@/contexts/ProjectContext'
 import { getCharacters, type Character } from '@/api/characters'
 import { useProjectWorlds } from '@/hooks/useProjectWorlds'
@@ -123,6 +124,7 @@ export default function WorldMap() {
   const [filterRegionType, setFilterRegionType] = useState('')
   const [filterTerrainType, setFilterTerrainType] = useState('')
   const [showModal, setShowModal] = useState(false)
+  const [showAgentDrawer, setShowAgentDrawer] = useState(false)
   const [editingRegion, setEditingRegion] = useState<Region | null>(null)
   const [formData, setFormData] = useState<RegionFormState>(emptyForm)
   const [pendingRequirement, setPendingRequirement] = useState<OutlineResourceRequirement | null>(null)
@@ -277,6 +279,46 @@ export default function WorldMap() {
     openCreateModal(focusedRequirement)
   }, [shouldAutoCreateFromRequirement, focusedRequirement, showModal, pendingRequirement, selectedWorldId])
 
+  const openCreateModalFromDraft = (draft: CreateRegionDTO) => {
+    setEditingRegion(null)
+    setFormData({
+      ...emptyForm,
+      name: draft.name || '',
+      region_type: draft.region_type || 'custom',
+      terrain_type: draft.terrain_type || 'custom',
+      description: draft.description || '',
+      atmosphere: draft.atmosphere || '',
+      x: typeof draft.coordinates?.x === 'number' ? String(draft.coordinates.x) : '',
+      y: typeof draft.coordinates?.y === 'number' ? String(draft.coordinates.y) : '',
+      connections: draft.connections || [],
+      terrain_features_text: stringifyItems(draft.terrain_features),
+      landmarks_text: stringifyItems(draft.landmarks),
+    })
+    setPendingRequirement(null)
+    setShowModal(true)
+  }
+
+  const createRegionFromDraft = async (draft: CreateRegionDTO) => {
+    if (!selectedWorldId || !draft.name.trim()) return
+    const result = await createRegion(selectedWorldId, {
+      ...draft,
+      name: draft.name.trim(),
+      region_type: draft.region_type || 'custom',
+      terrain_type: draft.terrain_type || 'custom',
+      coordinates: draft.coordinates || {},
+      area_size: draft.area_size || 0,
+      terrain_features: draft.terrain_features || [],
+      landmarks: draft.landmarks || [],
+      encounters: draft.encounters || [],
+      connections: draft.connections || [],
+      local_rules: draft.local_rules || [],
+      is_generated: true,
+      visit_count: draft.visit_count || 0,
+    })
+    if (result.id) setSelectedRegionId(result.id)
+    await loadRegions()
+  }
+
   const openEditModal = (region: Region) => {
     setEditingRegion(region)
     setFormData({
@@ -362,14 +404,24 @@ export default function WorldMap() {
   const selectedRegionCharacters = selectedRegion?.id ? charactersByRegion.get(selectedRegion.id) || [] : []
 
   const actions = (
-    <button
-      onClick={() => openCreateModal()}
-      disabled={!selectedWorldId}
-      className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:bg-gray-300 flex items-center gap-2"
-    >
-      <Plus className="w-4 h-4" />
-      新建区域
-    </button>
+    <>
+      <button
+        onClick={() => setShowAgentDrawer(true)}
+        disabled={!selectedWorldId}
+        className="px-4 py-2 border border-amber-300 bg-amber-50 text-amber-900 rounded-lg hover:bg-amber-100 disabled:bg-gray-100 disabled:text-gray-400 disabled:border-gray-200 flex items-center gap-2"
+      >
+        <Bot className="w-4 h-4" />
+        地图 Agent
+      </button>
+      <button
+        onClick={() => openCreateModal()}
+        disabled={!selectedWorldId}
+        className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:bg-gray-300 flex items-center gap-2"
+      >
+        <Plus className="w-4 h-4" />
+        新建区域
+      </button>
+    </>
   )
 
   return (
@@ -572,6 +624,20 @@ export default function WorldMap() {
             </aside>
           </div>
         </div>
+      )}
+
+      {currentProject && (
+        <WorldMapAgentDrawer
+          open={showAgentDrawer}
+          onClose={() => setShowAgentDrawer(false)}
+          projectId={currentProject.id}
+          worldId={selectedWorldId}
+          worldName={worlds.find(world => world.id === selectedWorldId)?.name}
+          regions={regions}
+          selectedRegion={selectedRegion}
+          onCreateDraft={createRegionFromDraft}
+          onOpenDraftInEditor={openCreateModalFromDraft}
+        />
       )}
 
       {showModal && (

@@ -105,6 +105,7 @@ export default function Worlds() {
 
   const [worlds, setWorlds] = useState<World[]>([])
   const [worldId, setWorldId] = useState<string | null>(null)
+  const [draftingNewWorld, setDraftingNewWorld] = useState(false)
   const [formData, setFormData] = useState<WorldFormData>(defaultFormData)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -114,6 +115,7 @@ export default function Worlds() {
     if (!currentProject?.id) {
       setWorlds([])
       setWorldId(null)
+      setDraftingNewWorld(false)
       setFormData({ ...defaultFormData })
       setLoading(false)
       return
@@ -123,6 +125,9 @@ export default function Worlds() {
     try {
       const data = sortWorldsForDisplay(await getWorlds(currentProject.id))
       setWorlds(data)
+      if (draftingNewWorld) {
+        return
+      }
       const selected = data.find(world => world.id === worldId) || data.find(world => world.id === currentProject.world_id) || data.find(world => world.is_default) || data[0]
       if (selected) {
         setWorldId(selected.id || null)
@@ -136,18 +141,20 @@ export default function Worlds() {
     } finally {
       setLoading(false)
     }
-  }, [currentProject?.id, currentProject?.world_id, worldId])
+  }, [currentProject?.id, currentProject?.world_id, worldId, draftingNewWorld])
 
   useEffect(() => {
     loadWorlds()
   }, [loadWorlds])
 
   const selectWorld = (world: World) => {
+    setDraftingNewWorld(false)
     setWorldId(world.id || null)
     setFormData(worldToFormData(world))
   }
 
   const createBlankWorld = (parentWorldId?: string) => {
+    setDraftingNewWorld(true)
     setWorldId(null)
     setFormData({
       ...defaultFormData,
@@ -173,10 +180,11 @@ export default function Worlds() {
         parent_world_id: formData.parent_world_id || null,
       }
 
-      if (worldId) {
+      if (worldId && !draftingNewWorld) {
         await updateWorld(worldId, data as UpdateWorldDTO)
       } else {
         const newWorld = await createWorld(data as CreateWorldDTO)
+        setDraftingNewWorld(false)
         setWorldId(newWorld.id || null)
       }
       await loadWorlds()

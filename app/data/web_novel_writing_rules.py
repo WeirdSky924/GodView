@@ -200,6 +200,24 @@ WEB_NOVEL_WRITING_RULES: List[Dict[str, Any]] = [
         ]
     },
     {
+        "id": "style_de_ai_natural_prose",
+        "name": "去AI感自然文风",
+        "description": "消除模板化、解释腔和助手式口吻，让正文像具体场景而不是生成摘要",
+        "category": "style",
+        "severity": "required",
+        "application_mode": "always_postcheck",
+        "tags": ["风格", "去AI感", "自然化", "文笔", "核心"],
+        "content": "正文必须消除明显 AI 感和模板化表达，读起来应像人物正在经历场景，而不是旁白在总结一段设定。\n\n硬性禁忌：\n1. 禁止助手式、作文式、报告式表达，例如「这不仅是……更是……」「与此同时……也意味着……」「在这一刻，他终于明白……」连续出现。\n2. 禁止用抽象标签替代画面，例如只写「复杂的情绪翻涌」「一种难以言说的感觉」「空气中弥漫着紧张气氛」。\n3. 禁止段落节奏过度工整：连续用同一种开头、同一种三段式排比、同一种总结句收尾。\n4. 禁止对话像设定说明书：角色不应把双方已知的信息完整解释给对方。\n5. 禁止所有角色使用同一种冷静、完整、漂亮的解释腔。\n\n自然化要求：\n1. 用动作、停顿、错词、回避、打断、身体反应和环境反馈承载情绪。\n2. 每个主要角色的句子长度、用词习惯、回避方式和攻击性都要不同。\n3. 叙述要保留生活噪音和不完美反应，不要把每段都磨成整齐结论。\n4. 情绪高点优先给读者看见具体后果，而不是替读者解释感受。\n5. 输出前自检：删掉可有可无的总结句、套话转折和抽象情绪名词。",
+        "examples": [
+            "【AI感】这一刻，林默终于明白，这不仅是一场战斗，更是他命运的转折点。\n【自然】林默盯着掌心的血。三秒后，他把通讯器捏碎，声音低得几乎听不见：「开门。」",
+            "【AI感】她的内心充满了复杂的情绪，既害怕又坚定。\n【自然】她把门锁拧了两次。第二次没拧动，才发现自己的手一直在抖。"
+        ],
+        "counter_examples": [
+            "空气中弥漫着一种无法言说的紧张感，仿佛所有人都意识到，真正的危机才刚刚开始。",
+            "他知道，自己必须做出选择。这不仅关系到他的未来，也关系到整个世界的命运。"
+        ]
+    },
+    {
         "id": "style_web_novel_pace",
         "name": "网文快节奏",
         "description": "保持紧凑的叙事节奏，不拖沓",
@@ -530,6 +548,7 @@ WEB_NOVEL_RULE_SETS: List[Dict[str, Any]] = [
             "structure_golden_opening",
             "structure_chapter_hook",
             "style_show_dont_tell",
+            "style_de_ai_natural_prose",
             "character_protagonist_consistency",
             "plot_satisfaction_density",
             "long_novel_slow_burn_pacing",
@@ -554,6 +573,7 @@ WEB_NOVEL_RULE_SETS: List[Dict[str, Any]] = [
             "structure_golden_three_chapters",
             "structure_plot_twist",
             "style_web_novel_pace",
+            "style_de_ai_natural_prose",
             "character_villain_smart",
             "plot_golden_finger_reasonable",
             "plot_face_slapping_technique",

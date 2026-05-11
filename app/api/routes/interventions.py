@@ -135,6 +135,9 @@ async def send_intervention(request: InterventionCreate):
             message=request.message,
             project_id=request.project_id,
             node_id=request.node_id,
+            assistant_session_id=request.assistant_session_id,
+            request_id=request.request_id,
+            db=db,
         )
 
         return {
@@ -145,6 +148,8 @@ async def send_intervention(request: InterventionCreate):
             "response_time_ms": result.get("response_time_ms"),
             "intervention_id": result.get("intervention_id"),
             "intervention_type": result.get("intervention_type"),
+            "assistant_session_id": result.get("assistant_session_id"),
+            "context_packet": result.get("context_packet"),
         }
     except Exception as e:
         logger.error(f"发送干预消息失败: {e}")
@@ -338,8 +343,48 @@ async def get_message_history(
         List: 消息历史
     """
     comm_service = get_agent_communication_service()
+    db = get_db()
 
     try:
+        if db:
+            from app.services.assistant_context import get_assistant_context_fabric
+
+            mode_filter = f"execution:{execution_id}:agent:{agent_type}" if agent_type else f"execution:{execution_id}:agent:%"
+            sessions = await db.execute_query(
+                """
+                SELECT * FROM assistant_sessions
+                WHERE assistant_surface = 'workflow_intervention'
+                  AND mode LIKE :mode
+                ORDER BY updated_at DESC NULLS LAST, created_at DESC
+                LIMIT 20
+                """,
+                {"mode": mode_filter},
+            )
+            fabric = get_assistant_context_fabric(db)
+            rows = []
+            for session in sessions:
+                messages = await fabric.sessions.get_history(session["id"], limit=200)
+                for user_msg in [m for m in messages if m.get("role") == "user"]:
+                    assistant_msg = next(
+                        (
+                            m for m in messages
+                            if m.get("role") == "assistant"
+                            and m.get("request_id") == user_msg.get("request_id")
+                        ),
+                        None,
+                    )
+                    rows.append({
+                        "id": user_msg.get("id"),
+                        "agent_type": (session.get("session_state") or {}).get("scope", {}).get("agent_type") or agent_type or "",
+                        "message": user_msg.get("content"),
+                        "response": assistant_msg.get("content") if assistant_msg else None,
+                        "timestamp": str(user_msg.get("created_at")),
+                        "assistant_session_id": session.get("id"),
+                        "context_packet": {"packet_id": user_msg.get("packet_id"), "snapshot_id": user_msg.get("snapshot_id")} if user_msg.get("packet_id") else None,
+                    })
+            if rows:
+                return sorted(rows, key=lambda item: item.get("timestamp") or "")
+
         history = comm_service.get_message_history(execution_id, agent_type)
         return history
     except Exception as e:

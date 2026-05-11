@@ -157,6 +157,8 @@ async def send_message(request: SendMessageRequest):
             session_id=request.session_id,
             message=request.message,
             project_id=request.project_id,
+            assistant_session_id=request.assistant_session_id,
+            request_id=request.request_id,
         )
         return {
             "success": True,
@@ -376,7 +378,7 @@ async def get_messages(session_id: str, limit: int = Query(default=50, le=200)):
 # ==================== 结束设定并提取 Seed ====================
 
 @router.post("/{session_id}/finalize-setting", response_model=Dict[str, Any])
-async def finalize_setting(session_id: str):
+async def finalize_setting(session_id: str, body: Optional[Dict[str, Any]] = Body(default=None)):
     """
     结束设定阶段并强制提取 Seed
 
@@ -392,13 +394,20 @@ async def finalize_setting(session_id: str):
 
     try:
         orchestrator = get_bootstrap_orchestrator()
-        result = await orchestrator.finalize_setting(session_id)
+        body = body or {}
+        result = await orchestrator.finalize_setting(
+            session_id,
+            assistant_session_id=body.get("assistant_session_id"),
+            request_id=body.get("request_id"),
+        )
 
         return {
             "success": True,
             "message": "设定阶段结束，Seed 已提取",
             "seed_data": result.get("seed_data"),
             "session": result.get("session"),
+            "assistant_session_id": result.get("assistant_session_id"),
+            "context_packet": result.get("context_packet"),
         }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

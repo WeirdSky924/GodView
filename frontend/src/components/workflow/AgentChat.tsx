@@ -1,7 +1,9 @@
 import { useState, useRef, useEffect } from 'react'
 import { useTheme } from '@/contexts/ThemeContext'
 import { sendV8Intervention, getMessageHistory } from '@/api/interventions'
+import { createAssistantSession, getAssistantHistory, type AssistantContextSummary } from '@/api/assistantContext'
 import { getAgentTypeOptions, getWorkflowNodeTypes, type WorkflowNodeTypes } from '@/api/nodeTypes'
+import AssistantContextControls from '@/components/assistant/AssistantContextControls'
 import {
   MessageSquare,
   Send,
@@ -37,12 +39,16 @@ export default function AgentChat({
   const [selectedAgent, setSelectedAgent] = useState('')
   const [message, setMessage] = useState('')
   const [messages, setMessages] = useState<Message[]>([])
+  const [assistantSessionId, setAssistantSessionId] = useState<string | null>(null)
+  const [contextPacket, setContextPacket] = useState<AssistantContextSummary | null>(null)
   const [sending, setSending] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [nodeTypes, setNodeTypes] = useState<WorkflowNodeTypes | null>(null)
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const agentOptions = getAgentTypeOptions(nodeTypes)
+  const assistantMode = executionId && selectedAgent ? `execution:${executionId}:agent:${selectedAgent}` : 'default'
+  const assistantScope = { workflow_execution_id: executionId, agent_type: selectedAgent, entry: 'workflow_private_chat' }
 
   useEffect(() => {
     let cancelled = false
@@ -66,25 +72,27 @@ export default function AgentChat({
   useEffect(() => {
     if (!executionId) {
       setMessages([])
+      setAssistantSessionId(null)
+      setContextPacket(null)
       return
     }
 
     const loadHistory = async () => {
       try {
-        const history = await getMessageHistory(executionId)
+        const history = await getMessageHistory(executionId, selectedAgent || undefined)
         const formatted: Message[] = history.map((h) => [
           {
             id: `${h.id}-user`,
             role: 'user' as const,
-            content: h.message,
+            content: h.message || h.user_message || '',
             agent_type: h.agent_type,
             timestamp: new Date(h.timestamp),
           },
-          h.response
+          (h.response || h.agent_response)
             ? {
                 id: `${h.id}-agent`,
                 role: 'agent' as const,
-                content: h.response,
+                content: h.response || h.agent_response || '',
                 agent_type: h.agent_type,
                 timestamp: new Date(h.timestamp),
               }
@@ -98,7 +106,36 @@ export default function AgentChat({
     }
 
     loadHistory()
-  }, [executionId])
+  }, [executionId, selectedAgent])
+
+  useEffect(() => {
+    if (!executionId || !selectedAgent) {
+      setAssistantSessionId(null)
+      setContextPacket(null)
+      return
+    }
+
+    const loadAssistantSession = async () => {
+      const storageKey = `workflowInterventionSession:${projectId}:${executionId}:${selectedAgent}`
+      const storedSessionId = localStorage.getItem(storageKey) || undefined
+      try {
+        const assistantSession = await createAssistantSession(projectId, {
+          assistant_surface: 'workflow_intervention',
+          mode: assistantMode,
+          session_id: storedSessionId,
+          scope: assistantScope,
+        })
+        setAssistantSessionId(assistantSession.session_id)
+        localStorage.setItem(storageKey, assistantSession.session_id)
+        const history = await getAssistantHistory(projectId, assistantSession.session_id, 80)
+        if (history.context_packet) setContextPacket(history.context_packet)
+      } catch (err) {
+        console.error('Failed to load workflow assistant session:', err)
+      }
+    }
+
+    loadAssistantSession()
+  }, [assistantMode, executionId, projectId, selectedAgent])
 
   // 滚动到底部
   useEffect(() => {
@@ -128,9 +165,16 @@ export default function AgentChat({
         workflow_execution_id: executionId,
         agent_type: selectedAgent,
         message: userMessage.content,
+        assistant_session_id: assistantSessionId || undefined,
+        request_id: `workflow_chat_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
       })
 
       if (result.success) {
+        if (result.assistant_session_id) {
+          setAssistantSessionId(result.assistant_session_id)
+          localStorage.setItem(`workflowInterventionSession:${projectId}:${executionId}:${selectedAgent}`, result.assistant_session_id)
+        }
+        if (result.context_packet) setContextPacket(result.context_packet)
         // 添加 Agent 响应
         const agentMessage: Message = {
           id: result.intervention_id || `response-${Date.now()}`,
@@ -191,7 +235,7 @@ export default function AgentChat({
       </div>
 
       {/* Agent 选择 */}
-      <div className={`p-4 border-b ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
+      <div className={`p-4 border-b space-y-3 ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
         <select
           value={selectedAgent}
           onChange={(e) => setSelectedAgent(e.target.value)}
@@ -210,6 +254,24 @@ export default function AgentChat({
             </option>
           ))}
         </select>
+        {selectedAgent && executionId && (
+          <AssistantContextControls
+            projectId={projectId}
+            sessionId={assistantSessionId}
+            assistantSurface="workflow_intervention"
+            mode={assistantMode}
+            scope={assistantScope}
+            contextPacket={contextPacket}
+            compact
+            onHistoryReset={(newSessionId) => {
+              setAssistantSessionId(newSessionId)
+              setContextPacket(null)
+              setMessages([])
+              localStorage.setItem(`workflowInterventionSession:${projectId}:${executionId}:${selectedAgent}`, newSessionId)
+            }}
+            onRereadComplete={(response) => setContextPacket(response.packet_metadata)}
+          />
+        )}
       </div>
 
       {/* 消息列表 */}

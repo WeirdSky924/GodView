@@ -85,6 +85,7 @@ class SettingAgentService:
     """设定 Agent 服务 - 持续的设定管理者"""
 
     SETTING_IMPROVEMENT_ANALYSIS_PROMPT_ID = "function_setting_improvement_analysis"
+    SETTING_MODIFICATION_EXTRACTION_PROMPT_ID = "function_setting_modification_extraction"
     SETTING_MANAGEMENT_SYSTEM_PROMPT_ID = "function_setting_management_system_prompt"
     SETTING_LORE_EXTRACTION_PROMPT_ID = "function_setting_lore_extraction_confirmation"
     SETTING_HOOK_EXTRACTION_PROMPT_ID = "function_setting_hook_extraction_confirmation"
@@ -484,14 +485,46 @@ class SettingAgentService:
                 pending_lores = [item.get("payload") or {} for item in pending_items if item.get("item_type") == "lore"]
                 pending_characters = [item.get("payload") or {} for item in pending_items if item.get("item_type") == "character"]
                 pending_hooks = [item.get("payload") or {} for item in pending_items if item.get("item_type") == "hook"]
+        context_packet = None
+        assistant_session_id = None
+        if postgres_db:
+            try:
+                assistant_session = await postgres_db.get_active_assistant_session(
+                    project_id=project_id,
+                    assistant_surface="setting_agent",
+                    mode=session.mode.value if hasattr(session.mode, "value") else str(session.mode),
+                )
+                if assistant_session:
+                    assistant_session_id = assistant_session.get("id")
+                    if assistant_session.get("last_packet_id"):
+                        packet = await postgres_db.get_assistant_packet(str(assistant_session["last_packet_id"]))
+                        if packet:
+                            context_packet = {
+                                "packet_id": packet.get("id"),
+                                "snapshot_id": packet.get("snapshot_id"),
+                                "snapshot_version": packet.get("snapshot_version"),
+                                "assistant_surface": packet.get("assistant_surface"),
+                                "invalidation_state": packet.get("invalidation_state") or "fresh",
+                                "force_reread": bool(packet.get("force_reread")),
+                                "history_reset_applied": bool(packet.get("history_reset_applied")),
+                                "token_estimate": packet.get("token_estimate") or 0,
+                                "selected_sections": packet.get("selected_sections") or [],
+                                "omitted_sections": (packet.get("metadata") or {}).get("omitted_sections", []),
+                                "delta_count": len(packet.get("delta_ids") or []),
+                                "rebuilt_at": (packet.get("metadata") or {}).get("rebuilt_at"),
+                            }
+            except Exception as e:
+                logger.debug(f"获取 Setting Agent Assistant Context 元数据失败: {e}")
         if not messages:
             messages = session.conversation_history
         return {
             "session_id": session.id,
+            "assistant_session_id": assistant_session_id,
             "messages": messages,
             "pending_lores": pending_lores,
             "pending_characters": pending_characters,
             "pending_hooks": pending_hooks,
+            "context_packet": context_packet,
         }
 
     async def process_setting_change(
@@ -1119,103 +1152,38 @@ class SettingAgentService:
             )
 
 
-        # ========== 优化2：增量上下文加载 ==========
-        # 第一次消息加载完整项目上下文并缓存；后续消息复用缓存
-        if not session.full_context_loaded:
-            # 首次：加载完整项目上下文
-            sections = await self._get_context_sections(project_id, user_message=message)
-            world_type = sections.pop("_world_type", None)
-
-            # 缓存 sections 到 session
-            session.cached_context_sections = sections
-            if world_type:
-                session.cached_context_sections["_world_type"] = world_type
-            session.full_context_loaded = True
-
-            logger.info(f"[SettingAgent] 首次加载完整上下文: {sum(len(v) for v in sections.values() if isinstance(v, str))} 字符")
-        else:
-            # 后续：复用缓存的上下文，不再重新查询数据库
-            sections = dict(session.cached_context_sections)
-            world_type = sections.pop("_world_type", None)
-
-            logger.info(f"[SettingAgent] 复用缓存上下文（增量模式）: {sum(len(v) for v in sections.values() if isinstance(v, str))} 字符")
-
-        # 计算上下文总长度（包括对话历史）
-        sections_length = sum(len(v) for v in sections.values() if isinstance(v, str))
-        history_length = sum(len(msg.get('content', '')) for msg in session.conversation_history[-10:])
-        context_length = sections_length + history_length
-
-        # 日志：简要信息
-        logger.info(f"[SettingAgent] 世界类型: {world_type or '未设置'} | sections: {sections_length} 字符 | 对话历史: {history_length} 字符")
-
-        # 如果上下文过长（超过 4000 字符），使用分段分析
-        CONTEXT_THRESHOLD = 4000
-        use_segmented_analysis = context_length > CONTEXT_THRESHOLD
-
-        logger.info(f"[SettingAgent] 总上下文: {context_length} 字符, 分段: {use_segmented_analysis}")
-
-        if use_segmented_analysis:
+        context_packet = None
+        sections = {}
+        world_type = None
+        if postgres_db:
             try:
-                # 分段分析返回：完整原始上下文 + 综合索引 + 跨段关系/冲突/资源缺口
-                segmented_synthesis = await self._analyze_with_segmented_context(
+                from app.services.assistant_context import get_assistant_context_fabric
+
+                context_packet = await get_assistant_context_fabric(postgres_db).build_packet(
                     project_id=project_id,
+                    assistant_surface="setting_agent",
+                    task_type="chat",
+                    session_id=session.id,
+                    mode=session.mode.value if hasattr(session.mode, "value") else str(session.mode),
+                    request_id=request_id,
+                    scope={
+                        "mode": session.mode.value if hasattr(session.mode, "value") else str(session.mode),
+                        "needs": ["world", "lore", "characters", "plot_hooks", "chapter_outlines", "recent_deltas"],
+                    },
                     user_message=message,
-                    sections=sections,
-                    world_type=world_type,
                 )
-                full_context = segmented_synthesis.full_context
-                key_info_index = segmented_synthesis.as_prompt_block()
+                context_str = context_packet["prompt_context"]
                 logger.info(
-                    "[SettingAgent] 分段分析完成: full_context长度=%s, key_info_index长度=%s, key_points=%s, conflicts=%s, requirements=%s",
-                    len(full_context),
-                    len(key_info_index),
-                    len(segmented_synthesis.key_points),
-                    len(segmented_synthesis.potential_conflicts),
-                    len(segmented_synthesis.resource_requirements),
+                    "[SettingAgent] 使用 Assistant Context Fabric packet=%s snapshot=v%s tokens=%s",
+                    context_packet.get("packet_id"),
+                    context_packet.get("snapshot_version"),
+                    context_packet.get("metadata", {}).get("token_estimate"),
                 )
             except Exception as e:
-                logger.error(f"[SettingAgent] 分段分析失败: {e}")
-                # 回退到常规方法
-                full_context = "\n\n".join([f"【{k}】\n{v}" for k, v in sections.items() if v and not k.startswith("_")])
-                key_info_index = "（分段分析失败，直接使用原始上下文；生成设定时仍需综合全部项目信息并标注关联/冲突/资源缺口）"
-
-            # 构建最终上下文：跨段综合要求 + 关键信息索引 + 完整原始上下文 + 最近对话
-            context_str = f"""【设定生成综合要求】
-请优先综合所有分段信息，而不是只依据最后一段或用户最新一句话生成孤立设定。
-新设定应保持相对独立、边界清晰，但必须主动说明它与既有角色、世界规则、势力、地点、伏笔或章节大纲的连接关系。
-如果输入中存在多个相关设定，请分析它们的互补关系、潜在冲突和可复用接口；不要让后面的分段覆盖前面的分段。
-
-【关键信息索引】
-{key_info_index}
-
-【项目完整信息】
-{full_context}
-
-【最近对话】
-""" + "\n".join([
-                f"{msg['role']}: {msg['content']}"
-                for msg in session.conversation_history[-6:]
-            ])
+                logger.error(f"[SettingAgent] Assistant Context Fabric 构建失败: {e}")
+                raise
         else:
-            # 从已加载的 sections 构建上下文
-            context_parts = []
-            for section_name, section_content in sections.items():
-                if section_content and not section_name.startswith("_"):
-                    context_parts.append(f"【{section_name}】\n{section_content}")
-
-            # 添加最近对话
-            if session.conversation_history:
-                history = "\n".join([
-                    f"{msg['role']}: {msg['content']}"
-                    for msg in session.conversation_history[-10:]
-                ])
-                context_parts.append(f"【最近对话】\n{history}")
-
-            context_str = "\n\n".join(context_parts)
-
-            # 如果 sections 为空，回退到原始方法
-            if not context_str or context_str.strip() == "":
-                context_str = await self._build_chat_context(session, context)
+            context_str = await self._build_chat_context(session, context)
 
         # 调用 LLM（传入 project_id 以记录 token）
         response = await self._call_llm(system_prompt, message, context_str, project_id=project_id)
@@ -1229,10 +1197,16 @@ class SettingAgentService:
 
         session.last_activity_at = datetime.now()
 
-        # 从对话中提取待确认的设定、伏笔和角色
-        pending_lores = await self._extract_lore_from_conversation(project_id, session)
-        pending_hooks = await self._extract_hooks_from_conversation(project_id, session)
-        pending_characters = await self._extract_characters_from_conversation(project_id, session)
+        # 从对话中提取待确认的设定、伏笔和角色；用户明确修改既有设定时优先生成修改建议，避免误抽成新增资源
+        lore_modification_suggestions = await self._extract_lore_modifications_from_conversation(project_id, session)
+        if lore_modification_suggestions:
+            pending_lores = []
+            pending_hooks = []
+            pending_characters = []
+        else:
+            pending_lores = await self._extract_lore_from_conversation(project_id, session)
+            pending_hooks = await self._extract_hooks_from_conversation(project_id, session)
+            pending_characters = await self._extract_characters_from_conversation(project_id, session)
 
         await self._persist_pending_items(session, "lore", pending_lores, request_id=request_id)
         await self._persist_pending_items(session, "hook", pending_hooks, request_id=request_id)
@@ -1258,8 +1232,8 @@ class SettingAgentService:
             if metadata_results.get("updated"):
                 logger.info(f"自动更新项目 {project_id} 元数据: {metadata_results}")
 
-        # 主动分析现有设定，识别改进点（每 3 次对话触发一次）
-        improvement_suggestions = []
+        # 主动分析现有设定，识别改进点（每 3 次对话触发一次），并合并用户明确提出的修改建议
+        improvement_suggestions = list(lore_modification_suggestions)
         if len(session.conversation_history) % 6 == 0:  # 每 3 次用户消息
             try:
                 # 构建对话上下文
@@ -1270,18 +1244,36 @@ class SettingAgentService:
                 # 获取世界类型
                 world_type = sections.get("_world_type") if 'sections' in dir() else None
 
-                improvement_suggestions = await self.analyze_existing_lores(
+                periodic_suggestions = await self.analyze_existing_lores(
                     project_id=project_id,
                     conversation_context=conversation_context,
                     world_type=world_type,
                 )
+                improvement_suggestions.extend(periodic_suggestions)
                 if improvement_suggestions:
-                    logger.info(f"[SettingAgent] 发现 {len(improvement_suggestions)} 个设定改进建议")
+                    logger.info(f"[SettingAgent] 发现 {len(improvement_suggestions)} 个设定改进/修改建议")
             except Exception as e:
                 logger.warning(f"[SettingAgent] 设定分析失败: {e}")
 
         if postgres_db:
+            packet_id = context_packet.get("packet_id") if context_packet else None
+            snapshot_id = context_packet.get("snapshot_id") if context_packet else None
             await postgres_db.append_setting_agent_message(session.id, "assistant", response, request_id=request_id)
+            if context_packet:
+                from app.services.assistant_context import get_assistant_context_fabric
+
+                assistant_session_id = context_packet.get("session_id") or session.id
+                assistant_session = await postgres_db.get_assistant_session(assistant_session_id)
+                if assistant_session:
+                    await get_assistant_context_fabric(postgres_db).sessions.append_message(
+                        session=assistant_session,
+                        role="assistant",
+                        content=response,
+                        request_id=request_id,
+                        metadata={"setting_agent_session_id": session.id, "context_packet_id": packet_id},
+                        packet_id=packet_id,
+                        snapshot_id=snapshot_id,
+                    )
         await self._persist_session_snapshot(session)
 
         result = self._build_chat_response(
@@ -1294,6 +1286,14 @@ class SettingAgentService:
         )
         result["prompt_render_trace"] = prompt_render_trace
         result["config_prompt_source"] = prompt_data.get("source") or "missing"
+        if context_packet:
+            result["assistant_session_id"] = context_packet.get("session_id")
+            result["context_packet"] = {
+                "packet_id": context_packet.get("packet_id"),
+                "snapshot_id": context_packet.get("snapshot_id"),
+                "snapshot_version": context_packet.get("snapshot_version"),
+                **(context_packet.get("metadata") or {}),
+            }
         return result
 
     async def _sync_to_agent_memory(
@@ -1479,6 +1479,145 @@ class SettingAgentService:
             prompt_asset,
             f"## 对话内容\n{history_text}",
         ]).strip()
+
+    def _build_lore_modification_extraction_prompt(self, history_text: str, lores_summary: str) -> str:
+        prompt_asset = self._load_md_prompt_content(self.SETTING_MODIFICATION_EXTRACTION_PROMPT_ID)
+        if not prompt_asset:
+            prompt_asset = (
+                "你是小说项目设定修改审稿人。请判断最近对话是否包含用户对既有设定的明确修改、改名、补充、纠错、合并或优先级调整请求。"
+                "只对【现有设定候选】中的条目生成建议；不要把新增设定请求误判为修改；不要自动执行修改。"
+                "输出 suggestions 列表，字段包括 type、target_lore_id、target_lore_title、issue、suggestion、suggested_content、"
+                "suggested_title、summary、category、new_priority、keywords、tags、constraints、related_characters、related_locations、related_items、related_entities、update_payload、priority、reason。"
+                "type 可用 optimize、priority、relation、rename、metadata。"
+            )
+        return "\n\n".join([
+            prompt_asset,
+            f"## 现有设定候选\n{lores_summary or '无'}",
+            f"## 最近对话内容\n{history_text}",
+            "## 判定边界\n- 只有用户明确要求修改/更正/补充/调整某个已有设定时才输出。\n- 如果用户只是提出新设定、新角色、新伏笔，返回空 suggestions。\n- target_lore_id 必须来自现有设定候选。\n- suggested_content 应是修改后的完整设定正文；只改标题/优先级/关联时可留空并使用对应字段。",
+        ]).strip()
+
+    async def _extract_lore_modifications_from_conversation(
+        self,
+        project_id: str,
+        session: SettingAgentSession,
+    ) -> List[Dict[str, Any]]:
+        """从最近对话中提取用户明确要求的既有设定修改建议（不自动执行）。"""
+        recent_messages = session.conversation_history[-6:]
+        if len(recent_messages) < 2:
+            return []
+
+        latest_user_message = ""
+        for msg in reversed(recent_messages):
+            if msg.get("role") == "user":
+                latest_user_message = str(msg.get("content") or "")
+                break
+        modification_keywords = [
+            "修改", "改成", "改为", "更改", "调整", "更新", "补充", "修正", "纠正", "改名", "重命名",
+            "rename", "modify", "update", "change", "revise", "correct",
+        ]
+        if not any(keyword in latest_user_message.lower() for keyword in modification_keywords):
+            return []
+
+        try:
+            from app.api.app import postgres_db
+            if not postgres_db:
+                return []
+
+            lores = await postgres_db.execute_query("""
+                SELECT id, title, category, priority, content, summary, keywords, tags, constraints,
+                       related_characters, related_locations, related_items
+                FROM lore_entries
+                WHERE project_id = CAST(:project_id AS UUID)
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT 80
+            """, {"project_id": project_id})
+            if not lores:
+                return []
+
+            def _compact_lore_value(value: Any, limit: int = 360) -> str:
+                if isinstance(value, (list, dict)):
+                    text = json.dumps(value, ensure_ascii=False)
+                else:
+                    text = str(value or "")
+                text = re.sub(r"\s+", " ", text).strip()
+                return text[:limit] + ("..." if len(text) > limit else "")
+
+            lores_summary = "\n".join([
+                " | ".join([
+                    f"ID={l.get('id')}",
+                    f"标题={l.get('title')}",
+                    f"分类={l.get('category')}",
+                    f"优先级={l.get('priority')}",
+                    f"摘要={_compact_lore_value(l.get('summary') or l.get('content'))}",
+                    f"关键词={_compact_lore_value(l.get('keywords'), 180)}",
+                ])
+                for l in lores
+            ])
+            history_text = "\n".join([
+                f"{msg['role']}: {msg['content']}"
+                for msg in recent_messages
+            ])
+            prompt = self._build_lore_modification_extraction_prompt(history_text, lores_summary)
+
+            from app.models.agent_output_schemas import SettingImprovementSuggestionsSchema
+            from app.services.structured_llm import StructuredOutputError
+
+            try:
+                parsed = await self._call_structured(
+                    SettingImprovementSuggestionsSchema,
+                    prompt,
+                    project_id=project_id,
+                )
+            except StructuredOutputError as e:
+                logger.info(f"[SettingAgent] 修改建议 structured 提取失败：{e}")
+                return []
+
+            existing_by_id = {str(l.get("id")): l for l in lores if l.get("id")}
+            valid_suggestions: List[Dict[str, Any]] = []
+            allowed_types = {"optimize", "priority", "relation", "rename", "metadata"}
+            for item in parsed.suggestions:
+                suggestion = item.model_dump()
+                target_id = str(suggestion.get("target_lore_id") or "").strip()
+                if not target_id or target_id not in existing_by_id:
+                    continue
+                mod_type = str(suggestion.get("type") or "optimize").strip().lower() or "optimize"
+                if mod_type not in allowed_types:
+                    mod_type = "optimize"
+                target_lore = existing_by_id[target_id]
+                issue = str(suggestion.get("issue") or latest_user_message or "用户要求修改既有设定").strip()
+                action_text = str(suggestion.get("suggestion") or "按用户最新要求修改该设定").strip()
+                reason = str(suggestion.get("reason") or "来自用户在当前对话中的明确修改请求").strip()
+                valid_suggestions.append({
+                    "id": str(uuid.uuid4()),
+                    "type": mod_type,
+                    "target_lore_id": target_id,
+                    "target_lore_title": suggestion.get("target_lore_title") or target_lore.get("title") or "",
+                    "issue": issue,
+                    "suggestion": action_text,
+                    "suggested_content": suggestion.get("suggested_content"),
+                    "suggested_title": suggestion.get("suggested_title"),
+                    "summary": suggestion.get("summary"),
+                    "category": suggestion.get("category"),
+                    "new_priority": suggestion.get("new_priority"),
+                    "keywords": self._normalize_string_list(suggestion.get("keywords")),
+                    "tags": self._normalize_string_list(suggestion.get("tags")),
+                    "constraints": self._normalize_string_list(suggestion.get("constraints")),
+                    "related_characters": self._normalize_string_list(suggestion.get("related_characters")),
+                    "related_locations": self._normalize_string_list(suggestion.get("related_locations")),
+                    "related_items": self._normalize_string_list(suggestion.get("related_items")),
+                    "related_entities": self._normalize_string_list(suggestion.get("related_entities")),
+                    "update_payload": suggestion.get("update_payload") if isinstance(suggestion.get("update_payload"), dict) else {},
+                    "priority": suggestion.get("priority") or "high",
+                    "reason": reason,
+                })
+
+            if valid_suggestions:
+                logger.info(f"[SettingAgent] 从对话中提取 {len(valid_suggestions)} 个既有设定修改建议")
+            return valid_suggestions
+        except Exception as e:
+            logger.error(f"[SettingAgent] 提取既有设定修改建议失败: {e}")
+            return []
 
     def _build_hook_extraction_prompt(self, history_text: str) -> str:
         prompt_asset = self._load_md_prompt_content(self.SETTING_HOOK_EXTRACTION_PROMPT_ID)
@@ -2103,7 +2242,11 @@ class SettingAgentService:
 
             # 过滤并验证
             valid_suggestions = []
+            existing_ids = {str(l.get("id")) for l in lores if l.get("id")}
             for s in suggestions:
+                target_id = str(s.get("target_lore_id") or "").strip()
+                if target_id and target_id not in existing_ids:
+                    continue
                 if s.get("type") and s.get("issue") and s.get("suggestion"):
                     valid_suggestions.append({
                         "id": str(uuid.uuid4()),
@@ -2113,6 +2256,18 @@ class SettingAgentService:
                         "issue": s.get("issue"),
                         "suggestion": s.get("suggestion"),
                         "suggested_content": s.get("suggested_content"),
+                        "suggested_title": s.get("suggested_title"),
+                        "summary": s.get("summary"),
+                        "category": s.get("category"),
+                        "new_priority": s.get("new_priority"),
+                        "keywords": self._normalize_string_list(s.get("keywords")),
+                        "tags": self._normalize_string_list(s.get("tags")),
+                        "constraints": self._normalize_string_list(s.get("constraints")),
+                        "related_characters": self._normalize_string_list(s.get("related_characters")),
+                        "related_locations": self._normalize_string_list(s.get("related_locations")),
+                        "related_items": self._normalize_string_list(s.get("related_items")),
+                        "related_entities": self._normalize_string_list(s.get("related_entities")),
+                        "update_payload": s.get("update_payload") if isinstance(s.get("update_payload"), dict) else {},
                         "priority": s.get("priority", "medium"),
                         "reason": s.get("reason", ""),
                     })
@@ -2145,24 +2300,63 @@ class SettingAgentService:
         if not postgres_db:
             return {"success": False, "error": "数据库未连接"}
 
-        mod_type = modification.get("type")
+        mod_type = str(modification.get("type") or "").strip().lower()
         target_id = modification.get("target_lore_id")
         suggested_content = modification.get("suggested_content", "")
 
         try:
-            if mod_type == "optimize" and target_id:
-                # 优化现有设定的内容
-                await postgres_db.execute_write("""
-                    UPDATE lore_entries
-                    SET content = :content, updated_at = :updated_at
-                    WHERE id = CAST(:id AS UUID) AND project_id = CAST(:project_id AS UUID)
-                """, {
+            if mod_type in {"optimize", "rename", "metadata"} and target_id:
+                existing = await postgres_db.get_lore_entry(str(target_id)) if hasattr(postgres_db, "get_lore_entry") else None
+                if not existing or str(existing.get("project_id")) != str(project_id):
+                    return {"success": False, "error": "目标设定不存在或不属于当前项目"}
+
+                update_payload = modification.get("update_payload") if isinstance(modification.get("update_payload"), dict) else {}
+                fields: Dict[str, Any] = {}
+                title_value = modification.get("suggested_title") or update_payload.get("title")
+                if title_value:
+                    fields["title"] = str(title_value).strip()
+                content_value = suggested_content or update_payload.get("content")
+                if content_value:
+                    fields["content"] = str(content_value).strip()
+                summary_value = modification.get("summary") or update_payload.get("summary")
+                if summary_value is not None:
+                    fields["summary"] = str(summary_value).strip()
+                category_value = modification.get("category") or update_payload.get("category")
+                if category_value:
+                    fields["category"] = normalize_lore_category(category_value).value
+                priority_value = modification.get("new_priority") or update_payload.get("priority")
+                if priority_value:
+                    fields["priority"] = normalize_lore_priority(priority_value).value
+                for list_field in [
+                    "keywords",
+                    "tags",
+                    "constraints",
+                    "related_characters",
+                    "related_locations",
+                    "related_items",
+                    "forbidden_actions",
+                ]:
+                    if list_field in modification or list_field in update_payload:
+                        fields[list_field] = json.dumps(self._normalize_string_list(
+                            modification.get(list_field, update_payload.get(list_field))
+                        ))
+                if not fields:
+                    return {"success": False, "error": "修改建议缺少可执行字段"}
+
+                set_clause = ", ".join([f"{field} = :{field}" for field in fields])
+                params = {
+                    **fields,
                     "id": target_id,
                     "project_id": project_id,
-                    "content": suggested_content,
                     "updated_at": datetime.now(),
-                })
-                return {"success": True, "message": f"已更新设定内容"}
+                }
+                await postgres_db.execute_write(f"""
+                    UPDATE lore_entries
+                    SET {set_clause}, updated_at = :updated_at
+                    WHERE id = CAST(:id AS UUID) AND project_id = CAST(:project_id AS UUID)
+                """, params)
+                self.invalidate_context_cache(project_id)
+                return {"success": True, "message": "已更新现有设定"}
 
             elif mod_type == "priority" and target_id:
                 # 调整优先级
@@ -2177,6 +2371,7 @@ class SettingAgentService:
                     "priority": new_priority,
                     "updated_at": datetime.now(),
                 })
+                self.invalidate_context_cache(project_id)
                 return {"success": True, "message": f"已调整设定优先级为 {new_priority}"}
 
             elif mod_type == "missing":
@@ -2216,6 +2411,7 @@ class SettingAgentService:
                     INSERT INTO lore_entries (id, project_id, title, category, priority, content, summary, keywords, tags, constraints, related_characters, related_locations, related_items, forbidden_actions, source, created_at, updated_at)
                     VALUES (:id, CAST(:project_id AS UUID), :title, :category, :priority, :content, :summary, :keywords, :tags, :constraints, :related_characters, :related_locations, :related_items, :forbidden_actions, :source, :created_at, :updated_at)
                 """, lore_entry)
+                self.invalidate_context_cache(project_id)
                 return {"success": True, "message": f"已添加新设定: {lore_entry['title']}"}
 
             elif mod_type == "relation" and target_id:
@@ -2228,9 +2424,10 @@ class SettingAgentService:
                 """, {
                     "id": target_id,
                     "project_id": project_id,
-                    "related": json.dumps(related),
+                    "related": json.dumps(self._normalize_string_list(related)),
                     "updated_at": datetime.now(),
                 })
+                self.invalidate_context_cache(project_id)
                 return {"success": True, "message": "已更新设定关联"}
 
             else:
@@ -2640,16 +2837,7 @@ class SettingAgentService:
                 logger.warning("数据库未连接，无法更新项目元数据")
                 return False
 
-            # 构建更新数据
-            update_data = {}
-            if world_type:
-                update_data["world_type"] = world_type
-            if tone:
-                update_data["tone"] = tone
-            if additional_metadata:
-                update_data["metadata"] = additional_metadata
-
-            if not update_data:
+            if not (world_type or tone or additional_metadata):
                 return True
 
             # 从项目元数据中获取现有值
@@ -2658,17 +2846,23 @@ class SettingAgentService:
                 logger.warning(f"项目不存在: {project_id}")
                 return False
 
-            # 更新元数据
             metadata = project.get("metadata", {})
-            if "metadata" not in update_data:
-                update_data["metadata"] = metadata
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except Exception:
+                    metadata = {}
+            if not isinstance(metadata, dict):
+                metadata = {}
 
-            # 合并世界类型和基调到元数据
+            if additional_metadata:
+                metadata.update(additional_metadata)
             if world_type:
-                update_data["world_type"] = world_type
+                metadata["world_type"] = world_type
             if tone:
-                update_data["tone"] = tone
+                metadata["tone"] = tone
 
+            update_data = {"metadata": metadata}
             await postgres_db.update_project(project_id, update_data)
 
             logger.info(f"更新项目 {project_id} 元数据: {update_data}")
@@ -3672,11 +3866,12 @@ class SettingAgentService:
         if repaired != normalized:
             attempts.append(repaired)
 
+        last_error: Optional[json.JSONDecodeError] = None
         for payload in attempts:
             try:
                 data = json.loads(payload)
             except json.JSONDecodeError as e:
-                logger.warning(f"[分段分析] JSON解析失败: {e}")
+                last_error = e
                 continue
 
             if isinstance(data, dict):
@@ -3707,6 +3902,8 @@ class SettingAgentService:
                 })
             return key_points
 
+        if last_error:
+            logger.debug(f"[分段分析] JSON解析失败，已保留原文上下文: {last_error}")
         return []
 
     def _normalize_segment_json(self, payload: str) -> str:

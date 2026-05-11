@@ -1341,7 +1341,7 @@ class SkillService:
                     "DELETE FROM skills WHERE id = :id AND prompt_template IS NOT NULL AND prompt_template <> ''",
                     {'id': skill_id},
                 )
-                self._skills.pop(skill_id, None)
+                self._skills_cache.pop(skill_id, None)
             if stale_ids:
                 logger.info(f"清理已删除的 MD Skills: {len(stale_ids)} 个")
         except Exception as e:

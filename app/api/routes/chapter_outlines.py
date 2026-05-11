@@ -91,6 +91,8 @@ class GenerateOutlineRequestAPI(BaseModel):
     context: Optional[str] = Field(None, description="上下文信息")
     previous_events: Optional[str] = Field(None, description="前文事件")
     special_requirements: Optional[List[str]] = Field(None, description="特殊要求")
+    session_id: Optional[str] = Field(None, description="Assistant Context 会话 ID")
+    request_id: Optional[str] = Field(None, description="幂等请求 ID")
 
 
 class CreateOutlineRequest(BaseModel):
@@ -161,6 +163,8 @@ class ChatRequest(BaseModel):
     """与 Agent 聊天请求"""
     message: str
     context: Optional[Dict[str, Any]] = None
+    session_id: Optional[str] = Field(None, description="Assistant Context 会话 ID")
+    request_id: Optional[str] = Field(None, description="幂等请求 ID")
 
 
 class ChatResponse(BaseModel):
@@ -172,6 +176,8 @@ class ChatResponse(BaseModel):
     saved_outline: Optional[Dict[str, Any]] = None
     saved_outlines: Optional[List[Dict[str, Any]]] = None  # 多章大纲保存
     prompt_render_trace: Optional[Dict[str, Any]] = None
+    assistant_session_id: Optional[str] = None
+    context_packet: Optional[Dict[str, Any]] = None
 
 
 class SavePendingOutlinesRequest(BaseModel):
@@ -1054,6 +1060,8 @@ async def generate_outline(project_id: str, chapter_number: int, request: Genera
         chapter_number=chapter_number,
         context=request.context,
         previous_events=request.previous_events,
+        session_id=request.session_id,
+        request_id=request.request_id,
     )
     return result
 
@@ -1233,6 +1241,8 @@ async def chat_with_agent(project_id: str, chapter_number: int, request: ChatReq
         message=request.message,
         existing_outline=existing_outline,
         context=request.context,
+        session_id=request.session_id,
+        request_id=request.request_id,
     )
 
     # 处理 pending_outlines
@@ -1248,6 +1258,8 @@ async def chat_with_agent(project_id: str, chapter_number: int, request: ChatReq
         saved_outline=response.get("saved_outline"),
         saved_outlines=response.get("saved_outlines"),
         prompt_render_trace=response.get("prompt_render_trace"),
+        assistant_session_id=response.get("assistant_session_id"),
+        context_packet=response.get("context_packet"),
     )
 
 

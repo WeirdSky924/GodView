@@ -4,6 +4,7 @@
  */
 
 import { api } from './client'
+import type { AssistantContextSummary } from './assistantContext'
 
 const API_BASE = '/setting-agent'
 
@@ -88,6 +89,8 @@ export interface ChatResponse {
     timestamp?: string
   }>
   improvement_suggestions?: ImprovementSuggestion[]
+  assistant_session_id?: string
+  context_packet?: AssistantContextSummary
 }
 
 export interface ImprovementSuggestion {
@@ -178,6 +181,8 @@ export interface ConversationHistory {
   pending_lores?: PendingLore[]
   pending_characters?: PendingCharacter[]
   pending_hooks?: PendingHook[]
+  context_packet?: AssistantContextSummary | null
+  assistant_session_id?: string
   total?: number
 }
 
@@ -300,6 +305,17 @@ export async function createOrGetSession(
   return await api.post(`${API_BASE}/${projectId}/session`, null, {
     params: { mode, session_id: sessionId },
   })
+}
+
+/**
+ * 兼容少数旧调用：读取会话必须仍然使用 POST，避免 GET /session 405。
+ */
+export async function getOrCreateSession(
+  projectId: string,
+  mode: 'bootstrap' | 'management' | 'conflict_resolution' = 'management',
+  sessionId?: string,
+) {
+  return createOrGetSession(projectId, mode, sessionId)
 }
 
 /**

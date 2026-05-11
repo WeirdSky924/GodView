@@ -157,6 +157,9 @@ class AgentCommunicationService:
         node_id: Optional[str] = None,
         context: Optional[Dict[str, Any]] = None,
         auto_classify: bool = True,
+        assistant_session_id: Optional[str] = None,
+        request_id: Optional[str] = None,
+        db: Any = None,
     ) -> Dict[str, Any]:
         """
         向 Agent 发送消息并获取响应
@@ -169,6 +172,9 @@ class AgentCommunicationService:
             node_id: 关联的节点ID
             context: 上下文信息
             auto_classify: 是否自动分类干预类型
+            assistant_session_id: Assistant Context 会话 ID
+            request_id: 幂等请求 ID
+            db: 数据库连接，用于持久化 Assistant Context 与干预日志
 
         Returns:
             Dict: 包含响应和相关信息
@@ -194,10 +200,29 @@ class AgentCommunicationService:
             if not agent:
                 raise ValueError(f"无法获取 Agent: {agent_type}")
 
+            context_packet = await self._build_workflow_context_packet(
+                db=db,
+                project_id=project_id,
+                execution_id=execution_id,
+                agent_type=agent_type,
+                node_id=node_id,
+                message=message,
+                context=context,
+                assistant_session_id=assistant_session_id,
+                request_id=request_id,
+            )
+            packet_context = context_packet.get("prompt_context") if context_packet else ""
+            input_context = {
+                **(context or {}),
+                "assistant_context_packet_id": context_packet.get("packet_id") if context_packet else None,
+                "assistant_context_snapshot_version": context_packet.get("snapshot_version") if context_packet else None,
+                "assistant_context": packet_context,
+            }
+
             # 构建输入
             input_data = {
                 "user_message": message,
-                "context": context or {},
+                "context": input_context,
                 "mode": "intervention",  # 标记为干预模式
                 "intervention_type": intervention_type.value,  # 传递干预类型
             }
@@ -221,12 +246,19 @@ class AgentCommunicationService:
                     intervention_type=intervention_type,
                     user_message=message,
                     agent_response=str(agent_response),
-                    context_snapshot=context or {},
+                    context_snapshot=input_context,
                     response_time_ms=response_time_ms,
                 )
-                intervention_id = await self._intervention_service.log_intervention(intervention)
+                intervention_id = await self._intervention_service.log_intervention(intervention, db=db)
 
-            # 缓存消息历史
+            await self._append_workflow_assistant_response(
+                db=db,
+                context_packet=context_packet,
+                response=str(agent_response),
+                request_id=request_id,
+            )
+
+            # 缓存消息历史（仅作为无 DB 场景的临时视图；持久权威为 assistant_messages/intervention_logs）
             history_key = f"{execution_id}:{agent_type}"
             if history_key not in self._message_history:
                 self._message_history[history_key] = []
@@ -235,6 +267,8 @@ class AgentCommunicationService:
                 "user_message": message,
                 "agent_response": agent_response,
                 "intervention_type": intervention_type.value,
+                "assistant_session_id": context_packet.get("session_id") if context_packet else assistant_session_id,
+                "context_packet_id": context_packet.get("packet_id") if context_packet else None,
             })
 
             logger.info(f"Agent通信完成: {agent_type}, 类型: {intervention_type.value}, 响应时间: {response_time_ms}ms")
@@ -247,6 +281,8 @@ class AgentCommunicationService:
                 "response_time_ms": response_time_ms,
                 "intervention_id": intervention_id,
                 "intervention_type": intervention_type.value,
+                "assistant_session_id": context_packet.get("session_id") if context_packet else assistant_session_id,
+                "context_packet": self._context_packet_metadata(context_packet),
             }
 
         except Exception as e:
@@ -281,6 +317,92 @@ class AgentCommunicationService:
                 "message": message,
                 "timestamp": datetime.now().isoformat(),
             })
+
+    async def _build_workflow_context_packet(
+        self,
+        *,
+        db: Any,
+        project_id: str,
+        execution_id: str,
+        agent_type: str,
+        node_id: Optional[str],
+        message: str,
+        context: Optional[Dict[str, Any]],
+        assistant_session_id: Optional[str],
+        request_id: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        if not db:
+            return None
+        try:
+            from app.services.assistant_context import get_assistant_context_fabric
+
+            scope = {
+                "workflow_execution_id": execution_id,
+                "node_id": node_id,
+                "agent_type": agent_type,
+                "surface_entry": "workflow_private_chat",
+                "workflow_context": context or {},
+                "needs": ["workflow_state", "chapter_outlines", "plot_hooks", "characters", "lore", "recent_deltas"],
+            }
+            packet = await get_assistant_context_fabric(db).build_packet(
+                project_id=project_id,
+                assistant_surface="workflow_intervention",
+                task_type="private_chat",
+                session_id=assistant_session_id,
+                mode=f"execution:{execution_id}:agent:{agent_type}",
+                request_id=request_id,
+                scope=scope,
+                user_message=message,
+            )
+            logger.info(
+                "[WorkflowIntervention] 使用 Assistant Context Fabric packet=%s snapshot=v%s tokens=%s",
+                packet.get("packet_id"),
+                packet.get("snapshot_version"),
+                packet.get("metadata", {}).get("token_estimate"),
+            )
+            return packet
+        except Exception:
+            logger.warning("构建 Workflow Intervention Assistant Context packet 失败", exc_info=True)
+            return None
+
+    def _context_packet_metadata(self, context_packet: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not context_packet:
+            return None
+        return {
+            "packet_id": context_packet.get("packet_id"),
+            "snapshot_id": context_packet.get("snapshot_id"),
+            "snapshot_version": context_packet.get("snapshot_version"),
+            **(context_packet.get("metadata") or {}),
+        }
+
+    async def _append_workflow_assistant_response(
+        self,
+        *,
+        db: Any,
+        context_packet: Optional[Dict[str, Any]],
+        response: str,
+        request_id: Optional[str],
+    ) -> None:
+        if not db or not context_packet:
+            return
+        try:
+            assistant_session_id = context_packet.get("session_id")
+            assistant_session = await db.get_assistant_session(assistant_session_id) if assistant_session_id else None
+            if not assistant_session:
+                return
+            from app.services.assistant_context import get_assistant_context_fabric
+
+            await get_assistant_context_fabric(db).sessions.append_message(
+                session=assistant_session,
+                role="assistant",
+                content=response,
+                request_id=request_id,
+                metadata={"context_packet_id": context_packet.get("packet_id"), "surface_entry": "workflow_private_chat"},
+                packet_id=context_packet.get("packet_id"),
+                snapshot_id=context_packet.get("snapshot_id"),
+            )
+        except Exception:
+            logger.warning("记录 Workflow Intervention Assistant Context 助手回复失败", exc_info=True)
 
     def get_message_history(
         self,

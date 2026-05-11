@@ -279,7 +279,7 @@ def create_app() -> FastAPI:
         return await request_validation_exception_handler(request, exc)
 
     # 注册路由
-    from app.api.routes import characters, worlds, plots, websocket, config, time, simulation, projects, bootstrap, lore, setting_agent, skills, token_usage, writing_rules, prompts, agent_templates, agent_configs, workflows, interventions, quality_checks, chapter_outlines, villains, memories, volumes, genre_templates, character_depth, golden_three_rules, world_expansion, state_changes
+    from app.api.routes import characters, worlds, plots, websocket, config, time, simulation, projects, bootstrap, lore, setting_agent, skills, token_usage, writing_rules, prompts, agent_templates, agent_configs, workflows, interventions, quality_checks, chapter_outlines, villains, memories, volumes, genre_templates, character_depth, golden_three_rules, world_expansion, state_changes, assistant_context
 
     app.include_router(characters.router, prefix="/api/characters", tags=["角色管理"])
     app.include_router(worlds.router, prefix="/api/worlds", tags=["世界管理"])
@@ -310,6 +310,7 @@ def create_app() -> FastAPI:
     app.include_router(golden_three_rules.router, tags=["黄金三章规则"])
     app.include_router(world_expansion.router, tags=["世界观展开"])
     app.include_router(state_changes.router, prefix="/api/state-changes", tags=["剧情状态变化"])
+    app.include_router(assistant_context.router, prefix="/api/assistant-context", tags=["助手上下文"])
 
     # 健康检查
     @app.get("/health")

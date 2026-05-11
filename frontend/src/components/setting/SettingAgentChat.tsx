@@ -1,6 +1,8 @@
 import { useState, useRef, useEffect } from 'react'
 import { MessageCircle, Send, AlertTriangle, CheckCircle, X, Loader2, Save, Trash2, Lightbulb, Wrench } from 'lucide-react'
 import { Button, Card } from '@/components/ui'
+import AssistantContextControls from '@/components/assistant/AssistantContextControls'
+import type { AssistantContextSummary } from '@/api/assistantContext'
 import {
   chatWithSettingAgent,
   negotiateConflict,
@@ -46,6 +48,13 @@ const severityLabels: Record<string, string> = {
   critical: '致命',
 }
 
+const createWelcomeMessage = (): Message => ({
+  id: `welcome_${Date.now()}`,
+  role: 'assistant',
+  content: '你好！我是设定管理者 Agent。我可以帮助你维护世界观设定的一致性，检测和处理设定冲突。请问有什么需要我帮助的吗？',
+  timestamp: new Date(),
+})
+
 // 获取 severity 标签，带默认值
 const getSeverityLabel = (severity: string): string => {
   return severityLabels[severity] || '未知'
@@ -78,6 +87,8 @@ export default function SettingAgentChat({
   const [showImprovementModal, setShowImprovementModal] = useState(false)
   const [executingSuggestion, setExecutingSuggestion] = useState<string | null>(null)
   const [sessionId, setSessionId] = useState<string | null>(null)
+  const [assistantContextSessionId, setAssistantContextSessionId] = useState<string | null>(null)
+  const [contextPacket, setContextPacket] = useState<AssistantContextSummary | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
   // 初始化或恢复持久化会话
@@ -107,21 +118,12 @@ export default function SettingAgentChat({
               timestamp: new Date(timestamp || Date.now()),
             }
           })
-        if (restored.length > 0) {
-          setMessages(restored)
-        } else {
-          setMessages([
-            {
-              id: 'welcome',
-              role: 'assistant',
-              content: '你好！我是设定管理者 Agent。我可以帮助你维护世界观设定的一致性，检测和处理设定冲突。请问有什么需要我帮助的吗？',
-              timestamp: new Date(),
-            },
-          ])
-        }
+        setMessages(restored.length > 0 ? restored : [createWelcomeMessage()])
         setPendingLores(history.pending_lores || session.pending_lores || [])
         setPendingCharacters(history.pending_characters || session.pending_characters || [])
         setPendingHooks(history.pending_hooks || session.pending_hooks || [])
+        setContextPacket(history.context_packet || null)
+        setAssistantContextSessionId(history.assistant_session_id || null)
       } catch (error) {
         console.error('Failed to hydrate setting agent session:', error)
       }
@@ -157,6 +159,12 @@ export default function SettingAgentChat({
       if (response.session_id && response.session_id !== sessionId) {
         setSessionId(response.session_id)
         localStorage.setItem(`settingAgentSession:${projectId}:management`, response.session_id)
+      }
+      if (response.assistant_session_id) {
+        setAssistantContextSessionId(response.assistant_session_id)
+      }
+      if (response.context_packet) {
+        setContextPacket(response.context_packet)
       }
 
       const assistantMessage: Message = {
@@ -646,8 +654,41 @@ export default function SettingAgentChat({
     ])
   }
 
+  const handleAssistantHistoryReset = (newSessionId: string) => {
+    setAssistantContextSessionId(newSessionId)
+    setMessages([createWelcomeMessage()])
+    setCurrentConflict(null)
+    setShowConfirmModal(false)
+    setShowCharacterModal(false)
+    setShowHookModal(false)
+    setShowImprovementModal(false)
+  }
+
   return (
     <div className="flex flex-col h-full">
+      <div className="p-4 pb-0">
+        <AssistantContextControls
+          projectId={projectId}
+          sessionId={assistantContextSessionId}
+          assistantSurface="setting_agent"
+          mode="management"
+          scope={{ needs: ['world', 'lore', 'characters', 'plot_hooks', 'chapter_outlines', 'recent_deltas'] }}
+          contextPacket={contextPacket}
+          compact
+          onHistoryReset={handleAssistantHistoryReset}
+          onRereadComplete={(response) => {
+            setAssistantContextSessionId(response.session_id || assistantContextSessionId)
+            setContextPacket({
+              ...response.packet_metadata,
+              snapshot_id: response.snapshot_id,
+              snapshot_version: response.snapshot_version,
+              force_reread: true,
+              invalidation_state: 'force_rebuilt',
+            })
+          }}
+        />
+      </div>
+
       {/* 消息列表 - 可滚动区域 */}
       <div className="flex-1 overflow-y-auto p-4 space-y-4 min-h-0">
         {messages.map((msg) => (

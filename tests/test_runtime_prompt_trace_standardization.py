@@ -3635,6 +3635,28 @@ def test_authoritative_templates_include_long_novel_skills_and_writing_rules_slo
         assert "writing_rules" in (template.default_prompt_order or []), template.id
         assert "skill_long_novel_awareness" in skill_ids, template.id
 
+    writer_skill_ids = {slot.skill_id for slot in DIRECTOR_WRITER.skill_slots if slot.is_enabled}
+    assert "skill_de_ai_if_y" in writer_skill_ids
+    assert "de_ai" in (DIRECTOR_WRITER.default_skill_order or [])
+    assert (DIRECTOR_WRITER.default_skill_order or []).index("de_ai") < (DIRECTOR_WRITER.default_skill_order or []).index("primary")
+
+
+def test_de_ai_natural_prose_rule_is_core_system_rule():
+    from app.data.web_novel_writing_rules import WEB_NOVEL_RULE_SETS, WEB_NOVEL_WRITING_RULES
+
+    rules_by_id = {rule["id"]: rule for rule in WEB_NOVEL_WRITING_RULES}
+    rule = rules_by_id["style_de_ai_natural_prose"]
+
+    assert rule["severity"] == "required"
+    assert rule["application_mode"] == "always_postcheck"
+    assert "去AI感" in rule["tags"]
+    assert "模板化" in rule["content"]
+    assert "解释腔" in rule["content"]
+
+    sets_by_id = {rule_set["id"]: rule_set for rule_set in WEB_NOVEL_RULE_SETS}
+    assert "style_de_ai_natural_prose" in sets_by_id["rule_set_web_novel_basics"]["rule_ids"]
+    assert "style_de_ai_natural_prose" in sets_by_id["rule_set_web_novel_advanced"]["rule_ids"]
+
 
 def test_writer_style_consistency_template_is_scenario_specific():
     from app.data.system_agent_templates import SYSTEM_AGENT_TEMPLATES, WRITER_STYLE_CONSISTENCY
@@ -3843,6 +3865,51 @@ async def test_shared_long_novel_rules_are_forced_when_rag_retrieval_misses(monk
 
 
 @pytest.mark.asyncio
+async def test_shared_de_ai_rule_is_forced_for_writer_and_evaluator_when_rag_misses(monkeypatch):
+    from app.services import agent_prompt_service as agent_prompt_module
+    from app.services.agent_prompt_service import AgentPromptService
+    from app.services.writing_rule_service import WritingRuleService
+
+    rule_service = WritingRuleService(db=None)
+
+    class EmptyRagService:
+        async def retrieve_for_project(self, project_id, context=None, limit=6):
+            scope = await rule_service.resolve_project_rule_scope(project_id)
+            return {
+                "project_id": project_id,
+                "query": "empty-rag",
+                "resolved_scope": rule_service.describe_project_rule_scope(scope),
+                "retrieved_rules": [],
+                "always_rules": [],
+                "rendered_guidance": "",
+            }
+
+    monkeypatch.setattr(agent_prompt_module, "get_writing_rule_service", lambda: rule_service)
+    monkeypatch.setattr(agent_prompt_module, "get_writing_rule_rag_service", lambda: EmptyRagService())
+
+    service = AgentPromptService()
+    for agent_type, scenario in [
+        ("writer", "workflow_chapter_generation"),
+        ("writer", "rewrite_by_review"),
+        ("evaluator", "chapter_quality_review"),
+    ]:
+        result = await service.build_writing_rules_prompt_with_trace(
+            project_id="project-1",
+            context={"query": "没有语义检索结果"},
+            agent_type=agent_type,
+            scenario=scenario,
+        )
+
+        assert "## 共享去AI感自然文风规则" in result["content"]
+        assert "style_de_ai_natural_prose" in result["content"]
+        assert "模板化" in result["content"]
+        assert AgentPromptService.SHARED_DE_AI_RULE_IDS.issubset(set(result["trace"]["writing_rule_ids"]))
+        assert set(result["trace"]["shared_de_ai_rule_ids"]) == AgentPromptService.SHARED_DE_AI_RULE_IDS
+        assert result["trace"]["missing_shared_de_ai_rule_ids"] == []
+        assert any(rule["reason"] == "shared_de_ai_core" for rule in result["trace"]["retrieved_rules"])
+
+
+@pytest.mark.asyncio
 async def test_prompt_template_service_resolves_md_only_template_when_cache_is_not_empty(monkeypatch):
     from app.models.prompt_template import PromptCategory, PromptTemplate
     from app.services.prompt_template_service import PromptTemplateService
@@ -3928,12 +3995,13 @@ def test_md_file_service_records_scan_errors_and_stats(monkeypatch, tmp_path):
 class MdSyncFakeDb:
     def __init__(self):
         self.writes = []
+        self.query_results = []
 
     async def execute_write(self, query, params=None):
         self.writes.append({"query": query, "params": params or {}})
 
     async def execute_query(self, query, params=None):
-        return []
+        return list(self.query_results)
 
 
 @pytest.mark.asyncio
@@ -4066,6 +4134,41 @@ async def test_skill_md_sync_returns_file_results_and_scenario_assignments(monke
     }
     assert {write["params"]["slot_name"] for write in assignment_writes} == {"writing"}
     assert {write["params"]["priority"] for write in assignment_writes} == {77}
+
+
+@pytest.mark.asyncio
+async def test_skill_md_sync_deletes_stale_md_skills_from_cache_and_db():
+    from app.models.skill import Skill, SkillCategory, SkillType
+    from app.services.skill_service import SkillService
+
+    db = MdSyncFakeDb()
+    db.query_results = [{"id": "skill_stale_md"}, {"id": "skill_current_md"}]
+    service = SkillService(db=db)
+    service._skills_cache["skill_stale_md"] = Skill(
+        id="skill_stale_md",
+        name="Stale MD Skill",
+        description="Removed md skill",
+        skill_type=SkillType.PROMPT,
+        category=SkillCategory.WRITING,
+        prompt_template="stale body",
+    )
+    service._skills_cache["skill_current_md"] = Skill(
+        id="skill_current_md",
+        name="Current MD Skill",
+        description="Synced md skill",
+        skill_type=SkillType.PROMPT,
+        category=SkillCategory.WRITING,
+        prompt_template="current body",
+    )
+
+    await service._delete_stale_md_skills({"skill_current_md"})
+
+    assert "skill_stale_md" not in service._skills_cache
+    assert "skill_current_md" in service._skills_cache
+    deleted_params = [write["params"] for write in db.writes if write["params"].get("id") == "skill_stale_md"]
+    assert len(deleted_params) == 2
+    assert any("DELETE FROM skill_assignments" in write["query"] for write in db.writes)
+    assert any("DELETE FROM skills" in write["query"] for write in db.writes)
 
 
 @pytest.mark.asyncio
@@ -4354,6 +4457,15 @@ async def test_project_agent_config_preview_uses_runtime_builder_and_trace_contr
     assert result["template"]["id"] == template.id
     assert result["render_trace"]["config_id"] == config.id
     assert_render_trace_contract(result["render_trace"])
+
+
+def test_agent_prompt_service_get_agent_template_accepts_agent_type_string():
+    from app.data.system_agent_templates import DIRECTOR_WRITER
+    from app.services.agent_prompt_service import AgentPromptService
+
+    service = AgentPromptService()
+
+    assert service.get_agent_template("writer") is DIRECTOR_WRITER
 
 
 @pytest.mark.asyncio
@@ -4771,8 +4883,8 @@ def test_evaluator_task_prompts_use_md_assets_for_stable_rules(monkeypatch):
     loaded_prompt_ids = []
 
     prompt_assets = {
-        "function_evaluator_chapter_quality_gate": "md evaluator chapter gate rules",
-        "function_evaluator_reader_simulation": "md evaluator reader simulation rules",
+        "function_evaluator_chapter_quality_gate": "md evaluator chapter gate rules\nAI感文风 Gate\nde_ai_style_check",
+        "function_evaluator_reader_simulation": "md evaluator reader simulation rules\nAI 腔与模板化总结检查",
         "function_evaluator_ooc_review": "md evaluator ooc review rules",
     }
 
@@ -4823,7 +4935,11 @@ def test_evaluator_task_prompts_use_md_assets_for_stable_rules(monkeypatch):
         "function_evaluator_ooc_review",
     ]
     assert "md evaluator chapter gate rules" in chapter_prompt
+    assert "AI感文风 Gate" in chapter_prompt
+    assert "de_ai_style_check" in chapter_prompt
+    assert "de_ai_style_check" in evaluator._evaluator_task_schema("chapter_end", word_count=1200, target_word_count=1500)
     assert "md evaluator reader simulation rules" in reader_prompt
+    assert "AI 腔与模板化总结检查" in reader_prompt
     assert "md evaluator ooc review rules" in ooc_prompt
     for prompt in (chapter_prompt, reader_prompt, ooc_prompt):
         assert "Evaluator runtime prompt" in prompt
