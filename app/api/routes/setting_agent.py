@@ -12,6 +12,7 @@ from app.models.setting_agent import (
     SettingChangeType,
     SettingConflict,
 )
+from app.services.character_reference_resolver import get_character_reference_resolver
 from app.services.setting_agent_service import get_setting_agent_service
 
 router = APIRouter()
@@ -81,6 +82,13 @@ class ExecuteLoreModificationRequest(BaseModel):
     """执行设定修改请求"""
     project_id: str
     modification: Dict[str, Any]
+
+
+class ResolveCharacterReferencesRequest(BaseModel):
+    """角色引用解析预检请求"""
+    project_id: str
+    references: List[Any]
+    provenance: Optional[Dict[str, Any]] = None
 
 
 class AnalyzeWorldDescriptionRequest(BaseModel):
@@ -160,6 +168,26 @@ async def analyze_world_description(request: AnalyzeWorldDescriptionRequest):
             description=request.description,
         )
         return {"structured_data": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/resolve-character-references")
+async def resolve_character_references(request: ResolveCharacterReferencesRequest):
+    """预检设定文本中的角色引用，返回已解析/歧义/未解析结果。"""
+    from app.api.app import postgres_db
+
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+
+    try:
+        resolver = get_character_reference_resolver(postgres_db)
+        result = await resolver.resolve_for_lore(
+            project_id=request.project_id,
+            references=request.references,
+            provenance=request.provenance or {"surface": "setting_agent", "operation": "preflight"},
+        )
+        return {"success": True, **result.to_dict()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

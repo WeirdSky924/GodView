@@ -11,8 +11,10 @@ import {
   searchLore,
   getLoreCategories,
   getLorePriorities,
+  bindLoreCharacterReference,
 } from '@/api/lore'
 import type {
+  BindLoreCharacterPayload,
   LoreEntry,
   LoreCategory,
   LorePriority,
@@ -20,6 +22,8 @@ import type {
   UpdateLoreDTO,
   LoreSearchResult,
 } from '@/api/lore'
+import { getCharacters, CharacterImportanceTier, TIER_DISPLAY_NAMES, type Character } from '@/api/characters'
+import type { CharacterReferenceResolution, UnresolvedCharacterReference } from '@/api/settingAgent'
 import {
   Plus, Edit, Trash2, Search, BookOpen, FolderOpen,
   Globe, Map, Clock, Users, Package, Zap, Shield, Star,
@@ -179,6 +183,14 @@ export default function Lore() {
   const [requirementRefreshKey, setRequirementRefreshKey] = useState(0)
   const [viewMode, setViewMode] = useState<'list' | 'tree'>('list')
   const [showAgentChat, setShowAgentChat] = useState(false)
+  const [bindingRef, setBindingRef] = useState<UnresolvedCharacterReference | null>(null)
+  const [bindForm, setBindForm] = useState<BindLoreCharacterPayload>({ name: '', description: '', aliases: [], status: 'active', importance_tier: CharacterImportanceTier.NPC })
+  const [bindAliasesInput, setBindAliasesInput] = useState('')
+  const [bindingLoadingKey, setBindingLoadingKey] = useState<string | null>(null)
+  const [referenceBindError, setReferenceBindError] = useState<string | null>(null)
+  const [charactersForBinding, setCharactersForBinding] = useState<Character[]>([])
+  const [loadingCharactersForBinding, setLoadingCharactersForBinding] = useState(false)
+  const [selectedExistingCharacterId, setSelectedExistingCharacterId] = useState('')
 
   const getPriorityColors = (priority?: LorePriority): string => {
     const colors: Record<string, { light: string; dark: string }> = {
@@ -317,6 +329,107 @@ export default function Lore() {
     setKeywordsInput(keywords.join('，'))
     setPendingRequirement(null)
     setShowModal(true)
+  }
+
+  const applyReferenceResolutionToLore = (lore: LoreEntry, resolution: CharacterReferenceResolution): LoreEntry => ({
+    ...lore,
+    related_characters: resolution.related_characters,
+    related_character_refs: resolution.related_character_refs,
+    unresolved_character_refs: resolution.unresolved_character_refs,
+    updated_at: new Date().toISOString(),
+  })
+
+  const updateLoreReferenceState = (loreId: string, resolution: CharacterReferenceResolution) => {
+    setLoreList(prev => prev.map(lore => lore.id === loreId ? applyReferenceResolutionToLore(lore, resolution) : lore))
+    setSelectedLore(prev => prev && prev.id === loreId ? applyReferenceResolutionToLore(prev, resolution) : prev)
+  }
+
+  const loadCharactersForBinding = async () => {
+    if (!currentProject || loadingCharactersForBinding) return
+    setLoadingCharactersForBinding(true)
+    try {
+      const characters = await getCharacters(currentProject.id)
+      setCharactersForBinding(characters)
+    } catch (error) {
+      console.error('Failed to load characters for binding:', error)
+      setReferenceBindError(formatApiErrorMessage(error, '加载角色候选失败'))
+    } finally {
+      setLoadingCharactersForBinding(false)
+    }
+  }
+
+  const openCreateBindModal = (ref: UnresolvedCharacterReference) => {
+    setBindingRef(ref)
+    setReferenceBindError(null)
+    setBindAliasesInput('')
+    setBindForm({
+      name: ref.source_text,
+      aliases: [],
+      status: 'active',
+      importance_tier: CharacterImportanceTier.NPC,
+      description: selectedLore ? `由设定「${selectedLore.title}」中的未解析角色引用「${ref.source_text}」创建。` : '',
+      has_agent: false,
+      agent_enabled: true,
+    })
+  }
+
+  const bindReference = async (ref: UnresolvedCharacterReference, characterId: string) => {
+    if (!currentProject || !selectedLore || !characterId) return
+    const loadingKey = `${ref.source_text}:existing:${characterId}`
+    setBindingLoadingKey(loadingKey)
+    setReferenceBindError(null)
+    try {
+      const result = await bindLoreCharacterReference(selectedLore.id, {
+        project_id: currentProject.id,
+        source_text: ref.source_text,
+        action: 'bind_existing',
+        character_id: characterId,
+        provenance: {
+          surface: 'lore_page',
+          operation: 'bind_unresolved_reference_existing',
+          lore_id: selectedLore.id,
+          lore_title: selectedLore.title,
+        },
+      })
+      updateLoreReferenceState(selectedLore.id, result.character_reference_resolution)
+      await loadLore()
+    } catch (error) {
+      setReferenceBindError(formatApiErrorMessage(error, '绑定角色引用失败'))
+    } finally {
+      setBindingLoadingKey(null)
+    }
+  }
+
+  const createAndBindReference = async () => {
+    if (!currentProject || !selectedLore || !bindingRef || !bindForm.name?.trim()) return
+    const loadingKey = `${bindingRef.source_text}:create`
+    setBindingLoadingKey(loadingKey)
+    setReferenceBindError(null)
+    try {
+      const result = await bindLoreCharacterReference(selectedLore.id, {
+        project_id: currentProject.id,
+        source_text: bindingRef.source_text,
+        action: 'create_character',
+        character: {
+          ...bindForm,
+          name: bindForm.name.trim(),
+          aliases: bindAliasesInput.split(/[，,\n]/).map(item => item.trim()).filter(Boolean),
+        },
+        provenance: {
+          surface: 'lore_page',
+          operation: 'create_character_from_unresolved_reference',
+          lore_id: selectedLore.id,
+          lore_title: selectedLore.title,
+        },
+      })
+      updateLoreReferenceState(selectedLore.id, result.character_reference_resolution)
+      setBindingRef(null)
+      await loadLore()
+    } catch (error) {
+      setReferenceBindError(formatApiErrorMessage(error, '创建并绑定角色失败'))
+    } finally {
+      setBindingLoadingKey(null)
+    }
   }
 
   const saveLore = async () => {
@@ -714,6 +827,84 @@ export default function Lore() {
                       </div>
                     )}
 
+                    {/* 角色引用解析 */}
+                    {((selectedLore.related_character_refs?.length || 0) > 0 || (selectedLore.unresolved_character_refs?.length || 0) > 0) && (
+                      <div className={`mb-6 rounded-xl border p-4 ${isDark ? 'border-gray-700 bg-gray-900/50' : 'border-gray-200 bg-white'}`}>
+                        <div className="mb-3 flex items-center justify-between gap-3">
+                          <h3 className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>角色引用解析</h3>
+                          <span className={`text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>canonical related_characters 只保存已绑定角色 ID</span>
+                        </div>
+                        {referenceBindError && (
+                          <div className={`mb-3 rounded-lg px-3 py-2 text-sm ${isDark ? 'bg-red-950/40 text-red-200' : 'bg-red-50 text-red-700'}`}>{referenceBindError}</div>
+                        )}
+                        {(selectedLore.related_character_refs || []).length > 0 && (
+                          <div className="mb-3 space-y-2">
+                            <div className={`text-xs font-medium ${isDark ? 'text-green-300' : 'text-green-700'}`}>已绑定角色</div>
+                            {(selectedLore.related_character_refs || []).map((ref, index) => (
+                              <div key={`${ref.character_id}-${index}`} className={`rounded-lg px-3 py-2 text-sm ${isDark ? 'bg-green-950/30 text-green-100' : 'bg-green-50 text-green-800'}`}>
+                                {ref.source_text} → <span className="font-medium">{ref.character_name}</span>
+                                <span className="ml-2 text-xs opacity-70">{ref.resolution_method}</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                        {(selectedLore.unresolved_character_refs || []).length > 0 && (
+                          <div className="space-y-3">
+                            <div className={`text-xs font-medium ${isDark ? 'text-amber-300' : 'text-amber-700'}`}>待处理引用</div>
+                            {(selectedLore.unresolved_character_refs || []).map((ref, index) => (
+                              <div key={`${ref.source_text}-${index}`} className={`rounded-xl border p-3 text-sm ${isDark ? 'border-amber-800/60 bg-amber-950/20 text-amber-100' : 'border-amber-200 bg-amber-50 text-amber-900'}`}>
+                                <div className="font-medium">{ref.source_text}</div>
+                                <div className="mt-1 text-xs opacity-80">{ref.message || ref.reason}</div>
+                                {ref.candidates?.length > 0 && (
+                                  <div className="mt-2 flex flex-wrap gap-2">
+                                    {ref.candidates.map(candidate => {
+                                      const loadingKey = `${ref.source_text}:existing:${candidate.character_id}`
+                                      return (
+                                        <Button
+                                          key={candidate.character_id}
+                                          size="sm"
+                                          variant="secondary"
+                                          onClick={() => bindReference(ref, candidate.character_id)}
+                                          disabled={bindingLoadingKey === loadingKey}
+                                        >
+                                          绑定候选：{candidate.name}
+                                        </Button>
+                                      )
+                                    })}
+                                  </div>
+                                )}
+                                <div className="mt-3 flex flex-wrap items-center gap-2">
+                                  <Button size="sm" onClick={() => openCreateBindModal(ref)} disabled={Boolean(bindingLoadingKey)}>
+                                    创建角色并绑定
+                                  </Button>
+                                  <Button size="sm" variant="secondary" onClick={loadCharactersForBinding} disabled={loadingCharactersForBinding}>
+                                    {loadingCharactersForBinding ? '加载中...' : '选择其他已有角色'}
+                                  </Button>
+                                  {charactersForBinding.length > 0 && (
+                                    <>
+                                      <select
+                                        value={selectedExistingCharacterId}
+                                        onChange={(event) => setSelectedExistingCharacterId(event.target.value)}
+                                        className={`rounded border px-2 py-1 text-sm ${isDark ? 'border-gray-700 bg-gray-950 text-gray-200' : 'border-amber-200 bg-white text-gray-700'}`}
+                                      >
+                                        <option value="">选择已有角色</option>
+                                        {charactersForBinding.map(character => (
+                                          <option key={character.id} value={character.id}>{character.name}</option>
+                                        ))}
+                                      </select>
+                                      <Button size="sm" variant="secondary" onClick={() => selectedExistingCharacterId && bindReference(ref, selectedExistingCharacterId)} disabled={!selectedExistingCharacterId || Boolean(bindingLoadingKey)}>
+                                        绑定所选角色
+                                      </Button>
+                                    </>
+                                  )}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
                     {/* 关联 */}
                     <div className="grid grid-cols-3 gap-4 text-sm">
                       <div className={`p-4 rounded-lg ${isDark ? 'bg-gray-800' : 'bg-gray-50'}`}>
@@ -805,6 +996,88 @@ export default function Lore() {
               <Button variant="secondary" onClick={() => setShowModal(false)}>取消</Button>
               <Button onClick={saveLore} disabled={!formData.title || !formData.content}>
                 {editingLore ? '保存修改' : '创建'}
+              </Button>
+            </div>
+          </div>
+        </Modal>
+
+        <Modal
+          isOpen={Boolean(bindingRef)}
+          onClose={() => setBindingRef(null)}
+          title="创建角色并绑定引用"
+          size="lg"
+        >
+          <div className="space-y-4">
+            {bindingRef && (
+              <div className={`rounded-lg px-3 py-2 text-sm ${isDark ? 'bg-amber-950/30 text-amber-100' : 'bg-amber-50 text-amber-800'}`}>
+                将未解析引用 <span className="font-semibold">{bindingRef.source_text}</span> 创建为角色，并绑定到当前设定。
+              </div>
+            )}
+            {referenceBindError && (
+              <div className={`rounded-lg px-3 py-2 text-sm ${isDark ? 'bg-red-950/40 text-red-200' : 'bg-red-50 text-red-700'}`}>{referenceBindError}</div>
+            )}
+            <div className="grid grid-cols-2 gap-4">
+              <Input
+                label="角色名称 *"
+                value={bindForm.name}
+                onChange={(e) => setBindForm({ ...bindForm, name: e.target.value })}
+                placeholder="角色名称"
+              />
+              <Input
+                label="别名"
+                value={bindAliasesInput}
+                onChange={(e) => setBindAliasesInput(e.target.value)}
+                placeholder="用逗号分隔"
+              />
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className={`block text-sm font-medium mb-1 ${isDark ? 'text-gray-300' : 'text-gray-700'}`}>重要性层级</label>
+                <select
+                  className={`w-full px-3 py-2 border rounded-lg ${isDark ? 'bg-gray-800 border-gray-600 text-white' : 'border-gray-300'}`}
+                  value={bindForm.importance_tier || CharacterImportanceTier.NPC}
+                  onChange={(e) => setBindForm({ ...bindForm, importance_tier: e.target.value as CharacterImportanceTier })}
+                >
+                  {Object.values(CharacterImportanceTier).map(tier => (
+                    <option key={tier} value={tier}>{TIER_DISPLAY_NAMES[tier]}</option>
+                  ))}
+                </select>
+              </div>
+              <Input
+                label="性别"
+                value={bindForm.gender || ''}
+                onChange={(e) => setBindForm({ ...bindForm, gender: e.target.value })}
+                placeholder="可选"
+              />
+            </div>
+            <TextArea
+              label="角色描述"
+              value={bindForm.description || ''}
+              onChange={(e) => setBindForm({ ...bindForm, description: e.target.value })}
+              rows={3}
+            />
+            <TextArea
+              label="外貌"
+              value={bindForm.appearance || ''}
+              onChange={(e) => setBindForm({ ...bindForm, appearance: e.target.value })}
+              rows={2}
+            />
+            <TextArea
+              label="性格 / 背景"
+              value={bindForm.background_story || ''}
+              onChange={(e) => setBindForm({ ...bindForm, background_story: e.target.value })}
+              rows={3}
+            />
+            <Input
+              label="说话风格"
+              value={bindForm.speech_pattern || ''}
+              onChange={(e) => setBindForm({ ...bindForm, speech_pattern: e.target.value })}
+              placeholder="可选"
+            />
+            <div className="flex justify-end gap-3 pt-4">
+              <Button variant="secondary" onClick={() => setBindingRef(null)}>取消</Button>
+              <Button onClick={createAndBindReference} disabled={!bindForm.name?.trim() || bindingLoadingKey === `${bindingRef?.source_text}:create`}>
+                {bindingLoadingKey === `${bindingRef?.source_text}:create` ? '创建中...' : '创建并绑定'}
               </Button>
             </div>
           </div>

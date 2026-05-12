@@ -318,6 +318,7 @@ class Character(BaseModel):
 
     id: Optional[str] = Field(None, description="角色唯一 ID（创建时自动生成）")
     name: str = Field(..., description="角色名称")
+    aliases: List[str] = Field(default_factory=list, description="角色别名/曾用名，用于设定引用解析")
 
     # 项目归属
     project_id: Optional[str] = Field(None, description="所属项目ID")
@@ -509,6 +510,7 @@ class Character(BaseModel):
             "example": {
                 "id": "char_001",
                 "name": "张三",
+                "aliases": ["张少侠"],
                 "description": "一个初入江湖的年轻侠客",
                 "role": "main",
                 "importance_tier": "protagonist",

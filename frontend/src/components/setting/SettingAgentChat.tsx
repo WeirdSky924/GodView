@@ -6,6 +6,7 @@ import type { AssistantContextSummary } from '@/api/assistantContext'
 import {
   chatWithSettingAgent,
   negotiateConflict,
+  resolveCharacterReferences,
   savePendingLores,
   savePendingCharacters,
   savePendingHooks,
@@ -15,6 +16,7 @@ import {
   PendingCharacter,
   PendingHook,
   ImprovementSuggestion,
+  CharacterReferenceResolution,
   createOrGetSession,
   getChatHistory,
 } from '@/api/settingAgent'
@@ -81,6 +83,8 @@ export default function SettingAgentChat({
   const [showCharacterModal, setShowCharacterModal] = useState(false)
   const [showHookModal, setShowHookModal] = useState(false)
   const [removedLoreIndices, setRemovedLoreIndices] = useState<Set<number>>(new Set())
+  const [loreReferenceResolution, setLoreReferenceResolution] = useState<Record<number, CharacterReferenceResolution>>({})
+  const [resolvingLoreReferences, setResolvingLoreReferences] = useState(false)
   const [removedCharacterIndices, setRemovedCharacterIndices] = useState<Set<number>>(new Set())
   const [removedHookIndices, setRemovedHookIndices] = useState<Set<number>>(new Set())
   const [improvementSuggestions, setImprovementSuggestions] = useState<ImprovementSuggestion[]>([])
@@ -260,6 +264,36 @@ export default function SettingAgentChat({
     }
   }
 
+  const preflightLoreReferences = async (lores: PendingLore[]) => {
+    if (lores.length === 0) return lores
+    setResolvingLoreReferences(true)
+    try {
+      const nextResolution: Record<number, CharacterReferenceResolution> = {}
+      const resolvedLores = await Promise.all(
+        lores.map(async (lore, idx) => {
+          const references = lore.related_characters || []
+          if (references.length === 0) return lore
+          const resolution = await resolveCharacterReferences(projectId, references, {
+            surface: 'setting_agent',
+            operation: 'pending_lore_preflight',
+            title: lore.title,
+          })
+          nextResolution[idx] = resolution
+          return {
+            ...lore,
+            related_characters: resolution.related_characters,
+            related_character_refs: resolution.related_character_refs,
+            unresolved_character_refs: resolution.unresolved_character_refs,
+          }
+        }),
+      )
+      setLoreReferenceResolution(nextResolution)
+      return resolvedLores
+    } finally {
+      setResolvingLoreReferences(false)
+    }
+  }
+
   // 保存用户确认的设定
   const handleConfirmSave = async () => {
     // 过滤掉已删除的设定
@@ -276,13 +310,19 @@ export default function SettingAgentChat({
       ])
       setPendingLores([])
       setRemovedLoreIndices(new Set())
+      setLoreReferenceResolution({})
       setShowConfirmModal(false)
       return
     }
 
     setLoading(true)
     try {
-      const result = await savePendingLores(projectId, loresToSave, {
+      const resolvedLoresToSave = await preflightLoreReferences(loresToSave)
+      const unresolvedCount = resolvedLoresToSave.reduce(
+        (sum, lore) => sum + (lore.unresolved_character_refs?.length || 0),
+        0,
+      )
+      const result = await savePendingLores(projectId, resolvedLoresToSave, {
         sessionId: sessionId || undefined,
         requestId: `save_lores_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
       })
@@ -292,7 +332,9 @@ export default function SettingAgentChat({
           {
             id: `saved_${Date.now()}`,
             role: 'assistant',
-            content: result.message,
+            content: unresolvedCount > 0
+              ? `${result.message}。其中 ${unresolvedCount} 个角色引用未能自动绑定，已作为待确认引用保存，不会写入 canonical related_characters。`
+              : result.message,
             timestamp: new Date(),
           },
         ])
@@ -303,6 +345,7 @@ export default function SettingAgentChat({
     } finally {
       setPendingLores([])
       setRemovedLoreIndices(new Set())
+      setLoreReferenceResolution({})
       setShowConfirmModal(false)
       setLoading(false)
     }
@@ -321,6 +364,7 @@ export default function SettingAgentChat({
     ])
     setPendingLores([])
     setRemovedLoreIndices(new Set())
+    setLoreReferenceResolution({})
     setShowConfirmModal(false)
   }
 
@@ -845,6 +889,38 @@ export default function SettingAgentChat({
                           <p className="text-sm text-gray-600 mb-2">{lore.summary}</p>
                         )}
                         <p className="text-xs text-gray-500 line-clamp-3">{lore.content}</p>
+                        {lore.related_characters.length > 0 && (
+                          <div className="mt-2 rounded border border-blue-100 bg-blue-50 p-2">
+                            <div className="text-xs font-medium text-blue-800">原始角色引用</div>
+                            <div className="mt-1 flex flex-wrap gap-1">
+                              {lore.related_characters.map((item, i) => (
+                                <span key={i} className="text-xs px-2 py-0.5 bg-white text-blue-700 rounded border border-blue-200">
+                                  {item}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                        {(loreReferenceResolution[idx] || lore.unresolved_character_refs?.length || lore.related_character_refs?.length) && (
+                          <div className="mt-2 space-y-2 rounded border border-amber-100 bg-amber-50 p-2">
+                            <div className="text-xs font-medium text-amber-900">角色引用解析状态</div>
+                            {(loreReferenceResolution[idx]?.related_character_refs || lore.related_character_refs || []).map((ref, i) => (
+                              <div key={`resolved-${i}`} className="text-xs text-green-700">
+                                已绑定：{ref.source_text} → {ref.character_name} ({ref.resolution_method})
+                              </div>
+                            ))}
+                            {(loreReferenceResolution[idx]?.unresolved_character_refs || lore.unresolved_character_refs || []).map((ref, i) => (
+                              <div key={`unresolved-${i}`} className="text-xs text-amber-800">
+                                待确认：{ref.source_text} — {ref.message}。保存后可在设定详情页创建新角色并绑定，或绑定到已有角色。
+                                {ref.candidates?.length > 0 && (
+                                  <div className="mt-1 text-amber-700">
+                                    候选：{ref.candidates.map((candidate) => candidate.name).join('、')}
+                                  </div>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        )}
                         {lore.keywords.length > 0 && (
                           <div className="flex flex-wrap gap-1 mt-2">
                             {lore.keywords.map((kw, i) => (
@@ -877,9 +953,9 @@ export default function SettingAgentChat({
                 </Button>
                 <Button
                   onClick={handleConfirmSave}
-                  disabled={loading || removedLoreIndices.size === pendingLores.length}
+                  disabled={loading || resolvingLoreReferences || removedLoreIndices.size === pendingLores.length}
                 >
-                  {loading ? (
+                  {loading || resolvingLoreReferences ? (
                     <Loader2 size={16} className="animate-spin mr-1" />
                   ) : (
                     <Save size={16} className="mr-1" />

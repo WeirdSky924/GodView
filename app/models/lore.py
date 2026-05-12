@@ -141,7 +141,9 @@ class LoreEntry(BaseModel):
     tags: List[str] = Field(default_factory=list, description="标签列表")
 
     # 关联信息
-    related_characters: List[str] = Field(default_factory=list, description="相关角色 ID")
+    related_characters: List[str] = Field(default_factory=list, description="已解析的相关角色 ID")
+    related_character_refs: List[Dict[str, Any]] = Field(default_factory=list, description="已解析角色引用元数据")
+    unresolved_character_refs: List[Dict[str, Any]] = Field(default_factory=list, description="待用户确认的未解析/歧义角色引用")
     related_locations: List[str] = Field(default_factory=list, description="相关地点 ID")
     related_items: List[str] = Field(default_factory=list, description="相关物品 ID")
     parent_lore_id: Optional[str] = Field(None, description="父设定 ID（用于层级结构）")

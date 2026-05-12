@@ -96,6 +96,28 @@ export default function CharacterRelationshipEditor({
     }
   }
 
+  const resolveRelationshipKey = (sourceKey: string, targetId: string) => {
+    if (!targetId || targetId === currentCharacterId) return
+    const relation = value?.[sourceKey]
+    if (!relation?.trim()) return
+    const next = { ...(value || {}) }
+    delete next[sourceKey]
+    next[targetId] = relation
+    onChange(next)
+  }
+
+  const candidateMatchesForKey = (sourceKey: string) => {
+    const normalized = sourceKey.trim().toLowerCase().replace(/\s+/g, '')
+    if (!normalized) return []
+    return candidateCharacters.filter((character) => {
+      const names = [character.name, ...(character.aliases || [])]
+      return names.some((name) => {
+        const candidate = name.trim().toLowerCase().replace(/\s+/g, '')
+        return candidate && (candidate.includes(normalized) || normalized.includes(candidate))
+      })
+    }).slice(0, 5)
+  }
+
   const updateLegacyRelationships = (nextValue: string) => {
     setLegacyInput(nextValue)
     onLegacyRelationshipsChange?.(splitLegacyRelationships(nextValue))
@@ -272,17 +294,47 @@ export default function CharacterRelationshipEditor({
             <AlertTriangle size={15} />未解析关系
           </div>
           <div className="space-y-2">
-            {unresolvedEntries.map(([targetId, relation]) => (
-              <div key={targetId} className={`flex items-center justify-between gap-3 rounded-lg px-3 py-2 text-sm ${isDark ? 'bg-gray-900/60 text-gray-300' : 'bg-white text-gray-700'}`}>
-                <div className="min-w-0">
-                  <div className="font-mono text-xs">{targetId}</div>
-                  <div className={`mt-1 text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>{relation}</div>
+            {unresolvedEntries.map(([targetId, relation]) => {
+              const candidates = candidateMatchesForKey(targetId)
+              return (
+                <div key={targetId} className={`rounded-lg px-3 py-2 text-sm ${isDark ? 'bg-gray-900/60 text-gray-300' : 'bg-white text-gray-700'}`}>
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="font-mono text-xs">{targetId}</div>
+                      <div className={`mt-1 text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>{relation}</div>
+                    </div>
+                    <Button variant="secondary" size="sm" onClick={() => removeRelationship(targetId)}>删除</Button>
+                  </div>
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <span className={`text-xs ${isDark ? 'text-amber-200/70' : 'text-amber-700/70'}`}>绑定到现有角色：</span>
+                    <select
+                      defaultValue=""
+                      onChange={(event) => {
+                        if (event.target.value) resolveRelationshipKey(targetId, event.target.value)
+                      }}
+                      className={`rounded border px-2 py-1 text-xs ${isDark ? 'border-gray-700 bg-gray-950 text-gray-200' : 'border-amber-200 bg-amber-50 text-gray-700'}`}
+                    >
+                      <option value="">选择角色</option>
+                      {candidateCharacters.map((character) => (
+                        <option key={character.id} value={character.id}>{character.name}</option>
+                      ))}
+                    </select>
+                    {candidates.map((candidate) => (
+                      <button
+                        key={candidate.id}
+                        type="button"
+                        onClick={() => candidate.id && resolveRelationshipKey(targetId, candidate.id)}
+                        className={`rounded-full px-2 py-0.5 text-xs ${isDark ? 'bg-amber-900/60 text-amber-100 hover:bg-amber-800' : 'bg-amber-100 text-amber-800 hover:bg-amber-200'}`}
+                      >
+                        建议：{candidate.name}
+                      </button>
+                    ))}
+                  </div>
                 </div>
-                <Button variant="secondary" size="sm" onClick={() => removeRelationship(targetId)}>删除</Button>
-              </div>
-            ))}
+              )
+            })}
           </div>
-          <p className={`mt-2 text-xs ${isDark ? 'text-amber-200/70' : 'text-amber-700/70'}`}>这些 key 无法匹配当前项目角色 ID，已保留以避免旧数据丢失；可手动删除后重新添加为标准关系。</p>
+          <p className={`mt-2 text-xs ${isDark ? 'text-amber-200/70' : 'text-amber-700/70'}`}>这些 key 无法匹配当前项目角色 ID；请选择现有角色完成绑定，或删除确认不需要的旧关系。</p>
         </div>
       )}
 

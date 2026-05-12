@@ -85,7 +85,9 @@ class ProjectSnapshotService:
         characters = await self.db.get_all_characters(project_id=project_id, limit=500)
         lores = await self.db.execute_query(
             """
-            SELECT id, title, category, priority, summary, content, keywords, updated_at, created_at
+            SELECT id, title, category, priority, summary, content, keywords,
+                   related_characters, related_character_refs, unresolved_character_refs,
+                   updated_at, created_at
             FROM lore_entries
             WHERE project_id = CAST(:project_id AS UUID)
             ORDER BY
@@ -157,7 +159,7 @@ class ProjectSnapshotService:
                 for item in source["worlds"]
             )
             sections.append(self._section(project_id, "world", "worlds", "世界设定", content, {"count": len(source["worlds"])}, self._refs("world", source["worlds"]), 20))
-        sections.extend(self._grouped_entity_sections(project_id, "lore", source.get("lores") or [], "设定", 30, ["title", "category", "priority", "summary", "content"]))
+        sections.extend(self._grouped_entity_sections(project_id, "lore", source.get("lores") or [], "设定", 30, ["title", "category", "priority", "summary", "content", "related_characters", "unresolved_character_refs"]))
         sections.extend(self._grouped_entity_sections(project_id, "characters", source.get("characters") or [], "角色", 35, ["name", "role", "personality", "background_story", "importance_tier", "status"]))
         sections.extend(self._grouped_entity_sections(project_id, "plot_hooks", source.get("hooks") or [], "伏笔", 45, ["title", "hook_type", "status", "description"]))
         sections.extend(self._grouped_entity_sections(project_id, "chapter_outlines", source.get("outlines") or [], "大纲", 50, ["chapter_number", "title", "status", "summary"]))

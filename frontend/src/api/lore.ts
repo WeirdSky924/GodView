@@ -1,4 +1,6 @@
 import { api } from './client'
+import type { Character, CharacterImportanceTier, NarrativeWeight, StoryArcRole } from './characters'
+import type { CharacterReferenceResolution, ResolvedCharacterReference, UnresolvedCharacterReference } from './settingAgent'
 
 export interface LoreEntry {
   id: string
@@ -11,6 +13,8 @@ export interface LoreEntry {
   keywords: string[]
   tags: string[]
   related_characters: string[]
+  related_character_refs?: ResolvedCharacterReference[]
+  unresolved_character_refs?: UnresolvedCharacterReference[]
   related_locations: string[]
   related_items: string[]
   parent_lore_id?: string
@@ -69,10 +73,66 @@ export interface CreateLoreDTO {
   tags?: string[]
   constraints?: string[]
   related_characters?: string[]
+  related_character_refs?: ResolvedCharacterReference[]
+  unresolved_character_refs?: UnresolvedCharacterReference[]
   related_locations?: string[]
   related_items?: string[]
   forbidden_actions?: string[]
   source?: string
+}
+
+export type LoreCharacterReferenceBindAction = 'bind_existing' | 'create_character'
+
+export interface BindLoreCharacterPayload {
+  name: string
+  aliases?: string[]
+  status?: Character['status']
+  description?: string
+  importance_tier?: CharacterImportanceTier
+  narrative_weight?: NarrativeWeight
+  story_arc_role?: StoryArcRole
+  plot_priority?: number
+  gender?: string
+  age?: number | null
+  appearance?: string
+  personality?: string
+  background_story?: string
+  speech_pattern?: string
+  lexicon?: string[]
+  forbidden_words?: string[]
+  voice_samples?: string[]
+  has_agent?: boolean
+  agent_enabled?: boolean
+  agent_goals?: string[]
+  agent_memory?: string[]
+  world_id?: string
+  current_location?: string
+  current_region_id?: string
+  current_location_reason?: string
+}
+
+export interface BindLoreCharacterReferenceDTO {
+  project_id: string
+  source_text: string
+  action: LoreCharacterReferenceBindAction
+  character_id?: string
+  character?: BindLoreCharacterPayload
+  provenance?: Record<string, unknown>
+}
+
+export interface BindLoreCharacterReferenceResponse {
+  success: boolean
+  lore_id: string
+  project_id: string
+  action: LoreCharacterReferenceBindAction
+  character: {
+    id: string
+    name: string
+    role?: string
+    importance_tier?: CharacterImportanceTier | string
+  }
+  character_reference_resolution: CharacterReferenceResolution
+  message: string
 }
 
 export interface UpdateLoreDTO {
@@ -85,6 +145,8 @@ export interface UpdateLoreDTO {
   tags?: string[]
   constraints?: string[]
   related_characters?: string[]
+  related_character_refs?: ResolvedCharacterReference[]
+  unresolved_character_refs?: UnresolvedCharacterReference[]
   related_locations?: string[]
   related_items?: string[]
   forbidden_actions?: string[]
@@ -115,6 +177,10 @@ export async function createLore(data: CreateLoreDTO) {
 
 export async function updateLore(id: string, data: UpdateLoreDTO) {
   return await api.put<LoreEntry>(`/lore/${id}`, data)
+}
+
+export async function bindLoreCharacterReference(id: string, data: BindLoreCharacterReferenceDTO) {
+  return await api.post<BindLoreCharacterReferenceResponse>(`/lore/${id}/character-references/bind`, data)
 }
 
 export async function deleteLore(id: string) {

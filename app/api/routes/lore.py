@@ -4,13 +4,16 @@
 
 import json
 import logging
+import re
 import uuid
 from datetime import datetime
+from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
+from app.models.character import Character, CharacterImportanceTier
 from app.models.lore import (
     LoreCategory,
     LoreEntry,
@@ -20,7 +23,42 @@ from app.models.lore import (
     normalize_lore_category,
     normalize_lore_priority,
 )
+from app.services.character_reference_resolver import get_character_reference_resolver
 from app.services.plot_outline_service import get_plot_outline_service
+
+
+class BindLoreCharacterReferenceAction(str, Enum):
+    """设定角色引用绑定动作。"""
+
+    BIND_EXISTING = "bind_existing"
+    CREATE_CHARACTER = "create_character"
+
+
+class BindLoreCharacterReferenceDTO(BaseModel):
+    """绑定/创建并绑定设定中的未解析角色引用。"""
+
+    project_id: str
+    source_text: str = Field(..., min_length=1)
+    action: BindLoreCharacterReferenceAction
+    character_id: Optional[str] = None
+    character: Optional[Character] = None
+    provenance: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_action_payload(self):
+        if self.action == BindLoreCharacterReferenceAction.BIND_EXISTING and not self.character_id:
+            raise ValueError("绑定已有角色时必须提供 character_id")
+        if self.action == BindLoreCharacterReferenceAction.CREATE_CHARACTER:
+            if self.character is None:
+                self.character = Character(
+                    name=self.source_text.strip(),
+                    project_id=self.project_id,
+                    description="",
+                    importance_tier=CharacterImportanceTier.NPC,
+                )
+            elif not self.character.name.strip():
+                self.character.name = self.source_text.strip()
+        return self
 
 
 class UpdateLoreDTO(BaseModel):
@@ -33,6 +71,8 @@ class UpdateLoreDTO(BaseModel):
     keywords: Optional[List[str]] = None
     tags: Optional[List[str]] = None
     related_characters: Optional[List[str]] = None
+    related_character_refs: Optional[List[Dict[str, Any]]] = None
+    unresolved_character_refs: Optional[List[Dict[str, Any]]] = None
     related_locations: Optional[List[str]] = None
     related_items: Optional[List[str]] = None
     constraints: Optional[List[str]] = None
@@ -77,11 +117,32 @@ async def _get_lore_entry_columns(postgres_db, force_refresh: bool = False) -> s
     return _lore_entry_columns_cache
 
 
+def _parse_json_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            return []
+    return []
+
+
+def _reference_match_key(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "").strip().casefold())
+
+
 def _serialize_lore_row(row: Dict[str, Any]) -> Dict[str, Any]:
     serialized = dict(row)
     serialized["category"] = normalize_lore_category(row.get("category", "custom")).value
     serialized["priority"] = normalize_lore_priority(row.get("priority", "standard")).value
-    serialized.setdefault("forbidden_actions", [])
+    serialized["related_characters"] = _parse_json_list(serialized.get("related_characters"))
+    serialized["related_character_refs"] = _parse_json_list(serialized.get("related_character_refs"))
+    serialized["unresolved_character_refs"] = _parse_json_list(serialized.get("unresolved_character_refs"))
+    serialized["forbidden_actions"] = _parse_json_list(serialized.get("forbidden_actions"))
     return serialized
 
 
@@ -92,6 +153,101 @@ def _invalidate_plot_outline_context(project_id: Optional[str]):
         get_plot_outline_service().invalidate_project_context(project_id)
     except Exception as e:
         logger.warning(f"Plot Outline 缓存失效失败: {e}")
+
+
+async def _build_lore_reference_character_data(postgres_db: Any, request: BindLoreCharacterReferenceDTO) -> Dict[str, Any]:
+    from app.api.routes.characters import (
+        _auto_configure_character_agent,
+        _derive_role_from_tier,
+        _validate_character_region_link,
+    )
+    from app.services.graph_projection_service import get_graph_projection_service
+
+    character = request.character or Character(
+        name=request.source_text.strip(),
+        project_id=request.project_id,
+        description="",
+        importance_tier=CharacterImportanceTier.NPC,
+    )
+    char_data = character.model_dump(mode="json")
+    char_data["project_id"] = request.project_id
+    char_data["name"] = (char_data.get("name") or request.source_text).strip()
+    if not char_data["name"]:
+        raise HTTPException(status_code=400, detail="角色名称不能为空")
+    if not char_data.get("id"):
+        char_data["id"] = str(uuid.uuid4())
+    now = datetime.now()
+    char_data["created_at"] = now
+    char_data["updated_at"] = now
+    if not char_data.get("status"):
+        char_data["status"] = "active"
+    if not char_data.get("importance_tier"):
+        char_data["importance_tier"] = CharacterImportanceTier.NPC.value
+    char_data["role"] = _derive_role_from_tier(char_data["importance_tier"])
+    for field in [
+        "personality_traits",
+        "lexicon",
+        "voice_samples",
+        "attributes",
+        "goals",
+        "inventory",
+        "agent_goals",
+        "agent_memory",
+        "aliases",
+    ]:
+        if char_data.get(field) is None:
+            char_data[field] = [] if field in ["lexicon", "voice_samples", "goals", "inventory", "agent_goals", "agent_memory", "aliases"] else {}
+    if char_data.get("has_agent") is None:
+        char_data["has_agent"] = False
+    if char_data.get("agent_enabled") is None:
+        char_data["agent_enabled"] = True
+
+    char_data = await _validate_character_region_link(postgres_db, char_data)
+    char_data = await _auto_configure_character_agent(char_data)
+    await postgres_db.save_character(char_data)
+
+    try:
+        graph_projection_service = get_graph_projection_service()
+        if graph_projection_service:
+            projection_result = await graph_projection_service.enqueue_character_projection(char_data)
+            if projection_result.get("status") == "failed":
+                logger.warning(f"角色关系图投影任务入队失败: {projection_result.get('reason')}")
+    except Exception as e:
+        logger.warning(f"角色引用绑定后的关系图投影入队失败: {e}")
+    return char_data
+
+
+async def _record_lore_reference_delta(
+    postgres_db,
+    *,
+    project_id: str,
+    lore_id: str,
+    operation: str,
+    resolution: Dict[str, Any],
+) -> None:
+    try:
+        from app.services.assistant_context import get_assistant_context_fabric
+
+        fabric = get_assistant_context_fabric(postgres_db)
+        await fabric.deltas.record_entity_change(
+            project_id=project_id,
+            entity_type="lore_character_reference",
+            entity_id=lore_id,
+            operation=operation,
+            after=resolution,
+            payload_summary={
+                "title": resolution.get("delta_title") or "设定角色引用解析更新",
+                "source_text": resolution.get("delta_source_text"),
+                "character_id": resolution.get("delta_character_id"),
+                "character_name": resolution.get("delta_character_name"),
+                "resolution_method": resolution.get("delta_resolution_method"),
+                "resolved_count": len(resolution.get("related_character_refs") or []),
+                "unresolved_count": len(resolution.get("unresolved_character_refs") or []),
+            },
+            source_table="lore_entries",
+        )
+    except Exception as e:
+        logger.warning(f"记录设定角色引用 Assistant Context delta 失败: {e}")
 
 
 # ==================== 静态路由（必须在动态路由之前） ====================
@@ -229,6 +385,13 @@ async def create_lore(lore: LoreEntry):
     # 始终生成新的 UUID（忽略前端传入的 ID）
     lore_id = str(uuid.uuid4())
 
+    resolver = get_character_reference_resolver(postgres_db)
+    reference_resolution = await resolver.resolve_for_lore(
+        project_id=lore.project_id,
+        references=lore.related_characters,
+        provenance={"surface": "lore_api", "operation": "create_lore", "lore_id": lore_id},
+    )
+
     # 设置创建时间
     now = datetime.now()
 
@@ -243,7 +406,9 @@ async def create_lore(lore: LoreEntry):
         "keywords": json.dumps(lore.keywords) if lore.keywords else "[]",
         "tags": json.dumps(lore.tags) if lore.tags else "[]",
         "constraints": json.dumps(lore.constraints) if lore.constraints else "[]",
-        "related_characters": json.dumps(lore.related_characters) if lore.related_characters else "[]",
+        "related_characters": json.dumps(reference_resolution.related_characters, ensure_ascii=False),
+        "related_character_refs": json.dumps(reference_resolution.related_character_refs, ensure_ascii=False),
+        "unresolved_character_refs": json.dumps(reference_resolution.unresolved_character_refs, ensure_ascii=False),
         "related_locations": json.dumps(lore.related_locations) if lore.related_locations else "[]",
         "related_items": json.dumps(lore.related_items) if lore.related_items else "[]",
         "forbidden_actions": json.dumps(lore.forbidden_actions) if lore.forbidden_actions else "[]",
@@ -256,24 +421,161 @@ async def create_lore(lore: LoreEntry):
         await postgres_db.execute_write("""
             INSERT INTO lore_entries (
                 id, project_id, title, category, priority, content, summary,
-                keywords, tags, constraints, related_characters, related_locations, related_items,
+                keywords, tags, constraints, related_characters, related_character_refs,
+                unresolved_character_refs, related_locations, related_items,
                 forbidden_actions, source, created_at, updated_at
             ) VALUES (
                 CAST(:id AS UUID), CAST(:project_id AS UUID), :title, :category, :priority, :content, :summary,
-                :keywords, :tags, :constraints, :related_characters, :related_locations, :related_items,
+                :keywords, :tags, :constraints, CAST(:related_characters AS jsonb), CAST(:related_character_refs AS jsonb),
+                CAST(:unresolved_character_refs AS jsonb), :related_locations, :related_items,
                 :forbidden_actions, :source, :created_at, :updated_at
             )
         """, params)
 
+        await resolver.persist_lore_resolution(
+            lore_id=lore_id,
+            project_id=lore.project_id,
+            resolution=reference_resolution,
+        )
+        await _record_lore_reference_delta(
+            postgres_db,
+            project_id=lore.project_id,
+            lore_id=lore_id,
+            operation="create_lore_reference_resolution",
+            resolution=reference_resolution.to_dict(),
+        )
         _invalidate_plot_outline_context(lore.project_id)
         return {
             "success": True,
             "id": lore_id,
             "message": f"设定 '{lore.title}' 创建成功",
+            "character_reference_resolution": reference_resolution.to_dict(),
         }
     except Exception as e:
         logger.error(f"创建设定失败：{e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{lore_id}/character-references/bind", response_model=Dict[str, Any])
+async def bind_lore_character_reference(lore_id: str, request: BindLoreCharacterReferenceDTO):
+    """将设定中的未解析/歧义角色引用绑定到已有角色，或创建新角色后绑定。"""
+    from app.api.app import postgres_db
+
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+
+    lore_rows = await postgres_db.execute_query(
+        "SELECT * FROM lore_entries WHERE id = CAST(:id AS UUID) AND project_id = CAST(:project_id AS UUID)",
+        {"id": lore_id, "project_id": request.project_id},
+    )
+    if not lore_rows:
+        raise HTTPException(status_code=404, detail="设定不存在或不属于当前项目")
+
+    lore_row = _serialize_lore_row(lore_rows[0])
+    source_text = request.source_text.strip()
+    source_key = _reference_match_key(source_text)
+    unresolved_refs = lore_row.get("unresolved_character_refs") or []
+    matching_unresolved = [
+        item for item in unresolved_refs
+        if _reference_match_key(item.get("source_text") if isinstance(item, dict) else item) == source_key
+    ]
+    if not matching_unresolved:
+        raise HTTPException(status_code=409, detail="该角色引用已被处理或不存在，请刷新后重试")
+
+    action = request.action.value
+    if request.action == BindLoreCharacterReferenceAction.BIND_EXISTING:
+        character = await postgres_db.get_character(request.character_id)
+        if not character:
+            raise HTTPException(status_code=404, detail="角色不存在")
+        if str(character.get("project_id")) != request.project_id:
+            raise HTTPException(status_code=409, detail="不能绑定其他项目的角色")
+        character_id = str(character.get("id"))
+        character_name = character.get("name") or character_id
+        resolution_method = "user_bind_existing"
+    else:
+        character = await _build_lore_reference_character_data(postgres_db, request)
+        character_id = str(character.get("id"))
+        character_name = character.get("name") or source_text
+        resolution_method = "user_create_character"
+
+    now = datetime.now().isoformat()
+    provenance = {
+        **(request.provenance or {}),
+        "surface": (request.provenance or {}).get("surface", "lore_reference_bind"),
+        "operation": action,
+        "lore_id": lore_id,
+        "source_text": source_text,
+        "bound_character_id": character_id,
+        "bound_at": now,
+    }
+    related_characters = list(dict.fromkeys([*(lore_row.get("related_characters") or []), character_id]))
+    related_character_refs = [
+        item for item in (lore_row.get("related_character_refs") or [])
+        if not (
+            isinstance(item, dict)
+            and _reference_match_key(item.get("source_text")) == source_key
+            and str(item.get("character_id")) == character_id
+        )
+    ]
+    related_character_refs.append({
+        "status": "resolved",
+        "source_text": source_text,
+        "source_payload": source_text,
+        "character_id": character_id,
+        "character_name": character_name,
+        "confidence": 1.0,
+        "resolution_method": resolution_method,
+        "provenance": provenance,
+    })
+    remaining_unresolved_refs = [
+        item for item in unresolved_refs
+        if not (isinstance(item, dict) and _reference_match_key(item.get("source_text")) == source_key)
+    ]
+
+    resolver = get_character_reference_resolver(postgres_db)
+    from app.services.character_reference_resolver import CharacterReferenceResolution
+
+    reference_resolution = CharacterReferenceResolution(
+        related_characters=related_characters,
+        related_character_refs=related_character_refs,
+        unresolved_character_refs=remaining_unresolved_refs,
+    )
+    await resolver.persist_lore_resolution(
+        lore_id=lore_id,
+        project_id=request.project_id,
+        resolution=reference_resolution,
+    )
+    delta_payload = {
+        **reference_resolution.to_dict(),
+        "delta_title": "设定角色引用绑定更新",
+        "delta_source_text": source_text,
+        "delta_character_id": character_id,
+        "delta_character_name": character_name,
+        "delta_resolution_method": resolution_method,
+    }
+    await _record_lore_reference_delta(
+        postgres_db,
+        project_id=request.project_id,
+        lore_id=lore_id,
+        operation="bind_lore_character_reference",
+        resolution=delta_payload,
+    )
+    _invalidate_plot_outline_context(request.project_id)
+
+    return {
+        "success": True,
+        "lore_id": lore_id,
+        "project_id": request.project_id,
+        "action": action,
+        "character": {
+            "id": character_id,
+            "name": character_name,
+            "role": character.get("role"),
+            "importance_tier": character.get("importance_tier"),
+        },
+        "character_reference_resolution": reference_resolution.to_dict(),
+        "message": f"已将角色引用 '{source_text}' 绑定到角色 '{character_name}'",
+    }
 
 
 @router.get("/{lore_id}", response_model=Dict[str, Any])
@@ -334,10 +636,22 @@ async def update_lore(lore_id: str, lore_update: UpdateLoreDTO):
         raise HTTPException(status_code=404, detail="设定不存在")
     project_id = project_id_result[0].get("project_id")
 
+    resolver = get_character_reference_resolver(postgres_db)
+    reference_resolution = None
+
     available_columns = await _get_lore_entry_columns(postgres_db)
 
     # 如果运行时刚执行过迁移，旧缓存可能仍缺少新列，这里主动刷新一次
     update_data = lore_update.model_dump(exclude_unset=True)
+    if "related_characters" in update_data:
+        reference_resolution = await resolver.resolve_for_lore(
+            project_id=str(project_id),
+            references=update_data.get("related_characters") or [],
+            provenance={"surface": "lore_api", "operation": "update_lore", "lore_id": lore_id},
+        )
+        update_data["related_characters"] = reference_resolution.related_characters
+        update_data["related_character_refs"] = reference_resolution.related_character_refs
+        update_data["unresolved_character_refs"] = reference_resolution.unresolved_character_refs
     missing_requested_columns = [key for key in update_data if key not in available_columns]
     if missing_requested_columns:
         available_columns = await _get_lore_entry_columns(postgres_db, force_refresh=True)
@@ -359,14 +673,16 @@ async def update_lore(lore_id: str, lore_update: UpdateLoreDTO):
                 "tags",
                 "constraints",
                 "related_characters",
+                "related_character_refs",
+                "unresolved_character_refs",
                 "related_locations",
                 "related_items",
                 "forbidden_actions",
             ]:
                 # JSON/JSONB 字段需要转换为 JSON 字符串
                 import json
-                update_fields.append(f"{key} = :{key}")
-                params[key] = json.dumps(value)
+                update_fields.append(f"{key} = CAST(:{key} AS jsonb)")
+                params[key] = json.dumps(value, ensure_ascii=False)
             else:
                 update_fields.append(f"{key} = :{key}")
                 params[key] = value
@@ -378,13 +694,29 @@ async def update_lore(lore_id: str, lore_update: UpdateLoreDTO):
 
     query = f"UPDATE lore_entries SET {', '.join(update_fields)} WHERE id = CAST(:id AS UUID)"
     await postgres_db.execute_write(query, params)
+    if reference_resolution:
+        await resolver.persist_lore_resolution(
+            lore_id=lore_id,
+            project_id=str(project_id),
+            resolution=reference_resolution,
+        )
+        await _record_lore_reference_delta(
+            postgres_db,
+            project_id=str(project_id),
+            lore_id=lore_id,
+            operation="update_lore_reference_resolution",
+            resolution=reference_resolution.to_dict(),
+        )
     _invalidate_plot_outline_context(project_id)
 
-    return {
+    response = {
         "success": True,
         "id": lore_id,
         "message": "设定更新成功",
     }
+    if reference_resolution:
+        response["character_reference_resolution"] = reference_resolution.to_dict()
+    return response
 
 
 @router.delete("/{lore_id}", response_model=Dict[str, Any])

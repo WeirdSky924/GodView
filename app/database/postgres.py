@@ -208,7 +208,7 @@ class PostgresDatabase:
                 'before_state', 'after_state', 'diff',
                 'completed_events', 'character_locations',
                 'memories', 'knowledge', 'working_memory',
-                'keywords', 'tags', 'constraints', 'related_characters', 'related_locations', 'related_items', 'forbidden_actions',
+                'keywords', 'tags', 'constraints', 'related_characters', 'related_character_refs', 'unresolved_character_refs', 'related_locations', 'related_items', 'forbidden_actions',
                 'participants', 'consequences', 'effects', 'related_regions',
                 # project_writing_configs 表的 JSONB 字段
                 'enabled_rule_ids', 'enabled_rule_set_ids', 'rule_overrides', 'rule_priorities',
@@ -296,7 +296,7 @@ class PostgresDatabase:
         params['id'] = char_id
 
         # 处理 JSONB 字段 (包括数组和对象类型)
-        jsonb_list_fields = ['lexicon', 'forbidden_words', 'voice_samples', 'goals', 'inventory', 'agent_goals', 'agent_memory', 'personality_traits', 'relationships', 'major_events', 'available_presence_types']
+        jsonb_list_fields = ['lexicon', 'forbidden_words', 'voice_samples', 'goals', 'inventory', 'agent_goals', 'agent_memory', 'personality_traits', 'relationships', 'major_events', 'available_presence_types', 'aliases']
         jsonb_dict_fields = ['attributes', 'key_relationships', 'death_detail']
 
         # 处理字段名映射 (background -> background_story)
@@ -385,7 +385,7 @@ class PostgresDatabase:
 
         # 使用 SQLAlchemy text 查询
         query = """
-        INSERT INTO characters (id, name, project_id, world_id, description, role, status,
+        INSERT INTO characters (id, name, aliases, project_id, world_id, description, role, status,
                                 importance_tier, narrative_weight, story_arc_role, plot_priority,
                                 debut_chapter, debut_scene, exit_chapter, exit_reason, active_arc,
                                 relationships, key_relationships,
@@ -395,7 +395,7 @@ class PostgresDatabase:
                                 current_region_id, current_location_reason, death_detail, available_presence_types,
                                 has_agent, agent_enabled, agent_goals, agent_memory,
                                 total_scenes, dialogue_count, major_events)
-        VALUES (:id, :name, :project_id, :world_id, :description, :role, :status,
+        VALUES (:id, :name, CAST(:aliases AS jsonb), :project_id, :world_id, :description, :role, :status,
                 :importance_tier, :narrative_weight, :story_arc_role, :plot_priority,
                 :debut_chapter, :debut_scene, :exit_chapter, :exit_reason, :active_arc,
                 CAST(:relationships AS jsonb), CAST(:key_relationships AS jsonb),
@@ -408,6 +408,7 @@ class PostgresDatabase:
                 :total_scenes, :dialogue_count, CAST(:major_events AS jsonb))
         ON CONFLICT (id) DO UPDATE SET
             name = EXCLUDED.name,
+            aliases = EXCLUDED.aliases,
             project_id = EXCLUDED.project_id,
             world_id = EXCLUDED.world_id,
             description = EXCLUDED.description,
@@ -467,6 +468,17 @@ class PostgresDatabase:
         query = "SELECT * FROM characters WHERE id = :id"
         results = await self.execute_query(query, {"id": character_id})
         return results[0] if results else None
+
+    async def get_characters_for_reference_resolution(self, project_id: str) -> List[Dict[str, Any]]:
+        """获取用于角色引用解析的项目角色候选集。"""
+        query = """
+        SELECT id, project_id, name, aliases, role, importance_tier, description, updated_at, created_at
+        FROM characters
+        WHERE project_id = CAST(:project_id AS UUID)
+        ORDER BY updated_at DESC NULLS LAST, created_at DESC
+        LIMIT 2000
+        """
+        return await self.execute_query(query, {"project_id": project_id})
 
     async def get_character_by_project_and_name(
         self,
@@ -2195,6 +2207,82 @@ class PostgresDatabase:
         )
         return rows[0] if rows else None
 
+    async def save_lore_character_reference_resolution(
+        self,
+        *,
+        lore_id: str,
+        project_id: str,
+        resolution: Dict[str, Any],
+    ) -> None:
+        """Persist canonical and reviewable lore-character reference metadata."""
+        related_characters = resolution.get("related_characters") or []
+        related_character_refs = resolution.get("related_character_refs") or []
+        unresolved_character_refs = resolution.get("unresolved_character_refs") or []
+        await self.execute_write(
+            """
+            UPDATE lore_entries
+            SET related_characters = CAST(:related_characters AS jsonb),
+                related_character_refs = CAST(:related_character_refs AS jsonb),
+                unresolved_character_refs = CAST(:unresolved_character_refs AS jsonb),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = CAST(:lore_id AS UUID)
+              AND project_id = CAST(:project_id AS UUID)
+            """,
+            {
+                "lore_id": lore_id,
+                "project_id": project_id,
+                "related_characters": json.dumps(related_characters, ensure_ascii=False),
+                "related_character_refs": json.dumps(related_character_refs, ensure_ascii=False),
+                "unresolved_character_refs": json.dumps(unresolved_character_refs, ensure_ascii=False),
+            },
+        )
+        await self.execute_write(
+            "DELETE FROM lore_character_references WHERE lore_id = CAST(:lore_id AS UUID)",
+            {"lore_id": lore_id},
+        )
+        rows = []
+        for item in related_character_refs:
+            character_id = _validate_uuid(item.get("character_id"))
+            if not character_id:
+                continue
+            rows.append({
+                "id": str(uuid_module.uuid4()),
+                "lore_id": lore_id,
+                "project_id": project_id,
+                "character_id": character_id,
+                "source_text": item.get("source_text") or "",
+                "confidence": item.get("confidence") or 0,
+                "resolution_method": item.get("resolution_method") or "unknown",
+                "status": "resolved",
+                "provenance": json.dumps(item.get("provenance") or {}, ensure_ascii=False),
+            })
+        for item in unresolved_character_refs:
+            rows.append({
+                "id": str(uuid_module.uuid4()),
+                "lore_id": lore_id,
+                "project_id": project_id,
+                "character_id": None,
+                "source_text": item.get("source_text") or "",
+                "confidence": 0,
+                "resolution_method": item.get("reason") or "unresolved",
+                "status": item.get("status") or "unresolved",
+                "provenance": json.dumps(item, ensure_ascii=False),
+            })
+        if rows:
+            await self.execute_many(
+                """
+                INSERT INTO lore_character_references (
+                    id, lore_id, project_id, character_id, source_text, confidence,
+                    resolution_method, status, provenance
+                ) VALUES (
+                    CAST(:id AS UUID), CAST(:lore_id AS UUID), CAST(:project_id AS UUID),
+                    CAST(:character_id AS UUID), :source_text, :confidence,
+                    :resolution_method, :status, CAST(:provenance AS jsonb)
+                )
+                """,
+                rows,
+            )
+
     async def get_chapter_resource_readiness(
         self,
         project_id: str,
@@ -3513,7 +3601,35 @@ class PostgresDatabase:
                     except Exception as e:
                         logger.warning(f"更新剧情状态变更表结构时出错: {str(e)[:100]}")
 
+            lore_character_reference_schema_sql = """
+            ALTER TABLE lore_entries ADD COLUMN IF NOT EXISTS related_character_refs JSONB DEFAULT '[]'::jsonb;
+            ALTER TABLE lore_entries ADD COLUMN IF NOT EXISTS unresolved_character_refs JSONB DEFAULT '[]'::jsonb;
+            CREATE TABLE IF NOT EXISTS lore_character_references (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                lore_id UUID NOT NULL REFERENCES lore_entries(id) ON DELETE CASCADE,
+                project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                character_id UUID REFERENCES characters(id) ON DELETE SET NULL,
+                source_text TEXT NOT NULL DEFAULT '',
+                confidence NUMERIC(5, 4) NOT NULL DEFAULT 0,
+                resolution_method TEXT NOT NULL DEFAULT 'unknown',
+                status TEXT NOT NULL DEFAULT 'unresolved',
+                provenance JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_lore_character_refs_lore ON lore_character_references(lore_id);
+            CREATE INDEX IF NOT EXISTS idx_lore_character_refs_project ON lore_character_references(project_id, status);
+            CREATE INDEX IF NOT EXISTS idx_lore_character_refs_character ON lore_character_references(character_id) WHERE character_id IS NOT NULL;
+            """
+            for statement in lore_character_reference_schema_sql.split(';'):
+                if statement.strip():
+                    try:
+                        await session.execute(text(statement))
+                    except Exception as e:
+                        logger.warning(f"更新设定角色引用表结构时出错: {str(e)[:100]}")
+
             character_schema_updates = [
+                "ALTER TABLE characters ADD COLUMN IF NOT EXISTS aliases JSONB DEFAULT '[]'::jsonb",
                 "ALTER TABLE characters ADD COLUMN IF NOT EXISTS world_id UUID REFERENCES worlds(id) ON DELETE SET NULL",
                 "ALTER TABLE characters ADD COLUMN IF NOT EXISTS current_location TEXT",
                 "ALTER TABLE characters ADD COLUMN IF NOT EXISTS current_region_id UUID REFERENCES regions(id) ON DELETE SET NULL",

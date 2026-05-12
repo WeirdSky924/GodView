@@ -10,6 +10,46 @@ const API_BASE = '/setting-agent'
 
 // ==================== 类型定义 ====================
 
+export interface CharacterReferenceCandidate {
+  character_id: string
+  name: string
+  role?: string
+  importance_tier?: string
+  description?: string
+  match_reason: string
+  confidence: number
+}
+
+export interface ResolvedCharacterReference {
+  status: 'resolved'
+  source_text: string
+  source_payload?: unknown
+  character_id: string
+  character_name: string
+  confidence: number
+  resolution_method: string
+  provenance?: Record<string, unknown>
+}
+
+export interface UnresolvedCharacterReference {
+  status: 'unresolved' | 'ambiguous'
+  source_text: string
+  source_payload?: unknown
+  reason: string
+  message: string
+  candidates: CharacterReferenceCandidate[]
+  recommended_actions: Array<'bind_existing' | 'create_character' | 'keep_text_only' | 'ignore'>
+  provenance?: Record<string, unknown>
+}
+
+export interface CharacterReferenceResolution {
+  success?: boolean
+  related_characters: string[]
+  related_character_refs: ResolvedCharacterReference[]
+  unresolved_character_refs: UnresolvedCharacterReference[]
+  has_unresolved: boolean
+}
+
 export interface PendingLore {
   title: string
   category: string
@@ -20,6 +60,8 @@ export interface PendingLore {
   tags: string[]
   constraints: string[]
   related_characters: string[]
+  related_character_refs?: ResolvedCharacterReference[]
+  unresolved_character_refs?: UnresolvedCharacterReference[]
   related_locations: string[]
   related_items: string[]
   related_factions?: string[]
@@ -321,11 +363,23 @@ export async function getOrCreateSession(
 /**
  * 保存用户确认的设定
  */
+export async function resolveCharacterReferences(
+  projectId: string,
+  references: unknown[],
+  provenance?: Record<string, unknown>,
+): Promise<CharacterReferenceResolution> {
+  return await api.post(`${API_BASE}/resolve-character-references`, {
+    project_id: projectId,
+    references,
+    provenance,
+  })
+}
+
 export async function savePendingLores(
   projectId: string,
   lores: PendingLore[],
   options?: { sessionId?: string; requestId?: string },
-): Promise<{ success: boolean; saved_count: number; message: string }> {
+): Promise<{ success: boolean; saved_count: number; message: string; character_reference_resolution?: CharacterReferenceResolution }> {
   return await api.post(`${API_BASE}/save-lores`, {
     project_id: projectId,
     lores,
@@ -372,7 +426,7 @@ export async function savePendingHooks(
 export async function executeLoreModification(
   projectId: string,
   modification: ImprovementSuggestion
-): Promise<{ success: boolean; message?: string; error?: string }> {
+): Promise<{ success: boolean; message?: string; error?: string; character_reference_resolution?: CharacterReferenceResolution }> {
   return await api.post(`${API_BASE}/execute-modification`, {
     project_id: projectId,
     modification,

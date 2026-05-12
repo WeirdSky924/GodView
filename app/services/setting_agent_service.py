@@ -32,6 +32,7 @@ from app.models.lore import LoreEntry, LorePriority, normalize_lore_category, no
 from app.models.plot import HookStatus, HookType
 from app.models.skill import ExecuteSkillDTO
 from app.models.token_usage import UsageCategory
+from app.services.character_reference_resolver import get_character_reference_resolver
 from app.services.conflict_detector import ConflictDetector, get_conflict_detector
 from app.services.operation_lifecycle_service import OperationLifecycleService
 from app.services.token_tracker import token_tracker
@@ -588,8 +589,8 @@ class SettingAgentService:
 
             rows = await postgres_db.execute_query(
                 """SELECT id, project_id, title, category, priority, content, summary,
-                          keywords, tags, constraints, related_characters, related_locations,
-                          related_items, created_at, updated_at
+                          keywords, tags, constraints, related_characters, related_character_refs,
+                          unresolved_character_refs, related_locations, related_items, created_at, updated_at
                    FROM lore_entries
                    WHERE project_id = CAST(:project_id AS UUID)
                    ORDER BY priority, created_at DESC""",
@@ -610,6 +611,8 @@ class SettingAgentService:
                     tags=json.loads(row.get("tags", "[]")) if isinstance(row.get("tags"), str) else row.get("tags", []),
                     constraints=json.loads(row.get("constraints", "[]")) if isinstance(row.get("constraints"), str) else row.get("constraints", []),
                     related_characters=json.loads(row.get("related_characters", "[]")) if isinstance(row.get("related_characters"), str) else row.get("related_characters", []),
+                    related_character_refs=json.loads(row.get("related_character_refs", "[]")) if isinstance(row.get("related_character_refs"), str) else row.get("related_character_refs", []),
+                    unresolved_character_refs=json.loads(row.get("unresolved_character_refs", "[]")) if isinstance(row.get("unresolved_character_refs"), str) else row.get("unresolved_character_refs", []),
                     related_locations=json.loads(row.get("related_locations", "[]")) if isinstance(row.get("related_locations"), str) else row.get("related_locations", []),
                     related_items=json.loads(row.get("related_items", "[]")) if isinstance(row.get("related_items"), str) else row.get("related_items", []),
                     created_at=row.get("created_at"),
@@ -1976,6 +1979,15 @@ class SettingAgentService:
                 continue
 
             lore_data = self._normalize_lore_interconnection_payload(lore_data)
+            resolver = get_character_reference_resolver(postgres_db)
+            reference_resolution = await resolver.resolve_for_lore(
+                project_id=project_id,
+                references=lore_data.get("related_characters", []),
+                provenance={"surface": "setting_agent", "operation": "save_pending_lores"},
+            )
+            lore_data["related_characters"] = reference_resolution.related_characters
+            lore_data["related_character_refs"] = reference_resolution.related_character_refs
+            lore_data["unresolved_character_refs"] = reference_resolution.unresolved_character_refs
             lore_entry = {
                 "id": str(uuid.uuid4()),
                 "project_id": project_id,
@@ -1987,7 +1999,9 @@ class SettingAgentService:
                 "keywords": json.dumps(lore_data.get("keywords", [])),
                 "tags": json.dumps(lore_data.get("tags", [])),
                 "constraints": json.dumps(lore_data.get("constraints", [])),
-                "related_characters": json.dumps(lore_data.get("related_characters", [])),
+                "related_characters": json.dumps(lore_data.get("related_characters", []), ensure_ascii=False),
+                "related_character_refs": json.dumps(lore_data.get("related_character_refs", []), ensure_ascii=False),
+                "unresolved_character_refs": json.dumps(lore_data.get("unresolved_character_refs", []), ensure_ascii=False),
                 "related_locations": json.dumps(lore_data.get("related_locations", [])),
                 "related_items": json.dumps(lore_data.get("related_items", [])),
                 "forbidden_actions": json.dumps(lore_data.get("forbidden_actions", [])),
@@ -1998,9 +2012,21 @@ class SettingAgentService:
 
             try:
                 await postgres_db.execute_write("""
-                    INSERT INTO lore_entries (id, project_id, title, category, priority, content, summary, keywords, tags, constraints, related_characters, related_locations, related_items, forbidden_actions, source, created_at, updated_at)
-                    VALUES (:id, CAST(:project_id AS UUID), :title, :category, :priority, :content, :summary, :keywords, :tags, :constraints, :related_characters, :related_locations, :related_items, :forbidden_actions, :source, :created_at, :updated_at)
+                    INSERT INTO lore_entries (id, project_id, title, category, priority, content, summary, keywords, tags, constraints, related_characters, related_character_refs, unresolved_character_refs, related_locations, related_items, forbidden_actions, source, created_at, updated_at)
+                    VALUES (:id, CAST(:project_id AS UUID), :title, :category, :priority, :content, :summary, :keywords, :tags, :constraints, CAST(:related_characters AS jsonb), CAST(:related_character_refs AS jsonb), CAST(:unresolved_character_refs AS jsonb), :related_locations, :related_items, :forbidden_actions, :source, :created_at, :updated_at)
                 """, lore_entry)
+                await resolver.persist_lore_resolution(
+                    lore_id=lore_entry["id"],
+                    project_id=project_id,
+                    resolution=reference_resolution,
+                )
+                await self._record_lore_reference_delta(
+                    postgres_db,
+                    project_id=project_id,
+                    lore_id=lore_entry["id"],
+                    operation="setting_agent_save_lore_reference_resolution",
+                    resolution=reference_resolution.to_dict(),
+                )
                 if session:
                     await postgres_db.mark_setting_agent_pending_item_saved(
                         session.id,
@@ -2310,6 +2336,8 @@ class SettingAgentService:
                 if not existing or str(existing.get("project_id")) != str(project_id):
                     return {"success": False, "error": "目标设定不存在或不属于当前项目"}
 
+                resolver = get_character_reference_resolver(postgres_db)
+                reference_resolution = None
                 update_payload = modification.get("update_payload") if isinstance(modification.get("update_payload"), dict) else {}
                 fields: Dict[str, Any] = {}
                 title_value = modification.get("suggested_title") or update_payload.get("title")
@@ -2337,13 +2365,28 @@ class SettingAgentService:
                     "forbidden_actions",
                 ]:
                     if list_field in modification or list_field in update_payload:
-                        fields[list_field] = json.dumps(self._normalize_string_list(
+                        raw_values = self._normalize_string_list(
                             modification.get(list_field, update_payload.get(list_field))
-                        ))
+                        )
+                        if list_field == "related_characters":
+                            reference_resolution = await resolver.resolve_for_lore(
+                                project_id=project_id,
+                                references=raw_values,
+                                provenance={"surface": "setting_agent", "operation": "execute_lore_modification", "lore_id": str(target_id)},
+                            )
+                            fields["related_characters"] = json.dumps(reference_resolution.related_characters, ensure_ascii=False)
+                            fields["related_character_refs"] = json.dumps(reference_resolution.related_character_refs, ensure_ascii=False)
+                            fields["unresolved_character_refs"] = json.dumps(reference_resolution.unresolved_character_refs, ensure_ascii=False)
+                        else:
+                            fields[list_field] = json.dumps(raw_values)
                 if not fields:
                     return {"success": False, "error": "修改建议缺少可执行字段"}
 
-                set_clause = ", ".join([f"{field} = :{field}" for field in fields])
+                jsonb_update_fields = {"related_characters", "related_character_refs", "unresolved_character_refs"}
+                set_clause = ", ".join([
+                    f"{field} = CAST(:{field} AS jsonb)" if field in jsonb_update_fields else f"{field} = :{field}"
+                    for field in fields
+                ])
                 params = {
                     **fields,
                     "id": target_id,
@@ -2355,8 +2398,24 @@ class SettingAgentService:
                     SET {set_clause}, updated_at = :updated_at
                     WHERE id = CAST(:id AS UUID) AND project_id = CAST(:project_id AS UUID)
                 """, params)
+                if reference_resolution:
+                    await resolver.persist_lore_resolution(
+                        lore_id=str(target_id),
+                        project_id=project_id,
+                        resolution=reference_resolution,
+                    )
+                    await self._record_lore_reference_delta(
+                        postgres_db,
+                        project_id=project_id,
+                        lore_id=str(target_id),
+                        operation="setting_agent_update_lore_reference_resolution",
+                        resolution=reference_resolution.to_dict(),
+                    )
                 self.invalidate_context_cache(project_id)
-                return {"success": True, "message": "已更新现有设定"}
+                response = {"success": True, "message": "已更新现有设定"}
+                if reference_resolution:
+                    response["character_reference_resolution"] = reference_resolution.to_dict()
+                return response
 
             elif mod_type == "priority" and target_id:
                 # 调整优先级
@@ -2388,6 +2447,15 @@ class SettingAgentService:
                     return {"success": True, "message": f"设定已存在，复用现有条目: {duplicate.get('id')}"}
 
                 modification = self._normalize_lore_interconnection_payload(modification)
+                resolver = get_character_reference_resolver(postgres_db)
+                reference_resolution = await resolver.resolve_for_lore(
+                    project_id=project_id,
+                    references=modification.get("related_characters", []),
+                    provenance={"surface": "setting_agent", "operation": "execute_lore_modification_missing"},
+                )
+                modification["related_characters"] = reference_resolution.related_characters
+                modification["related_character_refs"] = reference_resolution.related_character_refs
+                modification["unresolved_character_refs"] = reference_resolution.unresolved_character_refs
                 lore_entry = {
                     "id": str(uuid.uuid4()),
                     "project_id": project_id,
@@ -2399,7 +2467,9 @@ class SettingAgentService:
                     "keywords": json.dumps(modification.get("keywords", [])),
                     "tags": json.dumps(modification.get("tags", [])),
                     "constraints": json.dumps(modification.get("constraints", [])),
-                    "related_characters": json.dumps(modification.get("related_characters", [])),
+                    "related_characters": json.dumps(modification.get("related_characters", []), ensure_ascii=False),
+                    "related_character_refs": json.dumps(modification.get("related_character_refs", []), ensure_ascii=False),
+                    "unresolved_character_refs": json.dumps(modification.get("unresolved_character_refs", []), ensure_ascii=False),
                     "related_locations": json.dumps(modification.get("related_locations", [])),
                     "related_items": json.dumps(modification.get("related_items", [])),
                     "forbidden_actions": json.dumps(modification.get("forbidden_actions", [])),
@@ -2408,27 +2478,62 @@ class SettingAgentService:
                     "updated_at": datetime.now(),
                 }
                 await postgres_db.execute_write("""
-                    INSERT INTO lore_entries (id, project_id, title, category, priority, content, summary, keywords, tags, constraints, related_characters, related_locations, related_items, forbidden_actions, source, created_at, updated_at)
-                    VALUES (:id, CAST(:project_id AS UUID), :title, :category, :priority, :content, :summary, :keywords, :tags, :constraints, :related_characters, :related_locations, :related_items, :forbidden_actions, :source, :created_at, :updated_at)
+                    INSERT INTO lore_entries (id, project_id, title, category, priority, content, summary, keywords, tags, constraints, related_characters, related_character_refs, unresolved_character_refs, related_locations, related_items, forbidden_actions, source, created_at, updated_at)
+                    VALUES (:id, CAST(:project_id AS UUID), :title, :category, :priority, :content, :summary, :keywords, :tags, :constraints, CAST(:related_characters AS jsonb), CAST(:related_character_refs AS jsonb), CAST(:unresolved_character_refs AS jsonb), :related_locations, :related_items, :forbidden_actions, :source, :created_at, :updated_at)
                 """, lore_entry)
+                await resolver.persist_lore_resolution(
+                    lore_id=lore_entry["id"],
+                    project_id=project_id,
+                    resolution=reference_resolution,
+                )
+                await self._record_lore_reference_delta(
+                    postgres_db,
+                    project_id=project_id,
+                    lore_id=lore_entry["id"],
+                    operation="setting_agent_missing_lore_reference_resolution",
+                    resolution=reference_resolution.to_dict(),
+                )
                 self.invalidate_context_cache(project_id)
-                return {"success": True, "message": f"已添加新设定: {lore_entry['title']}"}
+                return {"success": True, "message": f"已添加新设定: {lore_entry['title']}", "character_reference_resolution": reference_resolution.to_dict()}
 
             elif mod_type == "relation" and target_id:
                 # 更新关联关系
                 related = modification.get("related_entities", [])
+                resolver = get_character_reference_resolver(postgres_db)
+                reference_resolution = await resolver.resolve_for_lore(
+                    project_id=project_id,
+                    references=self._normalize_string_list(related),
+                    provenance={"surface": "setting_agent", "operation": "execute_lore_modification_relation", "lore_id": str(target_id)},
+                )
                 await postgres_db.execute_write("""
                     UPDATE lore_entries
-                    SET related_characters = :related, updated_at = :updated_at
+                    SET related_characters = CAST(:related AS jsonb),
+                        related_character_refs = CAST(:related_character_refs AS jsonb),
+                        unresolved_character_refs = CAST(:unresolved_character_refs AS jsonb),
+                        updated_at = :updated_at
                     WHERE id = CAST(:id AS UUID) AND project_id = CAST(:project_id AS UUID)
                 """, {
                     "id": target_id,
                     "project_id": project_id,
-                    "related": json.dumps(self._normalize_string_list(related)),
+                    "related": json.dumps(reference_resolution.related_characters, ensure_ascii=False),
+                    "related_character_refs": json.dumps(reference_resolution.related_character_refs, ensure_ascii=False),
+                    "unresolved_character_refs": json.dumps(reference_resolution.unresolved_character_refs, ensure_ascii=False),
                     "updated_at": datetime.now(),
                 })
+                await resolver.persist_lore_resolution(
+                    lore_id=str(target_id),
+                    project_id=project_id,
+                    resolution=reference_resolution,
+                )
+                await self._record_lore_reference_delta(
+                    postgres_db,
+                    project_id=project_id,
+                    lore_id=str(target_id),
+                    operation="setting_agent_relation_lore_reference_resolution",
+                    resolution=reference_resolution.to_dict(),
+                )
                 self.invalidate_context_cache(project_id)
-                return {"success": True, "message": "已更新设定关联"}
+                return {"success": True, "message": "已更新设定关联", "character_reference_resolution": reference_resolution.to_dict()}
 
             else:
                 return {"success": False, "error": f"未知的修改类型: {mod_type}"}
@@ -2436,6 +2541,35 @@ class SettingAgentService:
         except Exception as e:
             logger.error(f"[SettingAgent] 执行设定修改失败: {e}")
             return {"success": False, "error": str(e)}
+
+    async def _record_lore_reference_delta(
+        self,
+        postgres_db,
+        *,
+        project_id: str,
+        lore_id: str,
+        operation: str,
+        resolution: Dict[str, Any],
+    ) -> None:
+        try:
+            from app.services.assistant_context import get_assistant_context_fabric
+
+            fabric = get_assistant_context_fabric(postgres_db)
+            await fabric.deltas.record_entity_change(
+                project_id=project_id,
+                entity_type="lore_character_reference",
+                entity_id=lore_id,
+                operation=operation,
+                after=resolution,
+                payload_summary={
+                    "title": "设定角色引用解析更新",
+                    "resolved_count": len(resolution.get("related_character_refs") or []),
+                    "unresolved_count": len(resolution.get("unresolved_character_refs") or []),
+                },
+                source_table="lore_entries",
+            )
+        except Exception as e:
+            logger.warning(f"记录设定角色引用 Assistant Context delta 失败: {e}")
 
     def _parse_character_list_value(self, value: Any) -> List[Any]:
         if isinstance(value, str):

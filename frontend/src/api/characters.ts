@@ -148,6 +148,7 @@ export const TIER_GROUPS = {
 export interface Character {
   id?: string
   name: string
+  aliases?: string[]
   role: string
   status: 'active' | 'inactive' | 'dead' | 'paused' | 'ghost' | 'resurrected'
   description: string
@@ -202,6 +203,7 @@ export interface Character {
 
 export interface CreateCharacterDTO {
   name: string
+  aliases?: string[]
   role?: string
   status: Character['status']
   description: string
