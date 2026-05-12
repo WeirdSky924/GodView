@@ -41,12 +41,13 @@ GodView 是一个面向长篇小说创作的 AI 多 Agent 工作流平台，提�
 
 | 长篇创作问题 | GodView 的处理方式 |
 |---|---|
-| 设定容易遗忘 | 通过 Lore、Memory、Writing Rules 和 RAG 组织长期上下文 |
-| 角色前后不一致 | 通过角色档案、角色深度、关系图谱和记忆服务维护人物状态 |
+| 设定容易遗忘 | 通过 Lore、Memory、Writing Rules、Assistant Context Fabric 和 RAG 组织长期上下文 |
+| 角色前后不一致 | 通过角色档案、角色深度、关系图谱、确认状态包和记忆服务维护人物状态 |
 | 剧情推进难以管理 | 通过 Plot、Outline、Hook、Volume、StateChange 等模块追踪叙事结构 |
-| AI 输出不可控 | 通过 Prompt、Skill、Agent Template、结构化输出、质量检查和人工干预提高可控性 |
+| AI 输出不可控 | 通过 Prompt、Skill、Agent Template、结构化输出、质量检查、运行时追踪和人工干预提高可控性 |
 | 多步骤创作流程复杂 | 通过 Workflow Engine 把任务拆成可执行、可观察、可重试的节点 |
-| 创作需要人机协作 | 在设定保存、质量评估、异常分支和干预日志中保留 Human-in-the-loop |
+| 多入口上下文容易过期或膨胀 | 通过 Assistant Context Fabric 的快照、增量、预算包和强制重读控制统一上下文来源 |
+| 创作需要人机协作 | 在设定保存、质量评估、异常分支、私聊干预和变更确认中保留 Human-in-the-loop |
 
 ### 1.2 GodView 不是什么
 
@@ -66,14 +67,15 @@ GodView 是一个面向长篇小说创作的 AI 多 Agent 工作流平台，提�
 | 能力域 | 用户能做什么 | 前端入口 | 后端/API 与服务 |
 |---|---|---|---|
 | 项目管理 | 创建、选择、查看小说项目 | `ProjectSetup.tsx`、`Dashboard.tsx` | `projects.py`、`project.py` |
-| Bootstrap 初始化 | 从项目想法、设定、大纲启动创作工程 | `Bootstrap.tsx` | `bootstrap.py`、`bootstrap_orchestrator.py` |
+| Bootstrap 初始化 | 从项目想法、设定、大纲启动创作工程，使用上下文包辅助收集和最终种子生成 | `Bootstrap.tsx` | `bootstrap.py`、`bootstrap_orchestrator.py`、Assistant Context Fabric |
 | 角色管理 | 管理人物档案、重要性、语音样本、所在地 | `Characters.tsx`、`CharacterVoice.tsx` | `characters.py`、`character.py`、角色相关服务 |
-| 世界观管理 | 管理世界、区域、地点、地理关系 | `Worlds.tsx`、`WorldMap.tsx` | `worlds.py`、`world.py`、`world_expansion_service.py` |
+| 世界观管理 | 管理世界、区域、地点、地理关系；地图 Agent 可生成待确认区域草稿 | `Worlds.tsx`、`WorldMap.tsx` | `worlds.py`、`world.py`、`world_expansion_service.py`、`world_map_manager.py` |
 | 设定库 Lore | 管理静态设定、优先级、分类、冲突 | `Lore.tsx`、`LoreTree.tsx` | `lore.py`、`lore_rag.py`、`lore_index_service.py` |
-| Setting Agent | 用对话方式提取设定、角色、伏笔并等待确认 | `SettingAgentChat.tsx` | `setting_agent.py`、`setting_agent_service.py` |
+| Setting Agent | 用对话方式提取/修改设定、角色、伏笔并等待确认，支持清空历史和强制重读项目上下文 | `SettingAgentChat.tsx` | `setting_agent.py`、`setting_agent_service.py`、`assistant_context.py` |
+| Assistant Context Fabric | 为多个 AI 入口提供项目快照、增量、预算上下文包、会话历史、强制重读和可观测 metadata | `AssistantContextControls.tsx` | `assistant_context.py`、`app/services/assistant_context/*` |
 | 剧情与伏笔 | 管理剧情、章节、伏笔和状态变化 | `Plots.tsx`、`Hooks.tsx` | `plots.py`、`state_changes.py`、`plot.py` |
-| 章节大纲 | 生成、校验、管理章节大纲 | `Outlines.tsx` | `chapter_outlines.py`、`plot_outline_service.py` |
-| 工作流编排 | 可视化搭建和执行 Agent 工作流 | `Visualizer.tsx`、`Director.tsx` | `workflows.py`、`workflow_engine.py` |
+| 章节大纲 | 生成、校验、管理章节大纲，Plot Outline Agent 使用上下文包而非孤立缓存 | `Outlines.tsx` | `chapter_outlines.py`、`plot_outline_service.py` |
+| 工作流编排 | 可视化搭建和执行 Agent 工作流，确认状态包进入后续 Writer/Evaluator 上下文 | `Visualizer.tsx`、`Director.tsx` | `workflows.py`、`workflow_engine.py` |
 | Director 上帝模式 | 观察世界状态、工作流状态、干预创作过程 | `Director.tsx` | `director.py`、`websocket.py`、`interventions.py` |
 | 质量评估 | 章节质量、爽点、黄金三章、读者反馈 | `ChapterEvaluator.tsx`、`ReaderSimulator.tsx` | `quality_checks.py`、`golden_three_rules.py`、Skill 体系 |
 | Prompt 管理 | 管理系统 Prompt 模板、渲染和分类 | `Prompts.tsx` | `prompts.py`、`prompt_template_service.py` |
@@ -102,12 +104,15 @@ flowchart TD
 
     Services --> Workflow[Workflow Engine]
     Services --> AgentLayer[Agent / Prompt / Skill 层]
+    Services --> ACF[Assistant Context Fabric]
     Services --> RAG[RAG Orchestrator]
     Services --> Simulation[世界模拟 / 时间系统]
 
+    ACF --> AgentLayer
     AgentLayer --> LLM[LLM Provider 抽象]
     RAG --> Embedding[Embedding Provider 抽象]
 
+    ACF --> PG
     Services --> PG[(PostgreSQL)]
     Services --> Qdrant[(Qdrant 向量库)]
     Services --> Nebula[(NebulaGraph 图数据库)]
@@ -131,9 +136,9 @@ flowchart TD
 7. 初始化系统 Agent 模板。
 8. 初始化项目级 Agent 配置。
 9. 从 Markdown 和数据库加载 Skill。
-10. 注册所有 FastAPI 路由并开始服务。
+10. 注册 Assistant Context、Prompt、Skill、Workflow、World、Lore 等 FastAPI 路由并开始服务。
 
-这意味着 GodView 的 Prompt、Skill、Agent Template、Writing Rules 不只是文档，而是运行时资产。
+这意味着 GodView 的 Prompt、Skill、Agent Template、Writing Rules 不只是文档，而是运行时资产。Assistant Context Fabric 也会把项目快照、会话、消息、增量和上下文包持久化到数据库，使多个 AI 入口共享同一套可追踪上下文基础设施。
 
 ---
 
@@ -221,7 +226,7 @@ flowchart TD
 
 **目标：** 用结构化世界、区域、地点和关系图谱支撑长篇叙事。
 
-能力包括世界基础信息、标签、力量体系、技术水平、历史、地理设定，区域和地点管理，地图坐标、区域连接、角色所在地显示，世界扩展和地图管理 Agent。
+能力包括世界基础信息、标签、力量体系、技术水平、历史、地理设定，区域和地点管理，地图坐标、区域连接、角色所在地显示，世界扩展和地图管理 Agent。地图 Agent 可以基于当前项目上下文生成区域草稿，草稿必须经用户直接创建或编辑确认后才会入库；保存后的区域变化会记录为 Assistant Context 增量，后续强制重读可纳入新快照。
 
 | 层 | 文件 | 能力 |
 |---|---|---|
@@ -238,7 +243,7 @@ flowchart TD
 
 **目标：** 把创作过程中的设定沉淀为可搜索、可校验、可人工确认的知识资产。
 
-能力包括 Lore 条目分类、优先级、搜索和更新，设定冲突检测，Setting Agent 对话抽取设定、角色、伏笔，待保存内容确认，Lore 向量索引和 RAG 检索。
+能力包括 Lore 条目分类、优先级、搜索和更新，设定冲突检测，Setting Agent 对话抽取设定、角色、伏笔，待保存内容确认，Lore 向量索引和 RAG 检索。Setting Agent 已接入 Assistant Context Fabric：对话会使用项目快照、增量和会话窗口构建上下文包，前端提供清空历史、重新全量读取项目、清空并重读等控制；用户明确要求修改既有设定时，会生成待确认的改进建议，而不是直接覆盖项目数据。
 
 | 层 | 文件 | 能力 |
 |---|---|---|
@@ -253,6 +258,8 @@ flowchart TD
 
 **目标：** 将剧情推进拆成可管理的结构：章节、剧情、伏笔、状态变化、卷规划和大纲。
 
+章节大纲 Agent 和卷规划相关生成已接入 Assistant Context Fabric。大纲聊天、生成、批量生成、资源补充草稿、卷规划和卷高潮设计都可以携带上下文包 metadata，用项目快照和近期增量替代孤立的大块 prompt 拼接。卷规划接口仍通过 `skill_volume_planning` 执行，但会把 `volume_planning` 上下文包传入 Skill，并兼容结构化输出、Markdown fenced JSON 和原始 JSON 文本。
+
 | 层 | 文件 | 能力 |
 |---|---|---|
 | 前端页面 | `Plots.tsx`、`Hooks.tsx`、`Outlines.tsx` | 剧情、伏笔、大纲管理 |
@@ -266,7 +273,7 @@ flowchart TD
 
 **目标：** 把章节生成、质量评估、设定补全、人工干预等复杂任务拆成可编排工作流。
 
-能力包括工作流定义 CRUD，节点类型发现，Agent/条件/并行节点，工作流校验、执行、暂停、恢复、取消，SSE 事件流监控执行状态，工作流执行回放和导出。
+能力包括工作流定义 CRUD，节点类型发现，Agent/条件/并行节点，工作流校验、执行、暂停、恢复、取消，SSE 事件流监控执行状态，工作流执行回放和导出。工作流私聊/干预已接入 Assistant Context Fabric，按项目、执行、节点/Agent 维度持久化会话，并在干预输入进入 Agent 前构建 `workflow_intervention` 上下文包。已确认或已应用的叙事状态变化会被归并为确认状态包进入后续 Writer/Evaluator 上下文；被拒绝状态不会被提升。
 
 | 层 | 文件 | 能力 |
 |---|---|---|
@@ -382,9 +389,11 @@ GodView 使用三类数据库，不是为了堆技术，而是因为长篇创作
 
 | 数据库 | 适合的问题 | 在 GodView 中的用途 | 关键代码 |
 |---|---|---|---|
-| PostgreSQL | 结构化、事务型、可查询业务数据 | 项目、角色、世界、剧情、设定、工作流、配置、Token 统计 | `app/database/postgres.py` |
+| PostgreSQL | 结构化、事务型、可查询业务数据 | 项目、角色、世界、剧情、设定、工作流、配置、Token 统计、Assistant Context 快照/会话/消息/上下文包/增量 | `app/database/postgres.py` |
 | Qdrant | 语义相似度检索 | Lore、Narrative、Memory、Voice、Writing Rules 的向量检索 | `app/database/qdrant.py` |
 | NebulaGraph | 多跳关系和图谱查询 | 角色关系、区域连接、事件关联、记忆关联、伏笔关联 | `app/database/nebulagraph.py` |
+
+Assistant Context Fabric 在 PostgreSQL 中维护以下核心数据：项目快照、快照分区、实体变更增量、通用 assistant session、assistant message、context packet。它用于让多个 AI 入口共享可审计的项目上下文，而不是每个页面自行拼接大段 prompt 或维护孤立缓存。
 
 ---
 
@@ -406,7 +415,7 @@ Embedding 支持 OpenAI Embedding、Sentence-Transformers 本地模型和 Ollama
 
 ### 9.3 Prompt 系统
 
-Prompt 是运行时资产，存放在 `prompts/` 和数据库中。
+Prompt 是运行时资产，存放在 `prompts/` 和数据库中。系统支持 Markdown 资产同步、数据库模板管理、运行时渲染 trace、Agent Template prompt slot 审计，以及按 agent_type/scenario 解析 Writer、Evaluator、Plot Outline、Setting、World Map 等 Agent 的任务指令。
 
 | 目录 | 说明 |
 |---|---|
@@ -417,7 +426,7 @@ Prompt 是运行时资产，存放在 `prompts/` 和数据库中。
 
 ### 9.4 Skill 系统
 
-Skill 是可复用的 Agent 能力资产，存放在 `skills/` 和数据库中，覆盖 analysis、core、evaluation、hook、plotting、summary、writing 等类别。
+Skill 是可复用的 Agent 能力资产，存放在 `skills/` 和数据库中，覆盖 analysis、core、evaluation、hook、performance、plotting、summary、writing 等类别。Skill Markdown 同步会返回文件级结果，并将适用场景写入 `skill_assignments`，便于 Agent Template 按场景选择能力。
 
 | 文件 | 说明 |
 |---|---|
@@ -429,7 +438,22 @@ Skill 是可复用的 Agent 能力资产，存放在 `skills/` 和数据库中�
 
 ### 9.5 Agent Template 与 Agent Config
 
-GodView 将 Agent 拆成多层：Prompt 定义身份和约束，Skill 定义可复用能力，Agent Template 定义标准行为，Agent Config 定义项目级运行时配置，Workflow Node 把 Agent 放入可执行流程。
+GodView 将 Agent 拆成多层：Prompt 定义身份和约束，Skill 定义可复用能力，Agent Template 定义标准行为，Agent Config 定义项目级运行时配置，Workflow Node 把 Agent 放入可执行流程。Agent Prompt Service 会生成稳定 render trace，暴露使用到的 prompt、skill、缺失项和 fallback 来源，避免运行时 Prompt 组合不可见。
+
+### 9.6 Assistant Context Fabric
+
+Assistant Context Fabric 是近期大型升级后的统一上下文底座，目标是让所有 assistant/generation 入口共享同一套“项目真相读取、会话窗口、增量、预算和可观测性”机制。
+
+| 能力 | 说明 |
+|---|---|
+| 项目快照 | 从数据库构建 durable snapshot，并按 project brief、world、lore、characters、plot hooks、chapter outlines、map regions、workflow state、writing rules 等 section 组织。 |
+| 增量账本 | 在 Lore、角色/世界/地图、大纲、workflow durable state 等项目资产变化后记录 delta，供后续上下文包优先选取近期变化。 |
+| 通用会话 | 使用 `assistant_sessions` / `assistant_messages` 管理不同 surface 的 bounded history，而不是每个页面各自维护不可审计历史。 |
+| 上下文包 | 每次 LLM 生成可持久化 `assistant_context_packets`，包含 selected/omitted sections、delta ids、token estimate、snapshot version、request id 和 packet hash。 |
+| 用户控制 | 前端共享 `AssistantContextControls` 支持清空历史、强制全量重读项目、清空并重读；强制重读失败时不应静默使用旧上下文。 |
+| 已接入 surface | `setting_agent`、`bootstrap_setting_agent`、`plot_outline_agent`、`workflow_intervention`、`world_map_agent`、`volume_planning`。 |
+
+关键文件：`app/models/assistant_context.py`、`app/services/assistant_context/*`、`app/api/routes/assistant_context.py`、`frontend/src/api/assistantContext.ts`、`frontend/src/components/assistant/AssistantContextControls.tsx`。
 
 ---
 
@@ -459,6 +483,8 @@ Workflow Engine 是 GodView 的核心工程化能力之一。它把复杂创作�
 - 人工干预。
 - SSE 执行事件推送。
 - 执行记录和回放导出。
+- 私聊干预会话持久化和 `workflow_intervention` 上下文包。
+- 已确认/已应用叙事状态的有效状态归并，供后续 Writer/Evaluator 使用。
 
 ---
 
@@ -549,11 +575,11 @@ npm run dev
 5. 在项目页创建或选择项目。
 6. 进入 Bootstrap 流程创建项目基础资产。
 7. 检查角色、世界、Lore、剧情、大纲页面是否能正常读写。
-8. 进入 Visualizer 创建或执行工作流。
-9. 进入 Director 查看工作流状态和 Agent 状态。
+8. 在 `/lore`、`/outlines`、`/bootstrap`、`/world-map` 或 workflow 私聊面板中检查“上下文织网”状态，并验证清空历史/重新读取是否符合预期。
+9. 进入 Visualizer 创建或修复工作流结构；进入 Director 执行工作流、查看状态和 Agent 私聊干预。
 10. 使用章节评估、读者模拟、Diff、干预日志等页面验证创作辅助能力。
 
-说明：以上是建议验证路径。是否完成端到端业务闭环，需要结合本地数据库状态、模型 API Key、Embedding 下载和实际运行日志确认。
+说明：以上是建议验证路径。是否完成端到端业务闭环，需要结合本地数据库状态、模型 API Key、Embedding 下载和实际运行日志确认。近期 `1.7.0` 验证中过：Assistant Context focused tests、runtime prompt trace tests、workflow API/engine tests、world region API tests、backend compile、frontend build、`git diff --check`，并用浏览器 smoke 验证过 `/world-map` 上下文控件和 `/api/volumes/plan` 的 `volume_planning` packet metadata。
 
 ---
 
@@ -587,6 +613,7 @@ npm run dev
 | `app/api/routes/__init__.py` | 路由包聚合 |
 | `app/api/routes/agent_configs.py` | 项目级 Agent 配置 API |
 | `app/api/routes/agent_templates.py` | Agent 模板 API、预览和 Prompt 组合相关接口 |
+| `app/api/routes/assistant_context.py` | Assistant Context 会话、历史、快照、强制重读、上下文包和健康状态 API |
 | `app/api/routes/bootstrap.py` | Bootstrap 项目初始化流程 API |
 | `app/api/routes/chapter_outlines.py` | 章节大纲生成、查询、校验 API |
 | `app/api/routes/character_depth.py` | 角色深度、成长弧和关系扩展 API |
@@ -635,6 +662,7 @@ npm run dev
 | `app/models/agent_output_contract.py` | Agent 输出契约模型 |
 | `app/models/agent_output_schemas.py` | Agent 输出结构 schema |
 | `app/models/agent_template.py` | Agent 模板模型 |
+| `app/models/assistant_context.py` | Assistant Context 快照、分区、增量、会话、消息、上下文包、重置和强制重读模型 |
 | `app/models/bootstrap.py` | Bootstrap 会话、阶段、消息、请求模型 |
 | `app/models/chapter_outline.py` | 章节大纲模型 |
 | `app/models/character.py` | 角色、关系、状态、语音样本模型 |
@@ -673,6 +701,7 @@ npm run dev
 | `app/services/agent_memory_service.py` | Agent 记忆服务 |
 | `app/services/agent_prompt_service.py` | Agent 运行时 Prompt 组合服务 |
 | `app/services/agent_template_service.py` | Agent Template 初始化、缓存和 CRUD 服务 |
+| `app/services/assistant_context/` | Assistant Context Fabric 服务包：session、snapshot、delta、retrieval、budget、packet、facade、observability |
 | `app/services/bootstrap_orchestrator.py` | Bootstrap 初始化流程编排器 |
 | `app/services/character_depth_service.py` | 角色深度服务 |
 | `app/services/character_detection.py` | 角色识别和检测辅助服务 |
@@ -823,6 +852,7 @@ npm run dev
 | `frontend/src/components/Layout.tsx` | 全局布局、侧边栏、项目选择、主题切换 |
 | `frontend/src/components/PageLayout.tsx` | 页面通用布局 |
 | `frontend/src/components/AgentConfigPanel.tsx` | Agent 配置面板 |
+| `frontend/src/components/assistant/AssistantContextControls.tsx` | Assistant Context 状态、清空历史、强制重读和清空并重读共享控件 |
 | `frontend/src/components/OpeningDesigner.tsx` | 开篇设计组件 |
 | `frontend/src/components/TokenStats.tsx` | Token 统计组件 |
 | `frontend/src/components/VillainManager.tsx` | 反派管理组件 |
@@ -859,6 +889,7 @@ npm run dev
 | `frontend/src/components/workflow/index.ts` | 工作流组件导出 |
 | `frontend/src/components/world/EventStream.tsx` | 世界事件流 |
 | `frontend/src/components/world/MapView.tsx` | 地图可视化 |
+| `frontend/src/components/world/WorldMapAgentDrawer.tsx` | 地图 Agent 抽屉：基于上下文包生成区域草稿，支持编辑/直接创建/忽略 |
 | `frontend/src/components/world/NetworkGraph.tsx` | 关系网络图 |
 | `frontend/src/components/world/TagSelector.tsx` | 标签选择器 |
 
@@ -868,6 +899,7 @@ npm run dev
 |---|---|
 | `frontend/src/api/agentConfigs.ts` | Agent Config API 封装 |
 | `frontend/src/api/agentTemplates.ts` | Agent Template API 封装 |
+| `frontend/src/api/assistantContext.ts` | Assistant Context 会话、历史、重读、重置、快照和上下文包 API 封装 |
 | `frontend/src/api/bootstrap.ts` | Bootstrap API 封装 |
 | `frontend/src/api/chapters.ts` | 章节 API 封装 |
 | `frontend/src/api/characters.ts` | 角色 API 封装 |
@@ -932,10 +964,18 @@ npm run dev
 | `prompts/instruction/function_event_generation.md` | 事件生成指令 |
 | `prompts/instruction/function_hook_management.md` | 伏笔管理指令 |
 | `prompts/instruction/function_map_management.md` | 地图管理指令 |
+| `prompts/instruction/function_map_draft_generation.md` | 地图 Agent 区域草稿生成指令 |
 | `prompts/instruction/function_plot_management.md` | 剧情管理指令 |
 | `prompts/instruction/function_plot_outline.md` | 剧情大纲指令 |
 | `prompts/instruction/function_scene_coordination.md` | 场景协调指令 |
 | `prompts/instruction/function_summarize.md` | 总结指令 |
+| `prompts/instruction/function_character_runtime_context_packet.md` | 角色 Agent 读取运行时上下文包和边界规则 |
+| `prompts/instruction/function_scene_coordinator_runtime_context_packet.md` | 场景协调 Agent 读取运行时上下文包和公私边界规则 |
+| `prompts/instruction/function_summarizer_runtime_context_packet.md` | 总结 Agent 读取运行时上下文包规则 |
+| `prompts/instruction/function_director_auto_write.md` | Director 自动写作决策指令 |
+| `prompts/instruction/function_skill_orchestration_decision.md` | Skill 编排决策指令 |
+| `prompts/instruction/function_skill_retrieval_decision.md` | Skill 检索决策指令 |
+| `prompts/instruction/function_master_plotter_forced_event.md` | 主剧情规划强制事件处理指令 |
 | `prompts/instruction/function_writing.md` | 写作指令 |
 | `prompts/output/base_json_output.md` | 基础 JSON 输出约束 |
 | `prompts/output/plot_outline_output.md` | 剧情大纲输出约束 |
@@ -1033,6 +1073,8 @@ npm run dev
 | `tests/test_intervention_service.py` | 干预服务测试 |
 | `tests/test_agent_contracts.py` | Agent 输出契约测试 |
 | `tests/test_structured_llm.py` | 结构化 LLM 测试 |
+| `tests/test_assistant_context_fabric.py` | Assistant Context Fabric 快照、会话、重置/重读、预算截断、跨 surface packet 测试 |
+| `tests/test_runtime_prompt_trace_standardization.py` | Prompt/Skill 运行时 trace、资产同步、Agent 规则和上下文包相关回归测试 |
 | `tests/test_writing_rule_rag.py` | 写作规则 RAG 测试 |
 | `tests/test_world_region_api.py` | 世界区域 API 测试 |
 | `tests/test_character_location_api.py` | 角色位置 API 测试 |
@@ -1047,13 +1089,22 @@ npm run dev
 运行测试示例：
 
 ```bash
-pytest
+PYTHONPATH=. conda run -n godview pytest
 ```
 
-也可以针对单个测试文件：
+也可以针对单个测试文件或当前核心回归集合：
 
 ```bash
-pytest tests/test_workflow_engine.py
+PYTHONPATH=. conda run -n godview pytest tests/test_workflow_engine.py
+PYTHONPATH=. conda run -n godview pytest tests/test_assistant_context_fabric.py tests/test_runtime_prompt_trace_standardization.py tests/test_workflow_api.py tests/test_workflow_engine.py tests/test_world_region_api.py -q
+```
+
+常用静态/构建检查：
+
+```bash
+PYTHONPATH=. conda run -n godview python -m compileall app
+npm --prefix frontend run build
+git diff --check
 ```
 
 ---
@@ -1080,21 +1131,25 @@ pytest tests/test_workflow_engine.py
 
 检查后端 SSE/WebSocket 是否可访问，工作流定义是否通过后端校验，Agent 节点是否配置了可用模型和 Prompt。
 
+### 16.6 Assistant Context 显示过期或上下文不符合预期
+
+在对应页面使用“重新读取”强制从当前数据库重建项目快照；如果只想清除本次 assistant 对话影响，使用“清空历史”；如果既要清除旧会话又要重建项目上下文，使用“清空并重读”。这些操作不会删除 Lore、角色、世界、章节、大纲或地图区域等项目资产。
+
 ---
 
 ## 17. 当前工程状态说明
 
-从代码结构看，GodView 已具备完整的前后端模块、Prompt/Skill 运行资产、多数据库适配、工作流引擎、RAG 相关服务、Agent 模板和项目级配置体系。
+从代码结构看，GodView 已具备完整的前后端模块、Prompt/Skill 运行资产、多数据库适配、工作流引擎、RAG 相关服务、Agent 模板、项目级配置体系，以及跨 assistant/generation 入口共享的 Assistant Context Fabric。当前版本状态以代码和配置中的 `1.7.0` 为准。
 
 需要注意：
 
 - README 中描述的是当前代码和工程结构所支持的能力。
-- 实际端到端效果依赖本地数据库状态、模型 API Key、Embedding 模型、Prompt/Skill 数据同步和运行时日志。
-- 在没有运行完整 E2E 流程前，不应声称所有功能都已在当前环境完成生产级验证。
+- 实际端到端效果依赖本地数据库状态、模型 API Key、Embedding 模型、Prompt/Skill 数据同步、Assistant Context 快照状态和运行时日志。
+- 当前已完成多轮单元/集成/构建/浏览器 smoke 验证，但在没有针对某一真实项目运行完整 E2E 创作闭环前，不应声称所有功能都已在当前环境完成生产级验证。
 - 如果用于简历或面试，应区分“代码已实现/系统支持”“已完成运行验证”“后续可生产化增强”三类表述。
 
 ---
 
 ## 18. 一句话总结
 
-GodView 的核心价值不是“让 AI 写一章小说”，而是把长篇创作拆解为可管理的工程系统：用 PostgreSQL 管结构化创作资产，用 Qdrant 做语义检索，用 NebulaGraph 表达复杂关系，用 Prompt/Skill/Agent 模板约束模型行为，用 Workflow Engine 编排多步骤任务，并通过人工干预与质量评估让创作过程可追踪、可验证、可持续迭代。
+GodView 的核心价值不是“让 AI 写一章小说”，而是把长篇创作拆解为可管理的工程系统：用 PostgreSQL 管结构化创作资产和 Assistant Context 快照/会话/上下文包，用 Qdrant 做语义检索，用 NebulaGraph 表达复杂关系，用 Prompt/Skill/Agent 模板约束模型行为，用 Workflow Engine 编排多步骤任务，并通过强制重读、人工干预、状态确认与质量评估让创作过程可追踪、可验证、可持续迭代。
