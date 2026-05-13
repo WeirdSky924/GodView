@@ -1,6 +1,7 @@
 import pytest
 from fastapi import HTTPException
 
+from app.models.world import Region
 from app.api.routes.worlds import (
     WorldMapAgentGenerateRequest,
     _normalize_agent_draft_regions,
@@ -182,6 +183,27 @@ def test_normalize_agent_draft_regions_resolves_safe_connections_and_warnings():
     assert any("未知区域类型" in warning for warning in draft["validation_warnings"])
     assert any("未知地形类型" in warning for warning in draft["validation_warnings"])
     assert any("不存在的区域" in warning for warning in draft["validation_warnings"])
+
+
+def test_region_accepts_agent_draft_encounters_without_id_or_type():
+    region = Region(
+        name="下城区集市",
+        region_type="village",
+        terrain_type="plain",
+        encounters=[
+            {
+                "name": "阿Ken的通讯",
+                "description": "触发条件：林默在此休息或交易；事件：阿Ken通过加密频道联系林默",
+            },
+            {"name": "失踪人口传闻", "type": "unknown-kind"},
+        ],
+    )
+
+    dumped = region.model_dump(mode="json")
+    assert len(dumped["encounters"]) == 2
+    assert dumped["encounters"][0]["id"]
+    assert dumped["encounters"][0]["type"] == "event"
+    assert dumped["encounters"][1]["type"] == "event"
 
 
 @pytest.mark.asyncio

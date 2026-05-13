@@ -858,7 +858,39 @@ async def get_workflow(workflow_id: str):
 
     workflow = await engine.get_workflow(workflow_id, db)
     if not workflow:
-        raise HTTPException(status_code=404, detail="工作流不存在")
+        active_execution = None
+        if db and hasattr(db, "execute_query"):
+            try:
+                rows = await db.execute_query(
+                    """
+                    SELECT id, status, current_node, started_at, updated_at
+                    FROM workflow_executions
+                    WHERE workflow_id = :workflow_id
+                      AND status IN ('running', 'paused', 'pending')
+                    ORDER BY updated_at DESC NULLS LAST, started_at DESC NULLS LAST
+                    LIMIT 1
+                    """,
+                    {"workflow_id": workflow_id},
+                )
+                if rows:
+                    active_execution = {key: rows[0].get(key) for key in ("id", "status", "current_node", "started_at", "updated_at")}
+                    logger.warning(
+                        "工作流定义缺失但存在活跃执行: workflow_id=%s execution_id=%s status=%s",
+                        workflow_id,
+                        active_execution.get("id"),
+                        active_execution.get("status"),
+                    )
+            except Exception as exc:
+                logger.warning("检查缺失工作流定义的活跃执行失败: workflow_id=%s error=%s", workflow_id, exc)
+        detail: Dict[str, Any] = {
+            "code": "workflow_definition_not_found",
+            "message": "工作流定义不存在或已被删除；如果执行仍在运行，请以执行状态为准。",
+            "workflow_id": workflow_id,
+            "recoverable_from_execution": bool(active_execution),
+        }
+        if active_execution:
+            detail["active_execution"] = active_execution
+        raise HTTPException(status_code=404, detail=detail)
 
     return workflow.model_dump()
 

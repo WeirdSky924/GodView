@@ -526,6 +526,13 @@ function NodeStateItem({ nodeId, state, isExpanded, onToggle, isDark }: NodeStat
     chapter_outline: outputData.chapter_outline,
     chapter_goals: outputData.chapter_goals,
     scene_directions: outputData.scene_directions,
+    discussion_topic: outputData.discussion_topic || outputData.topic,
+    messages: outputData.messages,
+    full_content: outputData.full_content,
+    public_performances: outputData.public_performances,
+    performance_word_count: outputData.performance_word_count,
+    performance_target_word_count: outputData.performance_target_word_count,
+    material_role: outputData.material_role || outputData.performance_result?.material_role,
     quality_passed: outputData.quality_passed,
     revision_notes: outputData.revision_notes,
   }

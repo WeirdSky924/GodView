@@ -716,17 +716,87 @@ class SettingAgentService:
         )
 
     def _is_save_intent(self, message: str) -> bool:
-        """检测用户消息是否为保存/确认意图（不需要调用LLM）"""
-        message_lower = message.strip().lower()
+        """检测用户消息是否为纯保存/确认意图（不需要调用LLM）。"""
+        return self._classify_save_intent(message).get("is_save_intent", False)
+
+    def _classify_save_intent(self, message: str) -> Dict[str, Any]:
+        """区分纯保存指令、指定条目保存、新内容输入，避免“保存”关键词误拦截。"""
+        raw_message = (message or "").strip()
+        message_lower = raw_message.lower()
         save_keywords = [
             "保存", "确认", "确定", "好的", "可以", "没问题",
             "就这样", "行", "ok", "yes", "save", "确认保存",
             "保存吧", "存一下", "存下来", "保存下来",
         ]
-        # 消息较短且包含保存关键词时才判定为保存意图
-        if len(message_lower) > 50:
-            return False
-        return any(keyword in message_lower for keyword in save_keywords)
+        if not any(keyword in message_lower for keyword in save_keywords):
+            return {"is_save_intent": False, "scope": "none", "targets": []}
+
+        explicit_names = self._extract_explicit_character_names_from_text(raw_message)
+        has_new_content_signal = bool(explicit_names) or any(marker in raw_message for marker in [
+            "角色是", "角色为", "角色叫", "角色名为", "新增角色", "添加角色", "创建角色",
+            "新设定", "设定是", "设定为", "伏笔是", "新增伏笔", "添加伏笔",
+        ])
+        if has_new_content_signal:
+            return {"is_save_intent": False, "scope": "new_content", "targets": explicit_names}
+
+        pure_save_phrases = {
+            "保存", "确认", "确定", "好的", "可以", "没问题", "就这样", "行",
+            "ok", "yes", "save", "确认保存", "保存吧", "存一下", "存下来", "保存下来",
+            "全部保存", "保存全部", "都保存", "全部确认", "确认全部",
+        }
+        compact = re.sub(r"[\s，。！!,.]+", "", message_lower)
+        compact_phrases = {re.sub(r"[\s，。！!,.]+", "", item.lower()) for item in pure_save_phrases}
+        if compact in compact_phrases:
+            return {"is_save_intent": True, "scope": "all", "targets": []}
+
+        target_names = self._extract_save_target_names(raw_message)
+        if target_names:
+            return {"is_save_intent": True, "scope": "targeted", "targets": target_names}
+
+        if len(raw_message) <= 16 and any(keyword in message_lower for keyword in save_keywords):
+            return {"is_save_intent": True, "scope": "all", "targets": []}
+
+        return {"is_save_intent": False, "scope": "content_with_save_keyword", "targets": []}
+
+    def _extract_save_target_names(self, message: str) -> List[str]:
+        names: List[str] = []
+        patterns = [
+            r"(?:只|仅)?保存\s*([^，。；;\n]+)",
+            r"(?:确认|确定)\s*([^，。；;\n]+)",
+        ]
+        for pattern in patterns:
+            for match in re.finditer(pattern, message or ""):
+                raw = match.group(1).strip()
+                raw = re.sub(r"^(这个|这条|该|角色|设定|伏笔)\s*", "", raw).strip()
+                raw = re.sub(r"\s*(这个|这条|角色|设定|伏笔)$", "", raw).strip()
+                if raw and raw not in {"全部", "所有", "一下", "下来", "吧"} and len(raw) <= 40:
+                    names.append(raw)
+        return list(dict.fromkeys(names))
+
+    def _pending_item_matches_targets(self, item: Dict[str, Any], targets: List[str]) -> bool:
+        searchable = [
+            item.get("name"),
+            item.get("title"),
+            item.get("description"),
+            item.get("content"),
+            item.get("summary"),
+        ]
+        text = "\n".join(str(value or "") for value in searchable)
+        return any(target and target in text for target in targets)
+
+    def _filter_pending_for_save_intent(
+        self,
+        session: SettingAgentSession,
+        classification: Dict[str, Any],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        if classification.get("scope") != "targeted":
+            return session.cached_pending_lores, session.cached_pending_characters, session.cached_pending_hooks
+        targets = classification.get("targets") or []
+        return (
+            [item for item in session.cached_pending_lores if self._pending_item_matches_targets(item, targets)],
+            [item for item in session.cached_pending_characters if self._pending_item_matches_targets(item, targets)],
+            [item for item in session.cached_pending_hooks if self._pending_item_matches_targets(item, targets)],
+        )
 
     def _clear_cached_pending_lores(self, project_id: str):
         """清除指定项目 session 中缓存的 pending_lores"""
@@ -1077,54 +1147,58 @@ class SettingAgentService:
                     pending_hooks=session.cached_pending_hooks or None,
                 )
 
-        # 检测用户是否发送"保存"等确认性指令
-        if self._is_save_intent(message) and (session.cached_pending_lores or session.cached_pending_characters or session.cached_pending_hooks):
-            logger.info(f"[SettingAgent] 检测到保存意图，直接返回缓存的 pending 数据（跳过LLM调用）")
+        # 检测用户是否发送纯保存/指定条目保存指令；包含新内容的“保存”不短路，继续交给 LLM/抽取链路识别
+        save_intent = self._classify_save_intent(message)
+        if save_intent.get("is_save_intent") and (session.cached_pending_lores or session.cached_pending_characters or session.cached_pending_hooks):
+            pending_lores_for_save, pending_characters_for_save, pending_hooks_for_save = self._filter_pending_for_save_intent(session, save_intent)
+            if pending_lores_for_save or pending_characters_for_save or pending_hooks_for_save:
+                logger.info(
+                    "[SettingAgent] 检测到%s保存意图，返回匹配 pending 数据（跳过LLM调用）",
+                    "指定条目" if save_intent.get("scope") == "targeted" else "纯",
+                )
 
-            # 添加用户消息到历史
-            session.conversation_history.append({
-                "role": "user",
-                "content": message,
-                "timestamp": datetime.now().isoformat(),
-            })
+                session.conversation_history.append({
+                    "role": "user",
+                    "content": message,
+                    "timestamp": datetime.now().isoformat(),
+                })
 
-            # 构建保存确认回复
-            save_summary_parts = []
-            if session.cached_pending_lores:
-                lore_titles = [l.get("title", "未命名") for l in session.cached_pending_lores]
-                save_summary_parts.append(f"{len(session.cached_pending_lores)} 条设定（{', '.join(lore_titles)}）")
-            if session.cached_pending_characters:
-                char_names = [c.get("name", "未命名") for c in session.cached_pending_characters]
-                save_summary_parts.append(f"{len(session.cached_pending_characters)} 个角色（{', '.join(char_names)}）")
-            if session.cached_pending_hooks:
-                hook_titles = [h.get("title", "未命名") for h in session.cached_pending_hooks]
-                save_summary_parts.append(f"{len(session.cached_pending_hooks)} 个伏笔（{', '.join(hook_titles)}）")
+                save_summary_parts = []
+                if pending_lores_for_save:
+                    lore_titles = [l.get("title", "未命名") for l in pending_lores_for_save]
+                    save_summary_parts.append(f"{len(pending_lores_for_save)} 条设定（{', '.join(lore_titles)}）")
+                if pending_characters_for_save:
+                    char_names = [c.get("name", "未命名") for c in pending_characters_for_save]
+                    save_summary_parts.append(f"{len(pending_characters_for_save)} 个角色（{', '.join(char_names)}）")
+                if pending_hooks_for_save:
+                    hook_titles = [h.get("title", "未命名") for h in pending_hooks_for_save]
+                    save_summary_parts.append(f"{len(pending_hooks_for_save)} 个伏笔（{', '.join(hook_titles)}）")
 
-            response = f"好的，已为您准备保存以下内容：{'、'.join(save_summary_parts)}。请在弹窗中确认保存。"
+                response = f"好的，已为您准备保存以下内容：{'、'.join(save_summary_parts)}。请在弹窗中确认保存。"
 
-            # 添加助手回复到历史
-            session.conversation_history.append({
-                "role": "assistant",
-                "content": response,
-                "timestamp": datetime.now().isoformat(),
-            })
+                session.conversation_history.append({
+                    "role": "assistant",
+                    "content": response,
+                    "timestamp": datetime.now().isoformat(),
+                })
 
-            session.last_activity_at = datetime.now()
+                session.last_activity_at = datetime.now()
 
-            result = self._build_chat_response(
-                session,
-                message=response,
-                pending_lores=session.cached_pending_lores or None,
-                pending_characters=session.cached_pending_characters or None,
-                pending_hooks=session.cached_pending_hooks or None,
-            )
+                result = self._build_chat_response(
+                    session,
+                    message=response,
+                    pending_lores=pending_lores_for_save or None,
+                    pending_characters=pending_characters_for_save or None,
+                    pending_hooks=pending_hooks_for_save or None,
+                )
 
-            if postgres_db:
-                await postgres_db.append_setting_agent_message(session.id, "user", message, request_id=request_id)
-                await postgres_db.append_setting_agent_message(session.id, "assistant", response, request_id=request_id)
-            await self._persist_session_snapshot(session)
+                if postgres_db:
+                    await postgres_db.append_setting_agent_message(session.id, "user", message, request_id=request_id)
+                    await postgres_db.append_setting_agent_message(session.id, "assistant", response, request_id=request_id)
+                await self._persist_session_snapshot(session)
 
-            return result
+                return result
+            logger.info("[SettingAgent] 检测到指定保存意图，但缓存 pending 中没有匹配条目，继续走识别链路")
 
         # 添加用户消息到历史
         session.conversation_history.append({
@@ -2587,6 +2661,221 @@ class SettingAgentService:
                 return {}
         return value if isinstance(value, dict) else {}
 
+    def _normalize_character_importance_tier(self, value: Any) -> str:
+        from app.models.character import CharacterImportanceTier
+
+        raw = str(value or "").strip()
+        key = re.sub(r"[\s\-_]+", "", raw.casefold())
+        valid = {item.value for item in CharacterImportanceTier}
+        if raw in valid:
+            return raw
+        alias_map = {
+            "main": CharacterImportanceTier.PROTAGONIST.value,
+            "lead": CharacterImportanceTier.PROTAGONIST.value,
+            "hero": CharacterImportanceTier.PROTAGONIST.value,
+            "core": CharacterImportanceTier.DEUTERAGONIST.value,
+            "major": CharacterImportanceTier.DEUTERAGONIST.value,
+            "important": CharacterImportanceTier.MAJOR_ALLY.value,
+            "supporting": CharacterImportanceTier.RECURRING.value,
+            "minor": CharacterImportanceTier.RECURRING.value,
+            "background": CharacterImportanceTier.BACKGROUND.value,
+            "extra": CharacterImportanceTier.BACKGROUND.value,
+            "主角": CharacterImportanceTier.PROTAGONIST.value,
+            "核心主角": CharacterImportanceTier.PROTAGONIST.value,
+            "核心": CharacterImportanceTier.DEUTERAGONIST.value,
+            "重要": CharacterImportanceTier.MAJOR_ALLY.value,
+            "主要": CharacterImportanceTier.MAJOR_ALLY.value,
+            "重要配角": CharacterImportanceTier.MAJOR_ALLY.value,
+            "配角": CharacterImportanceTier.RECURRING.value,
+            "次要": CharacterImportanceTier.RECURRING.value,
+            "反派": CharacterImportanceTier.MAJOR_ANTAGONIST.value,
+            "主要反派": CharacterImportanceTier.MAJOR_ANTAGONIST.value,
+            "背景": CharacterImportanceTier.BACKGROUND.value,
+            "路人": CharacterImportanceTier.BACKGROUND.value,
+            "npc": CharacterImportanceTier.NPC.value,
+        }
+        if key in alias_map:
+            return alias_map[key]
+        if "反派" in key or "antagonist" in key or "villain" in key:
+            return CharacterImportanceTier.MAJOR_ANTAGONIST.value
+        if "主角" in key or "protagonist" in key:
+            return CharacterImportanceTier.PROTAGONIST.value
+        if "核心" in key or "重要" in key or "major" in key:
+            return CharacterImportanceTier.MAJOR_ALLY.value
+        return CharacterImportanceTier.NPC.value
+
+    def _normalize_character_narrative_weight(self, value: Any, importance_tier: str) -> str:
+        from app.models.character import CharacterImportanceTier, NarrativeWeight, TIER_DEFAULTS
+
+        raw = str(value or "").strip()
+        key = re.sub(r"[\s\-_]+", "", raw.casefold())
+        valid = {item.value for item in NarrativeWeight}
+        if raw in valid:
+            return raw
+        alias_map = {
+            "full": NarrativeWeight.FULL_FOCUS.value,
+            "fullfocus": NarrativeWeight.FULL_FOCUS.value,
+            "core": NarrativeWeight.FULL_FOCUS.value,
+            "major": NarrativeWeight.MAJOR_FOCUS.value,
+            "majorfocus": NarrativeWeight.MAJOR_FOCUS.value,
+            "medium": NarrativeWeight.MODERATE.value,
+            "moderate": NarrativeWeight.MODERATE.value,
+            "low": NarrativeWeight.MINIMAL.value,
+            "minimal": NarrativeWeight.MINIMAL.value,
+            "background": NarrativeWeight.BACKGROUND.value,
+            "完全聚焦": NarrativeWeight.FULL_FOCUS.value,
+            "核心": NarrativeWeight.FULL_FOCUS.value,
+            "核心领袖角色": NarrativeWeight.FULL_FOCUS.value,
+            "主要": NarrativeWeight.MAJOR_FOCUS.value,
+            "重点": NarrativeWeight.MAJOR_FOCUS.value,
+            "中等": NarrativeWeight.MODERATE.value,
+            "普通": NarrativeWeight.MODERATE.value,
+            "最小": NarrativeWeight.MINIMAL.value,
+            "低": NarrativeWeight.MINIMAL.value,
+            "背景": NarrativeWeight.BACKGROUND.value,
+        }
+        if key in alias_map:
+            return alias_map[key]
+        if "核心" in key or "领袖" in key or "full" in key:
+            return NarrativeWeight.FULL_FOCUS.value
+        if "主要" in key or "重点" in key or "major" in key:
+            return NarrativeWeight.MAJOR_FOCUS.value
+        try:
+            tier = CharacterImportanceTier(importance_tier)
+            default_weight = TIER_DEFAULTS.get(tier, {}).get("narrative_weight")
+            if default_weight:
+                return default_weight.value
+        except Exception:
+            pass
+        return NarrativeWeight.MINIMAL.value
+
+    def _normalize_character_story_arc_role(self, value: Any) -> str:
+        from app.models.character import StoryArcRole
+
+        raw = str(value or "").strip()
+        key = re.sub(r"[\s\-_]+", "", raw.casefold())
+        valid = {item.value for item in StoryArcRole}
+        if raw in valid:
+            return raw
+        alias_map = {
+            "hero": StoryArcRole.HERO.value,
+            "leader": StoryArcRole.HERO.value,
+            "guide": StoryArcRole.GUIDE.value,
+            "helper": StoryArcRole.HELPER.value,
+            "protector": StoryArcRole.PROTECTOR.value,
+            "mentor": StoryArcRole.MENTOR_ROLE.value,
+            "villain": StoryArcRole.VILLAIN.value,
+            "obstacle": StoryArcRole.OBSTACLE.value,
+            "betrayer": StoryArcRole.BETRAYER.value,
+            "neutral": StoryArcRole.NEUTRAL.value,
+            "wildcard": StoryArcRole.WILD_CARD.value,
+            "sacrifice": StoryArcRole.SACRIFICE.value,
+            "tragic": StoryArcRole.TRAGIC.value,
+            "英雄": StoryArcRole.HERO.value,
+            "领袖": StoryArcRole.HERO.value,
+            "引导者": StoryArcRole.GUIDE.value,
+            "帮助者": StoryArcRole.HELPER.value,
+            "保护者": StoryArcRole.PROTECTOR.value,
+            "导师": StoryArcRole.MENTOR_ROLE.value,
+            "反派": StoryArcRole.VILLAIN.value,
+            "阻碍": StoryArcRole.OBSTACLE.value,
+            "叛徒": StoryArcRole.BETRAYER.value,
+            "中立": StoryArcRole.NEUTRAL.value,
+            "牺牲者": StoryArcRole.SACRIFICE.value,
+            "悲剧": StoryArcRole.TRAGIC.value,
+        }
+        if key in alias_map:
+            return alias_map[key]
+        if "牺牲" in key or "sacrifice" in key:
+            return StoryArcRole.SACRIFICE.value
+        if "反派" in key or "villain" in key:
+            return StoryArcRole.VILLAIN.value
+        if "领袖" in key or "英雄" in key or "hero" in key:
+            return StoryArcRole.HERO.value
+        return StoryArcRole.NEUTRAL.value
+
+    def _normalize_character_plot_priority(self, value: Any, importance_tier: str) -> int:
+        from app.models.character import CharacterImportanceTier, TIER_DEFAULTS
+
+        if isinstance(value, bool):
+            return 1 if value else 0
+        try:
+            numeric = int(value)
+            return max(0, min(10, numeric))
+        except (TypeError, ValueError):
+            pass
+        key = re.sub(r"[\s\-_]+", "", str(value or "").casefold())
+        alias_map = {
+            "critical": 10,
+            "veryhigh": 9,
+            "high": 8,
+            "mediumhigh": 7,
+            "medium": 5,
+            "mid": 5,
+            "normal": 4,
+            "low": 2,
+            "verylow": 1,
+            "none": 0,
+            "核心": 10,
+            "极高": 9,
+            "高": 8,
+            "重要": 7,
+            "中高": 7,
+            "中": 5,
+            "普通": 4,
+            "低": 2,
+            "很低": 1,
+            "无": 0,
+        }
+        if key in alias_map:
+            return alias_map[key]
+        try:
+            tier = CharacterImportanceTier(importance_tier)
+            return int(TIER_DEFAULTS.get(tier, {}).get("plot_priority", 0))
+        except Exception:
+            return 0
+
+    def _normalize_character_age(self, value: Any) -> Optional[int]:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            numeric = int(value)
+            return numeric if 0 <= numeric <= 1000 else None
+        except (TypeError, ValueError):
+            pass
+        match = re.search(r"\d+", str(value))
+        if not match:
+            return None
+        numeric = int(match.group(0))
+        return numeric if 0 <= numeric <= 1000 else None
+
+    def _normalize_character_bool(self, value: Any, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        raw = str(value).strip().casefold()
+        if raw in {"1", "true", "yes", "y", "on", "是", "有", "开启", "启用"}:
+            return True
+        if raw in {"0", "false", "no", "n", "off", "否", "无", "关闭", "禁用"}:
+            return False
+        return default
+
+    def _normalize_character_payload_for_persistence(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        normalized = dict(payload)
+        importance_tier = self._normalize_character_importance_tier(normalized.get("importance_tier"))
+        normalized["importance_tier"] = importance_tier
+        normalized["narrative_weight"] = self._normalize_character_narrative_weight(
+            normalized.get("narrative_weight"),
+            importance_tier,
+        )
+        normalized["story_arc_role"] = self._normalize_character_story_arc_role(normalized.get("story_arc_role"))
+        normalized["plot_priority"] = self._normalize_character_plot_priority(normalized.get("plot_priority"), importance_tier)
+        normalized["age"] = self._normalize_character_age(normalized.get("age"))
+        normalized["has_agent"] = self._normalize_character_bool(normalized.get("has_agent"), False)
+        normalized["agent_enabled"] = self._normalize_character_bool(normalized.get("agent_enabled"), True)
+        return normalized
+
     def _has_meaningful_character_value(self, value: Any) -> bool:
         if value is None:
             return False
@@ -2671,6 +2960,72 @@ class SettingAgentService:
 
         return merged
 
+    def _extract_explicit_character_names_from_text(self, text: str) -> List[str]:
+        """从用户明确的“X 是角色/角色是 X”表达中提取角色名，作为 structured extraction 的兜底。"""
+        if not text:
+            return []
+        names: List[str] = []
+        patterns = [
+            r"角色(?:是|为|叫|名为)\s*([^，。；;、\n]+)",
+            r"([^，。；;、\n]{2,24})(?:是|为)(?:一个|一名|位)?(?:角色|人物)",
+            r"(?:新增|添加|保存|创建)(?:角色|人物)\s*[:：]?\s*([^，。；;、\n]+)",
+        ]
+        stop_words = {"相关角色设定", "角色设定", "角色管理", "内容", "一个角色", "一名角色"}
+        for pattern in patterns:
+            for match in re.finditer(pattern, text):
+                raw = re.sub(r"[《》\"'“”‘’]", "", match.group(1)).strip()
+                raw = re.sub(r"^(这个|该|名叫|叫做|叫|是)\s*", "", raw).strip()
+                raw = re.sub(r"\s*(这个角色|该角色|角色|人物)$", "", raw).strip()
+                if not raw or raw in stop_words or len(raw) > 24:
+                    continue
+                if raw not in names:
+                    names.append(raw)
+        return names
+
+    def _build_minimal_pending_character(self, name: str, source_text: str = "") -> Dict[str, Any]:
+        return self._normalize_character_payload_for_persistence({
+            "name": name,
+            "importance_tier": "npc",
+            "description": f"由设定助手根据用户明确提到的角色名称补全的待确认角色：{name}",
+            "appearance": "",
+            "personality": "",
+            "background_story": source_text.strip()[:500],
+            "speech_pattern": "",
+            "age": None,
+            "gender": "",
+            "goals": [],
+            "relationships": [],
+            "key_relationships": {},
+            "lexicon": [],
+            "forbidden_words": [],
+            "voice_samples": [],
+            "attributes": {},
+            "inventory": [],
+            "narrative_weight": None,
+            "story_arc_role": None,
+            "plot_priority": None,
+            "has_agent": False,
+            "agent_enabled": True,
+            "agent_goals": [],
+            "agent_memory": [],
+        })
+
+    def _merge_explicit_pending_characters(
+        self,
+        characters: List[Dict[str, Any]],
+        recent_messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        merged = list(characters)
+        existing_names = {str(item.get("name") or "").strip().casefold() for item in merged}
+        user_text = "\n".join(str(msg.get("content") or "") for msg in recent_messages if msg.get("role") == "user")
+        for name in self._extract_explicit_character_names_from_text(user_text):
+            if name.casefold() in existing_names:
+                continue
+            merged.append(self._build_minimal_pending_character(name, user_text))
+            existing_names.add(name.casefold())
+            logger.info(f"[SettingAgent] structured 角色提取未覆盖显式角色名，已补入待确认角色: {name}")
+        return merged
+
     async def _extract_characters_from_conversation(
         self,
         project_id: str,
@@ -2710,16 +3065,16 @@ class SettingAgentService:
                 characters = [item.model_dump() for item in parsed.characters]
             except StructuredOutputError as e:
                 logger.warning(f"提取角色 structured 失败：{e}")
-                return []
+                return self._merge_explicit_pending_characters([], recent_messages)
 
             if not characters:
-                return []
+                return self._merge_explicit_pending_characters([], recent_messages)
 
             valid_characters = []
             for char_data in characters:
                 if not char_data.get("name"):
                     continue
-                valid_characters.append({
+                valid_characters.append(self._normalize_character_payload_for_persistence({
                     "name": char_data.get("name", ""),
                     "importance_tier": char_data.get("importance_tier", "npc"),
                     "description": char_data.get("description", ""),
@@ -2744,7 +3099,9 @@ class SettingAgentService:
                     "agent_enabled": char_data.get("agent_enabled"),
                     "agent_goals": self._parse_character_list_value(char_data.get("agent_goals")),
                     "agent_memory": self._parse_character_list_value(char_data.get("agent_memory")),
-                })
+                }))
+
+            valid_characters = self._merge_explicit_pending_characters(valid_characters, recent_messages)
 
             if valid_characters:
                 logger.info(f"从对话中提取 {len(valid_characters)} 个待确认角色")
@@ -2810,6 +3167,7 @@ class SettingAgentService:
                 merged_character = self._merge_character_payload(existing_character, char_data, project_id)
                 merged_character["name"] = name
                 merged_character["status"] = merged_character.get("status") or "active"
+                merged_character = self._normalize_character_payload_for_persistence(merged_character)
 
                 if existing_character:
                     merged_character["id"] = existing_character.get("id")

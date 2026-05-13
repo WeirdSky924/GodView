@@ -2999,6 +2999,61 @@ def test_workflow_runtime_constraints_use_md_asset_and_runtime_blocks(monkeypatc
     assert "角色来源、历史、身份和背景必须服从 selected_lore_entries" not in prompt
 
 
+def test_workflow_normalizes_discussion_message_shape():
+    engine = WorkflowEngine()
+
+    normalized = engine._normalize_discussion_message({
+        "speaker": "角色甲",
+        "role": "主角",
+        "public_content": "我们先离开这里。",
+    })
+
+    assert normalized["agent"] == "角色甲"
+    assert normalized["character"] == "角色甲"
+    assert normalized["speaker"] == "角色甲"
+    assert normalized["content"] == "我们先离开这里。"
+    assert normalized["public_content"] == "我们先离开这里。"
+    assert normalized["speaker_type"] == "agent"
+
+
+@pytest.mark.asyncio
+async def test_workflow_discussion_broadcast_uses_normalized_payload():
+    engine = WorkflowEngine()
+    events = []
+
+    async def fake_status(execution_id, event_type, data):
+        events.append((execution_id, event_type, data))
+
+    engine._broadcast_status = fake_status
+
+    await engine._broadcast_discussion_message_event(
+        "exec-1",
+        {"speaker": "角色乙", "summary": "总结了撤离路线。"},
+    )
+
+    assert events[0][0] == "exec-1"
+    assert events[0][1] == "discussion_message"
+    assert events[0][2]["agent"] == "角色乙"
+    assert events[0][2]["character"] == "角色乙"
+    assert events[0][2]["content"] == "总结了撤离路线。"
+    assert events[0][2]["message"]["speaker"] == "角色乙"
+
+
+@pytest.mark.asyncio
+async def test_workflow_discussion_broadcast_filters_empty_payload():
+    engine = WorkflowEngine()
+    events = []
+
+    async def fake_status(execution_id, event_type, data):
+        events.append((execution_id, event_type, data))
+
+    engine._broadcast_status = fake_status
+
+    await engine._broadcast_discussion_message_event("exec-1", {"speaker": "角色乙"})
+
+    assert events == []
+
+
 def test_workflow_reference_material_instruction_uses_constraints_asset(monkeypatch):
     engine = WorkflowEngine()
     loaded_prompt_ids = []

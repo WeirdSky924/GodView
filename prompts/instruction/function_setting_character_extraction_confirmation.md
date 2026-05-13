@@ -59,4 +59,9 @@ is_system: true
 
 ## 输出要求
 
-只输出 JSON 数组。如果没有用户明确确认的新角色，输出 `[]`。
+- 只输出 JSON 数组。如果没有用户明确确认的新角色，输出 `[]`。
+- `importance_tier` 必须使用系统枚举值，优先选择：`protagonist`、`co_protagonist`、`deuteragonist`、`mentor`、`love_interest`、`best_friend`、`archenemy`、`major_ally`、`major_antagonist`、`rival`、`family_member`、`guardian`、`arc_antagonist`、`arc_ally`、`recurring`、`catalyst`、`mystery_figure`、`minion`、`informant`、`mentor_figure`、`comic_relief`、`victim`、`npc`、`background`、`cameo`。不要输出 `major`、`minor`、中文标签或解释性短语。
+- `narrative_weight` 必须是 `full_focus`、`major_focus`、`moderate`、`minimal`、`background` 之一。
+- `story_arc_role` 必须是 `hero`、`guide`、`helper`、`protector`、`mentor_role`、`villain`、`obstacle`、`betrayer`、`corruptor`、`neutral`、`wild_card`、`double_agent`、`sacrifice`、`redeemed`、`tragic`、`herald` 之一。
+- `plot_priority` 必须是 0-10 的整数；不要输出 `high`、`medium`、`low` 或中文等级词。
+- `age` 只能是整数或 null；无法确定具体年龄时用 null，不要输出 `30多岁` 这类文本。

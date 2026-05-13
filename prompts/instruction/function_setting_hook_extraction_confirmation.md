@@ -54,5 +54,6 @@ is_system: true
 - `hook_type` 必须使用给定枚举之一。
 - `status` 固定为 `planted`。
 - `priority` 为 1-5 的整数。
-- 只输出 JSON 数组，不要输出解释文字或 markdown 代码块。
+- 输出顶层必须是 JSON 数组本身，不要包成 `{ "hooks": [...] }`，不要输出 markdown 代码块或解释文字。
+- `related_characters`、`related_locations`、`related_objects` 必须是数组；没有内容时输出 `[]`。
 - 如果没有用户明确确认的伏笔，输出 `[]`。

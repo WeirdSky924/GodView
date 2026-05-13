@@ -158,7 +158,7 @@ class AgentTemplateService:
                     {"agent_type": merged_template.agent_type.value}
                 )
                 if rows:
-                    logger.info(
+                    logger.debug(
                         "未找到 AgentTemplate 场景 Skill 分配，使用 default 分配: agent_type=%s, scenario=%s, count=%s",
                         merged_template.agent_type.value,
                         self._normalize_scenario(merged_template.scenario),

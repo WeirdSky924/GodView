@@ -1192,9 +1192,10 @@ export default function Visualizer() {
       const workflowSource = options?.availableWorkflows?.length ? options.availableWorkflows : workflows
       const workflow = workflowSource.find((item) => item.id === execution.workflow_id)
       if (!workflow) {
-        throw new Error(`执行 ${execution.id} 对应的工作流 ${execution.workflow_id} 不在当前项目工作流列表中`)
-      }
-      if (workflow.id !== selectedWorkflow?.id) {
+        const message = `执行 ${execution.id} 仍可读取，但对应的工作流定义 ${execution.workflow_id} 不在当前项目工作流列表中；监控将继续以执行快照为准。`
+        console.warn(message)
+        setExecutionRestoreError(message)
+      } else if (workflow.id !== selectedWorkflow?.id) {
         projectWorkflowFromDefinition(workflow)
       }
       applyExecutionState(execution)
@@ -1204,7 +1205,7 @@ export default function Visualizer() {
       } else if (isActiveExecutionStatus(execution.status)) {
         setRightWorkflowPanel('monitor')
       }
-      localStorage.setItem(executionStorageKey(currentProject.id, workflow.id), execution.id)
+      localStorage.setItem(executionStorageKey(currentProject.id, execution.workflow_id), execution.id)
       if (options?.updateUrl !== false) {
         const params = new URLSearchParams(window.location.search)
         params.set('project_id', currentProject.id)

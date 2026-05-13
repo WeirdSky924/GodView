@@ -24,7 +24,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 from typing import Any, List, Optional, Tuple, Type
 
 from langchain_core.language_models import BaseLanguageModel
@@ -125,7 +127,7 @@ class StructuredLLMRunner:
         current_messages: List[BaseMessage] = list(messages)
 
         # 第一次正常调用
-        parsed, raw_text, parse_error = await self._invoke_once(structured_model, current_messages)
+        parsed, raw_text, parse_error = await self._invoke_once(structured_model, current_messages, schema)
         last_raw_text = raw_text
         last_error = parse_error
         if parsed is not None and parse_error is None:
@@ -143,7 +145,7 @@ class StructuredLLMRunner:
 
         # RETRY_ONLY：原 messages 重试一次
         if retry_policy == OutputContractRetryPolicy.RETRY_ONLY:
-            parsed, raw_text, parse_error = await self._invoke_once(structured_model, current_messages)
+            parsed, raw_text, parse_error = await self._invoke_once(structured_model, current_messages, schema)
             last_raw_text = raw_text
             last_error = parse_error
             if parsed is not None and parse_error is None:
@@ -168,7 +170,7 @@ class StructuredLLMRunner:
                     )
                 )
             ]
-            parsed, raw_text, parse_error = await self._invoke_once(structured_model, repair_messages)
+            parsed, raw_text, parse_error = await self._invoke_once(structured_model, repair_messages, schema)
             last_raw_text = raw_text
             last_error = parse_error
             if parsed is not None and parse_error is None:
@@ -189,6 +191,7 @@ class StructuredLLMRunner:
         self,
         structured_model: Any,
         messages: List[BaseMessage],
+        schema: Type[BaseModel],
     ) -> Tuple[Optional[BaseModel], Optional[str], Optional[BaseException]]:
         """单次调用 structured model，返回 ``(parsed, raw_text, parse_error)``。"""
         try:
@@ -204,13 +207,61 @@ class StructuredLLMRunner:
             raw_text = _extract_text(raw_msg)
             if parsed is not None and parse_error is None:
                 return parsed, raw_text, None
+            recovered = self._parse_raw_text(schema, raw_text)
+            if recovered is not None:
+                return recovered, raw_text, None
             return None, raw_text, parse_error or ValueError("未拿到 parsed 对象")
 
         # 某些模型未必返回 dict；直接尝试当作 BaseModel
         if isinstance(result, BaseModel):
             return result, None, None
 
-        return None, str(result), ValueError(f"意料外的 structured output 返回：{type(result).__name__}")
+        raw_text = str(result)
+        recovered = self._parse_raw_text(schema, raw_text)
+        if recovered is not None:
+            return recovered, raw_text, None
+        return None, raw_text, ValueError(f"意料外的 structured output 返回：{type(result).__name__}")
+
+    def _parse_raw_text(self, schema: Type[BaseModel], raw_text: Optional[str]) -> Optional[BaseModel]:
+        """当 provider 没有填充 parsed 时，从 raw 文本中恢复 JSON 并校验 schema。"""
+        if not raw_text:
+            return None
+        text = raw_text.strip()
+        candidates = [text]
+        fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, re.IGNORECASE)
+        if fenced:
+            candidates.append(fenced.group(1).strip())
+        array_start = text.find("[")
+        array_end = text.rfind("]")
+        if 0 <= array_start < array_end:
+            candidates.append(text[array_start:array_end + 1])
+        object_start = text.find("{")
+        object_end = text.rfind("}")
+        if 0 <= object_start < object_end:
+            candidates.append(text[object_start:object_end + 1])
+
+        for candidate in candidates:
+            try:
+                loaded = json.loads(candidate)
+            except Exception:
+                continue
+            try:
+                if isinstance(loaded, list):
+                    wrapper_field = self._single_list_field_name(schema)
+                    if wrapper_field:
+                        loaded = {wrapper_field: loaded}
+                return schema.model_validate(loaded)
+            except Exception:
+                continue
+        return None
+
+    def _single_list_field_name(self, schema: Type[BaseModel]) -> Optional[str]:
+        fields = getattr(schema, "model_fields", {}) or {}
+        preferred = ["lores", "hooks", "characters", "suggestions"]
+        for name in preferred:
+            if name in fields:
+                return name
+        return next(iter(fields), None) if len(fields) == 1 else None
 
 
 # 模块级单例，供调用方复用

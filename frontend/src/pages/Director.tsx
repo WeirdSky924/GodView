@@ -354,6 +354,37 @@ function getSelectedWorkflow(workflows: WorkflowDefinition[], workflowId: string
   return workflows.find(w => w.id === workflowId) || null
 }
 
+function extractDiscussionSpeaker(message: any): string {
+  const speaker = message?.speaker || message?.agent || message?.character || message?.role || message?.source_character || message?.name
+  return typeof speaker === 'string' && speaker.trim() ? speaker.trim() : 'Agent'
+}
+
+function extractDiscussionContent(message: any): string {
+  const keys = ['content', 'public_content', 'summary', 'dialogue', 'action', 'message', 'text']
+  for (const key of keys) {
+    const value = message?.[key]
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  const data = message?.data
+  if (data && typeof data === 'object') {
+    for (const key of keys) {
+      const value = data[key]
+      if (typeof value === 'string' && value.trim()) return value.trim()
+    }
+  }
+  return ''
+}
+
+function formatDiscussionMessage(message: any) {
+  return {
+    character: extractDiscussionSpeaker(message),
+    content: extractDiscussionContent(message),
+    timestamp: new Date().toLocaleTimeString(),
+    isLLMGenerated: message?.is_llm_generated,
+    speakerType: message?.speaker_type,
+  }
+}
+
 function getPreferredWorkflowId(workflows: WorkflowDefinition[], currentWorkflowId: string): string {
   if (currentWorkflowId && workflows.some(w => w.id === currentWorkflowId)) {
     return currentWorkflowId
@@ -603,7 +634,7 @@ function GroupDiscussionCard({
 }: {
   discussion: {
     topic: string
-    messages: Array<{ character: string; content: string; timestamp: string }>
+    messages: Array<{ character: string; content: string; timestamp: string; isLLMGenerated?: boolean; speakerType?: string }>
     characters: string[]
     participants?: Array<{ type: string; name: string; role: string }>
     isActive: boolean
@@ -1115,7 +1146,7 @@ export default function Director() {
   // Discussion state
   const [groupDiscussion, setGroupDiscussion] = useState<{
     topic: string
-    messages: Array<{ character: string; content: string; timestamp: string }>
+    messages: Array<{ character: string; content: string; timestamp: string; isLLMGenerated?: boolean; speakerType?: string }>
     characters: string[]
     participants?: Array<{ type: string; name: string; role: string }>
     isActive: boolean
@@ -1542,11 +1573,9 @@ export default function Director() {
       case 'group_discussion_started': {
         addLog('🌟 集体讨论开始')
         const discussionMessages = eventData?.messages || []
-        const formattedMessages = discussionMessages.map((msg: any) => ({
-          character: msg.agent || msg.character || 'Agent',
-          content: msg.content || '',
-          timestamp: new Date().toLocaleTimeString(),
-        }))
+        const formattedMessages = discussionMessages
+          .map(formatDiscussionMessage)
+          .filter((msg: any) => msg.content)
         setGroupDiscussion({
           topic: eventData?.discussion_topic || '讨论',
           messages: formattedMessages,
@@ -1557,30 +1586,22 @@ export default function Director() {
         return true
       }
       case 'discussion_message': {
-        const speakerName = eventData?.agent || eventData?.character || '未知'
-        const messageContent = eventData?.content || ''
-        const isLLMGenerated = eventData?.is_llm_generated
-        addLog(`💬 ${speakerName}: ${messageContent}${isLLMGenerated ? ' 🤖' : ''}`)
+        const sourceMessage = eventData?.message && typeof eventData.message === 'object'
+          ? { ...eventData.message, ...eventData }
+          : eventData
+        const formattedMessage = formatDiscussionMessage(sourceMessage)
+        if (!formattedMessage.content) return true
+        addLog(`💬 ${formattedMessage.character}: ${formattedMessage.content}${formattedMessage.isLLMGenerated ? ' 🤖' : ''}`)
         setGroupDiscussion(prev => {
           if (prev) {
             return {
               ...prev,
-              messages: [...prev.messages, {
-                character: speakerName,
-                content: messageContent,
-                timestamp: new Date().toLocaleTimeString(),
-                isLLMGenerated,
-              }],
+              messages: [...prev.messages, formattedMessage],
             }
           }
           return {
             topic: '创作讨论会',
-            messages: [{
-              character: speakerName,
-              content: messageContent,
-              timestamp: new Date().toLocaleTimeString(),
-              isLLMGenerated,
-            }],
+            messages: [formattedMessage],
             characters: [],
             participants: [],
             isActive: true,

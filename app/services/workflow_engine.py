@@ -242,6 +242,64 @@ class WorkflowEngine:
         """设置讨论/角色演绎消息广播回调。"""
         self._broadcast_discussion_message = callback
 
+    def _extract_discussion_message_content(self, message: Dict[str, Any]) -> str:
+        """从讨论/演绎消息中提取可公开展示的稳定正文。"""
+        for key in ("content", "public_content", "summary", "dialogue", "action", "message", "text"):
+            value = message.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        data = message.get("data")
+        if isinstance(data, dict):
+            for key in ("content", "public_content", "summary", "dialogue", "action", "message", "text"):
+                value = data.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return ""
+
+    def _normalize_discussion_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        """规范化讨论/角色演绎消息的发言者与公开内容字段。"""
+        if not isinstance(message, dict):
+            return {}
+
+        normalized = dict(message)
+        raw_speaker = (
+            normalized.get("agent")
+            or normalized.get("character")
+            or normalized.get("speaker")
+            or normalized.get("role")
+            or normalized.get("source_character")
+            or normalized.get("name")
+        )
+        speaker = str(raw_speaker).strip() if raw_speaker is not None else ""
+        content = self._extract_discussion_message_content(normalized)
+        message_type = str(normalized.get("type") or normalized.get("message_type") or "discussion_message")
+
+        if not speaker:
+            if message_type in {"performance_summary", "summary"}:
+                speaker = "总结员"
+            elif message_type.startswith("performance"):
+                speaker = "场景协调器"
+            else:
+                speaker = "Agent"
+
+        normalized["agent"] = normalized.get("agent") or speaker
+        normalized["character"] = normalized.get("character") or speaker
+        normalized["speaker"] = speaker
+        normalized.setdefault("speaker_type", "user" if speaker in {"你", "用户"} else "agent")
+        normalized["content"] = content
+        normalized.setdefault("public_content", content)
+        normalized["type"] = message_type
+        return normalized
+
+    def _normalize_discussion_messages(self, messages: Any) -> List[Dict[str, Any]]:
+        """规范化并过滤真正空白的讨论/演绎消息列表。"""
+        normalized_messages: List[Dict[str, Any]] = []
+        for item in self._ensure_context_list(messages):
+            normalized = self._normalize_discussion_message(item)
+            if normalized.get("speaker") and normalized.get("content"):
+                normalized_messages.append(normalized)
+        return normalized_messages
+
     async def _broadcast_discussion_message_event(
         self,
         execution_id: str,
@@ -249,10 +307,13 @@ class WorkflowEngine:
         **flags: Any,
     ) -> None:
         """广播讨论/角色演绎消息，未注册专用回调时降级为普通 workflow event。"""
-        if self._broadcast_discussion_message:
-            await self._broadcast_discussion_message(execution_id, message, **flags)
+        normalized_message = self._normalize_discussion_message(message)
+        if not normalized_message.get("content"):
             return
-        payload = {"message": message}
+        if self._broadcast_discussion_message:
+            await self._broadcast_discussion_message(execution_id, normalized_message, **flags)
+            return
+        payload = {"message": normalized_message, **normalized_message}
         if flags:
             payload.update(flags)
         await self._broadcast_status(execution_id, "discussion_message", payload)
@@ -8736,8 +8797,9 @@ class WorkflowEngine:
         performance_result: Dict[str, Any],
     ) -> None:
         """将多角色场景的公开结果同步到通用角色上下文。"""
-        for perf in performance_result.get("performances", []):
-            character_name = perf.get("agent") or perf.get("character")
+        normalized_performances = self._normalize_discussion_messages(performance_result.get("performances", []))
+        for perf in normalized_performances:
+            character_name = perf.get("agent") or perf.get("character") or perf.get("speaker")
             content = perf.get("public_content") or perf.get("content") or perf.get("dialogue")
             emotion = perf.get("emotion") or perf.get("mood")
 
@@ -8815,6 +8877,14 @@ class WorkflowEngine:
             else:
                 target_word_count = max(1, int(chapter_word_count * target_word_multiplier))
 
+            material_role = str(node_config.get("material_role") or "performance_material")
+            reference_mode = bool(node_config.get("reference_mode", material_role == "reference_only"))
+            usage_instruction = (
+                self._build_workflow_reference_material_instruction()
+                if reference_mode or material_role == "reference_only"
+                else "输出可直接供 Writer 采纳的场景演绎素材：保持公开/私有边界，公开内容应足够承载本场情绪、行动与对话推进。"
+            )
+
             coordinator_input = {
                 "scene_directions": scene_directions,
                 "characters": characters_data,
@@ -8823,16 +8893,16 @@ class WorkflowEngine:
                 "mode": scene_directions.get("scene_type", "interactive"),
                 "iteration_count": iteration_count,
                 "target_word_count": target_word_count,
-                "reference_mode": True,
-                "material_role": "reference_only",
-                "usage_instruction": self._build_workflow_reference_material_instruction(),
+                "reference_mode": reference_mode,
+                "material_role": material_role,
+                "usage_instruction": usage_instruction,
                 "plot_intents": plot_intents,
                 "chapter_word_count": chapter_word_count,
             }
 
             logger.info(
                 f"场景执行参数: {iteration_count} 轮迭代, 目标 {target_word_count} 字, "
-                f"{len(characters_data)} 个角色"
+                f"{len(characters_data)} 个角色, material_role={material_role}, reference_mode={reference_mode}"
             )
 
             result = await scene_coordinator.execute(coordinator_input)
@@ -8845,7 +8915,8 @@ class WorkflowEngine:
                 performance_result = dict(performance_result)
             else:
                 performance_result = {}
-            performance_messages = list(performance_result.get("performances", []))
+            performance_messages = self._normalize_discussion_messages(performance_result.get("performances", []))
+            performance_result["performances"] = performance_messages
 
             for msg in performance_messages:
                 await self._broadcast_discussion_message_event(execution.id, msg)
@@ -8857,9 +8928,9 @@ class WorkflowEngine:
                 "scene_type": scene_directions.get("scene_type", "interactive"),
                 "characters": performance_result.get("characters") or [c.get("name", "未知") for c in characters_data],
                 "messages": performance_messages,
-                "material_role": "reference_only",
-                "reference_mode": True,
-                "usage_instruction": self._build_workflow_reference_material_instruction(),
+                "material_role": coordinator_input["material_role"],
+                "reference_mode": coordinator_input["reference_mode"],
+                "usage_instruction": coordinator_input["usage_instruction"],
                 "performers": scene_directions.get("performers", []),
                 "mentioned_characters": scene_directions.get("mentioned_characters", []),
                 "background_characters": scene_directions.get("background_characters", []),
@@ -8881,8 +8952,12 @@ class WorkflowEngine:
                     role_performance_gate=performance_result.get("role_performance_gate", {}),
                 )
                 if summary:
-                    performance_messages.append(summary)
-                    await self._broadcast_discussion_message_event(execution.id, summary)
+                    normalized_summary = self._normalize_discussion_message(summary)
+                    if normalized_summary.get("content"):
+                        performance_messages.append(normalized_summary)
+                        performance_result["performances"] = performance_messages
+                        performance_result["messages"] = performance_messages
+                        await self._broadcast_discussion_message_event(execution.id, normalized_summary)
 
             performance_summary = self._extract_discussion_summary_text(performance_result)
             performance_result.setdefault("summary", performance_summary)
@@ -8915,6 +8990,9 @@ class WorkflowEngine:
                 "scene_type": scene_directions.get("scene_type", "interactive"),
                 "characters": [c.get("name", "未知") for c in characters_data],
                 "messages": performance_messages,
+                "material_role": coordinator_input["material_role"],
+                "reference_mode": coordinator_input["reference_mode"],
+                "usage_instruction": coordinator_input["usage_instruction"],
                 "full_content": performance_result.get("full_content", ""),
                 "public_performances": performance_result.get("public_performances", []),
                 "private_performances": performance_result.get("private_performances", []),
@@ -8961,7 +9039,7 @@ class WorkflowEngine:
             db,
             participant_keys=["required_characters"],
             default_scene_name=node.label,
-            target_word_multiplier=0.25,
+            target_word_multiplier=0.6,
             default_iteration_count=2,
         )
 
@@ -10725,8 +10803,10 @@ class WorkflowEngine:
                     context=execution.context,
                 )
                 if opening_message:
-                    discussion_messages.append(opening_message)
-                    await self._broadcast_discussion_message_event(execution.id, opening_message, is_leader_action=True)
+                    opening_message = self._normalize_discussion_message(opening_message)
+                    if opening_message.get("content"):
+                        discussion_messages.append(opening_message)
+                        await self._broadcast_discussion_message_event(execution.id, opening_message, is_leader_action=True)
 
             # 广播讨论开始
             await self._broadcast_status(execution.id, "group_discussion_started", {
@@ -10764,8 +10844,10 @@ class WorkflowEngine:
                             evaluation_result, characters, execution.context
                         )
                         if message:
-                            discussion_messages.append(message)
-                            await self._broadcast_discussion_message_event(execution.id, message, broadcast_to_all=True)
+                            message = self._normalize_discussion_message(message)
+                            if message.get("content"):
+                                discussion_messages.append(message)
+                                await self._broadcast_discussion_message_event(execution.id, message, broadcast_to_all=True)
 
             # ========== 第三步：领头人汇总，请求用户确认 ==========
             if leader_agent and discussion_messages:
@@ -10773,8 +10855,10 @@ class WorkflowEngine:
                     leader_agent, chapter_title, discussion_messages, context=execution.context
                 )
                 if summary_request:
-                    discussion_messages.append(summary_request)
-                    await self._broadcast_discussion_message_event(execution.id, summary_request, is_leader_action=True)
+                    summary_request = self._normalize_discussion_message(summary_request)
+                    if summary_request.get("content"):
+                        discussion_messages.append(summary_request)
+                        await self._broadcast_discussion_message_event(execution.id, summary_request, is_leader_action=True)
 
             # ========== 第四步：存储讨论结果 ==========
             full_content = "\n".join([

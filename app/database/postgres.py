@@ -6,6 +6,7 @@ PostgreSQL 数据库操作层
 import asyncio
 import json
 import logging
+import re
 import uuid as uuid_module
 from collections import defaultdict
 from contextlib import asynccontextmanager
@@ -59,6 +60,48 @@ def _normalize_datetime(value: Any, default: Optional[datetime] = None) -> Optio
         except ValueError:
             return default
     return default
+
+
+def _normalize_int(value: Any, default: int = 0, minimum: Optional[int] = None, maximum: Optional[int] = None) -> int:
+    if isinstance(value, bool):
+        numeric = 1 if value else 0
+    else:
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError):
+            match = re.search(r"\d+", str(value or ""))
+            numeric = int(match.group(0)) if match else default
+    if minimum is not None:
+        numeric = max(minimum, numeric)
+    if maximum is not None:
+        numeric = min(maximum, numeric)
+    return numeric
+
+
+def _normalize_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    raw = str(value).strip().casefold()
+    if raw in {"1", "true", "yes", "y", "on", "是", "有", "开启", "启用"}:
+        return True
+    if raw in {"0", "false", "no", "n", "off", "否", "无", "关闭", "禁用"}:
+        return False
+    return default
+
+
+def _normalize_age(value: Any) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        numeric = int(value)
+    except (TypeError, ValueError):
+        match = re.search(r"\d+", str(value))
+        if not match:
+            return None
+        numeric = int(match.group(0))
+    return numeric if 0 <= numeric <= 1000 else None
 
 
 def _prepare_json_params(data: Dict[str, Any], json_fields: List[str]) -> Dict[str, Any]:
@@ -352,14 +395,15 @@ class PostgresDatabase:
         params['current_location_reason'] = params.get('current_location_reason') or ''
 
         # 处理布尔字段
-        params['has_agent'] = params.get('has_agent', False)
-        params['agent_enabled'] = params.get('agent_enabled', True)
+        params['has_agent'] = _normalize_bool(params.get('has_agent'), False)
+        params['agent_enabled'] = _normalize_bool(params.get('agent_enabled'), True)
 
         # 处理角色层级字段
         params['importance_tier'] = params.get('importance_tier', 'npc')
         params['narrative_weight'] = params.get('narrative_weight', 'minimal')
         params['story_arc_role'] = params.get('story_arc_role', 'neutral')
-        params['plot_priority'] = params.get('plot_priority', 0)
+        params['plot_priority'] = _normalize_int(params.get('plot_priority'), 0, 0, 10)
+        params['age'] = _normalize_age(params.get('age'))
 
         # 处理登场控制字段
         params['debut_chapter'] = params.get('debut_chapter')

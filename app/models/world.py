@@ -5,8 +5,9 @@
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class RegionType(str, Enum):
@@ -137,10 +138,10 @@ class World(BaseModel):
 class Encounter(BaseModel):
     """遭遇事件模型"""
 
-    id: str = Field(..., description="遭遇 ID")
-    type: str = Field(..., description="遭遇类型：monster/npc/event/treasure")
+    id: str = Field(default_factory=lambda: str(uuid4()), description="遭遇 ID")
+    type: str = Field(default=EncounterType.EVENT.value, description="遭遇类型：monster/npc/event/treasure")
     name: str = Field(..., description="遭遇名称")
-    description: str = Field(..., description="遭遇描述")
+    description: str = Field(default="", description="遭遇描述")
 
     # 触发条件
     trigger_conditions: Optional[Dict[str, Any]] = Field(None, description="触发条件")
@@ -151,6 +152,15 @@ class Encounter(BaseModel):
     # 概率权重
     weight: float = Field(default=1.0, ge=0, description="出现权重")
     is_once: bool = Field(default=False, description="是否一次性遭遇")
+
+    @field_validator("type", mode="before")
+    @classmethod
+    def normalize_type(cls, value: Any) -> str:
+        if value is None or str(value).strip() == "":
+            return EncounterType.EVENT.value
+        raw = str(value).strip().lower()
+        valid_types = {item.value for item in EncounterType}
+        return raw if raw in valid_types else EncounterType.EVENT.value
 
     model_config = ConfigDict(
         json_schema_extra={

@@ -53,4 +53,7 @@ is_system: true
 
 ## 输出要求
 
-只输出 JSON 数组。如果没有用户明确确认的新设定，输出 `[]`。
+- 只输出 JSON 数组。如果没有用户明确确认的新设定，输出 `[]`。
+- 输出顶层必须是 JSON 数组本身，不要包成 `{ "lores": [...] }`，不要输出 markdown 代码块或解释文字。
+- `keywords`、`tags`、`constraints`、`related_characters`、`related_locations`、`related_items`、`related_factions`、`depends_on_lore`、`supports_lore`、`potential_conflicts` 必须是数组；没有内容时输出 `[]`。
+- `resource_requirements` 必须是对象数组；没有内容时输出 `[]`。
