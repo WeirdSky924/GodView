@@ -98,9 +98,67 @@ is_system: true
 - 选择影响结局
 - 可重复性
 
-## 三、输出要求
+## 三、因果链与资源边界（强制）
 
-输出JSON格式的副本设计方案。
+每个副本必须回答：
+
+1. 为什么存在这个副本？
+2. 为什么现在开启或被发现？
+3. 为什么这些角色被卷入，而不是任意路人？
+4. 阻力、消耗、代价和失败后果是什么？
+5. 通关或失败后改变了什么状态？
+6. 后续留下什么影响、线索、债务、伤势、关系变化或风险？
+
+### 挑战约束
+
+- 挑战不能只列敌人/谜题，必须说明规则、限制、消耗、失败后果和可用解法。
+- 关键危机解决只能使用已铺垫资源；缺资源则降低事件规模或标注 `resource_requirements`。
+- 不要临场发明关键命名角色、核心设定、万能道具、关键地点或未铺垫能力来推动/解决剧情。
+
+### 奖励约束
+
+- 奖励不能只列掉落，必须说明来源、获得条件、使用限制、后续用途和潜在代价。
+- 奖励要与风险、损耗和故事阶段匹配，避免无代价超阶段升级。
+- `risk_reward_balance` 必须说明风险与收益是否匹配。
+
+### 秘密信息边界
+
+副本中的秘密信息应分层：
+
+- `author/system_known`：作者/系统知道的真实原因。
+- `reader_visible`：读者本章能看到的线索。
+- `pov_character_known`：视角角色当前能确认的信息。
+- `hidden_from_character`：角色暂时不能知道的真相。
+
+## 四、输出要求
+
+输出 JSON 格式的副本设计方案，建议包含以下字段：
+
+```json
+{
+  "dungeon_name": "副本名称",
+  "dungeon_type": "战斗/解谜/探索/剧情/混合",
+  "causal_chain": {
+    "background_pressure": "前因/背景压力",
+    "entry_trigger": "开启或发现触发机制",
+    "participant_involvement_reason": "参与者卷入理由",
+    "resistance_and_cost": "阻力、消耗与代价",
+    "state_change": "结果改变的状态",
+    "follow_up_impact": "后续影响"
+  },
+  "challenges": [{"rule": "挑战规则", "limitation": "限制", "failure_consequences": "失败后果", "available_solution": "可用解法"}],
+  "rewards": [{"source": "奖励来源", "condition": "获得条件", "usage_limit": "使用限制", "future_use": "后续用途", "cost_or_risk": "代价/风险"}],
+  "risk_reward_balance": "风险与收益匹配说明",
+  "knowledge_layers": {
+    "author/system_known": "真实原因",
+    "reader_visible": "读者可见线索",
+    "pov_character_known": "视角角色可知信息",
+    "hidden_from_character": "角色暂不可知真相"
+  },
+  "crisis_resolution_resources": ["解决危机所依赖的已铺垫资源"],
+  "resource_requirements": ["缺少但不能现场发明的设定/地点/道具/能力/敌人规则"]
+}
+```
 
 ## 可用技能
 

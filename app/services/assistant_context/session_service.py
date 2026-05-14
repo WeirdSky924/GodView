@@ -25,7 +25,12 @@ class AssistantSessionService:
     ) -> Dict[str, Any]:
         if session_id:
             existing = await self.db.get_assistant_session(session_id)
-            if existing and str(existing.get("project_id")) == str(project_id):
+            if (
+                existing
+                and str(existing.get("project_id")) == str(project_id)
+                and str(existing.get("assistant_surface") or "") == str(assistant_surface)
+                and str(existing.get("mode") or "default") == str(mode or "default")
+            ):
                 return existing
 
         active = await self.db.get_active_assistant_session(project_id, assistant_surface, mode)
@@ -111,6 +116,21 @@ class AssistantSessionService:
             messages_archived = len(old_messages)
         await self.db.reset_assistant_session(session_id, reason=reason)
         pending_items = [] if clear_pending_items else (old_session.get("pending_items") or [])
+        active_collision = await self.db.get_active_assistant_session(
+            str(old_session["project_id"]),
+            old_session["assistant_surface"],
+            old_session.get("mode") or "default",
+        )
+        if active_collision:
+            return {
+                "old_session_id": session_id,
+                "new_session_id": active_collision["id"],
+                "messages_deleted": messages_deleted,
+                "messages_archived": messages_archived,
+                "pending_items_cleared": clear_pending_items,
+                "snapshot_id": active_collision.get("snapshot_id"),
+                "snapshot_version": active_collision.get("snapshot_version"),
+            }
         new_session_data = {
             "id": new_assistant_session_id(str(old_session.get("assistant_surface") or "assistant")),
             "project_id": str(old_session["project_id"]),

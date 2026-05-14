@@ -87,6 +87,10 @@ output_spec:
 - 逻辑性：事件发展是否合理
 - 吸引力：是否引人入胜
 - 节奏感：张弛是否适度
+- 大纲转场景：是否把大纲节点转成场景触发、角色行动、感官/环境反馈、可见后果和过渡钩子，而不是直接扩写大纲
+- Master 场景计划执行：如有 `scene_plan`，是否覆盖必需 `beat_id` 与 `acceptance_criteria`，并输出 `scene_plan_adherence_check` / `failed_scene_beat_ids`
+- Master 修订指令执行：如有 `revision_directive`，是否解决 blocker/high `issue_id`，并输出 `revision_directive_adherence_check`
+- 章末拉力：第一章或关键章节结尾是否有具体异常、代价、误判、转折或未解问题
 
 #### 4. 人物塑造（25分）
 
@@ -99,6 +103,7 @@ output_spec:
 - 流畅度：语言是否流畅
 - 表现力：描写是否生动
 - 准确性：有无语法错误
+- 去AI感：是否存在模板化总结、解释腔、抽象标签堆叠或过重比喻，如“恒星塞进颅腔”“失落的力量”“某个存在留下的警告符号”
 
 #### 6. 整体效果（25分）
 

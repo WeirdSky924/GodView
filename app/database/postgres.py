@@ -104,6 +104,26 @@ def _normalize_age(value: Any) -> Optional[int]:
     return numeric if 0 <= numeric <= 1000 else None
 
 
+def _sanitize_postgres_text(value: Any) -> str:
+    """Remove characters PostgreSQL text/jsonb cannot store, especially NUL."""
+    if value is None:
+        return ""
+    return str(value).replace("\x00", "")
+
+
+def _sanitize_postgres_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _sanitize_postgres_text(value)
+    if isinstance(value, list):
+        return [_sanitize_postgres_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            _sanitize_postgres_text(key): _sanitize_postgres_value(item)
+            for key, item in value.items()
+        }
+    return value
+
+
 def _prepare_json_params(data: Dict[str, Any], json_fields: List[str]) -> Dict[str, Any]:
     """
     将 Python 列表/字典转换为 JSON 字符串，用于 SQLAlchemy text 查询
@@ -2186,7 +2206,9 @@ class PostgresDatabase:
         normalized_type = resource_type.strip().lower()
         if normalized_type in {"region", "place"}:
             normalized_type = "location"
-        if normalized_type not in {"character", "lore", "location"}:
+        if normalized_type in {"plot_hook", "foreshadowing"}:
+            normalized_type = "hook"
+        if normalized_type not in {"character", "lore", "location", "hook"}:
             raise ValueError(f"不支持的绑定资源类型: {resource_type}")
 
         if normalized_type == "character":
@@ -2199,6 +2221,12 @@ class PostgresDatabase:
             resource = await self.get_lore_entry(resource_id)
             if not resource or str(resource.get("project_id")) != str(project_id):
                 raise ValueError("绑定的设定资源不存在或不属于当前项目")
+            return normalized_type
+
+        if normalized_type == "hook":
+            resource = await self.get_hook(resource_id)
+            if not resource or str(resource.get("project_id")) != str(project_id):
+                raise ValueError("绑定的伏笔资源不存在或不属于当前项目")
             return normalized_type
 
         rows = await self.execute_query(
@@ -3420,9 +3448,12 @@ class PostgresDatabase:
             chapter_outline_schema_updates = [
                 "ALTER TABLE chapter_outlines ADD COLUMN IF NOT EXISTS previous_outline_id VARCHAR(64)",
                 "ALTER TABLE chapter_outlines ADD COLUMN IF NOT EXISTS next_outline_id VARCHAR(64)",
+                "ALTER TABLE chapter_outlines ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP WITH TIME ZONE",
                 "ALTER TABLE chapter_outlines DROP CONSTRAINT IF EXISTS chapter_outlines_project_id_chapter_number_key",
                 "DROP INDEX IF EXISTS chapter_outlines_project_id_chapter_number_key",
                 "CREATE INDEX IF NOT EXISTS idx_chapter_outlines_project_chapter ON chapter_outlines(project_id, chapter_number)",
+                "CREATE INDEX IF NOT EXISTS idx_chapter_outlines_active_project_chapter ON chapter_outlines(project_id, chapter_number) WHERE deleted_at IS NULL",
+                "CREATE INDEX IF NOT EXISTS idx_chapter_outlines_deleted_at ON chapter_outlines(deleted_at)",
                 "CREATE INDEX IF NOT EXISTS idx_chapter_outlines_previous ON chapter_outlines(previous_outline_id)",
                 "CREATE INDEX IF NOT EXISTS idx_chapter_outlines_next ON chapter_outlines(next_outline_id)",
             ]
@@ -5559,7 +5590,9 @@ class PostgresDatabase:
         snapshot_id: Optional[str] = None,
     ) -> str:
         """追加 Assistant 通用消息；带 request_id 时按角色幂等。"""
-        payload = json.dumps(metadata or {}, default=str)
+        safe_content = _sanitize_postgres_text(content)
+        safe_metadata = _sanitize_postgres_value(metadata or {})
+        payload = _sanitize_postgres_text(json.dumps(safe_metadata, default=str))
         rows = await self.execute_query(
             """
             INSERT INTO assistant_messages (session_id, project_id, request_id, role, content, metadata, packet_id, snapshot_id)
@@ -5576,7 +5609,7 @@ class PostgresDatabase:
                 "project_id": project_id,
                 "request_id": request_id,
                 "role": role,
-                "content": content,
+                "content": safe_content,
                 "metadata": payload,
                 "packet_id": _validate_uuid(packet_id),
                 "snapshot_id": _validate_uuid(snapshot_id),

@@ -13,6 +13,8 @@ from app.models.agent_output_schemas import (
     MasterPlotterAdvanceSchema,
     MasterPlotterPlanSchema,
     MasterPlotterWritingPlanSchema,
+    MasterRevisionDirectiveSchema,
+    MasterScenePlanSchema,
 )
 from app.models.agent_template import AgentType
 from app.models.token_usage import UsageCategory
@@ -175,6 +177,8 @@ class MasterPlotterAgent(BaseAgent):
         return {
             "workflow_plot_planning": "function_master_plotter_plot_planning",
             "workflow_chapter_planning": "function_master_plotter_chapter_writing_plan",
+            "workflow_scene_compilation": "function_master_plotter_chapter_scene_plan",
+            "workflow_revision_director": "function_master_plotter_revision_director",
             "workflow_forced_event": "function_master_plotter_forced_event",
             "workflow_plot_advance": "function_master_plotter_advance_decision",
             "workflow_advance_decision": "function_master_plotter_advance_decision",
@@ -348,6 +352,70 @@ class MasterPlotterAgent(BaseAgent):
   "suggested_chapter_outline": null,
   "suggested_chapter_goals": null
 }}"""
+
+    def _get_scene_compilation_output_schema(self, target_word_count: Any) -> str:
+        return f"""{{
+  "plan_id": "稳定计划ID，可为空由系统补齐",
+  "plan_version": "scene_compiler_v1",
+  "chapter_intent": "本章读者应经历的核心变化",
+  "core_conflict": "本章主要冲突",
+  "continuity_constraints": ["必须承接的前文状态"],
+  "scene_plan": [
+    {{
+      "beat_id": "beat_1",
+      "sequence_index": 1,
+      "purpose": "该 beat 的剧情功能",
+      "outline_refs": ["对应大纲节点"],
+      "location": "发生地点",
+      "pov_character": "视角角色",
+      "required_characters": ["允许正面参与的角色"],
+      "cause": "前因",
+      "trigger": "场景触发",
+      "character_action": "角色可见行动/反应",
+      "sensory_or_environment_feedback": ["感官/环境/设备反馈"],
+      "visible_result": "可见后果",
+      "information_release": ["信息释放顺序"],
+      "transition_to_next": "进入下一 beat 的过渡",
+      "target_word_count": {target_word_count or 0},
+      "must_include": ["必须保留事实"],
+      "forbidden_shortcuts": ["禁止直接解释/大纲复述/厚重抽象标签"],
+      "acceptance_criteria": ["Evaluator 可检查的验收标准"]
+    }}
+  ],
+  "writer_brief": {{"summary": "给 Writer 的执行简报", "must_follow": [], "must_avoid": []}},
+  "ending_hook_contract": {{"required": true, "hook_type": "具体钩子类型", "acceptance_criteria": []}},
+  "evaluator_checklist": {{"required_beat_ids": ["beat_1"], "hard_fail_if": []}},
+  "style_constraints": ["去AI感和有限视角约束"],
+  "risk_flags": ["可能失败点"],
+  "resource_requirements": []
+}}"""
+
+    def _get_revision_directive_output_schema(self) -> str:
+        return """{
+  "revision_id": "稳定修订ID，可为空由系统补齐",
+  "revision_attempt": 1,
+  "overall_diagnosis": "本轮失败的总诊断",
+  "rewrite_strategy": "targeted_patch/scene_rewrite/ending_rewrite/full_chapter_rewrite/human_review_required",
+  "issues": [
+    {
+      "issue_id": "issue_1",
+      "failure_type": "ai_style_overload/outline_transposition/weak_ending_hook/repetitive_phrasing/scene_plan_miss/continuity_break",
+      "severity": "blocker/high/medium/low",
+      "source": "evaluator/deterministic_gate/condition/user",
+      "failed_scene_beat_ids": ["beat_1"],
+      "evidence": ["具体问题片段或证据"],
+      "diagnosis": "为什么失败",
+      "required_fix": "必须如何修"
+    }
+  ],
+  "preserve": ["必须保留的剧情事实"],
+  "replace_or_remove": ["必须替换或删除的表达/结构"],
+  "scene_plan_delta": {"changed_beat_ids": [], "notes": []},
+  "writer_revision_brief": {"scope": "修订范围", "instructions": []},
+  "evaluator_focus": ["复评重点"],
+  "acceptance_criteria": ["本轮通过标准"],
+  "forbidden_regressions": ["不得引入的新问题"]
+}"""
 
     def _get_plot_planning_output_schema(self) -> str:
         return """{
@@ -535,6 +603,10 @@ class MasterPlotterAgent(BaseAgent):
                 return await self._execute_plot_planning(input_data)
             if task in {"prepare_writing_plan", "writing_plan", "chapter_workflow_plan"}:
                 return await self._execute_writing_plan(input_data)
+            if task in {"compile_scene_plan", "prepare_scene_plan", "workflow_scene_compilation"}:
+                return await self._execute_scene_compilation(input_data)
+            if task in {"prepare_revision_directive", "plan_revision", "workflow_revision_director"}:
+                return await self._execute_revision_directive(input_data)
 
             # 默认：剧情推进评估
             main_plot_progress = input_data.get("main_plot_progress", 0.0)
@@ -620,6 +692,142 @@ class MasterPlotterAgent(BaseAgent):
         if not text:
             return ""
         return f"【{title}】\n{text}"
+
+    async def _execute_scene_compilation(self, input_data: Dict[str, Any]) -> AgentResponse:
+        """把绑定章节大纲编译成可执行 scene plan，不直接写正文。"""
+        chapter_outline = self._as_dict(input_data.get("chapter_outline", {}))
+        chapter_goals = input_data.get("chapter_goals") or input_data.get("chapter_goal")
+        target_word_count = input_data.get("target_word_count") or input_data.get("chapter_target_word_count")
+        role_delta_context = self._role_delta_context(input_data)
+        role_delta_resource_requirements = self._role_delta_resource_requirements(role_delta_context)
+
+        blocks = [
+            self._format_context_block("绑定章节大纲（事实源，不可改写）", chapter_outline),
+            self._format_context_block("章节目标", chapter_goals),
+            self._format_context_block("目标字数", target_word_count),
+            self._format_context_block("世界/项目规则", self._as_dict(input_data.get("world_info", {}))),
+            self._format_context_block("固定最高级设定", self._as_list(input_data.get("fixed_lore_entries", []))),
+            self._format_context_block("动态设定/选中设定", self._as_list(input_data.get("dynamic_lore_entries") or input_data.get("selected_lore_entries") or [])),
+            self._format_context_block("后续大纲参考", self._as_list(input_data.get("upcoming_outline_context", []))),
+            self._format_context_block("后续大纲策略", input_data.get("upcoming_outline_policy")),
+            self._format_context_block("角色出场硬约束", input_data.get("character_constraints")),
+            self._format_context_block("场景方向", input_data.get("scene_directions")),
+            self._format_context_block("已确认前文章节状态包", input_data.get("confirmed_prior_state_packet")),
+            self._format_context_block("场景演绎素材", input_data.get("performance_result")),
+            self._format_context_block("关系/状态/连续性变化提案", role_delta_context),
+            self._format_context_block("由关系/状态变化触发的资源需求建议", role_delta_resource_requirements),
+            self._format_context_block("前文概要", self._as_list(input_data.get("previous_chapters", [])), max_chars=2500),
+            self._format_context_block("现有伏笔", self._as_list(input_data.get("existing_hooks", input_data.get("hooks", []))), max_chars=2500),
+            self._format_context_block("角色状态", self._as_list(input_data.get("characters", [])), max_chars=2500),
+        ]
+        context_text = "\n\n".join(block for block in blocks if block)
+        config_prompt = await self._get_master_plotter_config_prompt(
+            "workflow_scene_compilation",
+            variables={
+                **input_data,
+                "chapter_outline": chapter_outline,
+                "chapter_goals": chapter_goals,
+                "target_word_count": target_word_count or 0,
+            },
+        )
+        prompt = self._build_task_prompt(
+            config_prompt=config_prompt,
+            task_title="workflow_scene_compilation",
+            context_text=context_text,
+            output_schema=self._get_scene_compilation_output_schema(target_word_count),
+        )
+
+        try:
+            parsed = await self._call_structured(
+                MasterScenePlanSchema,
+                messages=[HumanMessage(content=prompt)],
+                temperature=0.35,
+                category=UsageCategory.PLOT,
+            )
+            plan = parsed.model_dump()
+            if role_delta_resource_requirements:
+                plan.setdefault("resource_requirements", [])
+                if isinstance(plan["resource_requirements"], list):
+                    plan["resource_requirements"].extend(role_delta_resource_requirements)
+            return AgentResponse(
+                success=True,
+                data={
+                    "master_scene_plan": plan,
+                    "scene_plan": plan.get("scene_plan", []),
+                    "writer_brief": plan.get("writer_brief", {}),
+                    "evaluator_checklist": plan.get("evaluator_checklist", {}),
+                    "writing_plan": {
+                        "chapter_focus": plan.get("chapter_intent", ""),
+                        "middle_beats": [beat.get("purpose", "") for beat in plan.get("scene_plan", []) if isinstance(beat, dict)],
+                        "ending": plan.get("ending_hook_contract", {}),
+                        "target_word_count": target_word_count,
+                    },
+                    "plot_guidance": {
+                        "must_include": plan.get("writer_brief", {}).get("must_follow", []) if isinstance(plan.get("writer_brief"), dict) else [],
+                        "avoid": plan.get("style_constraints", []) + plan.get("risk_flags", []),
+                        "hook_usage": [plan.get("ending_hook_contract", {})] if plan.get("ending_hook_contract") else [],
+                    },
+                    "scene_integration_plan": {"scene_plan": plan.get("scene_plan", [])},
+                    "resource_requirements": plan.get("resource_requirements", []),
+                },
+                metadata={"output_contract": "master_plotter.scene_plan.workflow_output", **self._get_runtime_trace_metadata()},
+            )
+        except StructuredOutputError as e:
+            logger.error("Master scene compilation structured 失败: %s", e)
+            return AgentResponse(success=False, error=str(e), metadata={"output_contract": "master_plotter.scene_plan.workflow_output"})
+        except Exception as e:
+            logger.error("Master scene compilation 失败: %s", e)
+            return AgentResponse(success=False, error=str(e), metadata={"output_contract": "master_plotter.scene_plan.workflow_output"})
+
+    async def _execute_revision_directive(self, input_data: Dict[str, Any]) -> AgentResponse:
+        """质量门失败后生成 Master 修订导演指令。"""
+        blocks = [
+            self._format_context_block("质量失败包", input_data.get("quality_failure_packet")),
+            self._format_context_block("Evaluator 评估反馈", input_data.get("evaluation_feedback")),
+            self._format_context_block("质量门历史", input_data.get("quality_gate_history"), max_chars=2500),
+            self._format_context_block("修订历史", input_data.get("revision_history"), max_chars=2500),
+            self._format_context_block("当前 Master 场景计划", input_data.get("master_scene_plan") or input_data.get("scene_plan"), max_chars=3500),
+            self._format_context_block("上一轮修订指令", input_data.get("revision_directive_history"), max_chars=2500),
+            self._format_context_block("暂存草稿元数据", {
+                "chapter_draft_attempt": input_data.get("chapter_draft_attempt"),
+                "chapter_draft_checksum": input_data.get("chapter_draft_checksum"),
+                "chapter_draft_word_count": input_data.get("chapter_draft_word_count"),
+            }),
+            self._format_context_block("绑定章节大纲", input_data.get("chapter_outline")),
+            self._format_context_block("章节目标", input_data.get("chapter_goals") or input_data.get("chapter_goal")),
+        ]
+        context_text = "\n\n".join(block for block in blocks if block)
+        config_prompt = await self._get_master_plotter_config_prompt("workflow_revision_director", variables=input_data)
+        prompt = self._build_task_prompt(
+            config_prompt=config_prompt,
+            task_title="workflow_revision_director",
+            context_text=context_text,
+            output_schema=self._get_revision_directive_output_schema(),
+        )
+        try:
+            parsed = await self._call_structured(
+                MasterRevisionDirectiveSchema,
+                messages=[HumanMessage(content=prompt)],
+                temperature=0.25,
+                category=UsageCategory.PLOT,
+            )
+            directive = parsed.model_dump()
+            return AgentResponse(
+                success=True,
+                data={
+                    "master_revision_directive": directive,
+                    "revision_directive": directive,
+                    "writer_revision_brief": directive.get("writer_revision_brief", {}),
+                    "evaluator_focus": directive.get("evaluator_focus", []),
+                },
+                metadata={"output_contract": "master_plotter.revision_directive.workflow_output", **self._get_runtime_trace_metadata()},
+            )
+        except StructuredOutputError as e:
+            logger.error("Master revision directive structured 失败: %s", e)
+            return AgentResponse(success=False, error=str(e), metadata={"output_contract": "master_plotter.revision_directive.workflow_output"})
+        except Exception as e:
+            logger.error("Master revision directive 失败: %s", e)
+            return AgentResponse(success=False, error=str(e), metadata={"output_contract": "master_plotter.revision_directive.workflow_output"})
 
     async def _execute_writing_plan(self, input_data: Dict[str, Any]) -> AgentResponse:
         """为章节写作工作流生成索引/检查/写作计划，不覆盖章节事实源。"""

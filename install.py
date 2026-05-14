@@ -921,11 +921,14 @@ CREATE TABLE IF NOT EXISTS chapter_outlines (
     approved_at TIMESTAMP WITH TIME ZONE,
     approved_by VARCHAR(255),
     previous_outline_id VARCHAR(64),
-    next_outline_id VARCHAR(64)
+    next_outline_id VARCHAR(64),
+    deleted_at TIMESTAMP WITH TIME ZONE
 );
 
 CREATE INDEX idx_chapter_outlines_project ON chapter_outlines(project_id);
 CREATE INDEX idx_chapter_outlines_chapter ON chapter_outlines(chapter_number);
+CREATE INDEX idx_chapter_outlines_active_project_chapter ON chapter_outlines(project_id, chapter_number) WHERE deleted_at IS NULL;
+CREATE INDEX idx_chapter_outlines_deleted_at ON chapter_outlines(deleted_at);
 
 -- ================== 卷大纲表 ==================
 CREATE TABLE IF NOT EXISTS volume_outlines (

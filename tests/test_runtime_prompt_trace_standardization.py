@@ -1,7 +1,7 @@
 import asyncio
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -414,6 +414,8 @@ def test_plot_outline_generation_prompt_uses_md_output_contract(monkeypatch):
     assert "【输出格式要求】\nmd plot outline output contract" in prompt
     assert "主角刚获得青铜书签" in prompt
     assert "- 林澈 (主角)" in prompt
+    assert "本章角色可用性硬约束" in prompt
+    assert "pov_character 与 participating_characters" in prompt
     assert "请输出 JSON 格式：" not in prompt
     assert "\"emotion_curve\"" not in prompt
     assert "\"hooks_to_plant\"" not in prompt
@@ -471,6 +473,172 @@ def test_plot_outline_consistency_repair_uses_md_asset_and_runtime_feedback(monk
     assert "时间线: 第三章早于觉醒事件" in repair_message
     assert "需要明确青铜书签能力边界" in repair_message
     assert "你刚生成的大纲存在设定一致性风险，请基于原任务立即修正后重新输出完整 JSON" not in repair_message
+
+
+def test_plot_outline_presence_hierarchy_assets_define_foreshadowing_semantics():
+    assets = {
+        "prompts/identity/role_plot_outline.md": [
+            "角色“存在”不等于角色“出场”",
+            "foreshadowing_presence",
+            "最终大反派的代理人篡改了城市广播",
+        ],
+        "prompts/instruction/function_plot_outline.md": [
+            "角色存在层级（必须先判断）",
+            "身影、阴影、注视、未知存在",
+            "不能把最终大反派写入出场角色",
+        ],
+        "prompts/output/plot_outline_output.md": [
+            "幕后影响、伏笔性存在、异常痕迹、未知注视",
+            "隐藏核心威胁只以痕迹和系统异常存在",
+        ],
+        "skills/core/skill_outline_context.md": [
+            "约束的是“直接出场”",
+            "不应自动变成角色绑定需求",
+        ],
+        "skills/plotting/skill_chapter_outline_generation.md": [
+            "近场钩子优先",
+            "不要默认动用最终大反派本人制造钩子",
+        ],
+        "skills/plotting/skill_chapter_villain_arc.md": [
+            "这不等于每章都必须安排反派本人出现",
+            "低确认度注视/异常",
+            "不应写成最终反派本人出场",
+        ],
+    }
+
+    for path, markers in assets.items():
+        content = Path(path).read_text(encoding="utf-8")
+        for marker in markers:
+            assert marker in content, f"{path} missing marker: {marker}"
+
+
+def test_plot_outline_assets_define_knowledge_boundary_and_causal_chain_rules():
+    assets = {
+        "prompts/identity/role_plot_outline.md": [
+            "设定真实 ≠ 角色可知",
+            "事件神秘 ≠ 事件无因",
+            "贫民窟少年根据国家机密",
+            "前因/背景压力 → 触发机制 → 主角为何卷入",
+        ],
+        "prompts/instruction/function_plot_outline.md": [
+            "角色知识边界与事件因果（强制）",
+            "author/system_known",
+            "贫民窟主角知道宪法级国家机密",
+            "每个关键事件都必须有可成立的因果链",
+        ],
+        "prompts/output/plot_outline_output.md": [
+            "角色知识边界",
+            "事件因果链",
+            "protagonist_knowledge_boundary",
+            "国家级机密是真实世界因果，但主角只接触到低层可感知线索",
+        ],
+        "skills/core/skill_outline_context.md": [
+            "完整上下文是给 Agent 用来保证设定不冲突的",
+            "贫民窟主角可以看到",
+            "前因/背景压力 → 触发机制 → 主角卷入路径",
+        ],
+        "skills/plotting/skill_chapter_outline_generation.md": [
+            "主角知识边界",
+            "因果优先于强钩子",
+            "贫民窟少年直接根据国家级机密判断军方行动",
+            "信息权限与因果链检查",
+        ],
+        "skills/plotting/skill_chapter_hooks_design.md": [
+            "因果可追溯原则",
+            "角色知识边界原则",
+            "天空突然掉下一份国家机密",
+        ],
+    }
+
+    for path, markers in assets.items():
+        content = Path(path).read_text(encoding="utf-8")
+        for marker in markers:
+            assert marker in content, f"{path} missing marker: {marker}"
+
+
+def test_plot_outline_assets_define_golden_three_information_and_tension_balance():
+    assets = {
+        "prompts/instruction/function_plot_outline.md": [
+            "低门槛信息赋予 + 高密度近场张力 + 渐进式主线牵引",
+            "信息通过冲突赋予",
+            "冲突规模：life_pressure / local_anomaly / proxy_conflict / mainline_edge / core_threat",
+        ],
+        "skills/plotting/skill_chapter_outline_generation.md": [
+            "读者信息赋予",
+            "主动张力来源",
+            "升级不是单纯变“大”，而是变得更与主角有关",
+        ],
+        "skills/plotting/skill_opening_design.md": [
+            "life_pressure",
+            "active_tension_source",
+            "读者由此理解贫民区资源制度",
+        ],
+        "skills/plotting/skill_chapter_hooks_design.md": [
+            "信息通过冲突赋予",
+            "不默认使用 core_threat",
+            "问题贴近主角且后果明确",
+        ],
+        "prompts/output/plot_outline_output.md": [
+            "opening_information_delivery",
+            "active_tension_source",
+            "not_over_escalated",
+        ],
+    }
+
+    for path, markers in assets.items():
+        content = Path(path).read_text(encoding="utf-8")
+        for marker in markers:
+            assert marker in content, f"{path} missing marker: {marker}"
+
+
+def test_auxiliary_prompt_assets_define_knowledge_causality_and_resource_safety():
+    assets = {
+        "prompts/identity/role_character.md": [
+            "设定真实 ≠ 角色可知",
+            "公开言行",
+            "不要现场发明成事实",
+        ],
+        "skills/performance/skill_character_performance.md": [
+            "public_content",
+            "private_thought",
+            "信息越界",
+        ],
+        "skills/writing/skill_chapter_hook_generator.md": [
+            "钩子可以神秘，但不能无因",
+            "真实来源",
+            "主角能感知到什么",
+        ],
+        "prompts/identity/role_dungeon_generator.md": [
+            "前因",
+            "触发机制",
+            "资源需求",
+        ],
+        "prompts/instruction/function_dungeon_design.md": [
+            "risk_reward_balance",
+            "failure_consequences",
+            "crisis_resolution_resources",
+        ],
+        "skills/plotting/skill_opening_design.md": [
+            "近场钩子优先",
+            "隐藏核心威胁克制",
+            "因果优先于强钩子",
+        ],
+        "skills/plotting/skill_webnovel_cool_points.md": [
+            "已铺垫资源",
+            "代价",
+            "状态改变",
+        ],
+        "skills/plotting/skill_villain_management.md": [
+            "direct_scene_presence",
+            "foreshadowing_presence",
+            "这不等于每章都必须安排反派本人出现",
+        ],
+    }
+
+    for path, markers in assets.items():
+        content = Path(path).read_text(encoding="utf-8")
+        for marker in markers:
+            assert marker in content, f"{path} missing marker: {marker}"
 
 
 def test_writer_legacy_fallback_loads_auxiliary_md_prompt_assets(monkeypatch):
@@ -3322,6 +3490,22 @@ def test_workflow_contract_normalization_preserves_agent_response_metadata():
     assert normalized["metadata"]["prompt_render_trace"]["template_id"] == "plot_outline-template"
 
 
+def test_master_and_evaluator_workflow_output_contracts_resolve_schemas():
+    engine = WorkflowEngine()
+
+    scene_contract = engine._resolve_output_contract("master_plotter.scene_plan.workflow_output")
+    revision_contract = engine._resolve_output_contract("master_plotter.revision_directive.workflow_output")
+    evaluator_contract = engine._resolve_output_contract("evaluator.chapter_quality_gate.workflow_output")
+
+    assert scene_contract.schema_ref.endswith("MasterScenePlanSchema")
+    assert "scene_plan" in scene_contract.structured_fields
+    assert revision_contract.schema_ref.endswith("MasterRevisionDirectiveSchema")
+    assert "writer_revision_brief" in revision_contract.structured_fields
+    assert evaluator_contract.schema_ref.endswith("EvaluatorChapterEndSchema")
+    assert "scene_plan_adherence_check" in evaluator_contract.structured_fields
+    assert "revision_directive_adherence_check" in evaluator_contract.structured_fields
+
+
 def test_character_runtime_user_message_keeps_task_instructions_in_prompt_assets():
     from app.agents.character_agent import CharacterAgent
     from app.models.character import Character
@@ -3643,9 +3827,17 @@ def test_phase_4_6_workflow_direct_character_performance_returns_layered_packet(
             "state_deltas": [{"source_character": "角色甲", "field": "location", "change": "进入前厅"}],
             "continuity_notes": [{"source_character": "角色甲", "note": "离开前厅后仍需回报"}],
             "performance_warnings": [{"source_character": "角色甲", "warning": "避免暴露行踪"}],
+            "master_scene_plan": {"plan_id": "plan-1", "scene_plan": [{"beat_id": "beat-1", "acceptance_criteria": ["可见后果"]}]},
+            "writer_brief": {"must_follow": ["按 beat 写"]},
+            "master_revision_directive": {"revision_id": "rev-1", "issues": [{"issue_id": "issue-1"}]},
+            "writer_revision_brief": {"scope": "重写 beat-1"},
+            "evaluator_focus": ["beat-1"],
         }
     )
 
+    assert "Master 场景计划" in block
+    assert "Master 修订指令" in block
+    assert "修订执行简报" in block
     assert "场景演绎分层上下文" in block
     assert "角色表演包" in block
     assert "关系/状态/连续性变化" in block
@@ -3707,10 +3899,109 @@ def test_de_ai_natural_prose_rule_is_core_system_rule():
     assert "去AI感" in rule["tags"]
     assert "模板化" in rule["content"]
     assert "解释腔" in rule["content"]
+    assert "大纲不是正文" in rule["content"]
+    assert "恒星塞进了他的颅腔" in rule["content"]
+    assert "记忆碎片" in rule["examples"][2]
+    assert "大纲转场景" in rule["examples"][2]
 
     sets_by_id = {rule_set["id"]: rule_set for rule_set in WEB_NOVEL_RULE_SETS}
     assert "style_de_ai_natural_prose" in sets_by_id["rule_set_web_novel_basics"]["rule_ids"]
     assert "style_de_ai_natural_prose" in sets_by_id["rule_set_web_novel_advanced"]["rule_ids"]
+
+
+def test_evaluator_chapter_end_schema_tracks_outline_transposition_check():
+    from app.models.agent_output_schemas import EvaluatorChapterEndSchema
+
+    data = {
+        "should_end": False,
+        "reason": "需要修订",
+        "pacing_check": {"is_appropriate": False, "note": "像梗概扩写"},
+        "long_term_check": {"has_room_for_future": True, "note": "仍有空间"},
+        "world_consistency_check": {"is_consistent": True, "issues": []},
+        "scores": {"info_gain": 6, "suspense": 4, "pacing": 4, "completeness": 6, "world_consistency": 8},
+        "outline_transposition_check": {
+            "passed": False,
+            "issues": ["大纲节点被直接扩写为旁白"],
+            "copied_outline_phrases": ["记忆碎片"],
+            "missing_scene_grounding": ["警告符号没有场景触发"],
+            "rewrite_focus": ["从身体反应和设备异常进入"],
+        },
+    }
+
+    parsed = EvaluatorChapterEndSchema.model_validate(data)
+
+    assert parsed.outline_transposition_check.passed is False
+    assert parsed.outline_transposition_check.copied_outline_phrases == ["记忆碎片"]
+    assert parsed.outline_transposition_check.rewrite_focus == ["从身体反应和设备异常进入"]
+
+
+def test_master_scene_and_revision_schemas_validate_runtime_artifacts():
+    from app.models.agent_output_schemas import (
+        EvaluatorChapterEndSchema,
+        MasterPlotterWritingPlanSchema,
+        MasterRevisionDirectiveSchema,
+        MasterScenePlanSchema,
+    )
+
+    scene_plan = MasterScenePlanSchema.model_validate({
+        "plan_id": "plan-1",
+        "chapter_intent": "让主角通过可见异常进入大纲事件",
+        "core_conflict": "是否触碰异常设备",
+        "scene_plan": [{
+            "beat_id": "beat-1",
+            "sequence_index": 1,
+            "purpose": "设备异常触发",
+            "cause": "前文留下未解释信号",
+            "trigger": "屏幕断帧",
+            "character_action": "主角伸手断电",
+            "sensory_or_environment_feedback": ["耳鸣", "灯管闪烁"],
+            "visible_result": "设备烧出黑痕",
+            "information_release": ["只释放坐标片段"],
+            "transition_to_next": "保安敲门",
+            "acceptance_criteria": ["正文必须出现可见设备后果"],
+        }],
+        "writer_brief": {"must_follow": ["不要直接复述大纲"]},
+        "evaluator_checklist": {"required_beat_ids": ["beat-1"]},
+    })
+    directive = MasterRevisionDirectiveSchema.model_validate({
+        "revision_id": "rev-1",
+        "revision_attempt": 1,
+        "rewrite_strategy": "scene_rewrite",
+        "issues": [{
+            "issue_id": "issue-1",
+            "failure_type": "outline_transposition",
+            "severity": "blocking",
+            "failed_scene_beat_ids": ["beat-1"],
+            "required_fix": "把旁白改为动作和后果",
+        }],
+        "writer_revision_brief": {"scope": "beat-1"},
+        "evaluator_focus": ["beat-1 是否场景化"],
+    })
+    legacy_plan = MasterPlotterWritingPlanSchema.model_validate({
+        "writing_plan": {"chapter_focus": "焦点", "opening": "承接", "middle_beats": [], "ending": "钩子", "target_word_count": 2000},
+        "master_scene_plan": scene_plan.model_dump(),
+        "scene_plan": scene_plan.scene_plan,
+        "writer_brief": scene_plan.writer_brief,
+        "evaluator_checklist": scene_plan.evaluator_checklist,
+    })
+    evaluator = EvaluatorChapterEndSchema.model_validate({
+        "should_end": False,
+        "reason": "需要修订",
+        "pacing_check": {"is_appropriate": False, "note": "缺 beat"},
+        "long_term_check": {"has_room_for_future": True, "note": "可修订"},
+        "world_consistency_check": {"is_consistent": True, "issues": []},
+        "scores": {"info_gain": 4, "suspense": 4, "pacing": 4, "completeness": 4, "world_consistency": 8},
+        "scene_plan_adherence_check": {"passed": False, "covered_beat_ids": [], "missing_beat_ids": ["beat-1"], "failed_beat_ids": ["beat-1"], "issues": ["缺 beat"]},
+        "revision_directive_adherence_check": {"passed": False, "resolved_issue_ids": [], "unresolved_issue_ids": ["issue-1"], "issues": ["未修复"]},
+        "failed_scene_beat_ids": ["beat-1"],
+        "scene_coverage": {"required_beat_count": 1, "covered_beat_count": 0},
+    })
+
+    assert scene_plan.scene_plan[0].beat_id == "beat-1"
+    assert directive.issues[0].failed_scene_beat_ids == ["beat-1"]
+    assert legacy_plan.master_scene_plan.plan_id == "plan-1"
+    assert evaluator.scene_plan_adherence_check.missing_beat_ids == ["beat-1"]
+    assert evaluator.revision_directive_adherence_check.unresolved_issue_ids == ["issue-1"]
 
 
 def test_writer_style_consistency_template_is_scenario_specific():
@@ -4992,6 +5283,10 @@ def test_evaluator_task_prompts_use_md_assets_for_stable_rules(monkeypatch):
     assert "md evaluator chapter gate rules" in chapter_prompt
     assert "AI感文风 Gate" in chapter_prompt
     assert "de_ai_style_check" in chapter_prompt
+    assert "outline_transposition_check" in evaluator._evaluator_task_schema("chapter_end", word_count=1200, target_word_count=1500)
+    assert "scene_plan_adherence_check" in evaluator._evaluator_task_schema("chapter_end", word_count=1200, target_word_count=1500)
+    assert "revision_directive_adherence_check" in evaluator._evaluator_task_schema("chapter_end", word_count=1200, target_word_count=1500)
+    assert "failed_scene_beat_ids" in evaluator._evaluator_task_schema("chapter_end", word_count=1200, target_word_count=1500)
     assert "de_ai_style_check" in evaluator._evaluator_task_schema("chapter_end", word_count=1200, target_word_count=1500)
     assert "md evaluator reader simulation rules" in reader_prompt
     assert "AI 腔与模板化总结检查" in reader_prompt
@@ -5003,6 +5298,10 @@ def test_evaluator_task_prompts_use_md_assets_for_stable_rules(monkeypatch):
     assert "当前运行时目标：输出 EvaluatorReaderSimulateSchema。" in reader_prompt
     assert "当前运行时目标：输出 EvaluatorOOCSchema。" in ooc_prompt
     assert "稳定评估规则以 md prompt 资产 function_evaluator_chapter_quality_gate 为准。" in chapter_prompt
+    assert "Master 场景计划" in chapter_prompt
+    assert "scene_plan_adherence_check" in chapter_prompt
+    assert "revision_directive_adherence_check" in chapter_prompt
+    assert "outline_transposition_check" in evaluator._evaluator_task_schema("chapter_end", word_count=1200, target_word_count=1500)
     assert "必须以 Agent Template / md prompt / writing-rules 中的门禁为准。" not in chapter_prompt
     assert "确定性 role_performance_gate 问题必须写入" not in reader_prompt
     assert "确定性角色约束预检问题必须作为阻断问题写入" not in ooc_prompt
@@ -5515,6 +5814,110 @@ def test_outline_version_api_routes_require_explicit_revision_selection(monkeypa
         set_plot_outline_service(None)
 
 
+@pytest.mark.asyncio
+async def test_plot_outline_soft_delete_excludes_stale_versions_and_forces_context_rebuild(monkeypatch):
+    from app.models.chapter_outline import ChapterOutline, ChapterOutlineStatus
+    from app.services.plot_outline_service import PlotOutlineService
+
+    class FakeDB:
+        def __init__(self):
+            self.rows = [
+                {
+                    "id": "outline-old",
+                    "project_id": "project-1",
+                    "chapter_number": 1,
+                    "title": "数据幽影",
+                    "summary": "旧主角林墨的已删除版本。",
+                    "status": "approved",
+                    "scenes": [],
+                    "chapter_goals": [],
+                    "character_arcs": {},
+                    "hooks_planted": [],
+                    "hooks_resolved": [],
+                    "quality_metrics": {},
+                    "target_word_count": 3000,
+                    "estimated_word_count": 0,
+                    "previous_outline_id": None,
+                    "next_outline_id": None,
+                    "deleted_at": None,
+                },
+                {
+                    "id": "outline-current",
+                    "project_id": "project-1",
+                    "chapter_number": 1,
+                    "title": "雨夜信标",
+                    "summary": "当前有效版本。",
+                    "status": "approved",
+                    "scenes": [],
+                    "chapter_goals": [],
+                    "character_arcs": {},
+                    "hooks_planted": [],
+                    "hooks_resolved": [],
+                    "quality_metrics": {},
+                    "target_word_count": 3000,
+                    "estimated_word_count": 0,
+                    "previous_outline_id": None,
+                    "next_outline_id": None,
+                    "deleted_at": None,
+                },
+            ]
+            self.stale_projects = []
+            self.writes = []
+
+        async def execute_query(self, query, params=None):
+            rows = [row for row in self.rows if row["project_id"] == params.get("project_id", "project-1")]
+            if params and params.get("id"):
+                rows = [row for row in self.rows if row["id"] == params["id"]]
+            if "deleted_at IS NULL" in query:
+                rows = [row for row in rows if row.get("deleted_at") is None]
+            return [dict(row) for row in rows]
+
+        async def execute_write(self, query, params=None):
+            self.writes.append((query, params))
+            for row in self.rows:
+                if row["id"] == params["id"]:
+                    row["deleted_at"] = "now"
+            return 1
+
+        async def mark_assistant_snapshots_stale(self, project_id, except_snapshot_id=None):
+            self.stale_projects.append(project_id)
+            return 1
+
+    class FakeSnapshots:
+        def __init__(self):
+            self.force_rebuild_calls = []
+
+        async def force_rebuild(self, project_id, request_id=None):
+            self.force_rebuild_calls.append((project_id, request_id))
+            return {"id": "snapshot-new"}
+
+    fake_db = FakeDB()
+    fake_snapshots = FakeSnapshots()
+    monkeypatch.setattr(
+        "app.services.assistant_context.get_assistant_context_fabric",
+        lambda db: SimpleNamespace(
+            snapshots=fake_snapshots,
+            deltas=SimpleNamespace(record_entity_change=AsyncMock()),
+        ),
+    )
+    service = PlotOutlineService(db=fake_db)
+
+    await service._ensure_cache("project-1")
+    assert "outline-old" in service._outlines_cache
+    assert "outline-current" in service._outlines_cache
+
+    result = await service.delete_outline("outline-old")
+
+    assert result["success"] is True
+    assert "outline-old" not in service._outlines_cache
+    assert fake_db.rows[0]["deleted_at"] == "now"
+    assert fake_db.stale_projects == ["project-1"]
+    assert fake_snapshots.force_rebuild_calls == [("project-1", None)]
+    assert (await service.get_outline("project-1", 1)).id == "outline-current"
+    versions = await service.get_outline_versions("project-1", 1)
+    assert [outline.id for outline in versions["versions"]] == ["outline-current"]
+
+
 def test_outline_version_api_routes_approve_revision_by_id(monkeypatch):
     from app.api.app import create_app
     from app.models.chapter_outline import ChapterOutline, ChapterOutlineStatus
@@ -5603,6 +6006,744 @@ async def test_plot_outline_resource_audit_refreshes_readiness_with_outline_id_o
     ]
 
 
+def test_outline_chat_route_defaults_to_preview_and_requires_explicit_auto_save(monkeypatch):
+    import app.api.app as api_app
+    from app.api.app import create_app
+    from app.services.plot_outline_service import PlotOutlineService, set_plot_outline_service
+
+    service = PlotOutlineService()
+    service._loaded_outline_projects.add("project-chat")
+    calls = []
+
+    async def fake_chat_with_agent(**kwargs):
+        calls.append(kwargs)
+        return {
+            "message": "预览大纲 JSON",
+            "outline_updates": {"title": "预览标题", "summary": "不应默认保存"},
+            "pending_outlines": [{"chapter_number": 1, "title": "预览标题", "summary": "不应默认保存", "scenes": []}] if not kwargs.get("auto_save") else None,
+            "saved_outline": {"id": "saved"} if kwargs.get("auto_save") else None,
+            "assistant_session_id": "session-1",
+            "parse_status": "outline_update",
+        }
+
+    monkeypatch.setattr(service, "chat_with_agent", fake_chat_with_agent)
+    monkeypatch.setattr(api_app, "postgres_db", object())
+    set_plot_outline_service(service)
+
+    try:
+        client = TestClient(create_app())
+        preview_response = client.post(
+            "/api/outlines/1/chat?project_id=project-chat",
+            json={"message": "生成一版大纲"},
+        )
+        autosave_response = client.post(
+            "/api/outlines/1/chat?project_id=project-chat",
+            json={"message": "保存这版大纲", "auto_save": True},
+        )
+
+        assert preview_response.status_code == 200
+        preview_payload = preview_response.json()
+        assert preview_payload["saved_outline"] is None
+        assert preview_payload["pending_outlines"][0]["title"] == "预览标题"
+        assert preview_payload["parse_status"] == "outline_update"
+        assert autosave_response.status_code == 200
+        assert autosave_response.json()["saved_outline"] == {"id": "saved"}
+        assert [call["auto_save"] for call in calls] == [False, True]
+    finally:
+        set_plot_outline_service(None)
+        monkeypatch.setattr(api_app, "postgres_db", None)
+
+
+def test_plot_outline_chat_contract_preserves_full_context_and_optional_json():
+    service = PlotOutlineService()
+
+    contract = service._build_chat_response_contract(auto_save=False)
+    assert "快速问答" not in contract
+    assert "可以正常回答" in contract
+    assert "```json" in contract
+
+    parsed = service._try_parse_outline_updates("我先解释一下，不输出大纲。")
+    assert parsed is None
+
+
+def test_plot_outline_chat_parser_accepts_common_wrapped_json_payloads():
+    service = PlotOutlineService()
+
+    parsed = service._try_parse_outline_updates(
+        '```json\n{"chapter_outline":{"chapter_number":1,"title":"灰巷噪点","summary":"主角只看到异常痕迹。","scenes":[]}}\n```'
+    )
+
+    assert parsed["chapter_number"] == 1
+    assert parsed["title"] == "灰巷噪点"
+
+    list_payload = service._try_parse_outline_updates(
+        '```json\n[{"chapter_number":1,"title":"第一章","summary":"开端","scenes":[]}]\n```'
+    )
+    assert list_payload["chapters"][0]["title"] == "第一章"
+
+
+@pytest.mark.asyncio
+async def test_plot_outline_chat_persists_assistant_message_before_pending_save(monkeypatch):
+    service = PlotOutlineService(db=object())
+
+    async def fake_build_packet(**kwargs):
+        return {
+            "packet_id": "00000000-0000-0000-0000-000000000001",
+            "snapshot_id": "00000000-0000-0000-0000-000000000002",
+            "snapshot_version": 1,
+            "session_id": "session-1",
+            "prompt_context": "上下文",
+            "metadata": {"token_estimate": 10},
+        }
+
+    async def fake_llm(**kwargs):
+        return '```json\n{"chapter_outline":{"chapter_number":1,"title":"灰巷噪点","summary":"主角只看到异常痕迹。","scenes":[{"title":"线索","summary":"主角只看到异常痕迹。"}]}}\n```'
+
+    append_calls = []
+
+    async def fake_append(**kwargs):
+        append_calls.append(kwargs)
+
+    monkeypatch.setattr(service, "_build_outline_context_packet", fake_build_packet)
+    monkeypatch.setattr(service, "_get_cached_project_context", AsyncMock(return_value={"characters": [], "world_settings": [], "hooks": {}}))
+    monkeypatch.setattr(service, "_get_cached_formatted_context", lambda *args, **kwargs: "完整项目上下文")
+    monkeypatch.setattr(service, "_get_cached_system_prompt_with_trace", AsyncMock(return_value={"content": "系统提示", "trace": {}}))
+    monkeypatch.setattr(service, "_build_outline_runtime_context", lambda existing_outline: "")
+    monkeypatch.setattr(service, "_build_chat_user_context", AsyncMock(return_value="用户上下文"))
+    monkeypatch.setattr(service, "_call_llm_for_chat", fake_llm)
+    monkeypatch.setattr(service, "_check_outline_setting_consistency", AsyncMock(return_value={}))
+    monkeypatch.setattr(service, "_append_outline_assistant_response", fake_append)
+
+    response = await service.chat_with_agent("project-1", 1, "生成第一章大纲", auto_save=False)
+
+    assert response["pending_outlines"][0]["title"] == "灰巷噪点"
+    assert append_calls and append_calls[0]["request_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_plot_outline_chat_continues_when_assistant_history_append_fails(monkeypatch):
+    service = PlotOutlineService(db=object())
+
+    async def fake_build_packet(**kwargs):
+        return {
+            "packet_id": "00000000-0000-0000-0000-000000000001",
+            "snapshot_id": "00000000-0000-0000-0000-000000000002",
+            "snapshot_version": 1,
+            "session_id": "session-1",
+            "prompt_context": "上下文",
+            "metadata": {"token_estimate": 10},
+        }
+
+    async def fake_llm(**kwargs):
+        return '```json\n{"chapters":[{"chapter_number":1,"title":"捕获","summary":"第一章","scenes":[{"summary":"缺标题场景","scene_type":"行动","conflict_level":"高"}]},{"chapter_number":2,"title":"回声","summary":"第二章","scenes":[{"title":"线索","summary":"只看到线索","emotion_start":"紧张"}]}]}\n```\x00'
+
+    async def failing_append(**kwargs):
+        raise ValueError("invalid byte sequence for encoding UTF8: 0x00")
+
+    monkeypatch.setattr(service, "_build_outline_context_packet", fake_build_packet)
+    monkeypatch.setattr(service, "_get_cached_project_context", AsyncMock(return_value={"characters": [], "world_settings": [], "hooks": {}}))
+    monkeypatch.setattr(service, "_get_cached_formatted_context", lambda *args, **kwargs: "完整项目上下文")
+    monkeypatch.setattr(service, "_get_cached_system_prompt_with_trace", AsyncMock(return_value={"content": "系统提示", "trace": {}}))
+    monkeypatch.setattr(service, "_build_outline_runtime_context", lambda existing_outline: "")
+    monkeypatch.setattr(service, "_build_chat_user_context", AsyncMock(return_value="用户上下文"))
+    monkeypatch.setattr(service, "_call_llm_for_chat", fake_llm)
+    monkeypatch.setattr(service, "_check_outline_setting_consistency", AsyncMock(return_value={}))
+    monkeypatch.setattr(service, "_append_outline_assistant_response", failing_append)
+
+    response = await service.chat_with_agent("project-1", 1, "生成黄金三章", auto_save=False)
+
+    assert response["parse_status"] == "outline_update"
+    assert [item["chapter_number"] for item in response["pending_outlines"]] == [1, 2]
+    assert response["pending_outlines"][0]["scenes"][0]["title"] == "场景1"
+    assert response["pending_outlines"][0]["scenes"][0]["scene_type"] == "action"
+    assert response["pending_outlines"][0]["scenes"][0]["conflict_level"] == "high"
+
+
+def test_assistant_message_append_sanitizes_postgres_nul_text():
+    from app.database.postgres import _sanitize_postgres_text, _sanitize_postgres_value
+
+    assert _sanitize_postgres_text("a\x00b") == "ab"
+    assert _sanitize_postgres_value({"bad\x00key": ["x\x00y"]}) == {"badkey": ["xy"]}
+
+
+def test_plot_outline_chat_contract_allows_multi_chapter_by_default():
+    service = PlotOutlineService()
+
+    contract = service._build_chat_response_contract(auto_save=False)
+
+    assert "不要默认限制为当前单章" in contract
+    assert "黄金三章" in contract
+    assert '{"chapters":[...]}' in contract
+
+
+def test_outlines_frontend_uses_single_agent_session_and_legacy_first_chapter_cache():
+    content = Path("frontend/src/pages/Outlines.tsx").read_text(encoding="utf-8")
+
+    assert "plotOutlineAgentSession:${projectId}:outlines" in content
+    assert "plotOutlineAgentSession:${projectId}:1" in content
+    assert "const outlineAgentMode = 'chapter:1'" in content
+    assert "localStorage.getItem(storageKey) || localStorage.getItem(legacyFirstChapterStorageKey)" in content
+    assert "mode={outlineAgentMode}" in content
+    assert "selected_chapter_number" in content
+    assert "localStorage.removeItem(`plotOutlineAgentSession:${currentProject.id}:${deletedChapter}`)" not in content
+    assert "mode: `chapter:${chapterNumber}`" not in content
+    assert "plotOutlineAgentSession:${currentProject.id}:${chapterNumber}`" not in content
+
+
+@pytest.mark.asyncio
+async def test_plot_outline_context_packet_uses_single_outlines_session_mode(monkeypatch):
+    service = PlotOutlineService(db=object())
+    captured = {}
+
+    class FakeFabric:
+        async def build_packet(self, **kwargs):
+            captured.update(kwargs)
+            return {
+                "packet_id": "packet-1",
+                "snapshot_id": "snapshot-1",
+                "snapshot_version": 1,
+                "session_id": kwargs.get("session_id") or "session-1",
+                "prompt_context": "上下文",
+                "metadata": {"token_estimate": 10},
+            }
+
+    import app.services.assistant_context as assistant_context_module
+
+    monkeypatch.setattr(assistant_context_module, "get_assistant_context_fabric", lambda db: FakeFabric())
+
+    packet = await service._build_outline_context_packet(
+        project_id="project-1",
+        chapter_number=7,
+        task_type="chat",
+        session_id="session-1",
+        request_id="request-1",
+        user_message="修改第7章",
+        extra_scope={"selected_chapter_number": 7},
+    )
+
+    assert packet["session_id"] == "session-1"
+    assert captured["mode"] == "chapter:1"
+    assert captured["scope"]["chapter_number"] == 7
+    assert captured["scope"]["selected_chapter_number"] == 7
+
+
+def test_plot_outline_chat_uses_larger_token_budget_for_multi_chapter_json():
+    service = PlotOutlineService()
+
+    assert service._outline_chat_max_tokens >= 8192
+    assert service._outline_chat_max_tokens >= service._llm_max_tokens
+    assert service._outline_chat_max_continuations >= 4
+
+
+def test_plot_outline_prompt_context_does_not_hard_truncate_character_or_lore_text():
+    service = PlotOutlineService()
+    long_description = "角色完整身份线索" * 80
+    long_background = "背景里的国家机密误认边界" * 70
+    long_goal = "长期目标需要完整保留" * 40
+    long_lore = "宪法级设定完整内容" * 120
+    context = {
+        "project": {"title": "星辰"},
+        "characters": [{
+            "name": "林默",
+            "aliases": [f"别名{i}" for i in range(10)],
+            "description": long_description,
+            "personality": "谨慎" * 100,
+            "background_story": long_background,
+            "goals": [long_goal, "第二目标"],
+            "key_relationships": {f"角色{i}": f"关系{i}" for i in range(8)},
+        }],
+        "constitutional_rules": [{"title": "国家级机密", "priority": "constitutional", "summary": long_lore}],
+        "core_settings": [],
+        "relevant_settings": [],
+        "hooks": {},
+    }
+
+    formatted = service.format_context_for_prompt(context)
+
+    assert long_description in formatted
+    assert long_background in formatted
+    assert long_goal in formatted
+    assert long_lore in formatted
+    assert "别名9" in formatted
+    assert "角色7:关系7" in formatted
+
+
+@pytest.mark.asyncio
+async def test_plot_outline_chat_continues_openai_length_truncated_multi_chapter_json(monkeypatch):
+    service = PlotOutlineService()
+    service._llm_provider = "openai"
+    service._llm_api_key = "test-key"
+    calls = []
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(
+                        finish_reason="length",
+                        message=SimpleNamespace(content='```json\n{"chapters":[{"chapter_number":2,"title":"钥匙","summary":"第二章","scenes":[{"title":"休整","summary":"线索"}]},')
+                    )]
+                )
+            return SimpleNamespace(
+                choices=[SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(content='{"chapter_number":3,"title":"东区血案","summary":"第三章","scenes":[{"title":"现场","summary":"抵达"}]}]}\n```')
+                )]
+            )
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+    fake_module = ModuleType("openai")
+    fake_module.AsyncOpenAI = FakeOpenAI
+    monkeypatch.setitem(sys.modules, "openai", fake_module)
+
+    response = await service._call_llm_for_chat("系统", "生成第2章到第3章", "上下文", {})
+    parsed = service._try_parse_outline_updates(response)
+
+    assert len(calls) == 2
+    assert calls[1]["messages"][-1]["role"] == "user"
+    assert "从上一轮回复的最后一个字符之后继续输出" in calls[1]["messages"][-1]["content"]
+    assert [item["chapter_number"] for item in parsed["chapters"]] == [2, 3]
+
+
+@pytest.mark.asyncio
+async def test_plot_outline_chat_continues_anthropic_max_tokens_until_json_complete(monkeypatch):
+    service = PlotOutlineService()
+    service._llm_provider = "anthropic"
+    service._llm_api_key = "test-key"
+    calls = []
+
+    class FakeMessages:
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return SimpleNamespace(
+                    stop_reason="max_tokens",
+                    content=[SimpleNamespace(text='```json\n{"chapter_outline":{"chapter_number":4,"title":"规则幽灵","summary":"第四章","scenes":[')],
+                )
+            return SimpleNamespace(
+                stop_reason="end_turn",
+                content=[SimpleNamespace(text='{"title":"追踪","summary":"主角只看到痕迹"}]}}\n```')],
+            )
+
+    class FakeAnthropic:
+        def __init__(self, **kwargs):
+            self.messages = FakeMessages()
+
+    fake_module = ModuleType("anthropic")
+    fake_module.AsyncAnthropic = FakeAnthropic
+    monkeypatch.setitem(sys.modules, "anthropic", fake_module)
+
+    response = await service._call_llm_for_chat("系统", "生成第四章", "上下文", {})
+    parsed = service._try_parse_outline_updates(response)
+
+    assert len(calls) == 2
+    assert calls[1]["messages"][-1]["role"] == "user"
+    assert parsed["chapter_number"] == 4
+    assert parsed["scenes"][0]["title"] == "追踪"
+
+
+@pytest.mark.asyncio
+async def test_plot_outline_chat_continues_structurally_incomplete_json_without_finish_reason(monkeypatch):
+    service = PlotOutlineService()
+    service._llm_provider = "openai"
+    service._llm_api_key = "test-key"
+    calls = []
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(
+                        finish_reason="stop",
+                        message=SimpleNamespace(content='```json\n{"chapter_outline":{"chapter_number":5,"title":"未闭合","summary":"第五章","scenes":[{"title":"开端","summary":"线索"}]')
+                    )]
+                )
+            return SimpleNamespace(
+                choices=[SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(content='}}\n```')
+                )]
+            )
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+    fake_module = ModuleType("openai")
+    fake_module.AsyncOpenAI = FakeOpenAI
+    monkeypatch.setitem(sys.modules, "openai", fake_module)
+
+    response = await service._call_llm_for_chat("系统", "生成第五章", "上下文", {})
+    parsed = service._try_parse_outline_updates(response)
+
+    assert len(calls) == 2
+    assert parsed["chapter_number"] == 5
+
+
+@pytest.mark.asyncio
+async def test_plot_outline_chat_refuses_to_save_after_exhausted_incomplete_continuations(monkeypatch):
+    service = PlotOutlineService()
+    service._outline_chat_max_continuations = 1
+    attempts = []
+
+    async def fake_build_packet(**kwargs):
+        return None
+
+    async def fake_llm(**kwargs):
+        attempts.append(kwargs)
+        return '```json\n{"chapters":[{"chapter_number":2,"title":"钥匙","summary":"第二章","scenes":[{"title":"休整","summary":"线索"}]}'
+
+    monkeypatch.setattr(service, "_build_outline_context_packet", fake_build_packet)
+    monkeypatch.setattr(service, "_get_cached_project_context", AsyncMock(return_value={"characters": [], "world_settings": [], "hooks": {}}))
+    monkeypatch.setattr(service, "_get_cached_formatted_context", lambda *args, **kwargs: "完整项目上下文")
+    monkeypatch.setattr(service, "_get_cached_system_prompt_with_trace", AsyncMock(return_value={"content": "系统提示", "trace": {}}))
+    monkeypatch.setattr(service, "_build_outline_runtime_context", lambda existing_outline: "")
+    monkeypatch.setattr(service, "_build_chat_user_context", AsyncMock(return_value="用户上下文"))
+    monkeypatch.setattr(service, "_call_llm_for_chat", fake_llm)
+
+    response = await service.chat_with_agent("project-1", 1, "请生成第2章大纲", auto_save=False)
+
+    assert response["parse_status"] == "outline_parse_failed"
+    assert response.get("pending_outlines") is None
+    assert response["outline_updates"] is None
+
+
+@pytest.mark.asyncio
+async def test_plot_outline_chat_warns_when_generation_response_has_no_saveable_json(monkeypatch):
+    service = PlotOutlineService()
+
+    async def fake_build_packet(**kwargs):
+        return None
+
+    async def fake_llm(**kwargs):
+        return "已保存成功。```json\n{\"status\":\"success\"}\n```"
+
+    monkeypatch.setattr(service, "_build_outline_context_packet", fake_build_packet)
+    monkeypatch.setattr(service, "_get_cached_project_context", AsyncMock(return_value={"characters": [], "world_settings": [], "hooks": {}}))
+    monkeypatch.setattr(service, "_get_cached_formatted_context", lambda *args, **kwargs: "完整项目上下文")
+    monkeypatch.setattr(service, "_get_cached_system_prompt_with_trace", AsyncMock(return_value={"content": "系统提示", "trace": {}}))
+    monkeypatch.setattr(service, "_build_outline_runtime_context", lambda existing_outline: "")
+    monkeypatch.setattr(service, "_build_chat_user_context", AsyncMock(return_value="用户上下文"))
+    monkeypatch.setattr(service, "_call_llm_for_chat", fake_llm)
+
+    response = await service.chat_with_agent("project-1", 1, "保存刚才的大纲", auto_save=False)
+
+    assert response["parse_status"] == "outline_parse_failed"
+    assert response.get("pending_outlines") is None
+    assert "没有解析到可保存的大纲 JSON" in response["warnings"][0]
+
+
+@pytest.mark.asyncio
+async def test_plot_outline_chat_rejects_truncated_multi_chapter_json_instead_of_text_fallback(monkeypatch):
+    service = PlotOutlineService()
+
+    async def fake_build_packet(**kwargs):
+        return None
+
+    async def fake_llm(**kwargs):
+        return '''我来生成第2章和第3章的大纲。
+```json
+{
+  "chapters": [
+    {
+      "chapter_number": 2,
+      "title": "钥匙",
+      "summary": "第二章",
+      "scenes": [{"scene_number": 1, "title": "休整", "summary": "林默休整"}]
+    },
+    {
+      "chapter_number": 3,
+      "title": "东区血案",
+      "summary": "第三章",
+      "scenes": [{"scene_number": 1, "title": "现场", "summary": "林默抵达现场"}]
+'''
+
+    monkeypatch.setattr(service, "_build_outline_context_packet", fake_build_packet)
+    monkeypatch.setattr(service, "_get_cached_project_context", AsyncMock(return_value={"characters": [], "world_settings": [], "hooks": {}}))
+    monkeypatch.setattr(service, "_get_cached_formatted_context", lambda *args, **kwargs: "完整项目上下文")
+    monkeypatch.setattr(service, "_get_cached_system_prompt_with_trace", AsyncMock(return_value={"content": "系统提示", "trace": {}}))
+    monkeypatch.setattr(service, "_build_outline_runtime_context", lambda existing_outline: "")
+    monkeypatch.setattr(service, "_build_chat_user_context", AsyncMock(return_value="用户上下文"))
+    monkeypatch.setattr(service, "_call_llm_for_chat", fake_llm)
+
+    response = await service.chat_with_agent("project-1", 1, "请生成第2章到第3章的大纲", auto_save=False)
+
+    assert response["parse_status"] == "outline_parse_failed"
+    assert response.get("pending_outlines") is None
+    assert response["outline_updates"] is None
+
+
+@pytest.mark.asyncio
+async def test_plot_outline_chat_keeps_multiple_saveable_chapters_from_long_response(monkeypatch):
+    service = PlotOutlineService()
+
+    async def fake_build_packet(**kwargs):
+        return None
+
+    async def fake_llm(**kwargs):
+        return '''以下是第2章到第4章：
+```json
+{
+  "chapters": [
+    {"chapter_number": 2, "title": "钥匙", "summary": "第二章", "scenes": [{"scene_number": 1, "title": "休整", "summary": "林默休整"}]},
+    {"chapter_number": 3, "title": "东区血案", "summary": "第三章", "scenes": [{"scene_number": 1, "title": "现场", "summary": "林默抵达现场"}]},
+    {"chapter_number": 4, "title": "规则幽灵", "summary": "第四章", "scenes": [{"scene_number": 1, "title": "追踪", "summary": "林默追踪线索"}]}
+  ]
+}
+```
+补充说明。'''
+
+    monkeypatch.setattr(service, "_build_outline_context_packet", fake_build_packet)
+    monkeypatch.setattr(service, "_get_cached_project_context", AsyncMock(return_value={"characters": [], "world_settings": [], "hooks": {}}))
+    monkeypatch.setattr(service, "_get_cached_formatted_context", lambda *args, **kwargs: "完整项目上下文")
+    monkeypatch.setattr(service, "_get_cached_system_prompt_with_trace", AsyncMock(return_value={"content": "系统提示", "trace": {}}))
+    monkeypatch.setattr(service, "_build_outline_runtime_context", lambda existing_outline: "")
+    monkeypatch.setattr(service, "_build_chat_user_context", AsyncMock(return_value="用户上下文"))
+    monkeypatch.setattr(service, "_call_llm_for_chat", fake_llm)
+    monkeypatch.setattr(service, "_check_outline_setting_consistency", AsyncMock(return_value={}))
+
+    response = await service.chat_with_agent("project-1", 1, "请一次性生成第2章到第4章的大纲", auto_save=False)
+
+    assert response["parse_status"] == "outline_update"
+    assert [item["chapter_number"] for item in response["pending_outlines"]] == [2, 3, 4]
+    assert all(item["scenes"] for item in response["pending_outlines"])
+
+
+@pytest.mark.asyncio
+async def test_plot_outline_chat_filters_unsaveable_chapters_from_multi_chapter_payload(monkeypatch):
+    service = PlotOutlineService()
+
+    async def fake_build_packet(**kwargs):
+        return None
+
+    async def fake_llm(**kwargs):
+        return '''```json
+{"chapters":[
+  {"chapter_number":2,"title":"无场景章","summary":"不能保存","scenes":[]},
+  {"chapter_number":3,"title":"可保存章","summary":"可以保存","scenes":[{"title":"线索","summary":"有场景"}]}
+]}
+```'''
+
+    monkeypatch.setattr(service, "_build_outline_context_packet", fake_build_packet)
+    monkeypatch.setattr(service, "_get_cached_project_context", AsyncMock(return_value={"characters": [], "world_settings": [], "hooks": {}}))
+    monkeypatch.setattr(service, "_get_cached_formatted_context", lambda *args, **kwargs: "完整项目上下文")
+    monkeypatch.setattr(service, "_get_cached_system_prompt_with_trace", AsyncMock(return_value={"content": "系统提示", "trace": {}}))
+    monkeypatch.setattr(service, "_build_outline_runtime_context", lambda existing_outline: "")
+    monkeypatch.setattr(service, "_build_chat_user_context", AsyncMock(return_value="用户上下文"))
+    monkeypatch.setattr(service, "_call_llm_for_chat", fake_llm)
+    monkeypatch.setattr(service, "_check_outline_setting_consistency", AsyncMock(return_value={}))
+
+    response = await service.chat_with_agent("project-1", 1, "生成多章大纲", auto_save=False)
+
+    assert response["parse_status"] == "outline_update"
+    assert [item["chapter_number"] for item in response["pending_outlines"]] == [3]
+
+
+@pytest.mark.asyncio
+async def test_plot_outline_resource_audit_auto_resolves_existing_lore_and_hook():
+    from app.models.chapter_outline import ChapterOutline, ChapterOutlineStatus, SceneOutline
+
+    service = PlotOutlineService()
+    outline = ChapterOutline(
+        id="outline-resource-auto-bind",
+        project_id="project-1",
+        chapter_number=1,
+        title="能力协议",
+        summary="主角在已知地点学习秘法，并触发旧伏笔。",
+        scenes=[SceneOutline(scene_number=1, title="训练", summary="秘法协议被启动", location="已知地点")],
+        hooks_planted=["旧伏笔再次出现"],
+        status=ChapterOutlineStatus.DRAFT,
+    )
+    full_context = {
+        "characters": [],
+        "world_settings": [
+            {"id": "lore-location", "title": "已知地点", "priority": "standard", "summary": "地点设定"},
+            {"id": "lore-ability", "title": "秘法协议", "priority": "core", "summary": "能力边界"},
+        ],
+        "hooks": {"pending": [{"id": "hook-1", "title": "旧伏笔", "description": "待回收"}], "to_resolve": [], "to_plant": []},
+        "character_availability_packet": {"availability_by_name": {}, "canonical_name_map": {}},
+    }
+
+    requirements = service._build_outline_resource_requirements(outline, full_context, set())
+
+    resolved = [item for item in requirements if item["status"] == "resolved"]
+    assert any(item["resource_name"] == "已知地点" and item["matched_resource_type"] == "lore" for item in resolved)
+    assert any(item["resource_name"] == "秘法协议" and item["matched_resource_id"] == "lore-ability" for item in resolved)
+    assert not [item for item in requirements if item["status"] == "pending" and item["resource_name"] in {"已知地点", "第1章能力规则"}]
+
+
+@pytest.mark.asyncio
+async def test_batch_generate_route_preview_does_not_save_without_policy(monkeypatch):
+    import app.api.app as api_app
+    from app.api.app import create_app
+    from app.models.chapter_outline import ChapterOutline, GenerateOutlineResponse
+    from app.services.plot_outline_service import PlotOutlineService, set_plot_outline_service
+
+    service = PlotOutlineService()
+    service._loaded_outline_projects.add("project-batch")
+    save_calls = []
+
+    async def fake_generate_outline(**kwargs):
+        chapter_number = kwargs["chapter_number"]
+        return GenerateOutlineResponse(
+            outline=ChapterOutline(
+                id=f"outline-preview-{chapter_number}",
+                project_id=kwargs["project_id"],
+                chapter_number=chapter_number,
+                title=f"第{chapter_number}章预览",
+                summary="只生成预览，不写库。",
+            ),
+            suggestions=["人工审核后保存"],
+            warnings=[],
+            context_packet={"packet_id": f"packet-{chapter_number}"},
+        )
+
+    async def fake_save_outline_updates(**kwargs):
+        save_calls.append(kwargs)
+        return None, []
+
+    monkeypatch.setattr(service, "generate_outline", fake_generate_outline)
+    monkeypatch.setattr(service, "_save_outline_updates", fake_save_outline_updates)
+    monkeypatch.setattr(api_app, "postgres_db", object())
+    set_plot_outline_service(service)
+
+    try:
+        client = TestClient(create_app())
+        response = client.post(
+            "/api/outlines/batch-generate",
+            json={"project_id": "project-batch", "start_chapter": 1, "end_chapter": 2},
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["success"] is True
+        assert payload["auto_save"] is False
+        assert payload["summary"] == {"generated": 2, "saved": 0, "approved": 0, "failed": 0}
+        assert [item["status"] for item in payload["results"]] == ["generated", "generated"]
+        assert save_calls == []
+    finally:
+        set_plot_outline_service(None)
+        monkeypatch.setattr(api_app, "postgres_db", None)
+
+
+@pytest.mark.asyncio
+async def test_batch_generate_route_auto_save_uses_explicit_policy(monkeypatch):
+    import app.api.app as api_app
+    from app.api.app import create_app
+    from app.models.chapter_outline import ChapterOutline, GenerateOutlineResponse
+    from app.services.plot_outline_service import PlotOutlineService, set_plot_outline_service
+
+    service = PlotOutlineService()
+    service._loaded_outline_projects.add("project-batch")
+    save_calls = []
+
+    async def fake_generate_outline(**kwargs):
+        chapter_number = kwargs["chapter_number"]
+        return GenerateOutlineResponse(
+            outline=ChapterOutline(
+                id=f"outline-preview-{chapter_number}",
+                project_id=kwargs["project_id"],
+                chapter_number=chapter_number,
+                title=f"第{chapter_number}章预览",
+                summary="显式保存。",
+            ),
+        )
+
+    async def fake_save_outline_updates(**kwargs):
+        save_calls.append(kwargs)
+        chapter_number = kwargs["default_chapter_number"]
+        return ChapterOutline(
+            id=f"outline-saved-{chapter_number}",
+            project_id=kwargs["project_id"],
+            chapter_number=chapter_number,
+            title="已保存",
+            summary="显式策略写库。",
+        ), []
+
+    monkeypatch.setattr(service, "generate_outline", fake_generate_outline)
+    monkeypatch.setattr(service, "_save_outline_updates", fake_save_outline_updates)
+    monkeypatch.setattr(api_app, "postgres_db", object())
+    set_plot_outline_service(service)
+
+    try:
+        client = TestClient(create_app())
+        response = client.post(
+            "/api/outlines/batch-generate",
+            json={"project_id": "project-batch", "chapter_numbers": [2, 1], "auto_save": True},
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["summary"] == {"generated": 2, "saved": 2, "approved": 0, "failed": 0}
+        assert [call["default_chapter_number"] for call in save_calls] == [1, 2]
+        assert [item["saved_outline"]["id"] for item in payload["results"]] == ["outline-saved-1", "outline-saved-2"]
+    finally:
+        set_plot_outline_service(None)
+        monkeypatch.setattr(api_app, "postgres_db", None)
+
+
+@pytest.mark.asyncio
+async def test_batch_generate_route_rejects_auto_approve_without_auto_save():
+    from app.api.app import create_app
+
+    client = TestClient(create_app())
+    response = client.post(
+        "/api/outlines/batch-generate",
+        json={"project_id": "project-batch", "chapter_numbers": [1], "auto_approve": True, "approved_by": "reviewer"},
+    )
+
+    assert response.status_code == 422
+
+
+def test_save_pending_outlines_normalizes_repairable_scene_fields(monkeypatch):
+    import app.api.app as api_app
+    from app.api.app import create_app
+    from app.services.plot_outline_service import PlotOutlineService, set_plot_outline_service
+
+    service = PlotOutlineService()
+    service._loaded_outline_projects.add("project-save")
+    monkeypatch.setattr(service, "_persist_outline_resource_audit", AsyncMock())
+    monkeypatch.setattr(api_app, "postgres_db", object())
+    set_plot_outline_service(service)
+
+    try:
+        client = TestClient(create_app())
+        response = client.post(
+            "/api/outlines/save-outlines?project_id=project-save",
+            json={
+                "outlines": [
+                    {
+                        "chapter_number": 1,
+                        "title": "可修复大纲",
+                        "summary": "场景缺少 title 且使用中文枚举，应被规范化后保存。",
+                        "scenes": [
+                            {
+                                "scene_number": 1,
+                                "summary": "缺少场景标题",
+                                "scene_type": "行动",
+                                "conflict_level": "高",
+                                "emotion_start": "紧张",
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["saved_count"] == 1
+        assert payload["results"][0]["status"] == "saved"
+    finally:
+        set_plot_outline_service(None)
+        monkeypatch.setattr(api_app, "postgres_db", None)
+
+
 def test_save_pending_outlines_reports_all_failed_validation_errors(monkeypatch):
     import app.api.app as api_app
     from app.api.app import create_app
@@ -5623,11 +6764,13 @@ def test_save_pending_outlines_reports_all_failed_validation_errors(monkeypatch)
                     {
                         "chapter_number": 1,
                         "title": "失效大纲",
-                        "summary": "场景缺少必填 title，应暴露为结构化保存失败。",
+                        "summary": "场景包含不可修复字段，应暴露为结构化保存失败。",
                         "scenes": [
                             {
                                 "scene_number": 1,
-                                "summary": "缺少场景标题",
+                                "title": "失效场景",
+                                "summary": "estimated_words 类型错误",
+                                "estimated_words": "很多",
                                 "participating_characters": ["林澈"],
                             }
                         ],
@@ -5645,7 +6788,7 @@ def test_save_pending_outlines_reports_all_failed_validation_errors(monkeypatch)
         assert detail["results"][0]["chapter_number"] == 1
         assert detail["results"][0]["status"] == "failed"
         assert detail["results"][0]["error_type"] == "validation_error"
-        assert "title" in detail["results"][0]["error"]
+        assert "estimated_words" in detail["results"][0]["error"]
     finally:
         set_plot_outline_service(None)
         monkeypatch.setattr(api_app, "postgres_db", None)
@@ -5684,11 +6827,13 @@ def test_save_pending_outlines_returns_partial_success_results(monkeypatch):
                     {
                         "chapter_number": 2,
                         "title": "失效大纲",
-                        "summary": "场景缺少必填 title。",
+                        "summary": "场景包含不可修复字段。",
                         "scenes": [
                             {
                                 "scene_number": 1,
-                                "summary": "缺少场景标题",
+                                "title": "失效场景",
+                                "summary": "estimated_words 类型错误",
+                                "estimated_words": "很多",
                             }
                         ],
                     },

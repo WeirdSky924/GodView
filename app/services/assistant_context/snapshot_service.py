@@ -113,6 +113,7 @@ class ProjectSnapshotService:
             SELECT id, chapter_number, title, summary, status, updated_at, created_at
             FROM chapter_outlines
             WHERE project_id = :project_id
+              AND deleted_at IS NULL
             ORDER BY chapter_number ASC, updated_at DESC NULLS LAST
             LIMIT 500
             """,
@@ -160,7 +161,13 @@ class ProjectSnapshotService:
             )
             sections.append(self._section(project_id, "world", "worlds", "世界设定", content, {"count": len(source["worlds"])}, self._refs("world", source["worlds"]), 20))
         sections.extend(self._grouped_entity_sections(project_id, "lore", source.get("lores") or [], "设定", 30, ["title", "category", "priority", "summary", "content", "related_characters", "unresolved_character_refs"]))
-        sections.extend(self._grouped_entity_sections(project_id, "characters", source.get("characters") or [], "角色", 35, ["name", "role", "personality", "background_story", "importance_tier", "status"]))
+        sections.extend(self._grouped_entity_sections(project_id, "characters", source.get("characters") or [], "角色", 35, [
+            "name", "aliases", "description", "role", "importance_tier", "narrative_weight",
+            "story_arc_role", "plot_priority", "status", "debut_chapter", "debut_scene",
+            "exit_chapter", "exit_reason", "active_arc", "available_presence_types",
+            "personality", "background_story", "goals", "relationships", "key_relationships",
+            "current_region_id", "current_location", "current_location_reason", "death_detail", "major_events",
+        ]))
         sections.extend(self._grouped_entity_sections(project_id, "plot_hooks", source.get("hooks") or [], "伏笔", 45, ["title", "hook_type", "status", "description"]))
         sections.extend(self._grouped_entity_sections(project_id, "chapter_outlines", source.get("outlines") or [], "大纲", 50, ["chapter_number", "title", "status", "summary"]))
         sections.extend(self._grouped_entity_sections(project_id, "map_regions", source.get("regions") or [], "地图区域", 55, ["world_name", "name", "region_type", "terrain_type", "description", "atmosphere"]))
@@ -169,7 +176,7 @@ class ProjectSnapshotService:
     def _grouped_entity_sections(self, project_id: str, section_type: str, rows: List[Dict[str, Any]], title: str, priority: int, fields: List[str]) -> List[Dict[str, Any]]:
         if not rows:
             return []
-        chunks = [rows[index:index + 40] for index in range(0, len(rows), 40)]
+        chunks = self._chunk_entity_rows(section_type, rows)
         sections = []
         for idx, chunk in enumerate(chunks, start=1):
             lines = []
@@ -191,6 +198,17 @@ class ProjectSnapshotService:
                 priority,
             ))
         return sections
+
+    def _chunk_entity_rows(self, section_type: str, rows: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+        if section_type != "lore":
+            return [rows[index:index + 40] for index in range(0, len(rows), 40)]
+        constitutional = [row for row in rows if str(row.get("priority") or "").lower() == "constitutional"]
+        others = [row for row in rows if str(row.get("priority") or "").lower() != "constitutional"]
+        chunks: List[List[Dict[str, Any]]] = []
+        if constitutional:
+            chunks.extend(constitutional[index:index + 20] for index in range(0, len(constitutional), 20))
+        chunks.extend(others[index:index + 40] for index in range(0, len(others), 40))
+        return chunks
 
     def _section(self, project_id: str, section_type: str, scope_key: str, title: str, content: str, payload: Dict[str, Any], refs: List[Dict[str, Any]], priority: int) -> Dict[str, Any]:
         content_hash = hash_text(content)

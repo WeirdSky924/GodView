@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS chapter_outlines (
     -- 关联信息
     previous_outline_id VARCHAR(64),
     next_outline_id VARCHAR(64),
+    deleted_at TIMESTAMP WITH TIME ZONE,
 
     -- 约束
     UNIQUE(project_id, chapter_number)
@@ -59,6 +60,8 @@ CREATE TABLE IF NOT EXISTS chapter_outlines (
 CREATE INDEX IF NOT EXISTS idx_chapter_outlines_project ON chapter_outlines(project_id);
 CREATE INDEX IF NOT EXISTS idx_chapter_outlines_status ON chapter_outlines(status);
 CREATE INDEX IF NOT EXISTS idx_chapter_outlines_chapter ON chapter_outlines(chapter_number);
+CREATE INDEX IF NOT EXISTS idx_chapter_outlines_active_project_chapter ON chapter_outlines(project_id, chapter_number) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_chapter_outlines_deleted_at ON chapter_outlines(deleted_at);
 
 -- 注释
 COMMENT ON TABLE chapter_outlines IS '章节大纲表 - 存储每章的详细规划';

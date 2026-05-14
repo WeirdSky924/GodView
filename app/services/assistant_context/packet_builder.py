@@ -38,7 +38,10 @@ class ContextPacketBuilder:
         for section in ordered_sections:
             section_tokens = int(section.get("token_estimate") or estimate_tokens(section.get("content") or ""))
             summary = self._section_summary(section, section_tokens)
-            if used_tokens + section_tokens <= snapshot_budget:
+            must_include = self._must_include_section(assistant_surface, section)
+            if used_tokens + section_tokens <= snapshot_budget or must_include:
+                if must_include and used_tokens + section_tokens > snapshot_budget:
+                    summary["reason"] = "required_over_budget"
                 selected_sections.append(summary)
                 section_blocks.append(f"## {section.get('title') or section.get('section_type')}\n{section.get('content') or ''}")
                 used_tokens += section_tokens
@@ -119,6 +122,19 @@ class ContextPacketBuilder:
             "history_window": history_window,
             "history_summary": history_summary,
         }
+
+    def _must_include_section(self, assistant_surface: str, section: Dict[str, Any]) -> bool:
+        if assistant_surface not in {"plot_outline_agent", "outline_generation"}:
+            return False
+        if section.get("section_type") == "project_brief":
+            return True
+        if section.get("section_type") != "lore":
+            return False
+        payload = section.get("structured_payload") or {}
+        if str(payload.get("priority") or "").lower() == "constitutional":
+            return True
+        content = str(section.get("content") or "").lower()
+        return "priority: constitutional" in content or "宪法级" in content
 
     def _section_summary(self, section: Dict[str, Any], tokens: int) -> Dict[str, Any]:
         return {

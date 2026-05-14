@@ -242,7 +242,18 @@ async def test_quality_gated_writer_finalizes_after_pass_once_with_quality_metad
         workflow_id="wf-gated-pass",
         project_id="00000000-0000-0000-0000-000000000001",
         status=WorkflowStatus.RUNNING,
-        context={"chapter_num": 5, "chapter_title": "第五章：通过", "chapter_outline_id": "outline-pass"},
+        context={
+            "chapter_num": 5,
+            "chapter_title": "第五章：通过",
+            "chapter_outline_id": "outline-pass",
+            "scene_plan_id": "plan-1",
+            "scene_plan_checksum": "scene-checksum",
+            "scene_plan_attempt": 1,
+            "revision_directive_id": "rev-1",
+            "revision_directive_checksum": "revision-checksum",
+            "revision_directive_attempt": 1,
+            "evaluation_feedback": {"scene_coverage": {"required_beat_count": 1, "covered_beat_count": 1}},
+        },
         node_states={},
     )
     writer_node = type("WriterNode", (), {"id": "writer", "label": "写作", "agent_type": "writer"})()
@@ -303,6 +314,12 @@ async def test_quality_gated_writer_finalizes_after_pass_once_with_quality_metad
     assert saved_payload["quality_gate_attempts"] == 1
     assert saved_payload["revision_attempts"] == 1
     assert saved_payload["finalized_from_draft_attempt"] == 1
+    assert saved_payload["scene_plan_id"] == "plan-1"
+    assert saved_payload["scene_plan_checksum"] == "scene-checksum"
+    assert saved_payload["revision_directive_id"] == "rev-1"
+    assert saved_payload["revision_directive_attempt"] == 1
+    assert saved_payload["final_scene_coverage"] == {"required_beat_count": 1, "covered_beat_count": 1}
+    assert execution.context["chapter_draft_payload"]["scene_plan_id"] == "plan-1"
     assert [event[1] for event in events].count("chapter_saved") == 1
     assert "chapter_finalized" in [event[1] for event in events]
     assert len(db.state_changes) == 1
@@ -398,7 +415,16 @@ async def test_failed_quality_gate_records_revision_without_saving(tmp_path, mon
             "chapter_draft_payload": {"draft_attempt": 1, "content_checksum": "abc", "content_chars": 12},
             "chapter_draft_attempt": 1,
             "chapter_draft_checksum": "abc",
-            "evaluation_feedback": {"passed": False, "score": 4, "issues": ["逻辑断裂"], "suggestions": ["重写动机"]},
+            "scene_plan_id": "plan-fail",
+            "scene_plan_checksum": "scene-fail-checksum",
+            "evaluation_feedback": {
+                "passed": False,
+                "score": 4,
+                "issues": ["逻辑断裂"],
+                "suggestions": ["重写动机"],
+                "scene_plan_adherence_check": {"passed": False, "failed_beat_ids": ["beat-fail"], "issues": ["beat 失败"]},
+                "failed_scene_beat_ids": ["beat-fail"],
+            },
         },
         node_states={},
     )
@@ -418,6 +444,8 @@ async def test_failed_quality_gate_records_revision_without_saving(tmp_path, mon
     assert execution.context.get("chapter_saved") is not True
     assert execution.context["is_retry"] is True
     assert execution.context["revision_history"][0]["quality_summary"]["issues_count"] == 1
+    assert execution.context["quality_failure_packet"]["scene_plan_id"] == "plan-fail"
+    assert execution.context["quality_failure_packet"]["failed_scene_beat_ids"] == ["beat-fail"]
     assert db.state_changes == {}
     assert "saved_chapter_state_writeback" not in execution.context
     assert events == [(execution.id, "chapter_revision_requested", execution.context["revision_history"][0])]

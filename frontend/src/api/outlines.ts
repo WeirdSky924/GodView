@@ -86,6 +86,7 @@ export interface ChapterOutline {
   approved_by?: string
   previous_outline_id?: string
   next_outline_id?: string
+  deleted_at?: string
 }
 
 export interface OutlineRevisionProposalResponse {
@@ -129,6 +130,51 @@ export interface GenerateOutlineRequest {
   special_requirements?: string[]
   session_id?: string
   request_id?: string
+  auto_save?: boolean
+  auto_approve?: boolean
+  approved_by?: string
+}
+
+export type OutlineGenerationScope = 'current' | 'selected' | 'all'
+export type OutlineGenerationOperation = 'generate' | 'audit' | 'revise'
+
+export interface BatchGenerateOutlineRequest {
+  project_id: string
+  start_chapter?: number
+  end_chapter?: number
+  chapter_numbers?: number[]
+  context?: string
+  previous_events?: string
+  special_requirements?: string[]
+  session_id?: string
+  request_id?: string
+  scope?: OutlineGenerationScope
+  operation?: OutlineGenerationOperation
+  auto_save?: boolean
+  auto_approve?: boolean
+  approved_by?: string
+}
+
+export interface BatchGenerateOutlineResult {
+  chapter_number: number
+  status: 'generated' | 'saved' | 'approved' | 'skipped' | 'failed' | string
+  outline?: ChapterOutline | null
+  saved_outline?: ChapterOutline | null
+  warnings: string[]
+  suggestions: string[]
+  context_packet?: AssistantContextSummary
+  error?: string
+}
+
+export interface BatchGenerateOutlineResponse {
+  success: boolean
+  mode: 'multi' | string
+  scope: OutlineGenerationScope | string
+  auto_save: boolean
+  auto_approve: boolean
+  results: BatchGenerateOutlineResult[]
+  summary: Record<string, number>
+  message: string
 }
 
 export interface GenerateOutlineResponse {
@@ -158,6 +204,7 @@ export interface ChatRequest {
   context?: Record<string, any>
   session_id?: string
   request_id?: string
+  auto_save?: boolean
 }
 
 export interface PendingOutline {
@@ -211,11 +258,13 @@ export interface ChatResponse {
   message: string
   outline_updates?: Partial<ChapterOutline>
   suggestions?: string[]
+  warnings?: string[]
   pending_outlines?: PendingOutline[]
   saved_outline?: ChapterOutline
   saved_outlines?: ChapterOutline[]  // 多章大纲保存
   assistant_session_id?: string
   context_packet?: AssistantContextSummary
+  parse_status?: 'outline_update' | 'no_outline_updates' | string
 }
 
 export type ResourceRequirementSeverity = 'blocking' | 'advisory' | 'optional'
@@ -423,16 +472,42 @@ export async function rejectOutlineRevisionById(
 /**
  * 删除大纲
  */
+export interface DeleteOutlineResponse {
+  success: boolean
+  message: string
+  outline_id?: string
+  chapter_number?: number
+  deleted_outline_ids?: string[]
+  deleted_versions?: number
+  remaining_versions?: number
+  soft_deleted_chapters?: number
+}
+
 export async function deleteOutline(
   projectId: string,
   chapterNumber: number,
-  options?: { softDeleteGeneratedChapters?: boolean }
-): Promise<{ success: boolean; message: string; soft_deleted_chapters?: number }> {
+  options?: { softDeleteGeneratedChapters?: boolean; deleteAllVersions?: boolean }
+): Promise<DeleteOutlineResponse> {
   const params = new URLSearchParams({ project_id: projectId })
   if (options?.softDeleteGeneratedChapters) {
     params.set('soft_delete_generated_chapters', 'true')
   }
+  if (options?.deleteAllVersions) {
+    params.set('delete_all_versions', 'true')
+  }
   return await api.delete(`${API_BASE}/${chapterNumber}?${params.toString()}`)
+}
+
+export async function deleteOutlineById(
+  projectId: string,
+  outlineId: string,
+  options?: { softDeleteGeneratedChapters?: boolean }
+): Promise<DeleteOutlineResponse> {
+  const params = new URLSearchParams({ project_id: projectId })
+  if (options?.softDeleteGeneratedChapters) {
+    params.set('soft_delete_generated_chapters', 'true')
+  }
+  return await api.delete(`${API_BASE}/by-id/${outlineId}?${params.toString()}`)
 }
 
 /**
@@ -445,12 +520,14 @@ export async function chatWithAgent(
   context?: Record<string, any>,
   sessionId?: string,
   requestId?: string,
+  autoSave = false,
 ): Promise<ChatResponse> {
   return await api.post(`${API_BASE}/${chapterNumber}/chat?project_id=${projectId}`, {
     message,
     context,
     session_id: sessionId,
     request_id: requestId,
+    auto_save: autoSave,
   })
 }
 
@@ -458,20 +535,9 @@ export async function chatWithAgent(
  * 批量生成大纲
  */
 export async function batchGenerateOutlines(
-  projectId: string,
-  startChapter: number,
-  endChapter: number,
-  options?: {
-    context?: string
-    parallel?: boolean
-  }
-): Promise<{ outlines: ChapterOutline[]; message: string }> {
-  return await api.post(`${API_BASE}/batch-generate`, {
-    project_id: projectId,
-    start_chapter: startChapter,
-    end_chapter: endChapter,
-    ...options,
-  })
+  request: BatchGenerateOutlineRequest
+): Promise<BatchGenerateOutlineResponse> {
+  return await api.post(`${API_BASE}/batch-generate`, request)
 }
 
 /**

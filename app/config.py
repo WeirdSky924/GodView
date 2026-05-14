@@ -29,7 +29,7 @@ class Settings(BaseSettings):
 
     # 应用基本信息
     app_name: str = "Godview"
-    app_version: str = "1.8.4"
+    app_version: str = "1.8.18"
     debug: bool = os.getenv("DEBUG", "false").lower() in {"1", "true", "yes", "on"}
     log_level: str = "INFO"
 

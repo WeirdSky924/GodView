@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from app.models.chapter_outline import (
     ChapterOutline,
@@ -22,6 +22,9 @@ from app.models.chapter_outline import (
     ValidateOutlineResponse,
     SceneOutline,
     EmotionCurve,
+    EmotionType,
+    SceneType,
+    ConflictLevel,
 )
 from app.services.plot_outline_service import get_plot_outline_service, set_plot_outline_service
 
@@ -82,6 +85,90 @@ def _validate_resource_requirement_severity(severity: Optional[str], *, default:
     return normalized
 
 
+def _normalize_emotion_value(emotion: Any) -> str:
+    value = str(emotion or "neutral").strip().lower()
+    aliases = {
+        "震惊": "surprise",
+        "惊讶": "surprise",
+        "恐惧": "fear",
+        "害怕": "fear",
+        "紧张": "tension",
+        "悬疑": "tension",
+        "平静": "neutral",
+        "希望": "anticipation",
+        "期待": "anticipation",
+        "放松": "relief",
+    }
+    normalized = aliases.get(value, value)
+    try:
+        return EmotionType(normalized).value
+    except ValueError:
+        return EmotionType.NEUTRAL.value
+
+
+def _normalize_scene_type_value(scene_type: Any) -> str:
+    value = str(scene_type or "dialogue").strip().lower()
+    aliases = {
+        "对话": "dialogue",
+        "对白": "dialogue",
+        "交谈": "dialogue",
+        "行动": "action",
+        "动作": "action",
+        "战斗": "action",
+        "描写": "description",
+        "描述": "description",
+        "环境": "description",
+        "转场": "transition",
+        "过渡": "transition",
+        "高潮": "climax",
+        "收束": "resolution",
+        "解决": "resolution",
+        "回忆": "flashback",
+        "闪回": "flashback",
+        "伏笔": "foreshadow",
+        "铺垫": "foreshadow",
+    }
+    normalized = aliases.get(value, value)
+    try:
+        return SceneType(normalized).value
+    except ValueError:
+        return SceneType.DIALOGUE.value
+
+
+def _normalize_conflict_level_value(conflict_level: Any) -> str:
+    value = str(conflict_level or "low").strip().lower()
+    aliases = {
+        "低": "low",
+        "轻微": "low",
+        "中": "medium",
+        "中等": "medium",
+        "高": "high",
+        "强": "high",
+        "激烈": "high",
+        "危急": "critical",
+        "关键": "critical",
+        "致命": "critical",
+    }
+    normalized = aliases.get(value, value)
+    try:
+        return ConflictLevel(normalized).value
+    except ValueError:
+        return ConflictLevel.LOW.value
+
+
+def _normalize_pending_scene(scene: Dict[str, Any], index: int) -> Dict[str, Any]:
+    data = dict(scene)
+    data["scene_number"] = data.get("scene_number") or index + 1
+    data["title"] = str(data.get("title") or f"场景{index + 1}").strip() or f"场景{index + 1}"
+    data["summary"] = str(data.get("summary") or data.get("description") or data["title"]).strip()
+    data["scene_type"] = _normalize_scene_type_value(data.get("scene_type", "dialogue"))
+    data["conflict_level"] = _normalize_conflict_level_value(data.get("conflict_level", "low"))
+    data["emotion_start"] = _normalize_emotion_value(data.get("emotion_start", "neutral"))
+    data["emotion_end"] = _normalize_emotion_value(data.get("emotion_end", "neutral"))
+    data["emotion_arc"] = [_normalize_emotion_value(item) for item in data.get("emotion_arc") or []]
+    return data
+
+
 # ==================== 请求/响应模型 ====================
 
 class GenerateOutlineRequestAPI(BaseModel):
@@ -93,6 +180,64 @@ class GenerateOutlineRequestAPI(BaseModel):
     special_requirements: Optional[List[str]] = Field(None, description="特殊要求")
     session_id: Optional[str] = Field(None, description="Assistant Context 会话 ID")
     request_id: Optional[str] = Field(None, description="幂等请求 ID")
+    auto_save: bool = Field(False, description="是否生成后自动保存为草稿/修订提案")
+    auto_approve: bool = Field(False, description="是否在自动保存后立即审批")
+    approved_by: Optional[str] = Field(None, description="自动审批人")
+
+
+class BatchGenerateOutlineRequest(BaseModel):
+    """批量/多章大纲生成请求。"""
+    project_id: str
+    start_chapter: Optional[int] = Field(None, ge=1, description="起始章节号")
+    end_chapter: Optional[int] = Field(None, ge=1, description="结束章节号")
+    chapter_numbers: Optional[List[int]] = Field(None, description="指定章节号列表")
+    context: Optional[str] = Field(None, description="额外上下文")
+    previous_events: Optional[str] = Field(None, description="前文事件")
+    special_requirements: Optional[List[str]] = Field(None, description="特殊要求")
+    session_id: Optional[str] = Field(None, description="Assistant Context 会话 ID")
+    request_id: Optional[str] = Field(None, description="幂等请求 ID")
+    scope: str = Field("selected", description="current/selected/all")
+    operation: str = Field("generate", description="generate/audit/revise")
+    auto_save: bool = Field(False, description="是否生成后自动保存")
+    auto_approve: bool = Field(False, description="是否保存后自动审批")
+    approved_by: Optional[str] = Field(None, description="自动审批人")
+
+    @model_validator(mode="after")
+    def validate_generation_policy(self):
+        if self.auto_approve and not self.auto_save:
+            raise ValueError("auto_approve 需要同时开启 auto_save")
+        if self.auto_approve and not (self.approved_by or "").strip():
+            raise ValueError("auto_approve 需要提供 approved_by")
+        if self.chapter_numbers:
+            self.chapter_numbers = sorted({int(chapter) for chapter in self.chapter_numbers if int(chapter) > 0})
+        elif self.start_chapter is not None and self.end_chapter is not None:
+            if self.end_chapter < self.start_chapter:
+                raise ValueError("end_chapter 不能小于 start_chapter")
+        else:
+            raise ValueError("必须提供 chapter_numbers 或 start_chapter/end_chapter")
+        return self
+
+
+class BatchGenerateOutlineResult(BaseModel):
+    chapter_number: int
+    status: str
+    outline: Optional[ChapterOutline] = None
+    saved_outline: Optional[ChapterOutline] = None
+    warnings: List[str] = Field(default_factory=list)
+    suggestions: List[str] = Field(default_factory=list)
+    context_packet: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+
+class BatchGenerateOutlineResponse(BaseModel):
+    success: bool
+    mode: str = "multi"
+    scope: str = "selected"
+    auto_save: bool = False
+    auto_approve: bool = False
+    results: List[BatchGenerateOutlineResult] = Field(default_factory=list)
+    summary: Dict[str, int] = Field(default_factory=dict)
+    message: str = ""
 
 
 class CreateOutlineRequest(BaseModel):
@@ -165,6 +310,7 @@ class ChatRequest(BaseModel):
     context: Optional[Dict[str, Any]] = None
     session_id: Optional[str] = Field(None, description="Assistant Context 会话 ID")
     request_id: Optional[str] = Field(None, description="幂等请求 ID")
+    auto_save: bool = Field(False, description="是否自动保存 Agent 输出的大纲 JSON；默认仅预览/待确认")
 
 
 class ChatResponse(BaseModel):
@@ -172,12 +318,14 @@ class ChatResponse(BaseModel):
     message: str
     outline_updates: Optional[Dict[str, Any]] = None
     suggestions: Optional[List[str]] = None
+    warnings: Optional[List[str]] = None
     pending_outlines: Optional[List[PendingOutline]] = None
     saved_outline: Optional[Dict[str, Any]] = None
     saved_outlines: Optional[List[Dict[str, Any]]] = None  # 多章大纲保存
     prompt_render_trace: Optional[Dict[str, Any]] = None
     assistant_session_id: Optional[str] = None
     context_packet: Optional[Dict[str, Any]] = None
+    parse_status: Optional[str] = None
 
 
 class SavePendingOutlinesRequest(BaseModel):
@@ -851,8 +999,27 @@ async def save_pending_outlines(
     for pending in request.outlines:
         chapter_number = pending.chapter_number
         try:
-            scenes = [SceneOutline(**s) for s in pending.scenes] if pending.scenes else []
-            emotion_curve = EmotionCurve(**pending.emotion_curve) if pending.emotion_curve else None
+            scenes = [
+                SceneOutline(**_normalize_pending_scene(s, i))
+                for i, s in enumerate(pending.scenes or [])
+                if isinstance(s, dict)
+            ]
+            emotion_curve_payload = dict(pending.emotion_curve or {})
+            if emotion_curve_payload:
+                emotion_curve_payload.setdefault("chapter_number", chapter_number)
+            if emotion_curve_payload.get("dominant_emotion"):
+                emotion_curve_payload["dominant_emotion"] = _normalize_emotion_value(
+                    emotion_curve_payload.get("dominant_emotion")
+                )
+            if emotion_curve_payload.get("points"):
+                normalized_points = []
+                for point in emotion_curve_payload.get("points") or []:
+                    if isinstance(point, dict):
+                        point_data = dict(point)
+                        point_data["emotion"] = _normalize_emotion_value(point_data.get("emotion"))
+                        normalized_points.append(point_data)
+                emotion_curve_payload["points"] = normalized_points
+            emotion_curve = EmotionCurve(**emotion_curve_payload) if emotion_curve_payload else None
 
             # 检查是否已存在该章节大纲
             existing = await service.get_outline(project_id, chapter_number)
@@ -1047,12 +1214,106 @@ async def get_outline(project_id: str, chapter_number: int):
     return outline
 
 
+async def _persist_generated_outline_if_requested(
+    service,
+    *,
+    project_id: str,
+    chapter_number: int,
+    generated: GenerateOutlineResponse,
+    auto_save: bool,
+    auto_approve: bool,
+    approved_by: Optional[str],
+) -> Optional[ChapterOutline]:
+    if not auto_save:
+        return None
+    saved_outline, _ = await service._save_outline_updates(
+        project_id=project_id,
+        default_chapter_number=chapter_number,
+        outline_updates=generated.outline.model_dump(mode="json"),
+    )
+    if auto_approve and saved_outline:
+        approved = await service.approve_outline(saved_outline.id, approved_by or "outline_agent")
+        return approved or saved_outline
+    return saved_outline
+
+
+@router.post("/batch-generate", response_model=BatchGenerateOutlineResponse)
+async def batch_generate_outlines(request: BatchGenerateOutlineRequest):
+    """批量生成/预览章节大纲；默认不写库，写库/审批必须显式开启。"""
+    service = get_plot_outline_service()
+    if request.chapter_numbers:
+        chapter_numbers = request.chapter_numbers
+    else:
+        chapter_numbers = list(range(int(request.start_chapter or 1), int(request.end_chapter or request.start_chapter or 1) + 1))
+
+    results: List[BatchGenerateOutlineResult] = []
+    generated_count = saved_count = approved_count = failed_count = 0
+    for chapter_number in chapter_numbers:
+        try:
+            generated = await service.generate_outline(
+                project_id=request.project_id,
+                chapter_number=chapter_number,
+                context=request.context,
+                previous_events=request.previous_events,
+                session_id=request.session_id,
+                request_id=f"{request.request_id}:{chapter_number}" if request.request_id else None,
+            )
+            generated_count += 1
+            saved_outline = await _persist_generated_outline_if_requested(
+                service,
+                project_id=request.project_id,
+                chapter_number=chapter_number,
+                generated=generated,
+                auto_save=request.auto_save,
+                auto_approve=request.auto_approve,
+                approved_by=request.approved_by,
+            )
+            status = "generated"
+            if saved_outline:
+                saved_count += 1
+                status = "approved" if saved_outline.status == ChapterOutlineStatus.APPROVED else "saved"
+                if saved_outline.status == ChapterOutlineStatus.APPROVED:
+                    approved_count += 1
+            results.append(BatchGenerateOutlineResult(
+                chapter_number=chapter_number,
+                status=status,
+                outline=generated.outline,
+                saved_outline=saved_outline,
+                warnings=generated.warnings,
+                suggestions=generated.suggestions,
+                context_packet=generated.context_packet,
+            ))
+        except Exception as exc:
+            logger.exception("批量生成第 %s 章大纲失败", chapter_number)
+            failed_count += 1
+            results.append(BatchGenerateOutlineResult(
+                chapter_number=chapter_number,
+                status="failed",
+                error=str(exc),
+            ))
+
+    return BatchGenerateOutlineResponse(
+        success=failed_count == 0,
+        scope=request.scope,
+        auto_save=request.auto_save,
+        auto_approve=request.auto_approve,
+        results=results,
+        summary={
+            "generated": generated_count,
+            "saved": saved_count,
+            "approved": approved_count,
+            "failed": failed_count,
+        },
+        message=f"已处理 {len(chapter_numbers)} 章：生成 {generated_count}，保存 {saved_count}，审批 {approved_count}，失败 {failed_count}",
+    )
+
+
 @router.post("/{chapter_number}/generate", response_model=GenerateOutlineResponse)
 async def generate_outline(project_id: str, chapter_number: int, request: GenerateOutlineRequestAPI):
     """
     生成章节大纲
 
-    使用 AI 自动生成章节大纲
+    使用 AI 自动生成章节大纲；默认只返回预览，不直接保存。
     """
     service = get_plot_outline_service()
     result = await service.generate_outline(
@@ -1062,6 +1323,15 @@ async def generate_outline(project_id: str, chapter_number: int, request: Genera
         previous_events=request.previous_events,
         session_id=request.session_id,
         request_id=request.request_id,
+    )
+    await _persist_generated_outline_if_requested(
+        service,
+        project_id=project_id,
+        chapter_number=chapter_number,
+        generated=result,
+        auto_save=request.auto_save,
+        auto_approve=request.auto_approve,
+        approved_by=request.approved_by,
     )
     return result
 
@@ -1183,11 +1453,43 @@ async def approve_outline(project_id: str, chapter_number: int, request: Approve
     return updated
 
 
+@router.delete("/by-id/{outline_id}")
+async def delete_outline_by_id(
+    project_id: str,
+    outline_id: str,
+    soft_delete_generated_chapters: bool = Query(False, description="是否同步软删除该大纲生成的小说正文"),
+):
+    """按 outline ID 精确删除一个大纲版本。"""
+    service = get_plot_outline_service()
+    outline = await service.get_outline_by_id(project_id, outline_id)
+    if not outline:
+        raise HTTPException(status_code=404, detail="章节大纲版本不存在")
+
+    result = await service.delete_outline(
+        outline.id,
+        soft_delete_generated_chapters=soft_delete_generated_chapters,
+    )
+    if not result.get("success"):
+        raise HTTPException(status_code=500, detail="删除失败")
+
+    versions = await service.get_outline_versions(project_id, outline.chapter_number)
+    soft_deleted_chapters = int(result.get("soft_deleted_chapters", 0))
+    return {
+        "success": True,
+        "message": f"第{outline.chapter_number}章大纲版本已删除，剩余 {versions['total']} 个版本",
+        "outline_id": outline.id,
+        "chapter_number": outline.chapter_number,
+        "remaining_versions": versions["total"],
+        "soft_deleted_chapters": soft_deleted_chapters,
+    }
+
+
 @router.delete("/{chapter_number}")
 async def delete_outline(
     project_id: str,
     chapter_number: int,
     soft_delete_generated_chapters: bool = Query(False, description="是否同步软删除该大纲生成的小说正文"),
+    delete_all_versions: bool = Query(False, description="是否删除该章节的全部大纲版本"),
 ):
     """
     删除章节大纲
@@ -1196,28 +1498,39 @@ async def delete_outline(
     soft_delete_generated_chapters=true，则软删除该大纲关联生成的章节。
     """
     service = get_plot_outline_service()
-    outline = await service.get_outline(project_id, chapter_number)
-
-    if not outline:
+    versions = await service.get_outline_versions(project_id, chapter_number)
+    if versions["total"] == 0:
         raise HTTPException(status_code=404, detail="章节大纲不存在")
 
-    result = await service.delete_outline(
-        outline.id,
-        soft_delete_generated_chapters=soft_delete_generated_chapters,
-    )
+    targets = list(versions["versions"]) if delete_all_versions else [await service.get_outline(project_id, chapter_number)]
+    targets = [outline for outline in targets if outline]
+    if not targets:
+        raise HTTPException(status_code=404, detail="章节大纲不存在")
 
-    if not result.get("success"):
-        raise HTTPException(status_code=500, detail="删除失败")
+    soft_deleted_chapters = 0
+    deleted_ids: List[str] = []
+    for outline in targets:
+        result = await service.delete_outline(
+            outline.id,
+            soft_delete_generated_chapters=soft_delete_generated_chapters,
+        )
+        if not result.get("success"):
+            raise HTTPException(status_code=500, detail="删除失败")
+        deleted_ids.append(outline.id)
+        soft_deleted_chapters += int(result.get("soft_deleted_chapters", 0))
 
-    soft_deleted_chapters = int(result.get("soft_deleted_chapters", 0))
+    remaining = await service.get_outline_versions(project_id, chapter_number)
     if soft_delete_generated_chapters:
-        message = f"第{chapter_number}章大纲已删除，已软删除 {soft_deleted_chapters} 个关联生成章节"
+        message = f"第{chapter_number}章已删除 {len(deleted_ids)} 个大纲版本，已软删除 {soft_deleted_chapters} 个关联生成章节"
     else:
-        message = f"第{chapter_number}章大纲已删除，已生成正文已保留"
+        message = f"第{chapter_number}章已删除 {len(deleted_ids)} 个大纲版本，已生成正文已保留"
 
     return {
         "success": True,
         "message": message,
+        "deleted_outline_ids": deleted_ids,
+        "deleted_versions": len(deleted_ids),
+        "remaining_versions": remaining["total"],
         "soft_deleted_chapters": soft_deleted_chapters,
     }
 
@@ -1243,23 +1556,41 @@ async def chat_with_agent(project_id: str, chapter_number: int, request: ChatReq
         context=request.context,
         session_id=request.session_id,
         request_id=request.request_id,
+        auto_save=request.auto_save,
     )
 
-    # 处理 pending_outlines
+    # 处理 pending_outlines；逐条容错，避免单个格式问题让整轮聊天失败。
     pending_outlines = None
     if response.get("pending_outlines"):
-        pending_outlines = [PendingOutline(**o) for o in response["pending_outlines"]]
+        pending_outlines = []
+        for index, outline in enumerate(response["pending_outlines"]):
+            try:
+                outline_payload = dict(outline)
+                if not outline_payload.get("chapter_number"):
+                    outline_payload["chapter_number"] = chapter_number + index
+                outline_payload["title"] = str(outline_payload.get("title") or f"第{outline_payload['chapter_number']}章")
+                outline_payload["summary"] = str(outline_payload.get("summary") or outline_payload["title"])
+                outline_payload["scenes"] = [
+                    _normalize_pending_scene(scene, scene_index)
+                    for scene_index, scene in enumerate(outline_payload.get("scenes") or [])
+                    if isinstance(scene, dict)
+                ]
+                pending_outlines.append(PendingOutline(**outline_payload))
+            except Exception:
+                logger.warning("跳过无法转换为待保存大纲的 Agent 输出项: index=%s payload=%s", index, outline, exc_info=True)
 
     return ChatResponse(
         message=response.get("message", ""),
         outline_updates=response.get("outline_updates"),
         suggestions=response.get("suggestions"),
+        warnings=response.get("warnings"),
         pending_outlines=pending_outlines,
         saved_outline=response.get("saved_outline"),
         saved_outlines=response.get("saved_outlines"),
         prompt_render_trace=response.get("prompt_render_trace"),
         assistant_session_id=response.get("assistant_session_id"),
         context_packet=response.get("context_packet"),
+        parse_status=response.get("parse_status"),
     )
 
 

@@ -372,7 +372,10 @@ ROLE_CHARACTER = PromptTemplate(
 注意事项：
 - 不要直接描述自己的心理活动，而是通过言行表现出来
 - 避免使用现代词汇或与时代背景不符的表达
-- 角色的知识和能力要与设定相符""",
+- 角色的知识和能力要与设定相符
+- 设定真实 ≠ 角色可知；角色只能基于身份、经历、位置、权限、能力、关系和本场景实际获得的线索行动
+- 公开言行只能表达角色当前能说、能做、能被看见/听见的内容，不要泄露作者视角、未来剧情或其他角色私密想法
+- 缺少角色、设定、地点、物品、能力或事件规则时，提出 warning / 资源需求，不要现场发明成事实""",
     variables=["character_background", "character_personality", "character_goals"],
     default_values={
         "character_background": "一个普通人",
@@ -832,6 +835,9 @@ ROLE_DUNGEON_GENERATOR = PromptTemplate(
 - 难度曲线要合理（由易到难）
 - 提供多种解决方案
 - 奖励要与风险匹配
+- 副本必须有前因、触发机制、参与者卷入理由、退出条件和失败后果
+- 不得临场发明万能道具、未铺垫能力、未授权高阶人物、关键地点或新规则来解决核心危机
+- 缺少关键地点、敌人规则、奖励来源、危机解决规则或设定依据时，提出资源需求，不要现场发明成事实
 
 请按以下格式输出副本：
 ```json
@@ -984,6 +990,11 @@ FUNCTION_DUNGEON_DESIGN = PromptTemplate(
    - 与主线剧情自然衔接
    - 提供世界观补充
    - 推动人物成长
+
+5. **因果与资源安全**
+   - 每个副本必须说明前因、entry_trigger、participant_involvement_reason、failure_consequences 和后续状态改变
+   - 奖励必须说明 risk_reward_balance、来源、使用限制、后续用途和代价
+   - 关键危机解决只能依赖 crisis_resolution_resources 中已铺垫资源；缺口写入 resource_requirements，不要现场发明成事实
 
 副本设计请求参数：
 - 副本类型

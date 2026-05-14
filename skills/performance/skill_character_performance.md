@@ -92,14 +92,28 @@ parameters:
 - 情感变化过程
 - 决策思考
 
+#### 5. public/private 信息边界
+
+- **设定真实 ≠ 角色可知**：角色只能依据自己当前身份、经历、位置、权限、能力、关系和本场景实际获得的线索判断。
+- `dialogue` / `action` / `expression` 属于 public_content，只能包含其他角色可看见、可听见或可合理推断的内容。
+- `inner_thought` 属于 private_thought，仅供 Writer/Evaluator 理解角色状态；其他角色不得无故知道其中内容。
+- hidden_intent、withheld_information、misinterpretation 可以影响角色表演，但不得泄露进公开台词，除非场景里有可信信息来源。
+- 信息越界时不要硬演：如果角色缺少知道秘密的渠道，应表现为困惑、误判、警觉、试探或沉默。
+- 不得为了推进剧情临场发明关键能力、道具、地点、组织、救场规则或把缺失资源说成既定事实；缺口应写入 warnings / resource_requirements。
+
 ### 输出格式（JSON）
 
 ```json
 {
-  "dialogue": "角色说的话",
-  "action": "角色的动作",
-  "expression": "角色的表情",
-  "inner_thought": "内心活动（可选）",
-  "emotion_shift": "情绪变化（如有）"
+  "dialogue": "角色说的话（public_content，只包含公开可听见内容）",
+  "action": "角色的动作（public_content，只包含公开可看见内容）",
+  "expression": "角色的表情（public_content，只包含外显线索）",
+  "inner_thought": "内心活动（private_thought，可选；只能包含角色本人当前可知内容）",
+  "emotion_shift": "情绪变化（如有）",
+  "knowledge_basis": "角色当前判断依据：亲眼所见/传闻/经验/他人告知/能力感知等（可选）",
+  "withheld_information": "角色选择隐瞒但不公开说出的信息（可选）",
+  "misinterpretation": "角色基于有限线索产生的误判（可选）",
+  "warnings": ["如存在信息越界或资源缺口，在此说明"],
+  "resource_requirements": ["缺少但不能现场发明的设定/地点/能力/道具等"]
 }
 ```

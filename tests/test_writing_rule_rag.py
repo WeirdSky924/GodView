@@ -174,6 +174,17 @@ async def test_retrieve_on_match_rule_can_fallback_on_explicit_match_without_qdr
     assert result["retrieved_rules"][0]["reason"] == "explicit_match"
 
 
+def test_system_de_ai_rule_contains_outline_transposition_examples():
+    from app.data.web_novel_writing_rules import WEB_NOVEL_WRITING_RULES
+
+    rule = next(item for item in WEB_NOVEL_WRITING_RULES if item["id"] == "style_de_ai_natural_prose")
+
+    assert "大纲不是正文" in rule["content"]
+    assert "恒星塞进了他的颅腔" in rule["content"]
+    assert "记忆碎片" in "\n".join(rule["examples"])
+    assert "大纲转场景" in "\n".join(rule["examples"])
+
+
 def test_extract_retrieve_on_match_terms_supports_stringified_tags_from_db_rows():
     rule = WritingRule.model_construct(
         id="custom_rule_1",

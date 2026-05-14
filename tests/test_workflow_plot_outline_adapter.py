@@ -168,60 +168,23 @@ class TestPlotOutlineWorkflowAdapter:
         assert service.calls["generate_outline"] == []
 
     @pytest.mark.asyncio
-    async def test_execute_falls_back_to_generate_when_outline_missing(self, monkeypatch):
-        generated_outline = {
-            "id": "outline-generated-3",
-            "title": "裂钟回响",
-            "summary": "守夜人从回响中拼出真相。",
-            "chapter_goals": "阻止裂钟再次鸣响",
-            "scenes": [
-                {
-                    "title": "钟楼顶层",
-                    "participating_characters": ["守夜人", "洛澜", "守夜人"],
-                }
-            ],
-        }
-        service = _FakePlotOutlineService(
-            stored_outline=None,
-            generated_outline=generated_outline,
-            suggestions=["补充钟楼结构细节"],
-            warnings=["上一章摘要缺失，已按有限上下文生成"],
-        )
+    async def test_execute_blocks_when_approved_outline_missing(self, monkeypatch):
+        from app.services.workflow_engine import ChapterReadinessBlockedError
+
+        service = _FakePlotOutlineService(stored_outline=None, generated_outline={"id": "generated-ignored"})
         monkeypatch.setattr(plot_outline_adapter_module, "get_plot_outline_service", lambda: service)
 
-        result = await self.adapter.execute(
-            node=None,
-            execution=self._make_execution(
-                context={
-                    "chapter_num": 9,
-                    "chapter_title": "预设标题",
-                    "chapter_summary": "预设摘要",
-                    "previous_chapters": [
-                        {"chapter_num": 7, "title": "潮汐裂隙", "summary": "进入裂隙"},
-                        {"chapter_num": 8, "title": "雾港余烬", "summary": "搜寻残片"},
-                    ],
-                }
-            ),
-            db=None,
-        )
+        with pytest.raises(ChapterReadinessBlockedError) as exc_info:
+            await self.adapter.execute(
+                node=None,
+                execution=self._make_execution(context={"chapter_num": 9}),
+                db=None,
+            )
 
-        self._assert_output_shape(result)
-        assert result["chapter_number"] == 9
-        assert result["chapter_title"] == "裂钟回响"
-        assert result["chapter_summary"] == "守夜人从回响中拼出真相。"
-        assert result["chapter_goals"] == ["阻止裂钟再次鸣响"]
-        assert result["outline_id"] == "outline-generated-3"
-        assert result["outline_source"] == "generated"
-        assert result["suggestions"] == ["补充钟楼结构细节"]
-        assert result["warnings"] == ["上一章摘要缺失，已按有限上下文生成"]
-        assert result["scene_directions"]["selected_characters"] == ["守夜人", "洛澜"]
+        payload = exc_info.value.payload
+        assert payload["block_reason"] == "approved_outline_missing"
+        assert payload["chapter_num"] == 9
         assert service.calls["get_chapter_outline_for_workflow"] == [
             {"project_id": "test-project", "chapter_number": 9}
         ]
-        assert len(service.calls["generate_outline"]) == 1
-        generate_call = service.calls["generate_outline"][0]
-        assert generate_call["project_id"] == "test-project"
-        assert generate_call["chapter_number"] == 9
-        assert "当前工作流目标章节：第9章" in generate_call["context"]
-        assert "第7章《潮汐裂隙》：进入裂隙" in generate_call["previous_events"]
-        assert "第8章《雾港余烬》：搜寻残片" in generate_call["previous_events"]
+        assert service.calls["generate_outline"] == []

@@ -1416,6 +1416,12 @@ class WriterAgent(BaseAgent):
                 ],
                 "packet": workflow_context.get("confirmed_prior_state_packet"),
             }),
+            ("Master 场景计划（优先级高于普通写作计划）", workflow_context.get("master_scene_plan") or workflow_context.get("scene_plan")),
+            ("Writer 执行简报", workflow_context.get("writer_brief")),
+            ("Master 修订指令（重试时优先遵循）", workflow_context.get("master_revision_directive") or workflow_context.get("revision_directive")),
+            ("修订执行简报", workflow_context.get("writer_revision_brief")),
+            ("Evaluator 复评关注点", workflow_context.get("evaluator_focus")),
+            ("质量失败包", workflow_context.get("quality_failure_packet")),
             ("总编剧写作计划", workflow_context.get("writing_plan") or workflow_context.get("plot_guidance")),
             ("次要角色辅助计划", workflow_context.get("supporting_character_plan")),
             ("已确认/待使用次要角色", workflow_context.get("plotter_created_characters") or workflow_context.get("character_candidates")),
@@ -1434,6 +1440,8 @@ class WriterAgent(BaseAgent):
             parts.append(
                 "【工作流状态使用要求】\n"
                 "以上内容是本次章节写作的动态事实输入源，必须按 Writer 配置规则中的工作流上下文绑定规则使用。"
+                "如存在 Master 场景计划或 Master 修订指令，它们是本轮写作/重写的最高优先级执行简报；"
+                "不得只根据 Evaluator 原始建议自由重写。"
             )
 
         return "\n\n".join(parts)

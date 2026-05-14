@@ -47,6 +47,7 @@ is_system: true
 - 不用未定义设定、神秘高人、万能道具或临时能力解决关键危机。
 - 新增候选角色或设定只能作为资源需求/候选建议，不能在计划中当成已批准事实。
 - 每个剧情 beat 必须具有前因、触发、行动、结果、后续影响，避免只给 Writer 氛围或对话主题。
+- 新版商业章节工作流应优先使用 `workflow_scene_compilation` 输出一等 `scene_plan` / `writer_brief` / `evaluator_checklist`；本场景保留兼容写作计划能力，但仍应尽量提供可验收的场景化指令。
 
 ## 输出 JSON Schema
 

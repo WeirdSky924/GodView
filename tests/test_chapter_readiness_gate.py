@@ -211,7 +211,7 @@ async def test_readiness_gate_rejects_non_current_approved_outline(monkeypatch):
             _GateFakeDB(),
         )
 
-    assert exc_info.value.payload["block_reason"] == "outline_not_current_approved"
+    assert exc_info.value.payload["block_reason"] == "outline_superseded"
     assert exc_info.value.payload["chapter_outline_id"] == OUTLINE_ID
 
 
@@ -455,3 +455,102 @@ async def test_director_auto_mode_exposes_blocked_chapter_and_completes(monkeypa
     assert any(event_type == "chapter_blocked" for event_type, _ in events)
     completed_events = [data for event_type, data in events if event_type == "completed"]
     assert completed_events[-1]["blocked_chapters"] == 1
+
+
+@pytest.mark.asyncio
+async def test_director_auto_mode_blocks_without_approved_outline(monkeypatch):
+    director = DirectorSystem({"id": "world-1", "name": "测试世界"}, project_id=PROJECT_ID)
+    events = []
+
+    async def callback(event_type, data):
+        events.append((event_type, data))
+
+    class FakeEngine:
+        async def get_workflow(self, workflow_id, db):
+            return {"id": workflow_id}
+
+    class FakePlotService:
+        async def get_outlines_by_project(self, project_id):
+            return []
+
+    monkeypatch.setattr("app.services.workflow_engine.get_workflow_engine", lambda: FakeEngine())
+    monkeypatch.setattr("app.services.plot_outline_service.get_plot_outline_service", lambda: FakePlotService())
+    monkeypatch.setattr("app.api.app.postgres_db", _GateFakeDB())
+
+    result = await director.start_auto_mode(
+        workflow_id="workflow-1",
+        chapter_count=1,
+        words_per_chapter=1200,
+        callback=callback,
+        project_id=PROJECT_ID,
+    )
+
+    assert result["success"] is False
+    assert result["blocked_chapters"][0]["block_reason"] == "approved_outline_required"
+    assert any(event_type == "chapter_blocked" for event_type, _ in events)
+
+
+@pytest.mark.asyncio
+async def test_director_auto_mode_pauses_instead_of_direct_fallback_when_workflow_not_completed(monkeypatch):
+    director = DirectorSystem({"id": "world-1", "name": "测试世界"}, project_id=PROJECT_ID)
+    events = []
+    auto_write_called = False
+
+    async def callback(event_type, data):
+        events.append((event_type, data))
+
+    class FakeExecution:
+        status = "failed"
+        context = {}
+
+    class FakeEngine:
+        async def get_workflow(self, workflow_id, db):
+            return {"id": workflow_id}
+
+        async def execute_workflow(self, workflow_id, project_id, initial_context, db):
+            return "exec-failed"
+
+        async def get_execution_state(self, execution_id, db):
+            return FakeExecution()
+
+    fake_outline = SimpleNamespace(
+        id=OUTLINE_ID,
+        chapter_number=3,
+        title="第三章",
+        summary="推进剧情",
+        chapter_goals=[],
+        target_word_count=1200,
+        status="approved",
+        next_outline_id=None,
+        model_dump=lambda mode="json": {"id": OUTLINE_ID, "chapter_number": 3, "status": "approved"},
+    )
+
+    class FakePlotService:
+        async def get_outlines_by_project(self, project_id):
+            return [fake_outline]
+
+    async def fake_auto_write_chapter(*args, **kwargs):
+        nonlocal auto_write_called
+        auto_write_called = True
+        return {"success": True}
+
+    monkeypatch.setattr("app.services.workflow_engine.get_workflow_engine", lambda: FakeEngine())
+    monkeypatch.setattr("app.services.plot_outline_service.get_plot_outline_service", lambda: FakePlotService())
+    monkeypatch.setattr("app.api.app.postgres_db", _GateFakeDB())
+    monkeypatch.setattr(director, "auto_write_chapter", fake_auto_write_chapter)
+
+    result = await director.start_auto_mode(
+        workflow_id="workflow-1",
+        chapter_count=1,
+        words_per_chapter=1200,
+        callback=callback,
+        outline_mode="selected",
+        outline_ids=[OUTLINE_ID],
+        project_id=PROJECT_ID,
+    )
+
+    assert result["success"] is True
+    assert result["chapters"] == []
+    assert result["blocked_chapters"][0]["block_reason"] == "workflow_not_completed"
+    assert auto_write_called is False
+    assert any(event_type == "chapter_blocked" for event_type, _ in events)

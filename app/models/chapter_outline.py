@@ -237,6 +237,7 @@ class ChapterOutline(BaseModel):
     # 关联信息
     previous_outline_id: Optional[str] = Field(None, description="上一章大纲ID")
     next_outline_id: Optional[str] = Field(None, description="下一章大纲ID")
+    deleted_at: Optional[datetime] = Field(None, description="软删除时间")
 
     model_config = ConfigDict(
         json_schema_extra={

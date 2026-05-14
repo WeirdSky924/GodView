@@ -46,6 +46,30 @@ class _DeAIStyleCheck(BaseModel):
     rewrite_focus: List[str] = Field(default_factory=list)
 
 
+class _OutlineTranspositionCheck(BaseModel):
+    passed: bool = True
+    issues: List[str] = Field(default_factory=list)
+    copied_outline_phrases: List[str] = Field(default_factory=list)
+    missing_scene_grounding: List[str] = Field(default_factory=list)
+    rewrite_focus: List[str] = Field(default_factory=list)
+
+
+class _ScenePlanAdherenceCheck(BaseModel):
+    passed: bool = True
+    covered_beat_ids: List[str] = Field(default_factory=list)
+    missing_beat_ids: List[str] = Field(default_factory=list)
+    failed_beat_ids: List[str] = Field(default_factory=list)
+    issues: List[str] = Field(default_factory=list)
+    rewrite_focus: List[str] = Field(default_factory=list)
+
+
+class _RevisionDirectiveAdherenceCheck(BaseModel):
+    passed: bool = True
+    resolved_issue_ids: List[str] = Field(default_factory=list)
+    unresolved_issue_ids: List[str] = Field(default_factory=list)
+    issues: List[str] = Field(default_factory=list)
+
+
 class EvaluatorChapterEndSchema(BaseModel):
     """章节结束判定输出。"""
 
@@ -69,6 +93,11 @@ class EvaluatorChapterEndSchema(BaseModel):
     upstream_context_usage_check: Dict[str, Any] = Field(default_factory=dict)
     asset_persistence_check: Dict[str, Any] = Field(default_factory=dict)
     de_ai_style_check: _DeAIStyleCheck = Field(default_factory=_DeAIStyleCheck)
+    outline_transposition_check: _OutlineTranspositionCheck = Field(default_factory=_OutlineTranspositionCheck)
+    scene_plan_adherence_check: _ScenePlanAdherenceCheck = Field(default_factory=_ScenePlanAdherenceCheck)
+    revision_directive_adherence_check: _RevisionDirectiveAdherenceCheck = Field(default_factory=_RevisionDirectiveAdherenceCheck)
+    failed_scene_beat_ids: List[str] = Field(default_factory=list)
+    scene_coverage: Dict[str, Any] = Field(default_factory=dict)
 
     model_config = {"extra": "allow"}
 
@@ -353,6 +382,84 @@ class MasterPlotterAdvanceSchema(BaseModel):
     model_config = _PERMISSIVE_CONFIG
 
 
+class MasterSceneBeatSchema(BaseModel):
+    """Master 将大纲节点编译成可执行场景 beat 的最小单元。"""
+
+    beat_id: str = ""
+    sequence_index: int = 0
+    purpose: str = ""
+    outline_refs: List[str] = Field(default_factory=list)
+    location: str = ""
+    pov_character: Optional[str] = None
+    required_characters: List[str] = Field(default_factory=list)
+    cause: str = ""
+    trigger: str = ""
+    character_action: str = ""
+    sensory_or_environment_feedback: List[str] = Field(default_factory=list)
+    visible_result: str = ""
+    information_release: List[str] = Field(default_factory=list)
+    transition_to_next: str = ""
+    target_word_count: int = 0
+    must_include: List[str] = Field(default_factory=list)
+    forbidden_shortcuts: List[str] = Field(default_factory=list)
+    acceptance_criteria: List[str] = Field(default_factory=list)
+
+    model_config = _PERMISSIVE_CONFIG
+
+
+class MasterScenePlanSchema(BaseModel):
+    """Master 场景编译输出，供 Writer/Evaluator/质量门消费。"""
+
+    plan_id: str = ""
+    plan_version: str = "scene_compiler_v1"
+    chapter_intent: str = ""
+    core_conflict: str = ""
+    continuity_constraints: List[str] = Field(default_factory=list)
+    scene_plan: List[MasterSceneBeatSchema] = Field(default_factory=list)
+    writer_brief: Dict[str, Any] = Field(default_factory=dict)
+    ending_hook_contract: Dict[str, Any] = Field(default_factory=dict)
+    evaluator_checklist: Dict[str, Any] = Field(default_factory=dict)
+    style_constraints: List[str] = Field(default_factory=list)
+    risk_flags: List[str] = Field(default_factory=list)
+    resource_requirements: List[Dict[str, Any]] = Field(default_factory=list)
+
+    model_config = _PERMISSIVE_CONFIG
+
+
+class MasterRevisionIssueSchema(BaseModel):
+    """Master 修订导演识别出的单个可执行问题。"""
+
+    issue_id: str = ""
+    failure_type: str = ""
+    severity: str = "medium"
+    source: str = ""
+    failed_scene_beat_ids: List[str] = Field(default_factory=list)
+    evidence: List[str] = Field(default_factory=list)
+    diagnosis: str = ""
+    required_fix: str = ""
+
+    model_config = _PERMISSIVE_CONFIG
+
+
+class MasterRevisionDirectiveSchema(BaseModel):
+    """Master 在质量门失败后给 Writer/Rewriter 的修订导演指令。"""
+
+    revision_id: str = ""
+    revision_attempt: int = 1
+    overall_diagnosis: str = ""
+    rewrite_strategy: str = "targeted_patch"
+    issues: List[MasterRevisionIssueSchema] = Field(default_factory=list)
+    preserve: List[str] = Field(default_factory=list)
+    replace_or_remove: List[str] = Field(default_factory=list)
+    scene_plan_delta: Dict[str, Any] = Field(default_factory=dict)
+    writer_revision_brief: Dict[str, Any] = Field(default_factory=dict)
+    evaluator_focus: List[str] = Field(default_factory=list)
+    acceptance_criteria: List[str] = Field(default_factory=list)
+    forbidden_regressions: List[str] = Field(default_factory=list)
+
+    model_config = _PERMISSIVE_CONFIG
+
+
 class MasterPlotterWritingPlanSchema(BaseModel):
     """章节工作流中总编剧的索引/检查/写作计划输出。"""
 
@@ -364,6 +471,10 @@ class MasterPlotterWritingPlanSchema(BaseModel):
     supporting_character_plan: Dict[str, Any] = Field(default_factory=dict)
     role_delta_resource_requirements: List[Dict[str, Any]] = Field(default_factory=list)
     resource_requirements: List[Dict[str, Any]] = Field(default_factory=list)
+    master_scene_plan: Optional[MasterScenePlanSchema] = None
+    scene_plan: List[MasterSceneBeatSchema] = Field(default_factory=list)
+    writer_brief: Dict[str, Any] = Field(default_factory=dict)
+    evaluator_checklist: Dict[str, Any] = Field(default_factory=dict)
     suggested_chapter_outline: Optional[Dict[str, Any]] = None
     suggested_chapter_goals: Optional[List[Any]] = None
 

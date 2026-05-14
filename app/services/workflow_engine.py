@@ -1454,29 +1454,47 @@ class WorkflowEngine:
                 nodes=[
                     WorkflowNode(id="start", node_type=NodeType.START, label="开始", position={"x": 0, "y": 0}),
                     WorkflowNode(
+                        id="master_scene_compiler",
+                        node_type=NodeType.AGENT,
+                        agent_type="master_plotter",
+                        label="Master 场景编译夹具",
+                        config={"scenario": "workflow_scene_compilation", "task": "compile_scene_plan"},
+                        position={"x": 180, "y": 0},
+                    ),
+                    WorkflowNode(
                         id="writer",
                         node_type=NodeType.AGENT,
                         agent_type="writer",
                         label="Writer 状态交接夹具" if is_state_handoff_fixture else "Writer 质量门夹具",
                         config={"quality_gate_enabled": True},
-                        position={"x": 220, "y": 0},
+                        position={"x": 360, "y": 0},
                     ),
                     WorkflowNode(
                         id="evaluator",
                         node_type=NodeType.AGENT,
                         agent_type="evaluator",
                         label="Evaluator 状态交接夹具" if is_state_handoff_fixture else "Evaluator 质量门夹具",
-                        position={"x": 440, "y": 0},
+                        position={"x": 540, "y": 0},
                     ),
-                    WorkflowNode(id="gate", node_type=NodeType.CONDITION, label="质量门", position={"x": 660, "y": 0}),
-                    WorkflowNode(id="end", node_type=NodeType.END, label="结束", position={"x": 880, "y": 0}),
+                    WorkflowNode(id="gate", node_type=NodeType.CONDITION, label="质量门", config={"max_retry_policy": "human_review_required"}, position={"x": 720, "y": 0}),
+                    WorkflowNode(
+                        id="master_revision_director",
+                        node_type=NodeType.AGENT,
+                        agent_type="master_plotter",
+                        label="Master 修订导演夹具",
+                        config={"scenario": "workflow_revision_director", "task": "prepare_revision_directive"},
+                        position={"x": 900, "y": 120},
+                    ),
+                    WorkflowNode(id="end", node_type=NodeType.END, label="结束", position={"x": 1080, "y": 0}),
                 ],
                 edges=[
-                    WorkflowEdge(id="edge_start_writer", source="start", target="writer"),
+                    WorkflowEdge(id="edge_start_master_scene", source="start", target="master_scene_compiler"),
+                    WorkflowEdge(id="edge_master_scene_writer", source="master_scene_compiler", target="writer"),
                     WorkflowEdge(id="edge_writer_evaluator", source="writer", target="evaluator"),
                     WorkflowEdge(id="edge_evaluator_gate", source="evaluator", target="gate"),
                     WorkflowEdge(id="edge_gate_end", source="gate", target="end", condition={"result": "pass"}),
-                    WorkflowEdge(id="edge_gate_retry", source="gate", target="writer", condition={"result": "retry"}),
+                    WorkflowEdge(id="edge_gate_retry_master", source="gate", target="master_revision_director", condition={"result": "retry"}),
+                    WorkflowEdge(id="edge_master_revision_writer", source="master_revision_director", target="writer"),
                 ],
                 variables={"runtime_fixture": True, "fixture_type": normalized_type, "cleanup_token": cleanup_token},
                 is_template=False,
@@ -3041,6 +3059,12 @@ class WorkflowEngine:
             "writer_output_content_chars": len(content_value),
             "writer_output_word_count": writer_output.get("word_count"),
             "writer_prompt_trace_present": bool(compact_prompt_trace),
+            "scene_plan_id": execution.context.get("scene_plan_id"),
+            "scene_plan_checksum": execution.context.get("scene_plan_checksum"),
+            "scene_plan_attempt": execution.context.get("scene_plan_attempt"),
+            "revision_directive_id": execution.context.get("revision_directive_id"),
+            "revision_directive_checksum": execution.context.get("revision_directive_checksum"),
+            "revision_directive_attempt": execution.context.get("revision_directive_attempt"),
         }
         if compact_prompt_trace:
             provenance["writer_prompt_trace"] = compact_prompt_trace
@@ -4643,7 +4667,15 @@ class WorkflowEngine:
             self._attach_upcoming_outline_context(context)
 
         if resolved_agent_type in {"master_plotter", "plotter"} and context.get("chapter_outline"):
-            context.setdefault("task", "prepare_writing_plan")
+            node_config = node.config or {}
+            if node_config.get("task"):
+                context["task"] = node_config["task"]
+            elif resolved_scenario == "workflow_scene_compilation":
+                context["task"] = "compile_scene_plan"
+            elif resolved_scenario == "workflow_revision_director":
+                context["task"] = "prepare_revision_directive"
+            else:
+                context.setdefault("task", "prepare_writing_plan")
 
         execution.context.update(context)
         logger.info(
@@ -4733,6 +4765,153 @@ class WorkflowEngine:
 
         serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    def _make_compact_scene_plan_summary(self, plan: Dict[str, Any]) -> Dict[str, Any]:
+        scene_plan = plan.get("scene_plan") if isinstance(plan, dict) else []
+        beats = scene_plan if isinstance(scene_plan, list) else []
+        return self._make_json_safe({
+            "plan_id": plan.get("plan_id") if isinstance(plan, dict) else None,
+            "plan_version": plan.get("plan_version") if isinstance(plan, dict) else None,
+            "beat_count": len(beats),
+            "beat_ids": [str(beat.get("beat_id"))[:80] for beat in beats[:20] if isinstance(beat, dict) and beat.get("beat_id")],
+            "chapter_intent": str(plan.get("chapter_intent") or "")[:240] if isinstance(plan, dict) else "",
+            "core_conflict": str(plan.get("core_conflict") or "")[:240] if isinstance(plan, dict) else "",
+        })
+
+    def _make_compact_revision_directive_summary(self, directive: Dict[str, Any]) -> Dict[str, Any]:
+        issues = directive.get("issues") if isinstance(directive, dict) else []
+        issues = issues if isinstance(issues, list) else []
+        return self._make_json_safe({
+            "revision_id": directive.get("revision_id") if isinstance(directive, dict) else None,
+            "revision_attempt": directive.get("revision_attempt") if isinstance(directive, dict) else None,
+            "rewrite_strategy": directive.get("rewrite_strategy") if isinstance(directive, dict) else None,
+            "issue_count": len(issues),
+            "issue_ids": [str(issue.get("issue_id"))[:80] for issue in issues[:20] if isinstance(issue, dict) and issue.get("issue_id")],
+            "overall_diagnosis": str(directive.get("overall_diagnosis") or "")[:240] if isinstance(directive, dict) else "",
+        })
+
+    async def _normalize_master_workflow_output(
+        self,
+        node: WorkflowNode,
+        output_data: Dict[str, Any],
+        execution: "WorkflowExecution",
+        db=None,
+    ) -> Dict[str, Any]:
+        updates: Dict[str, Any] = {}
+        scene_plan = output_data.get("master_scene_plan")
+        if not isinstance(scene_plan, dict) and isinstance(output_data.get("scene_plan"), list):
+            scene_plan = {
+                "plan_id": output_data.get("plan_id") or f"{node.id}_scene_plan",
+                "plan_version": output_data.get("plan_version") or "scene_compiler_v1",
+                "scene_plan": output_data.get("scene_plan"),
+                "writer_brief": output_data.get("writer_brief") or {},
+                "evaluator_checklist": output_data.get("evaluator_checklist") or {},
+                "ending_hook_contract": output_data.get("ending_hook_contract") or {},
+                "resource_requirements": output_data.get("resource_requirements") or [],
+            }
+        if isinstance(scene_plan, dict):
+            attempt = int(execution.context.get("scene_plan_attempt") or 0) + 1
+            checksum = self._hash_json_payload(scene_plan)
+            plan_id = scene_plan.get("plan_id") or f"{node.id}_scene_plan_{attempt}"
+            scene_plan = {**scene_plan, "plan_id": plan_id}
+            summary = self._make_compact_scene_plan_summary(scene_plan)
+            provenance = self._make_json_safe({
+                "source_node_id": node.id,
+                "source_node_label": node.label,
+                "source_agent_type": node.agent_type,
+                "source_trace_id": execution.trace_id,
+                "compiled_at": datetime.now().isoformat(),
+            })
+            history = execution.context.get("scene_plan_history")
+            if not isinstance(history, list):
+                history = []
+            history.append({**summary, "attempt": attempt, "checksum": checksum, "provenance": provenance})
+            updates.update({
+                "master_scene_plan": scene_plan,
+                "scene_plan": scene_plan.get("scene_plan", []),
+                "scene_plan_id": plan_id,
+                "scene_plan_attempt": attempt,
+                "scene_plan_checksum": checksum,
+                "scene_plan_provenance": provenance,
+                "scene_plan_history": history,
+                "writer_brief": scene_plan.get("writer_brief") or output_data.get("writer_brief") or {},
+                "evaluator_checklist": scene_plan.get("evaluator_checklist") or output_data.get("evaluator_checklist") or {},
+            })
+            event = self._make_json_safe({**summary, "attempt": attempt, "checksum": checksum, "node_id": node.id})
+            await self._broadcast_status(execution.id, "master_scene_plan_compiled", event)
+            if db:
+                await get_trace_service(db).record_event("master_scene_plan_compiled", event)
+
+        directive = output_data.get("master_revision_directive") or output_data.get("revision_directive")
+        if isinstance(directive, dict):
+            attempt = int(execution.context.get("revision_directive_attempt") or 0) + 1
+            checksum = self._hash_json_payload(directive)
+            revision_id = directive.get("revision_id") or f"{node.id}_revision_{attempt}"
+            directive = {**directive, "revision_id": revision_id, "revision_attempt": directive.get("revision_attempt") or attempt}
+            summary = self._make_compact_revision_directive_summary(directive)
+            history = execution.context.get("revision_directive_history")
+            if not isinstance(history, list):
+                history = []
+            history.append({**summary, "attempt": attempt, "checksum": checksum, "created_at": datetime.now().isoformat()})
+            updates.update({
+                "master_revision_directive": directive,
+                "revision_directive": directive,
+                "revision_directive_id": revision_id,
+                "revision_directive_attempt": attempt,
+                "revision_directive_checksum": checksum,
+                "revision_directive_history": history,
+                "writer_revision_brief": directive.get("writer_revision_brief") or output_data.get("writer_revision_brief") or {},
+                "evaluator_focus": directive.get("evaluator_focus") or output_data.get("evaluator_focus") or [],
+            })
+            event = self._make_json_safe({**summary, "attempt": attempt, "checksum": checksum, "node_id": node.id})
+            await self._broadcast_status(execution.id, "master_revision_directive_created", event)
+            if db:
+                await get_trace_service(db).record_event("master_revision_directive_created", event)
+
+        if updates:
+            get_workflow_state(execution).merge_runtime_state(updates, source=f"master_artifact:{node.id}")
+            output_data.update(self._make_json_safe(updates))
+        return updates
+
+    def _build_quality_failure_packet(
+        self,
+        execution: "WorkflowExecution",
+        node: WorkflowNode,
+        evaluation_feedback: Dict[str, Any],
+        retry_count: int,
+    ) -> Dict[str, Any]:
+        summary = self._build_quality_summary(evaluation_feedback if isinstance(evaluation_feedback, dict) else {})
+        failed_beat_ids = summary.get("failed_scene_beat_ids") or []
+        scene_check = summary.get("scene_plan_adherence_check") or {}
+        if isinstance(scene_check, dict):
+            for beat_id in scene_check.get("missing_beat_ids") or []:
+                if beat_id not in failed_beat_ids:
+                    failed_beat_ids.append(beat_id)
+            for beat_id in scene_check.get("failed_beat_ids") or []:
+                if beat_id not in failed_beat_ids:
+                    failed_beat_ids.append(beat_id)
+        return self._make_json_safe({
+            "condition_node_id": node.id,
+            "condition_node_label": node.label,
+            "retry_count": retry_count,
+            "draft_attempt": execution.context.get("chapter_draft_attempt"),
+            "draft_checksum": execution.context.get("chapter_draft_checksum"),
+            "draft_word_count": execution.context.get("chapter_draft_word_count"),
+            "quality_summary": summary,
+            "failed_checks": [key for key in (
+                "word_count_check",
+                "de_ai_style_check",
+                "outline_transposition_check",
+                "scene_plan_adherence_check",
+                "revision_directive_adherence_check",
+                "deterministic_style_gate",
+            ) if isinstance(summary.get(key), dict) and summary[key].get("passed") is False],
+            "deterministic_style_gate": summary.get("deterministic_style_gate"),
+            "failed_scene_beat_ids": failed_beat_ids,
+            "scene_plan_id": execution.context.get("scene_plan_id"),
+            "scene_plan_checksum": execution.context.get("scene_plan_checksum"),
+            "requested_at": datetime.now().isoformat(),
+        })
 
     def _compact_state_packet_text(self, value: Any, limit: int = 240) -> str:
         text = self._coerce_context_text(value).strip()
@@ -5946,6 +6125,16 @@ class WorkflowEngine:
 
         output_data = payload if isinstance(payload, dict) else {}
 
+        normalized_master_output = None
+        resolved_agent_type = context.get("_resolved_agent_type") or node.agent_type
+        if result.success and resolved_agent_type in {"master_plotter", "plotter"} and isinstance(output_data, dict):
+            normalized_master_output = await self._normalize_master_workflow_output(
+                node,
+                output_data,
+                execution,
+                db,
+            )
+
         # 如果是评估 Agent，保存完整评估结果
         if node.agent_type == "evaluator" and result.success:
             # 字数检查
@@ -5983,6 +6172,17 @@ class WorkflowEngine:
                 output_data["approved"] = False
                 output_data["pass"] = False
 
+            deterministic_style_gate = self._run_deterministic_chapter_style_gate(
+                chapter_content,
+                output_data,
+                execution.context,
+            )
+            output_data["deterministic_style_gate"] = deterministic_style_gate
+            if not deterministic_style_gate.get("passed", True):
+                output_data["quality_passed"] = False
+                output_data["approved"] = False
+                output_data["pass"] = False
+
             def _get_explicit_bool(data: Dict[str, Any], keys: List[str], default: bool) -> bool:
                 for key in keys:
                     if key in data:
@@ -5996,6 +6196,14 @@ class WorkflowEngine:
                 evaluation_issues = [str(evaluation_issues)] if evaluation_issues else []
             if not isinstance(evaluation_suggestions, list):
                 evaluation_suggestions = [str(evaluation_suggestions)] if evaluation_suggestions else []
+            gate_issues = deterministic_style_gate.get("issues") if isinstance(deterministic_style_gate, dict) else []
+            gate_suggestions = deterministic_style_gate.get("suggestions") if isinstance(deterministic_style_gate, dict) else []
+            for issue in gate_issues if isinstance(gate_issues, list) else []:
+                if issue and str(issue) not in evaluation_issues:
+                    evaluation_issues.append(str(issue))
+            for suggestion in gate_suggestions if isinstance(gate_suggestions, list) else []:
+                if suggestion and str(suggestion) not in evaluation_suggestions:
+                    evaluation_suggestions.append(str(suggestion))
 
             # 字数不达标或超标直接判定为不合格
             if not word_count_check.get("passed", True):
@@ -6014,6 +6222,13 @@ class WorkflowEngine:
                 "summary": output_data.get("summary", output_data.get("comment", "")),
                 "word_count_check": word_count_check,
                 "coherence_check": output_data.get("coherence_check", {}),
+                "de_ai_style_check": output_data.get("de_ai_style_check", {}),
+                "outline_transposition_check": output_data.get("outline_transposition_check", {}),
+                "scene_plan_adherence_check": output_data.get("scene_plan_adherence_check", {}),
+                "revision_directive_adherence_check": output_data.get("revision_directive_adherence_check", {}),
+                "failed_scene_beat_ids": output_data.get("failed_scene_beat_ids", []),
+                "scene_coverage": output_data.get("scene_coverage", {}),
+                "deterministic_style_gate": deterministic_style_gate,
             }
 
             # 如果字数不达标，添加到issues
@@ -6116,7 +6331,9 @@ class WorkflowEngine:
 
         # 如果是编剧 Agent，保存剧情规划
         if node.agent_type in ["master_plotter", "plotter"] and result.success and output_data:
-            await self._save_plot_from_plotter(execution, output_data, db)
+            scenario = context.get("agent_scenario") or context.get("scenario")
+            if scenario not in {"workflow_scene_compilation", "workflow_revision_director"}:
+                await self._save_plot_from_plotter(execution, output_data, db)
 
         # ========== 保存 Agent 记忆 ==========
         if hasattr(agent, 'save_memory') and agent._memory:
@@ -6370,6 +6587,116 @@ class WorkflowEngine:
     def _extract_writer_content(self, writer_output: Dict[str, Any]) -> str:
         return writer_output.get("content") or writer_output.get("chapter_content") or ""
 
+    def _run_deterministic_chapter_style_gate(
+        self,
+        chapter_content: str,
+        evaluator_output: Dict[str, Any],
+        execution_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Conservatively catch severe AI-prose and outline-expansion failures."""
+        issues: List[str] = []
+        suggestions: List[str] = []
+        warnings: List[str] = []
+        content = chapter_content or ""
+        output = evaluator_output if isinstance(evaluator_output, dict) else {}
+
+        def _subcheck_failed(key: str) -> bool:
+            check = output.get(key)
+            return isinstance(check, dict) and check.get("passed") is False
+
+        if _subcheck_failed("de_ai_style_check"):
+            issues.append("Evaluator de_ai_style_check 未通过，质量门强制要求修订。")
+        if _subcheck_failed("outline_transposition_check"):
+            issues.append("Evaluator outline_transposition_check 未通过，正文疑似只是扩写大纲而非场景化创作。")
+        if _subcheck_failed("scene_plan_adherence_check"):
+            issues.append("Evaluator scene_plan_adherence_check 未通过，正文未完成 Master 场景计划硬性 beat。")
+        if _subcheck_failed("revision_directive_adherence_check"):
+            issues.append("Evaluator revision_directive_adherence_check 未通过，Writer 未解决 Master 修订指令中的阻断项。")
+
+        summary = str(output.get("summary") or output.get("comment") or "").strip()
+        raw_issues = output.get("issues") or output.get("problems") or []
+        if not isinstance(raw_issues, list):
+            raw_issues = [raw_issues] if raw_issues else []
+        optimistic_pass = any(output.get(key) is True for key in ("quality_passed", "approved", "pass"))
+        if optimistic_pass and not summary and not raw_issues:
+            warnings.append("Evaluator 声称通过但 summary 与 issues 为空，质量证据不足。")
+
+        paragraphs = [part.strip() for part in re.split(r"\n+", content) if part.strip()]
+        cosmic_terms = ("恒星", "宇宙", "星辰", "苍穹", "命运", "永恒", "古老")
+        vague_terms = ("某个存在", "另一个存在", "不可名状", "未知存在")
+        abstract_lore_terms = ("记忆碎片", "失落的力量", "警告符号", "古老的代码", "真相", "意识", "灵魂")
+        summary_patterns = ("这不仅", "更是", "意味着", "在这一刻", "终于明白", "真正的危机才刚刚开始")
+        trigger_terms = ("像是", "仿佛", "属于", "涌入", "呼啸")
+        grounding_terms = ("手", "指", "眼", "血", "疼", "咳", "退", "握", "按", "摔", "抬头", "屏幕", "灯", "墙", "门", "声音", "耳", "气味", "「", "」")
+        abstract_terms = ("力量", "存在", "记忆", "警告", "命运", "真相", "意义", "意识", "灵魂", "情绪", "恐惧", "复杂")
+
+        severe_style_hits = 0
+        abstract_without_grounding = 0
+        for paragraph in paragraphs:
+            density = sum(paragraph.count(term) for term in (*cosmic_terms, *vague_terms, *abstract_lore_terms, *summary_patterns))
+            triggers = sum(paragraph.count(term) for term in trigger_terms)
+            if density >= 4 and triggers >= 1:
+                severe_style_hits += 1
+            abstract_count = sum(paragraph.count(term) for term in abstract_terms)
+            grounding_count = sum(paragraph.count(term) for term in grounding_terms)
+            if abstract_count >= 5 and grounding_count <= 1:
+                abstract_without_grounding += 1
+
+        if severe_style_hits:
+            issues.append("正文存在高密度 AI 式抽象/宇宙级比喻堆叠，破坏角色有限视角和场景沉浸。")
+            suggestions.append("删除过重比喻和设定标签，改为身体反应、设备异常、物件变化或局部代价进入大纲节点。")
+        if abstract_without_grounding >= 2:
+            issues.append("多个段落以抽象概念推进，缺少角色行动、感官反馈或环境后果。")
+            suggestions.append("把抽象信息拆成场景触发、角色误判、可见动作和具体后果。")
+
+        repeated_phrases = []
+        for phrase in re.findall(r"[\u4e00-\u9fff，。！？；：、]{10,28}", content):
+            normalized = phrase.strip("，。！？；：、")
+            if len(normalized) >= 10 and content.count(normalized) >= 2 and normalized not in repeated_phrases:
+                repeated_phrases.append(normalized)
+                if len(repeated_phrases) >= 3:
+                    break
+        if repeated_phrases:
+            issues.append(f"正文存在重复长句/短语：{'；'.join(repeated_phrases[:3])}")
+            suggestions.append("清理重复句式和重复意象，避免机械扩写感。")
+
+        passed = not issues
+        return self._make_json_safe({
+            "passed": passed,
+            "issues": issues,
+            "suggestions": suggestions,
+            "warnings": warnings,
+            "version": "de_ai_outline_scene_v1",
+        })
+
+    def _compact_quality_check(self, check: Dict[str, Any]) -> Dict[str, Any]:
+        """Keep quality-gate sub-check evidence compact enough for trace/history."""
+        if not isinstance(check, dict) or not check:
+            return {}
+        compact: Dict[str, Any] = {}
+        if "passed" in check:
+            compact["passed"] = check.get("passed")
+        for key in (
+            "issues",
+            "suggestions",
+            "rewrite_focus",
+            "copied_outline_phrases",
+            "missing_scene_grounding",
+            "covered_beat_ids",
+            "missing_beat_ids",
+            "failed_beat_ids",
+            "resolved_issue_ids",
+            "unresolved_issue_ids",
+        ):
+            value = check.get(key)
+            if isinstance(value, list):
+                compact[key] = [str(item)[:180] for item in value[:5] if item]
+            elif value:
+                compact[key] = [str(value)[:180]]
+        if check.get("version"):
+            compact["version"] = str(check.get("version"))[:80]
+        return compact
+
     def _build_quality_summary(self, feedback: Dict[str, Any]) -> Dict[str, Any]:
         issues = feedback.get("issues") if isinstance(feedback, dict) else []
         suggestions = feedback.get("suggestions") if isinstance(feedback, dict) else []
@@ -6377,6 +6704,11 @@ class WorkflowEngine:
             issues = [str(issues)] if issues else []
         if not isinstance(suggestions, list):
             suggestions = [str(suggestions)] if suggestions else []
+        de_ai_style_check = feedback.get("de_ai_style_check") if isinstance(feedback, dict) and isinstance(feedback.get("de_ai_style_check"), dict) else {}
+        outline_transposition_check = feedback.get("outline_transposition_check") if isinstance(feedback, dict) and isinstance(feedback.get("outline_transposition_check"), dict) else {}
+        deterministic_style_gate = feedback.get("deterministic_style_gate") if isinstance(feedback, dict) and isinstance(feedback.get("deterministic_style_gate"), dict) else {}
+        scene_plan_adherence_check = feedback.get("scene_plan_adherence_check") if isinstance(feedback, dict) and isinstance(feedback.get("scene_plan_adherence_check"), dict) else {}
+        revision_directive_adherence_check = feedback.get("revision_directive_adherence_check") if isinstance(feedback, dict) and isinstance(feedback.get("revision_directive_adherence_check"), dict) else {}
         return self._make_json_safe({
             "passed": feedback.get("passed") if isinstance(feedback, dict) else None,
             "score": feedback.get("score") if isinstance(feedback, dict) else None,
@@ -6386,6 +6718,13 @@ class WorkflowEngine:
             "suggestions": [str(item)[:240] for item in suggestions[:5]],
             "summary": str(feedback.get("summary") or "")[:500] if isinstance(feedback, dict) else "",
             "word_count_check": feedback.get("word_count_check") if isinstance(feedback, dict) else None,
+            "de_ai_style_check": self._compact_quality_check(de_ai_style_check),
+            "outline_transposition_check": self._compact_quality_check(outline_transposition_check),
+            "scene_plan_adherence_check": self._compact_quality_check(scene_plan_adherence_check),
+            "revision_directive_adherence_check": self._compact_quality_check(revision_directive_adherence_check),
+            "failed_scene_beat_ids": [str(item)[:80] for item in (feedback.get("failed_scene_beat_ids") or [])[:10]] if isinstance(feedback, dict) and isinstance(feedback.get("failed_scene_beat_ids"), list) else [],
+            "scene_coverage": feedback.get("scene_coverage") if isinstance(feedback, dict) and isinstance(feedback.get("scene_coverage"), dict) else {},
+            "deterministic_style_gate": self._compact_quality_check(deterministic_style_gate),
         })
 
     def _build_quality_gate_saved_metadata(self, execution: "WorkflowExecution") -> Dict[str, Any]:
@@ -6405,6 +6744,12 @@ class WorkflowEngine:
             "revision_attempts": len(revisions),
             "finalized_from_draft_attempt": execution.context.get("chapter_draft_attempt"),
             "forced_pass": gate.get("forced_pass"),
+            "scene_plan_id": execution.context.get("scene_plan_id"),
+            "scene_plan_checksum": execution.context.get("scene_plan_checksum"),
+            "scene_plan_attempt": execution.context.get("scene_plan_attempt"),
+            "revision_directive_id": execution.context.get("revision_directive_id"),
+            "revision_directive_attempt": execution.context.get("revision_directive_attempt"),
+            "final_scene_coverage": self._build_quality_summary(execution.context.get("evaluation_feedback") if isinstance(execution.context.get("evaluation_feedback"), dict) else {}).get("scene_coverage"),
         })
 
     async def _stage_writer_draft(
@@ -6436,6 +6781,12 @@ class WorkflowEngine:
         )
         draft_payload = {
             "draft_attempt": attempt,
+            "scene_plan_id": execution.context.get("scene_plan_id"),
+            "scene_plan_checksum": execution.context.get("scene_plan_checksum"),
+            "scene_plan_attempt": execution.context.get("scene_plan_attempt"),
+            "revision_directive_id": execution.context.get("revision_directive_id"),
+            "revision_directive_checksum": execution.context.get("revision_directive_checksum"),
+            "revision_directive_attempt": execution.context.get("revision_directive_attempt"),
             "chapter_num": execution.context.get("chapter_num"),
             "chapter_number": execution.context.get("chapter_num"),
             "chapter_title": execution.context.get("chapter_title"),
@@ -6500,6 +6851,10 @@ class WorkflowEngine:
             "suggestions": summary.get("suggestions"),
             "summary": summary.get("summary"),
             "word_count_check": summary.get("word_count_check"),
+            "scene_plan_adherence_check": summary.get("scene_plan_adherence_check"),
+            "revision_directive_adherence_check": summary.get("revision_directive_adherence_check"),
+            "failed_scene_beat_ids": summary.get("failed_scene_beat_ids"),
+            "scene_coverage": summary.get("scene_coverage"),
             "evaluated_at": datetime.now().isoformat(),
         })
         history = execution.context.get("quality_gate_history")
@@ -8136,6 +8491,14 @@ class WorkflowEngine:
             })
             revision_history.append(revision_entry)
             execution.context["revision_history"] = revision_history
+            quality_failure_packet = self._build_quality_failure_packet(
+                execution,
+                node,
+                evaluation_feedback if isinstance(evaluation_feedback, dict) else {},
+                retry_count,
+            )
+            execution.context["quality_failure_packet"] = quality_failure_packet
+            output["quality_failure_packet"] = quality_failure_packet
             if isinstance(execution.context.get("quality_gate"), dict):
                 execution.context["quality_gate"] = {**execution.context["quality_gate"], "status": "revision_requested"}
                 execution.context["quality_gate_status"] = "revision_requested"
@@ -9127,12 +9490,36 @@ class WorkflowEngine:
                     "advisory_requirements": [],
                 })
 
-            outline_status = str(outline_payload.get("status") or "").lower()
-            if outline_status != "approved" or outline_payload.get("next_outline_id"):
+            if outline_payload.get("deleted_at"):
                 raise ChapterReadinessBlockedError({
                     "readiness_status": "blocked",
-                    "block_reason": "outline_not_current_approved",
-                    "message": f"第 {resolved_chapter_num or chapter_num or '未知'} 章大纲不是当前已审批版本，不能启动章节生成工作流。",
+                    "block_reason": "outline_deleted",
+                    "message": f"第 {resolved_chapter_num or chapter_num or '未知'} 章大纲已删除，不能启动章节生成工作流。",
+                    "chapter_num": resolved_chapter_num or chapter_num,
+                    "chapter_outline_id": outline_payload.get("id") or requested_outline_id,
+                    "outline_status": str(outline_payload.get("status") or "").lower() or None,
+                    "blocking_requirements": [],
+                    "advisory_requirements": [],
+                })
+
+            outline_status = str(outline_payload.get("status") or "").lower()
+            if outline_payload.get("next_outline_id"):
+                raise ChapterReadinessBlockedError({
+                    "readiness_status": "blocked",
+                    "block_reason": "outline_superseded",
+                    "message": f"第 {resolved_chapter_num or chapter_num or '未知'} 章大纲已被后续版本替代，不能启动章节生成工作流。",
+                    "chapter_num": resolved_chapter_num or chapter_num,
+                    "chapter_outline_id": outline_payload.get("id") or requested_outline_id,
+                    "outline_status": outline_status,
+                    "superseded_by_outline_id": outline_payload.get("next_outline_id"),
+                    "blocking_requirements": [],
+                    "advisory_requirements": [],
+                })
+            if outline_status != "approved":
+                raise ChapterReadinessBlockedError({
+                    "readiness_status": "blocked",
+                    "block_reason": "outline_revision_not_approved" if outline_status == "revision" else "approved_outline_required",
+                    "message": f"第 {resolved_chapter_num or chapter_num or '未知'} 章大纲不是已审批版本，不能启动章节生成工作流。",
                     "chapter_num": resolved_chapter_num or chapter_num,
                     "chapter_outline_id": outline_payload.get("id") or requested_outline_id,
                     "outline_status": outline_status,
@@ -9143,6 +9530,17 @@ class WorkflowEngine:
             context["chapter_num"] = resolved_chapter_num or chapter_num
             context["chapter_outline_id"] = str(outline_payload.get("id"))
             context["chapter_outline"] = outline_payload
+            context["chapter_outline_status"] = outline_status
+            context["chapter_outline_approved_at"] = outline_payload.get("approved_at")
+            context["chapter_outline_snapshot_hash"] = self._hash_json_payload({
+                "id": outline_payload.get("id"),
+                "chapter_number": resolved_chapter_num or chapter_num,
+                "title": outline_payload.get("title"),
+                "summary": outline_payload.get("summary"),
+                "status": outline_status,
+                "approved_at": outline_payload.get("approved_at"),
+                "updated_at": outline_payload.get("updated_at"),
+            })
             context.setdefault("chapter_title", outline_payload.get("title", f"第{context.get('chapter_num')}章"))
             context.setdefault("chapter_summary", outline_payload.get("summary", ""))
             outline_target_word_count = outline_payload.get("target_word_count")
@@ -12260,6 +12658,20 @@ class WorkflowEngine:
                 if retry_edge:
                     # 检查是否达到重试上限
                     if retry_count >= self.MAX_RETRY_COUNT:
+                        max_retry_policy = (current_node.config or {}).get("max_retry_policy") if current_node and current_node.config else None
+                        if max_retry_policy == "human_review_required":
+                            logger.warning(f"已达到重试上限 ({self.MAX_RETRY_COUNT} 次)，进入人工复核而非强制保存")
+                            execution.context["human_review_required"] = True
+                            execution.context["human_review_reason"] = f"已重试 {retry_count} 次仍未通过质量门"
+                            if isinstance(execution.context.get("quality_gate"), dict):
+                                execution.context["quality_gate"] = {
+                                    **execution.context["quality_gate"],
+                                    "status": "human_review_required",
+                                    "human_review_required": True,
+                                    "human_review_reason": execution.context["human_review_reason"],
+                                }
+                                execution.context["quality_gate_status"] = "human_review_required"
+                            return None
                         logger.warning(f"已达到重试上限 ({self.MAX_RETRY_COUNT} 次)，强制通过")
                         execution.context["forced_pass"] = True
                         execution.context["forced_pass_reason"] = f"已重试 {retry_count} 次仍未通过评估，自动接受当前内容"

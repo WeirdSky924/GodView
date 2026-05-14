@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from app.services.plot_outline_service import get_plot_outline_service
+from app.services.workflow_engine import ChapterReadinessBlockedError
 
 
 class PlotOutlineWorkflowAdapter:
@@ -34,20 +35,15 @@ class PlotOutlineWorkflowAdapter:
             outline_source = "database"
 
         if outline_payload is None:
-            outline_result = await service.generate_outline(
-                project_id=execution.project_id,
-                chapter_number=chapter_number,
-                context=self._build_runtime_context(context, chapter_number),
-                previous_events=self._build_previous_events(context),
-            )
-            outline_payload = self._normalize_outline_payload(
-                outline_result.outline,
-                chapter_number=chapter_number,
-                context=context,
-            )
-            suggestions = list(outline_result.suggestions or [])
-            warnings = list(outline_result.warnings or [])
-            outline_source = "generated"
+            raise ChapterReadinessBlockedError({
+                "readiness_status": "blocked",
+                "block_reason": "approved_outline_missing",
+                "message": "正式写作工作流必须绑定当前已审批大纲；Plot Outline 节点不会在写作流程中自动生成替代大纲。",
+                "chapter_num": chapter_number,
+                "chapter_outline_id": context.get("chapter_outline_id") or context.get("outline_id"),
+                "blocking_requirements": [],
+                "advisory_requirements": [],
+            })
 
         scene_directions = self._build_scene_directions(outline_payload)
 

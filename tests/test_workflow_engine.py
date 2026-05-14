@@ -1590,7 +1590,7 @@ class TestWorkflowExecution:
                 evaluator_attempts["count"] += 1
                 if evaluator_attempts["count"] == 1:
                     return FakeAgentResponse({"quality_passed": False, "score": 4, "issues": ["动机断裂"], "suggestions": ["重写动机"], "word_count_check": {"passed": True}})
-                return FakeAgentResponse({"quality_passed": True, "score": 8.5, "issues": [], "suggestions": ["可保存"], "word_count_check": {"passed": True}})
+                return FakeAgentResponse({"quality_passed": True, "score": 8.5, "issues": [], "suggestions": ["可保存"], "summary": "质量达标", "word_count_check": {"passed": True}})
 
         async def fake_provider(agent_type, project_id):
             if agent_type == "writer":
@@ -1651,6 +1651,193 @@ class TestWorkflowExecution:
         assert "chapter_revision_requested" in [event for event, _ in broadcasts]
         assert "chapter_finalized" in [event for event, _ in broadcasts]
         assert db.outlines["outline-quality-loop"]["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_failed_quality_gate_routes_to_master_revision_director_before_writer(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "app.services.chapter_document_storage.chapter_document_storage",
+            ChapterDocumentStorage(str(tmp_path)),
+        )
+        workflow = WorkflowDefinition(
+            id="wf-master-quality-loop",
+            project_id="00000000-0000-0000-0000-000000000001",
+            name="Master质量门循环",
+            nodes=[
+                WorkflowNode(id="start", node_type=NodeType.START, label="开始"),
+                WorkflowNode(id="master_scene", node_type=NodeType.AGENT, agent_type="master_plotter", label="Master场景", config={"scenario": "workflow_scene_compilation"}),
+                WorkflowNode(id="writer", node_type=NodeType.AGENT, agent_type="writer", label="写作", config={"quality_gate_enabled": True}),
+                WorkflowNode(id="evaluator", node_type=NodeType.AGENT, agent_type="evaluator", label="评估"),
+                WorkflowNode(id="gate", node_type=NodeType.CONDITION, label="质量门", config={"max_retry_policy": "human_review_required"}),
+                WorkflowNode(id="master_revision", node_type=NodeType.AGENT, agent_type="master_plotter", label="Master修订", config={"scenario": "workflow_revision_director"}),
+                WorkflowNode(id="end", node_type=NodeType.END, label="结束"),
+            ],
+            edges=[
+                WorkflowEdge(source="start", target="master_scene"),
+                WorkflowEdge(source="master_scene", target="writer"),
+                WorkflowEdge(source="writer", target="evaluator"),
+                WorkflowEdge(source="evaluator", target="gate"),
+                WorkflowEdge(source="gate", target="end", condition={"result": "pass"}),
+                WorkflowEdge(source="gate", target="master_revision", condition={"result": "retry"}),
+                WorkflowEdge(source="master_revision", target="writer"),
+            ],
+        )
+        self.engine._workflows[workflow.id] = workflow
+        db = FakeDiscussionDB()
+        db.outlines["outline-master-loop"] = {"id": "outline-master-loop", "project_id": workflow.project_id, "chapter_number": 11, "status": "approved"}
+
+        async def fake_save_workflow_execution(data):
+            db.executions.append(dict(data))
+            return data.get("id")
+
+        db.save_workflow_execution = fake_save_workflow_execution
+        contexts = {"master": [], "writer": [], "evaluator": []}
+        counts = {"writer": 0, "evaluator": 0, "master_revision": 0}
+
+        class FakeMasterAgent:
+            name = "fake-master"
+            model = None
+            _stream_callback = None
+
+            async def execute(self, context):
+                contexts["master"].append(dict(context))
+                if context.get("task") == "prepare_revision_directive":
+                    counts["master_revision"] += 1
+                    assert "quality_failure_packet" in context
+                    return FakeAgentResponse({
+                        "master_revision_directive": {
+                            "revision_id": "rev-1",
+                            "revision_attempt": 1,
+                            "rewrite_strategy": "scene_rewrite",
+                            "issues": [{"issue_id": "issue-1", "failure_type": "scene_plan_miss", "failed_scene_beat_ids": ["beat-1"], "required_fix": "补足可见后果"}],
+                            "writer_revision_brief": {"scope": "beat-1"},
+                            "evaluator_focus": ["beat-1"],
+                        }
+                    }, contract_id="master_plotter.revision_directive.workflow_output", schema_name="master_plotter.revision_directive.workflow_output")
+                return FakeAgentResponse({
+                    "master_scene_plan": {
+                        "plan_id": "plan-1",
+                        "plan_version": "scene_compiler_v1",
+                        "scene_plan": [{"beat_id": "beat-1", "acceptance_criteria": ["可见后果"]}],
+                        "writer_brief": {"must_follow": ["beat-1"]},
+                        "evaluator_checklist": {"required_beat_ids": ["beat-1"]},
+                    }
+                }, contract_id="master_plotter.scene_plan.workflow_output", schema_name="master_plotter.scene_plan.workflow_output")
+
+        class FakeWriterAgent:
+            name = "fake-writer"
+            model = None
+            _stream_callback = None
+
+            async def execute(self, context):
+                contexts["writer"].append(dict(context))
+                counts["writer"] += 1
+                if counts["writer"] == 1:
+                    assert context["scene_plan_id"] == "plan-1"
+                    return FakeAgentResponse({"chapter_content": "第一版正文", "word_count": 100}, contract_id="writer.workflow_output", schema_name="writer.workflow_output")
+                assert context["revision_directive_id"] == "rev-1"
+                assert context["writer_revision_brief"] == {"scope": "beat-1"}
+                return FakeAgentResponse({"chapter_content": "第二版正文", "word_count": 100}, contract_id="writer.workflow_output", schema_name="writer.workflow_output")
+
+        class FakeEvaluatorAgent:
+            name = "fake-evaluator"
+            model = None
+            _stream_callback = None
+
+            async def execute(self, context):
+                contexts["evaluator"].append(dict(context))
+                counts["evaluator"] += 1
+                assert context["scene_plan_id"] == "plan-1"
+                if counts["evaluator"] == 1:
+                    return FakeAgentResponse({"quality_passed": False, "score": 4, "issues": ["缺 beat"], "suggestions": ["修订"], "word_count_check": {"passed": True}, "scene_plan_adherence_check": {"passed": False, "missing_beat_ids": ["beat-1"], "failed_beat_ids": ["beat-1"], "issues": ["缺 beat"]}, "failed_scene_beat_ids": ["beat-1"]})
+                assert context["revision_directive_id"] == "rev-1"
+                return FakeAgentResponse({"quality_passed": True, "score": 8.5, "issues": [], "suggestions": [], "summary": "通过", "word_count_check": {"passed": True}, "scene_plan_adherence_check": {"passed": True, "covered_beat_ids": ["beat-1"]}, "revision_directive_adherence_check": {"passed": True, "resolved_issue_ids": ["issue-1"]}})
+
+        async def fake_provider(agent_type, project_id):
+            if agent_type == "master_plotter":
+                return FakeMasterAgent()
+            if agent_type == "writer":
+                return FakeWriterAgent()
+            if agent_type == "evaluator":
+                return FakeEvaluatorAgent()
+            raise AssertionError(agent_type)
+
+        self.engine.set_agent_provider(fake_provider)
+        execution = WorkflowExecution(
+            workflow_id=workflow.id,
+            project_id=workflow.project_id,
+            status=WorkflowStatus.RUNNING,
+            context={"chapter_num": 11, "chapter_outline_id": "outline-master-loop", "chapter_outline": {"title": "测试"}, "target_word_count": 5},
+            node_states={node.id: NodeExecutionState(node_id=node.id, status=NodeStatus.PENDING) for node in workflow.nodes},
+        )
+        predecessors = self.engine._build_predecessor_graph(workflow)
+        completed_nodes = set()
+        for node_id in ["start", "master_scene", "writer", "evaluator", "gate", "master_revision", "writer", "evaluator", "gate", "end"]:
+            node = next(item for item in workflow.nodes if item.id == node_id)
+            await self.engine._execute_node_with_merge(execution, node, predecessors, workflow, db)
+            completed_nodes.add(node_id)
+            if node.node_type == NodeType.CONDITION:
+                next_node_id = self.engine._get_next_node(node_id, execution, workflow)
+                if next_node_id in completed_nodes:
+                    reset_nodes = self.engine._get_goto_reset_nodes(workflow, node_id, next_node_id)
+                    self.engine._reset_nodes_for_goto(execution, completed_nodes, reset_nodes, f"test goto: {node_id} -> {next_node_id}")
+
+        assert counts == {"writer": 2, "evaluator": 2, "master_revision": 1}
+        assert execution.context["quality_failure_packet"]["failed_scene_beat_ids"] == ["beat-1"]
+        assert execution.context["revision_directive_id"] == "rev-1"
+        assert execution.context["chapter_saved_payload"]["scene_plan_id"] == "plan-1"
+        assert execution.context["chapter_saved_payload"]["revision_directive_id"] == "rev-1"
+        assert db.chapters and (tmp_path / db.chapters[0]["content_path"]).read_text(encoding="utf-8") == "第二版正文"
+
+    def test_deterministic_chapter_style_gate_blocks_overblown_ai_prose(self):
+        engine = WorkflowEngine()
+        chapter_content = (
+            "像是有人把恒星塞进了他的颅腔。"
+            "属于另一个存在的记忆碎片呼啸着涌入——古老的代码、失落的力量、还有某个存在留下的警告符号。\n"
+            "他知道，真正的危机才刚刚开始，这不仅关系到他的未来，更是命运的转折。"
+        )
+        evaluator_output = {"quality_passed": True, "score": 8.5, "issues": [], "suggestions": []}
+
+        gate = engine._run_deterministic_chapter_style_gate(chapter_content, evaluator_output, {})
+
+        assert gate["passed"] is False
+        assert any("高密度 AI" in issue for issue in gate["issues"])
+        assert gate["warnings"] == ["Evaluator 声称通过但 summary 与 issues 为空，质量证据不足。"]
+        assert gate["version"] == "de_ai_outline_scene_v1"
+
+    def test_deterministic_chapter_style_gate_propagates_nested_transposition_failure(self):
+        engine = WorkflowEngine()
+        gate = engine._run_deterministic_chapter_style_gate(
+            "林墨关掉终端。",
+            {
+                "quality_passed": True,
+                "summary": "基本覆盖大纲",
+                "outline_transposition_check": {
+                    "passed": False,
+                    "issues": ["大纲节点被直接扩写"],
+                    "rewrite_focus": ["从场景触发进入"],
+                },
+            },
+            {},
+        )
+
+        assert gate["passed"] is False
+        assert any("outline_transposition_check" in issue for issue in gate["issues"])
+
+    def test_deterministic_chapter_style_gate_propagates_scene_and_revision_failures(self):
+        engine = WorkflowEngine()
+        gate = engine._run_deterministic_chapter_style_gate(
+            "林墨关掉终端。",
+            {
+                "quality_passed": True,
+                "scene_plan_adherence_check": {"passed": False, "failed_beat_ids": ["beat-1"], "issues": ["缺可见后果"]},
+                "revision_directive_adherence_check": {"passed": False, "unresolved_issue_ids": ["issue-1"], "issues": ["未修订"]},
+            },
+            {},
+        )
+
+        assert gate["passed"] is False
+        assert any("scene_plan_adherence_check" in issue for issue in gate["issues"])
+        assert any("revision_directive_adherence_check" in issue for issue in gate["issues"])
 
     def test_replay_export_includes_quality_gate_audit_without_content(self):
         workflow = WorkflowDefinition(

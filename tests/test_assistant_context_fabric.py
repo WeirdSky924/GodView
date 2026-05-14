@@ -59,6 +59,17 @@ class InMemoryAssistantContextDB:
         self.lores = [
             {
                 "id": str(uuid4()),
+                "title": "星门宪章",
+                "category": "law",
+                "priority": "constitutional",
+                "summary": "所有大纲必须遵守的星门社会根规则。",
+                "content": "宪法级：星门不能被私人军阀直接占有。",
+                "keywords": ["星门", "宪章"],
+                "created_at": datetime(2026, 5, 1),
+                "updated_at": datetime(2026, 5, 4),
+            },
+            {
+                "id": str(uuid4()),
                 "title": "星门协议",
                 "category": "technology",
                 "priority": "core",
@@ -131,7 +142,10 @@ class InMemoryAssistantContextDB:
         if "FROM hooks" in query:
             return list(self.hooks)
         if "FROM chapter_outlines" in query:
-            return list(self.outlines)
+            rows = list(self.outlines)
+            if "deleted_at IS NULL" in query:
+                rows = [row for row in rows if row.get("deleted_at") is None]
+            return rows
         if "FROM regions" in query:
             return list(self.regions)
         raise AssertionError(f"Unexpected SQL in fake DB: {query}")
@@ -270,6 +284,85 @@ class InMemoryAssistantContextDB:
         return self.packets.get(packet_id)
 
 
+def test_plot_outline_retrieval_prioritizes_constitutional_lore_and_scope_hits():
+    from app.services.assistant_context.retrieval import ContextRetrievalService
+
+    retrieval = ContextRetrievalService()
+    sections = [
+        {
+            "section_type": "chapter_outlines",
+            "scope_key": "chapter_outlines:1",
+            "title": "大纲 1",
+            "content": "chapter_number: 1；title: 雨夜信标；summary: 远郊调查",
+            "priority": 50,
+        },
+        {
+            "section_type": "lore",
+            "scope_key": "lore:2",
+            "title": "普通设定",
+            "content": "priority: standard；content: 港口商业规则",
+            "priority": 30,
+        },
+        {
+            "section_type": "lore",
+            "scope_key": "lore:1",
+            "title": "星门宪章",
+            "content": "priority: constitutional；content: 星门不能被私人军阀直接占有",
+            "priority": 30,
+        },
+    ]
+
+    selected = retrieval.select_sections(
+        assistant_surface="plot_outline_agent",
+        scope={"user_message": "生成第一章港口星门冲突"},
+        sections=sections,
+    )
+
+    titles = [section["title"] for section in selected]
+    assert titles[0] == "星门宪章"
+    assert titles.index("普通设定") < titles.index("大纲 1")
+
+
+def test_plot_outline_packet_must_include_constitutional_lore_over_budget():
+    builder = ContextPacketBuilder()
+    packet = builder.build(
+        project_id=PROJECT_ID,
+        assistant_surface="plot_outline_agent",
+        task_type="chat",
+        snapshot={"id": "snapshot-constitutional", "snapshot_version": 1, "summary": "摘要"},
+        sections=[
+            {
+                "id": "project",
+                "section_type": "project_brief",
+                "scope_key": "project",
+                "title": "项目",
+                "content": "项目简介",
+                "priority": 10,
+                "token_estimate": 4,
+            },
+            {
+                "id": "constitutional-lore",
+                "section_type": "lore",
+                "scope_key": "lore:constitutional",
+                "title": "星门宪章",
+                "content": "priority: constitutional；宪法级设定：星门不能被私人军阀直接占有。" * 20,
+                "structured_payload": {"priority": "constitutional"},
+                "priority": 30,
+                "token_estimate": 80,
+            },
+        ],
+        deltas=[],
+        session=None,
+        scope={},
+        budget=AssistantContextBudget(max_context_tokens=1000, snapshot_tokens=10, delta_tokens=10, history_tokens=10, retrieval_tokens=10),
+    )
+
+    selected = packet["metadata"]["selected_sections"]
+    assert [section["title"] for section in selected] == ["项目", "星门宪章"]
+    assert selected[1]["reason"] == "required_over_budget"
+    assert "星门不能被私人军阀直接占有" in packet["prompt_context"]
+
+
 @pytest.mark.asyncio
 async def test_snapshot_builds_typed_sections_and_stales_previous_snapshot():
     db = InMemoryAssistantContextDB()
@@ -288,7 +381,7 @@ async def test_snapshot_builds_typed_sections_and_stales_previous_snapshot():
     sections = await db.get_assistant_snapshot_sections(second["id"])
     section_types = {section["section_type"] for section in sections}
     assert {"project_brief", "world", "lore", "characters", "plot_hooks", "chapter_outlines", "map_regions"}.issubset(section_types)
-    assert second["structured_index"]["lores"] == 1
+    assert second["structured_index"]["lores"] == 2
     assert second["token_estimate"] > 0
 
 
@@ -328,6 +421,113 @@ async def test_fabric_build_packet_persists_session_message_packet_and_delta_met
 
 
 @pytest.mark.asyncio
+async def test_snapshot_excludes_soft_deleted_outlines_after_rebuild():
+    db = InMemoryAssistantContextDB()
+    db.outlines.append({
+        "id": str(uuid4()),
+        "chapter_number": 1,
+        "title": "数据幽影",
+        "summary": "旧主角林墨的已删除大纲不应进入上下文。",
+        "status": "approved",
+        "deleted_at": datetime.utcnow(),
+        "created_at": datetime(2026, 5, 1),
+        "updated_at": datetime(2026, 5, 6),
+    })
+    service = ProjectSnapshotService(db)
+
+    snapshot = await service.force_rebuild(PROJECT_ID, request_id="outline-delete")
+    sections = await db.get_assistant_snapshot_sections(snapshot["id"])
+    outline_content = "\n".join(
+        section.get("content", "")
+        for section in sections
+        if section.get("section_type") == "chapter_outlines"
+    )
+
+    assert "雨夜信标" in outline_content
+    assert "数据幽影" not in outline_content
+    assert "林墨" not in outline_content
+
+
+@pytest.mark.asyncio
+async def test_assistant_session_id_isolated_by_surface_and_mode():
+    from app.services.assistant_context.session_service import AssistantSessionService
+
+    db = InMemoryAssistantContextDB()
+    service = AssistantSessionService(db)
+    stale = {
+        "id": "plot-outline-stale-session",
+        "project_id": PROJECT_ID,
+        "assistant_surface": "plot_outline_agent",
+        "mode": "chapter:1",
+        "status": "active",
+        "history_window": [{"role": "assistant", "content": "旧大纲 数据幽影"}],
+        "last_activity_at": datetime.utcnow(),
+    }
+    await db.save_assistant_session(stale)
+
+    reused = await service.get_or_create_session(
+        project_id=PROJECT_ID,
+        assistant_surface="plot_outline_agent",
+        mode="chapter:1",
+        session_id=stale["id"],
+    )
+    isolated = await service.get_or_create_session(
+        project_id=PROJECT_ID,
+        assistant_surface="plot_outline_agent",
+        mode="chapter:2",
+        session_id=stale["id"],
+    )
+
+    assert reused["id"] == stale["id"]
+    assert isolated["id"] != stale["id"]
+    assert isolated["mode"] == "chapter:2"
+    assert isolated["history_window"] == []
+
+
+@pytest.mark.asyncio
+async def test_reset_history_reuses_existing_active_session_after_stale_client_reset():
+    from app.services.assistant_context.session_service import AssistantSessionService
+
+    db = InMemoryAssistantContextDB()
+    service = AssistantSessionService(db)
+    stale = {
+        "id": "plot-outline-stale-session",
+        "project_id": PROJECT_ID,
+        "assistant_surface": "plot_outline_agent",
+        "mode": "chapter:1",
+        "status": "active",
+        "history_window": [],
+        "pending_items": [{"kind": "outline"}],
+        "last_activity_at": datetime.utcnow(),
+    }
+    active = {
+        "id": "plot-outline-active-session",
+        "project_id": PROJECT_ID,
+        "assistant_surface": "plot_outline_agent",
+        "mode": "chapter:1",
+        "status": "active",
+        "history_window": [],
+        "pending_items": [],
+        "snapshot_id": "snapshot-new",
+        "snapshot_version": 5,
+        "last_activity_at": datetime.utcnow(),
+    }
+    await db.save_assistant_session(stale)
+    await db.save_assistant_session(active)
+
+    reset = await service.reset_history(
+        session_id=stale["id"],
+        reason="force_reread_with_history_reset",
+        snapshot={"id": "snapshot-new", "snapshot_version": 5},
+    )
+
+    assert db.sessions[stale["id"]]["status"] == "reset"
+    assert reset["new_session_id"] == active["id"]
+    assert reset["snapshot_id"] == "snapshot-new"
+    assert len(db.sessions) == 2
+
+
+@pytest.mark.asyncio
 async def test_reset_history_archives_old_session_without_deleting_project_data_or_pending_items():
     db = InMemoryAssistantContextDB()
     fabric = get_assistant_context_fabric(db)
@@ -349,7 +549,7 @@ async def test_reset_history_archives_old_session_without_deleting_project_data_
     assert new_session["status"] == "active"
     assert new_session["history_window"] == []
     assert new_session["pending_items"] == [{"kind": "lore", "title": "待确认设定"}]
-    assert db.lores[0]["title"] == "星门协议"
+    assert any(lore["title"] == "星门协议" for lore in db.lores)
 
 
 def test_packet_builder_truncates_low_priority_sections_deterministically():

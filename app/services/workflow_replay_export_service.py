@@ -45,6 +45,10 @@ class WorkflowReplayExportService:
         if quality_gate_lines:
             lines.extend(["", *quality_gate_lines])
 
+        master_artifact_lines = self._render_master_artifact_section(execution)
+        if master_artifact_lines:
+            lines.extend(["", *master_artifact_lines])
+
         saved_chapter_lines = self._render_saved_chapter_section(execution)
         if saved_chapter_lines:
             lines.extend(["", *saved_chapter_lines])
@@ -213,6 +217,56 @@ class WorkflowReplayExportService:
                 ])
         return lines
 
+    def _render_master_artifact_section(self, execution: WorkflowExecution) -> List[str]:
+        context = execution.context if isinstance(execution.context, dict) else {}
+        scene_history = context.get("scene_plan_history") if isinstance(context.get("scene_plan_history"), list) else []
+        directive_history = context.get("revision_directive_history") if isinstance(context.get("revision_directive_history"), list) else []
+        failure_packet = context.get("quality_failure_packet") if isinstance(context.get("quality_failure_packet"), dict) else {}
+        if not scene_history and not directive_history and not failure_packet:
+            return []
+
+        lines: List[str] = ["## Master 场景/修订链路审计", ""]
+        if scene_history:
+            lines.extend(["### 场景计划", ""])
+            for entry in scene_history:
+                if not isinstance(entry, dict):
+                    continue
+                beat_ids = entry.get("beat_ids") if isinstance(entry.get("beat_ids"), list) else []
+                lines.extend([
+                    f"- **尝试**: {entry.get('attempt') or '-'}",
+                    f"  - Plan ID: `{entry.get('plan_id') or '-'}`",
+                    f"  - Checksum: `{entry.get('checksum') or '-'}`",
+                    f"  - Beat 数量: {entry.get('beat_count') if entry.get('beat_count') is not None else '-'}",
+                    f"  - Beat IDs: {', '.join(str(item) for item in beat_ids[:20]) or '-'}",
+                ])
+        if failure_packet:
+            failed_checks = failure_packet.get("failed_checks") if isinstance(failure_packet.get("failed_checks"), list) else []
+            failed_beats = failure_packet.get("failed_scene_beat_ids") if isinstance(failure_packet.get("failed_scene_beat_ids"), list) else []
+            lines.extend([
+                "",
+                "### 质量失败包",
+                "",
+                f"- **草稿尝试/校验和**: {failure_packet.get('draft_attempt') or '-'} / `{failure_packet.get('draft_checksum') or '-'}`",
+                f"- **Scene Plan**: `{failure_packet.get('scene_plan_id') or '-'}` / `{failure_packet.get('scene_plan_checksum') or '-'}`",
+                f"- **失败检查**: {', '.join(str(item) for item in failed_checks) or '-'}",
+                f"- **失败 Beat IDs**: {', '.join(str(item) for item in failed_beats[:20]) or '-'}",
+            ])
+        if directive_history:
+            lines.extend(["", "### 修订指令", ""])
+            for entry in directive_history:
+                if not isinstance(entry, dict):
+                    continue
+                issue_ids = entry.get("issue_ids") if isinstance(entry.get("issue_ids"), list) else []
+                lines.extend([
+                    f"- **尝试**: {entry.get('attempt') or '-'}",
+                    f"  - Revision ID: `{entry.get('revision_id') or '-'}`",
+                    f"  - Strategy: `{entry.get('rewrite_strategy') or '-'}`",
+                    f"  - Checksum: `{entry.get('checksum') or '-'}`",
+                    f"  - Issue IDs: {', '.join(str(item) for item in issue_ids[:20]) or '-'}",
+                ])
+        lines.append("")
+        return lines
+
     def _render_saved_chapter_section(self, execution: WorkflowExecution) -> List[str]:
         context = execution.context if isinstance(execution.context, dict) else {}
         payload = context.get("chapter_saved_payload")
@@ -246,6 +300,8 @@ class WorkflowReplayExportService:
             f"- **质量门通过**: `{payload.get('quality_gate_passed') if payload.get('quality_gate_passed') is not None else '-'}`",
             f"- **质量分数**: {payload.get('quality_gate_score') if payload.get('quality_gate_score') is not None else '-'}",
             f"- **质量门尝试 / 修订次数**: {payload.get('quality_gate_attempts') if payload.get('quality_gate_attempts') is not None else '-'} / {payload.get('revision_attempts') if payload.get('revision_attempts') is not None else '-'}",
+            f"- **Scene Plan**: `{payload.get('scene_plan_id') or provenance.get('scene_plan_id') or context.get('scene_plan_id') or '-'}` / `{payload.get('scene_plan_checksum') or provenance.get('scene_plan_checksum') or context.get('scene_plan_checksum') or '-'}`",
+            f"- **Revision Directive**: `{payload.get('revision_directive_id') or provenance.get('revision_directive_id') or context.get('revision_directive_id') or '-'}` / attempt `{payload.get('revision_directive_attempt') or provenance.get('revision_directive_attempt') or context.get('revision_directive_attempt') or '-'}`",
         ]
 
         prompt_trace = provenance.get("writer_prompt_trace") or payload.get("writer_prompt_trace")

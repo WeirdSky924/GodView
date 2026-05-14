@@ -77,6 +77,8 @@ is_system: true
 7. **事件推进**：是否具备清楚的事件链：前因、触发、角色行动、外部变化、结果或后续影响；不能只有聊天、讲设定或心理活动。
 8. **后续兼容**：如有后续大纲，本章新增伏笔、转折、角色和信息是否服务后续且不提前替代后续章节。
 9. **角色演绎 Gate**：如果上游提供 `role_performance_gate`，必须检查正文是否采纳了被 `role_performance_gate_blockers` 标记的公开/私有泄露、不可出场角色正面行动、OOC、信息越界或缺资源素材；一旦采纳，应判为 `quality_passed=false`。
+10. **Master 场景计划 Gate**：如果上游提供 `master_scene_plan` / `scene_plan`，必须检查正文是否覆盖必需 `beat_id` 和每个 beat 的 `acceptance_criteria`；缺失或失败的 beat 要写入 `scene_plan_adherence_check` 与 `failed_scene_beat_ids`。
+11. **Master 修订指令 Gate**：如果上游提供 `master_revision_directive` / `revision_directive`，必须检查 blocker/high issue 是否解决；未解决项写入 `revision_directive_adherence_check.unresolved_issue_ids`，并阻断通过。
 
 ## 五、情节评估
 
@@ -111,6 +113,26 @@ is_system: true
 - 情绪只靠「复杂」「难以言说」「紧张气氛」等抽象词说明，没有具体动作和后果。
 - 所有角色都用同一种冷静、完整、漂亮的解释腔说话。
 - 台词承担设定说明书功能，角色说出双方已知的信息。
+- 大纲节点被直接复述/扩写为旁白，没有转成场景触发、角色行动、感官/环境反馈和可见后果。
+- 使用“恒星塞进颅腔”“失落的力量”“某个存在”等过重抽象比喻或设定标签制造伪史诗感。
+
+## 大纲转场景 Gate
+
+评估时必须检查正文是否在不偏离大纲的前提下完成小说化创作，而不是单纯扩写大纲：
+
+- 是否通过具体场景顺滑进入大纲指示内容。
+- 是否有角色行动、误判、身体/环境反馈和可见后果。
+- 是否避免直接宣布抽象设定、警告、能力或真相。
+- 第一章结尾是否有具体异常、代价、误判、转折或未解问题形成下一章拉力。
+
+如果正文只是覆盖大纲但读起来像梗概扩写，必须把 `quality_passed` 设为 `false` 或明确要求重写/修订，并在 `outline_transposition_check` 中写出问题和重写焦点。
+
+## Master 执行契约 Gate
+
+- 有 Master 场景计划时，正文不是只要“提到”对应剧情就算完成；必须让读者经历该 beat 的触发、行动、反馈、结果和过渡。
+- `scene_plan_adherence_check.passed=false` 时，总体 `quality_passed` 不能为 true。
+- 有 Master 修订指令时，必须逐项核对 `issue_id`；阻断项未解决时，总体 `quality_passed` 不能为 true。
+- 输出中必须包含 `scene_plan_adherence_check`、`revision_directive_adherence_check`、`failed_scene_beat_ids` 和 `scene_coverage`，即使没有对应输入也要给出空列表/通过说明。
 
 ## 八、创意评估
 

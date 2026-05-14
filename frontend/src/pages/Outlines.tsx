@@ -21,6 +21,8 @@ import {
   approveOutlineById,
   rejectOutlineRevisionById,
   chatWithAgent,
+  savePendingOutlines,
+  formatSavePendingOutlinesFailure,
   deleteOutline,
   getOutlineResourceRequirements,
   getChapterResourceReadiness,
@@ -120,6 +122,7 @@ export default function Outlines() {
   const [chatMessages, setChatMessages] = useState<Array<{ role: 'user' | 'assistant'; content: string }>>([])
   const [chatInput, setChatInput] = useState('')
   const [sendingMessage, setSendingMessage] = useState(false)
+  const [outlineChatAutoSave, setOutlineChatAutoSave] = useState(false)
   const [assistantSessionId, setAssistantSessionId] = useState<string | null>(null)
   const [contextPacket, setContextPacket] = useState<AssistantContextSummary | null>(null)
 
@@ -231,14 +234,6 @@ export default function Outlines() {
     }
   }
 
-  const removeOutlineFromState = (chapterNumber: number) => {
-    setOutlines(prev => prev.filter(outline => outline.chapter_number !== chapterNumber))
-
-    const fallbackOutline = chapterNavigationOutlines.find(outline => outline.chapter_number !== chapterNumber) ?? null
-    setSelectedChapter(fallbackOutline?.chapter_number ?? null)
-    setCurrentOutline(fallbackOutline)
-    setOutlineVersions(null)
-  }
 
   // 加载大纲列表
   useEffect(() => {
@@ -247,19 +242,27 @@ export default function Outlines() {
     }
   }, [currentProject?.id])
 
-  const loadOutlineAssistantSession = async (chapterNumber: number) => {
+  const getOutlineAgentStorageKey = (projectId: string) => `plotOutlineAgentSession:${projectId}:outlines`
+  const getLegacyFirstChapterAgentStorageKey = (projectId: string) => `plotOutlineAgentSession:${projectId}:1`
+  const outlineAgentMode = 'chapter:1'
+
+  const loadOutlineAssistantSession = async (selectedChapterNumber = selectedChapter || 1) => {
     if (!currentProject?.id) return
-    const storageKey = `plotOutlineAgentSession:${currentProject.id}:${chapterNumber}`
-    const storedSessionId = localStorage.getItem(storageKey) || undefined
+    setAssistantSessionId(null)
+    setContextPacket(null)
+    const storageKey = getOutlineAgentStorageKey(currentProject.id)
+    const legacyFirstChapterStorageKey = getLegacyFirstChapterAgentStorageKey(currentProject.id)
+    const storedSessionId = localStorage.getItem(storageKey) || localStorage.getItem(legacyFirstChapterStorageKey) || undefined
     try {
       const session = await createAssistantSession(currentProject.id, {
         assistant_surface: 'plot_outline_agent',
-        mode: `chapter:${chapterNumber}`,
+        mode: outlineAgentMode,
         session_id: storedSessionId,
-        scope: { chapter_number: chapterNumber, entry: 'outlines' },
+        scope: { entry: 'outlines', selected_chapter_number: selectedChapterNumber },
       })
       setAssistantSessionId(session.session_id)
       localStorage.setItem(storageKey, session.session_id)
+      localStorage.setItem(legacyFirstChapterStorageKey, session.session_id)
       const history = await getAssistantHistory(currentProject.id, session.session_id, 80)
       setChatMessages(history.messages
         .filter(message => message.role === 'user' || message.role === 'assistant')
@@ -278,6 +281,10 @@ export default function Outlines() {
       const navigationOutlines = getChapterNavigationOutlines(result.outlines)
       if (navigationOutlines.length > 0 && !selectedChapter) {
         selectChapter(navigationOutlines[0].chapter_number)
+      } else if (navigationOutlines.length === 0 && !selectedChapter) {
+        setSelectedChapter(1)
+        setCurrentOutline(null)
+        setOutlineVersions(null)
       }
     } catch (error) {
       console.error('Failed to load outlines:', error)
@@ -332,6 +339,9 @@ export default function Outlines() {
       setOutlineVersions(null)
       await loadResourceStatus(chapterNumber)
     } finally {
+      if (showChat && !assistantSessionId) {
+        await loadOutlineAssistantSession(chapterNumber)
+      }
       setLoading(false)
     }
   }
@@ -555,9 +565,24 @@ export default function Outlines() {
       if (!softDeleteGeneratedChapters) return
     }
 
+    const deleteAllVersions = confirm(
+      `是否删除第${selectedChapter}章的全部大纲版本？\n\n点击“确定”：删除本章所有草稿/修订/已审批版本。\n点击“取消”：只删除当前有效版本。`
+    )
+
     try {
-      const result = await deleteOutline(currentProject.id, selectedChapter, { softDeleteGeneratedChapters })
-      removeOutlineFromState(selectedChapter)
+      const deletedChapter = selectedChapter
+      const result = await deleteOutline(currentProject.id, deletedChapter, { softDeleteGeneratedChapters, deleteAllVersions })
+      setCurrentOutline(null)
+      setOutlineVersions(null)
+      setResourceReadiness(null)
+      setResourceRequirements([])
+      setResourceDrafts([])
+      await loadOutlines()
+      try {
+        await loadOutlineVersions(deletedChapter)
+      } catch {
+        setOutlineVersions(null)
+      }
       alert(result.message)
     } catch (error) {
       console.error('Failed to delete outline:', error)
@@ -565,7 +590,7 @@ export default function Outlines() {
     }
   }
 
-  const handleStartFirstChapterChat = () => {
+  const handleStartFirstChapterChat = async () => {
     // 设置为第一章
     setSelectedChapter(1)
     setResourceRequirements([])
@@ -576,35 +601,72 @@ export default function Outlines() {
     // 设置初始消息
     const initialMessage = '请帮我生成第一章大纲'
     setChatInput(initialMessage)
+    await loadOutlineAssistantSession(1)
     // 自动发送消息
-    sendChatMessage(initialMessage)
+    await sendChatMessage(initialMessage, 1)
   }
 
-  const sendChatMessage = async (message: string) => {
+  const openOutlineChat = async (chapterNumber = selectedChapter || 1) => {
+    setSelectedChapter(chapterNumber)
+    setShowChat(true)
+    await loadOutlineAssistantSession(chapterNumber)
+  }
+
+  const sendChatMessage = async (message: string, explicitChapterNumber?: number) => {
     if (!currentProject?.id) return
 
-    const chapterNumber = selectedChapter || 1
+    const chapterNumber = explicitChapterNumber || selectedChapter || 1
+    setSelectedChapter(chapterNumber)
     setSendingMessage(true)
 
     // 添加用户消息
     setChatMessages(prev => [...prev, { role: 'user' as const, content: message }])
 
     try {
+      let sessionId = assistantSessionId || undefined
+      const storageKey = getOutlineAgentStorageKey(currentProject.id)
+      const legacyFirstChapterStorageKey = getLegacyFirstChapterAgentStorageKey(currentProject.id)
+      if (!sessionId) {
+        const session = await createAssistantSession(currentProject.id, {
+          assistant_surface: 'plot_outline_agent',
+          mode: outlineAgentMode,
+          session_id: localStorage.getItem(storageKey) || localStorage.getItem(legacyFirstChapterStorageKey) || undefined,
+          scope: { entry: 'outlines', selected_chapter_number: chapterNumber },
+        })
+        sessionId = session.session_id
+        setAssistantSessionId(session.session_id)
+        localStorage.setItem(storageKey, session.session_id)
+        localStorage.setItem(legacyFirstChapterStorageKey, session.session_id)
+      }
       const requestId = `outline_chat_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
-      const response = await chatWithAgent(currentProject.id, chapterNumber, message, undefined, assistantSessionId || undefined, requestId)
+      const response = await chatWithAgent(
+        currentProject.id,
+        chapterNumber,
+        message,
+        { selected_chapter_number: chapterNumber, entry: 'outlines' },
+        sessionId,
+        requestId,
+        outlineChatAutoSave,
+      )
       if (response.assistant_session_id) {
         setAssistantSessionId(response.assistant_session_id)
-        localStorage.setItem(`plotOutlineAgentSession:${currentProject.id}:${chapterNumber}`, response.assistant_session_id)
+        localStorage.setItem(storageKey, response.assistant_session_id)
+        localStorage.setItem(legacyFirstChapterStorageKey, response.assistant_session_id)
       }
       if (response.context_packet) setContextPacket(response.context_packet)
       setChatMessages(prev => [...prev, { role: 'assistant' as const, content: response.message }])
+      if (response.parse_status === 'outline_parse_failed') {
+        const warning = response.warnings?.[0] || '未解析到可保存的大纲 JSON，因此没有创建左侧草稿。'
+        setChatMessages(prev => [...prev, { role: 'assistant' as const, content: warning }])
+        return
+      }
 
       // 处理多章大纲保存
       const savedOutlines = response.saved_outlines
       if (savedOutlines && savedOutlines.length > 0) {
         setChatMessages(prev => [...prev, {
           role: 'assistant' as const,
-          content: `✅ 已保存 ${savedOutlines.length} 章大纲草稿：${savedOutlines.map(o => `第${o.chapter_number}章`).join('、')}`
+          content: `已保存 ${savedOutlines.length} 章大纲草稿：${savedOutlines.map(o => `第${o.chapter_number}章`).join('、')}`
         }])
         upsertOutlines(savedOutlines)
         const firstSaved = savedOutlines[0]
@@ -616,6 +678,43 @@ export default function Outlines() {
         setSelectedChapter(response.saved_outline.chapter_number)
         upsertOutline(response.saved_outline)
         await loadResourceStatus(response.saved_outline.chapter_number, response.saved_outline.id)
+      } else if (response.pending_outlines && response.pending_outlines.length > 0) {
+        const saveResult = await savePendingOutlines(currentProject.id, response.pending_outlines)
+        if (saveResult.saved_count <= 0) {
+          setChatMessages(prev => [...prev, {
+            role: 'assistant' as const,
+            content: formatSavePendingOutlinesFailure(saveResult)
+          }])
+          return
+        }
+
+        setChatMessages(prev => [...prev, {
+          role: 'assistant' as const,
+          content: `已生成并保存 ${saveResult.saved_count} 章大纲草稿。${saveResult.failed_count ? `失败 ${saveResult.failed_count} 章，请查看日志或重试。` : ''}`
+        }])
+        const savedIds = new Set(saveResult.results.filter(item => item.status === 'saved' && item.outline_id).map(item => item.outline_id as string))
+        const firstSavedChapter = saveResult.results.find(item => item.status === 'saved')?.chapter_number || response.pending_outlines[0]?.chapter_number || chapterNumber
+        const refreshed = await getOutlines(currentProject.id)
+        setOutlines(refreshed.outlines)
+        const savedFromList = refreshed.outlines.filter(outline => savedIds.has(outline.id))
+        if (savedFromList.length === 0) {
+          setChatMessages(prev => [...prev, {
+            role: 'assistant' as const,
+            content: '后端返回保存成功，但刷新列表后没有找到对应草稿。请不要相信本轮“保存成功”，请检查后端保存日志或重试。'
+          }])
+          return
+        }
+        upsertOutlines(savedFromList)
+        setSelectedChapter(firstSavedChapter)
+        try {
+          const outline = await getOutline(currentProject.id, firstSavedChapter)
+          setCurrentOutline(outline)
+          upsertOutline(outline)
+          await loadResourceStatus(firstSavedChapter, outline.id)
+          await loadOutlineVersions(firstSavedChapter)
+        } catch (error) {
+          console.error('Failed to load saved pending outline:', error)
+        }
       } else if (response.outline_updates) {
         setCurrentOutline(prev => prev ? { ...prev, ...response.outline_updates } : prev)
       }
@@ -631,7 +730,7 @@ export default function Outlines() {
   }
 
   const handleSendMessage = async () => {
-    if (!currentProject?.id || !selectedChapter || !chatInput.trim()) return
+    if (!currentProject?.id || !chatInput.trim() || sendingMessage) return
     const message = chatInput.trim()
     setChatInput('')
     await sendChatMessage(message)
@@ -1116,7 +1215,7 @@ export default function Outlines() {
                   {currentOutline.scenes.length === 0 ? (
                     <div className={`text-center py-8 ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
                       <p>暂无场景规划</p>
-                      <Button size="sm" className="mt-2" onClick={() => setShowChat(true)}>
+                      <Button size="sm" className="mt-2" onClick={() => openOutlineChat()}>
                         与 Agent 讨论
                       </Button>
                     </div>
@@ -1290,12 +1389,12 @@ export default function Outlines() {
                       </Button>
                     </div>
                     <div className="flex items-center gap-2">
-                      <Button variant="secondary" onClick={() => setShowChat(true)}>
+                      <Button variant="secondary" onClick={() => openOutlineChat()}>
                         <MessageSquare className="w-4 h-4 mr-1" />
                         与 Agent 讨论
                       </Button>
                       <Button variant="secondary" onClick={() => {
-                        setShowChat(true)
+                        openOutlineChat()
                         setChatInput('请帮我重新生成这一章的大纲')
                       }}>
                         <RefreshCw className="w-4 h-4 mr-1" />
@@ -1315,12 +1414,12 @@ export default function Outlines() {
                   </h3>
                   <p className="mb-4">该章节尚未生成大纲</p>
                   <div className="flex justify-center gap-2">
-                    <Button variant="secondary" onClick={() => setShowChat(true)}>
+                    <Button variant="secondary" onClick={() => openOutlineChat()}>
                       <MessageSquare className="w-4 h-4 mr-1" />
                       与 Agent 讨论
                     </Button>
                     <Button onClick={() => {
-                      setShowChat(true)
+                      openOutlineChat()
                       setChatInput(`请帮我生成第${selectedChapter}章的大纲`)
                     }}>
                       <Sparkles className="w-4 h-4 mr-1" />
@@ -1417,7 +1516,7 @@ export default function Outlines() {
                 <div>
                   <h3 className={`font-medium ${isDark ? 'text-white' : 'text-gray-800'}`}>Plot Outline Agent</h3>
                   <p className={`text-xs ${isDark ? 'text-gray-400' : 'text-gray-500'}`}>
-                    第{selectedChapter || '?'}章大纲规划
+                    /outlines 全局大纲会话{selectedChapter ? ` · 当前查看第${selectedChapter}章` : ''}
                   </p>
                 </div>
               </div>
@@ -1432,21 +1531,37 @@ export default function Outlines() {
                   projectId={currentProject.id}
                   sessionId={assistantSessionId}
                   assistantSurface="plot_outline_agent"
-                  mode={`chapter:${selectedChapter || 1}`}
-                  scope={{ chapter_number: selectedChapter || 1, entry: 'outlines' }}
+                  mode={outlineAgentMode}
+                  scope={{ entry: 'outlines', selected_chapter_number: selectedChapter || 1 }}
                   contextPacket={contextPacket}
                   compact
                   onHistoryReset={(newSessionId) => {
                     setAssistantSessionId(newSessionId)
                     setChatMessages([])
-                    if (selectedChapter) {
-                      localStorage.setItem(`plotOutlineAgentSession:${currentProject.id}:${selectedChapter}`, newSessionId)
-                    }
+                    localStorage.setItem(getOutlineAgentStorageKey(currentProject.id), newSessionId)
+                    localStorage.setItem(getLegacyFirstChapterAgentStorageKey(currentProject.id), newSessionId)
                   }}
                   onRereadComplete={(response) => setContextPacket(response.packet_metadata)}
                 />
               </div>
             )}
+
+            <div className={`px-3 py-2 border-b text-xs ${isDark ? 'border-gray-700 text-gray-300' : 'border-gray-200 text-gray-600'}`}>
+              <label className="flex items-start gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={outlineChatAutoSave}
+                  onChange={(event) => setOutlineChatAutoSave(event.target.checked)}
+                />
+                <span>
+                  自动保存 Agent 输出的大纲 JSON
+                  <span className={`block ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+                    默认关闭时，新生成的大纲仍会保存为草稿并显示在左侧；开启后修改已审批大纲会创建修订提案，不覆盖原审批版本。
+                  </span>
+                </span>
+              </label>
+            </div>
 
             {/* 快捷命令 */}
             <div className={`p-3 border-b ${isDark ? 'border-gray-700' : 'border-gray-200'}`}>
