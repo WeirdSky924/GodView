@@ -821,6 +821,11 @@ class WorkflowEngine:
         logger.info(f"工作流包含 {len(all_node_ids)} 个节点: {all_node_ids}")
 
         predecessors = {node.id: [] for node in workflow.nodes}
+        conditional_retry_targets = {
+            edge.target
+            for edge in workflow.edges
+            if (edge.condition or {}).get("result") == "retry"
+        }
 
         # 记录边的连接情况
         logger.info(f"工作流包含 {len(workflow.edges)} 条边:")
@@ -841,6 +846,14 @@ class WorkflowEngine:
                     logger.info(
                         f"  条件回边不加入前驱依赖: {edge.source} -> {edge.target} "
                         f"({edge_condition})"
+                    )
+                    continue
+                if edge.source in conditional_retry_targets and edge.target in predecessors and any(
+                    other_edge.target == edge.target and other_edge.source not in conditional_retry_targets
+                    for other_edge in workflow.edges
+                ):
+                    logger.info(
+                        f"  retry 分支出口不加入初始前驱依赖: {edge.source} -> {edge.target}"
                     )
                     continue
                 predecessors[edge.target].append(edge.source)
@@ -917,10 +930,30 @@ class WorkflowEngine:
             node_predecessors = predecessors.get(node.id, [])
 
             if not node_predecessors:
-                # 没有前驱的节点（应该只有开始节点）
+                actual_node_type = node.node_type
+                if node.id == "end" or node.label in ["结束", "End", "end"]:
+                    actual_node_type = NodeType.END
+                if actual_node_type == NodeType.END:
+                    unfinished_non_terminal = [
+                        candidate.id
+                        for candidate in workflow.nodes
+                        if candidate.id != node.id
+                        and candidate.id not in completed_nodes
+                    ]
+                    if unfinished_non_terminal:
+                        logger.debug(f"  结束节点 {node.id} 没有前驱但仍有未完成节点，跳过: {unfinished_non_terminal}")
+                        continue
+                # 没有前驱的节点（通常只有开始节点）
                 logger.debug(f"  节点 {node.id} 没有前驱，标记为就绪")
                 ready_nodes.append(node.id)
             else:
+                failed_preds = [
+                    p for p in node_predecessors
+                    if execution.node_states.get(p) and execution.node_states[p].status == NodeStatus.FAILED
+                ]
+                if failed_preds:
+                    logger.debug(f"  节点 {node.id} 有失败前驱，阻断调度: {failed_preds}")
+                    continue
                 # 检查前驱是否都完成
                 pending_preds = [p for p in node_predecessors if p not in completed_nodes]
                 if pending_preds:
@@ -1365,6 +1398,38 @@ class WorkflowEngine:
         self._running_tasks[execution_id] = task
         return task
 
+    async def _heartbeat_running_execution(
+        self,
+        execution: WorkflowExecution,
+        db,
+        operation_service: OperationLifecycleService,
+        ttl_seconds: int,
+    ) -> None:
+        now = datetime.now()
+        execution.last_heartbeat_at = now
+        execution.lease_expires_at = now + timedelta(seconds=ttl_seconds)
+        await self._save_execution_to_db(execution, db)
+        if execution.request_id:
+            operation = await db.get_operation_request_by_request_id(execution.request_id)
+            if operation:
+                await operation_service.heartbeat(operation)
+
+    async def _run_execution_heartbeat_loop(self, execution: WorkflowExecution, db) -> None:
+        """Keep long-running node executions from expiring their workflow lease."""
+        ttl_seconds = max(10, int(getattr(settings, "operation_lease_ttl_seconds", 60) or 60))
+        interval_seconds = max(5.0, min(30.0, ttl_seconds / 2))
+        operation_service = OperationLifecycleService(db=db, redis=redis_service)
+        try:
+            while execution.status == WorkflowStatus.RUNNING and not execution.cancel_requested:
+                await asyncio.sleep(interval_seconds)
+                if execution.status != WorkflowStatus.RUNNING or execution.cancel_requested:
+                    return
+                await self._heartbeat_running_execution(execution, db, operation_service, ttl_seconds)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("workflow heartbeat loop failed: execution=%s, error=%s", execution.id, exc)
+
     async def _get_execution_id_by_operation_id(self, operation_id: str, db) -> Optional[str]:
         """按 operation_id 获取关联 execution。"""
         if not operation_id:
@@ -1395,6 +1460,87 @@ class WorkflowEngine:
             await operation_service.cancel_requested(operation, payload)
         elif execution.status == WorkflowStatus.FAILED:
             await operation_service.fail(operation, execution.error or "workflow failed", payload)
+
+    async def reset_director_session_workflow(
+        self,
+        project_id: str,
+        workflow_id: str,
+        director_session_id: str,
+        db,
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """废弃当前 Director 会话工作流执行和幂等记录，返回新的后端 reset token。"""
+        if not db:
+            raise ValueError("数据库未连接")
+        normalized_session_id = (director_session_id or "").strip()
+        if not project_id or not workflow_id or not normalized_session_id:
+            raise ValueError("project_id、workflow_id、director_session_id 不能为空")
+
+        reset_token = f"reset_{uuid.uuid4().hex}"
+        reset_reason = reason or "director_session_reset"
+        if hasattr(db, "get_director_session_workflow_execution"):
+            row = await db.get_director_session_workflow_execution(
+                project_id=project_id,
+                workflow_id=workflow_id,
+                director_session_id=normalized_session_id,
+            )
+        else:
+            row = await db.get_active_workflow_execution(
+                project_id=project_id,
+                workflow_id=workflow_id,
+                director_session_id=normalized_session_id,
+            )
+        previous_execution_id = row.get("id") if row else None
+        previous_operation_id = str(row.get("operation_id")) if row and row.get("operation_id") else None
+        previous_request_id = row.get("request_id") if row else None
+
+        if previous_execution_id:
+            execution = await self._get_or_load_execution(previous_execution_id, db)
+            if execution:
+                task = self._running_tasks.get(previous_execution_id)
+                if task and not task.done():
+                    task.cancel()
+                execution.status = WorkflowStatus.CANCELLED
+                execution.cancel_requested = True
+                execution.completed_at = execution.completed_at or datetime.now()
+                execution.error = execution.error or reset_reason
+                execution.resume_cursor = {
+                    **(execution.resume_cursor or {}),
+                    "reset_at": datetime.now().isoformat(),
+                    "reset_reason": reset_reason,
+                    "reset_token": reset_token,
+                }
+                await self._save_execution_to_db(execution, db)
+                await db.reset_workflow_execution(previous_execution_id, reason=reset_reason)
+                await self._broadcast_status(previous_execution_id, "workflow_reset", {
+                    "execution_id": previous_execution_id,
+                    "reason": reset_reason,
+                    "reset_token": reset_token,
+                })
+            else:
+                await db.reset_workflow_execution(previous_execution_id, reason=reset_reason)
+
+        if previous_request_id:
+            operation = await db.get_operation_request_by_request_id(previous_request_id)
+            if operation:
+                operation_service = OperationLifecycleService(db=db, redis=redis_service)
+                await operation_service.reset(
+                    operation,
+                    reason=reset_reason,
+                    superseded_by_request_id=reset_token,
+                )
+
+        return {
+            "success": True,
+            "project_id": project_id,
+            "workflow_id": workflow_id,
+            "director_session_id": normalized_session_id,
+            "previous_execution_id": previous_execution_id,
+            "previous_operation_id": previous_operation_id,
+            "previous_request_id": previous_request_id,
+            "reset_token": reset_token,
+            "can_start_new": True,
+        }
 
     async def create_runtime_fixture(
         self,
@@ -2245,6 +2391,10 @@ class WorkflowEngine:
         if not execution:
             return
 
+        heartbeat_task: Optional[asyncio.Task] = None
+        if db:
+            heartbeat_task = asyncio.create_task(self._run_execution_heartbeat_loop(execution, db))
+
         try:
             # ========== 构建前驱图和后继图 ==========
             predecessors = self._build_predecessor_graph(workflow)
@@ -2355,6 +2505,9 @@ class WorkflowEngine:
                 if execution.status in [WorkflowStatus.PAUSED, WorkflowStatus.CANCELLED]:
                     logger.info(f"工作流 {execution_id} 被暂停或取消")
                     return
+                if execution.status == WorkflowStatus.FAILED:
+                    logger.info(f"工作流 {execution_id} 已失败，停止调度后续节点")
+                    break
 
                 # 如果没有就绪节点，等待正在执行的节点完成
                 if not ready_nodes:
@@ -2390,6 +2543,10 @@ class WorkflowEngine:
                             if execution.status == WorkflowStatus.PAUSED:
                                 logger.info(f"并行节点触发工作流暂停: {node_id} ({node.label})")
                                 return (node_id, False, "paused")
+                            node_state = execution.node_states.get(node_id)
+                            if node_state and node_state.status == NodeStatus.FAILED:
+                                logger.error(f"并行节点执行失败: {node_id} ({node.label}) - {node_state.error}")
+                                return (node_id, False, node_state.error or "node failed")
                             logger.info(f"并行节点执行完成: {node_id} ({node.label})")
                             return (node_id, True, None)
                         except Exception as e:
@@ -2415,7 +2572,10 @@ class WorkflowEngine:
 
                         if isinstance(result, Exception):
                             logger.error(f"节点 {node_id} 任务抛出异常: {result}")
-                            completed_nodes.add(node_id)  # 标记为完成（失败）以避免死锁
+                            node_state = execution.node_states.get(node_id)
+                            if node_state:
+                                node_state.status = NodeStatus.FAILED
+                                node_state.error = str(result)
                         elif isinstance(result, tuple):
                             nid, success, error = result
                             if success:
@@ -2425,16 +2585,27 @@ class WorkflowEngine:
                             if execution.status == WorkflowStatus.PAUSED:
                                 logger.info(f"工作流 {execution_id} 已暂停，等待外部输入")
                                 return
+                            if not success:
+                                node_state = execution.node_states.get(nid)
+                                if node_state:
+                                    node_state.status = NodeStatus.FAILED
+                                    node_state.error = error or node_state.error or "node failed"
+                                execution.status = WorkflowStatus.FAILED
+                                execution.error = error or node_state.error if node_state else "node failed"
+                                continue
                             completed_nodes.add(nid)
 
                             # 检查条件分支的 goto
-                            if success and node.node_type == NodeType.CONDITION:
+                            if node.node_type == NodeType.CONDITION:
                                 next_node_id = self._get_next_node(nid, execution, workflow)
                                 if next_node_id and next_node_id in completed_nodes:
                                     goto_target = next_node_id
                                     goto_source_node = nid
                                     logger.info(f"并行执行中检测到条件分支 goto: {nid} -> {next_node_id}")
                         else:
+                            node_state = execution.node_states.get(node_id)
+                            if node_state and node_state.status == NodeStatus.FAILED:
+                                continue
                             completed_nodes.add(node_id)
 
                     # 处理 goto（只处理第一个检测到的，最多重试 3 次）
@@ -2493,6 +2664,9 @@ class WorkflowEngine:
                                 )
 
                     logger.info(f"并行执行完成，已完成节点: {completed_nodes}")
+                    if execution.status == WorkflowStatus.FAILED:
+                        logger.info(f"工作流 {execution_id} 并行节点失败，停止调度后续节点")
+                        break
 
                 elif len(ready_nodes) == 1:
                     # 单个节点执行
@@ -2513,6 +2687,12 @@ class WorkflowEngine:
                         if execution.status == WorkflowStatus.PAUSED:
                             logger.info(f"工作流 {execution_id} 已暂停，等待外部输入")
                             return
+                        node_state = execution.node_states.get(node_id)
+                        if node_state and node_state.status == NodeStatus.FAILED:
+                            logger.error(f"节点 {node_id} 执行失败，停止调度后续节点: {node_state.error}")
+                            execution.status = WorkflowStatus.FAILED
+                            execution.error = node_state.error or f"节点 {node_id} 执行失败"
+                            break
                         completed_nodes.add(node_id)
                         logger.info(f"节点 {node_id} 执行完成")
 
@@ -2585,8 +2765,9 @@ class WorkflowEngine:
                         if node_state:
                             node_state.status = NodeStatus.FAILED
                             node_state.error = str(e)
-                        # 标记为完成但失败，避免死锁
-                        completed_nodes.add(node_id)
+                        execution.status = WorkflowStatus.FAILED
+                        execution.error = str(e)
+                        break
                 else:
                     # ready_nodes 为空，这不应该发生
                     logger.warning("ready_nodes 为空，检查是否有死锁")
@@ -2657,6 +2838,13 @@ class WorkflowEngine:
             execution.completed_at = datetime.now()
 
         finally:
+            if heartbeat_task:
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+
             # 计算总耗时
             if execution.started_at and execution.completed_at:
                 delta = execution.completed_at - execution.started_at
@@ -3419,10 +3607,10 @@ class WorkflowEngine:
         seen: set[tuple[str, str, str, str]] = set()
         for item in normalized:
             seen.add((
-                str(item.get("requirement_type") or "").strip(),
-                str(item.get("resource_name") or "").strip(),
-                str(item.get("reason") or "").strip(),
-                str(item.get("source_node_id") or "").strip(),
+                str(item.get("chapter_outline_id") or item.get("outline_id") or "").strip(),
+                str(item.get("chapter_num") or item.get("chapter_number") or "").strip(),
+                str(item.get("requirement_type") or "").strip().lower(),
+                str(item.get("resource_name") or "").strip().lower(),
             ))
 
         latest_all: List[Dict[str, Any]] = []
@@ -3463,8 +3651,26 @@ class WorkflowEngine:
                 normalized_item.setdefault("chapter_outline_id", execution.context.get("chapter_outline_id"))
             normalized_item.setdefault("suggested_payload", {})
 
-            fingerprint = (requirement_type, resource_name, reason, node.id)
+            fingerprint = (
+                str(normalized_item.get("chapter_outline_id") or normalized_item.get("outline_id") or "").strip(),
+                str(normalized_item.get("chapter_num") or normalized_item.get("chapter_number") or "").strip(),
+                requirement_type.strip().lower(),
+                resource_name.strip().lower(),
+            )
             if fingerprint in seen:
+                for existing_item in normalized:
+                    existing_fingerprint = (
+                        str(existing_item.get("chapter_outline_id") or existing_item.get("outline_id") or "").strip(),
+                        str(existing_item.get("chapter_num") or existing_item.get("chapter_number") or "").strip(),
+                        str(existing_item.get("requirement_type") or "").strip().lower(),
+                        str(existing_item.get("resource_name") or "").strip().lower(),
+                    )
+                    if existing_fingerprint != fingerprint:
+                        continue
+                    existing_reason = str(existing_item.get("reason") or "").strip()
+                    if reason and reason not in existing_reason:
+                        existing_item["reason"] = f"{existing_reason}\n{reason}" if existing_reason else reason
+                    break
                 continue
             seen.add(fingerprint)
             normalized.append(normalized_item)
@@ -13069,6 +13275,30 @@ class WorkflowEngine:
 
             return True
 
+    def _find_nearest_upstream_agent_node(
+        self,
+        workflow: WorkflowDefinition,
+        target_node_id: str,
+    ) -> Optional[str]:
+        """Find nearest upstream Agent node so recovery can re-run LLM work, not only terminal glue."""
+        nodes_by_id = {node.id: node for node in workflow.nodes}
+        predecessors: Dict[str, List[str]] = defaultdict(list)
+        for edge in workflow.edges:
+            predecessors[edge.target].append(edge.source)
+
+        visited: Set[str] = set()
+        queue: deque[str] = deque(predecessors.get(target_node_id, []))
+        while queue:
+            current_node_id = queue.popleft()
+            if current_node_id in visited:
+                continue
+            visited.add(current_node_id)
+            node = nodes_by_id.get(current_node_id)
+            if node and node.node_type == NodeType.AGENT:
+                return current_node_id
+            queue.extend(predecessors.get(current_node_id, []))
+        return None
+
     def _find_failed_recovery_target(
         self,
         execution: "WorkflowExecution",
@@ -13078,6 +13308,7 @@ class WorkflowEngine:
         node_id: Optional[str] = None,
     ) -> str:
         workflow_node_ids = {node.id for node in workflow.nodes}
+        workflow_nodes_by_id = {node.id: node for node in workflow.nodes}
         normalized_mode = (mode or "retry_failed").strip().lower()
         if normalized_mode == "retry_failed":
             failed_entry = next(
@@ -13091,6 +13322,16 @@ class WorkflowEngine:
             if not failed_entry:
                 raise ValueError("执行中没有可恢复的失败节点")
             target_node_id = failed_entry[0]
+            target_node = workflow_nodes_by_id.get(target_node_id)
+            if target_node and target_node.node_type != NodeType.AGENT:
+                upstream_agent_id = self._find_nearest_upstream_agent_node(workflow, target_node_id)
+                if upstream_agent_id:
+                    logger.info(
+                        "失败节点 %s 不是 Agent，恢复目标回退到上游 Agent: %s",
+                        target_node_id,
+                        upstream_agent_id,
+                    )
+                    target_node_id = upstream_agent_id
         elif normalized_mode == "retry_from_node":
             if not node_id:
                 raise ValueError("retry_from_node 模式需要 node_id")

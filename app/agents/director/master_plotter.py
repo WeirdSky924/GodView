@@ -749,27 +749,25 @@ class MasterPlotterAgent(BaseAgent):
                 plan.setdefault("resource_requirements", [])
                 if isinstance(plan["resource_requirements"], list):
                     plan["resource_requirements"].extend(role_delta_resource_requirements)
+            workflow_output = {
+                **plan,
+                "master_scene_plan": plan,
+                "writing_plan": {
+                    "chapter_focus": plan.get("chapter_intent", ""),
+                    "middle_beats": [beat.get("purpose", "") for beat in plan.get("scene_plan", []) if isinstance(beat, dict)],
+                    "ending": plan.get("ending_hook_contract", {}),
+                    "target_word_count": target_word_count,
+                },
+                "plot_guidance": {
+                    "must_include": plan.get("writer_brief", {}).get("must_follow", []) if isinstance(plan.get("writer_brief"), dict) else [],
+                    "avoid": plan.get("style_constraints", []) + plan.get("risk_flags", []),
+                    "hook_usage": [plan.get("ending_hook_contract", {})] if plan.get("ending_hook_contract") else [],
+                },
+                "scene_integration_plan": {"scene_plan": plan.get("scene_plan", [])},
+            }
             return AgentResponse(
                 success=True,
-                data={
-                    "master_scene_plan": plan,
-                    "scene_plan": plan.get("scene_plan", []),
-                    "writer_brief": plan.get("writer_brief", {}),
-                    "evaluator_checklist": plan.get("evaluator_checklist", {}),
-                    "writing_plan": {
-                        "chapter_focus": plan.get("chapter_intent", ""),
-                        "middle_beats": [beat.get("purpose", "") for beat in plan.get("scene_plan", []) if isinstance(beat, dict)],
-                        "ending": plan.get("ending_hook_contract", {}),
-                        "target_word_count": target_word_count,
-                    },
-                    "plot_guidance": {
-                        "must_include": plan.get("writer_brief", {}).get("must_follow", []) if isinstance(plan.get("writer_brief"), dict) else [],
-                        "avoid": plan.get("style_constraints", []) + plan.get("risk_flags", []),
-                        "hook_usage": [plan.get("ending_hook_contract", {})] if plan.get("ending_hook_contract") else [],
-                    },
-                    "scene_integration_plan": {"scene_plan": plan.get("scene_plan", [])},
-                    "resource_requirements": plan.get("resource_requirements", []),
-                },
+                data=workflow_output,
                 metadata={"output_contract": "master_plotter.scene_plan.workflow_output", **self._get_runtime_trace_metadata()},
             )
         except StructuredOutputError as e:
@@ -812,14 +810,14 @@ class MasterPlotterAgent(BaseAgent):
                 category=UsageCategory.PLOT,
             )
             directive = parsed.model_dump()
+            workflow_output = {
+                **directive,
+                "master_revision_directive": directive,
+                "revision_directive": directive,
+            }
             return AgentResponse(
                 success=True,
-                data={
-                    "master_revision_directive": directive,
-                    "revision_directive": directive,
-                    "writer_revision_brief": directive.get("writer_revision_brief", {}),
-                    "evaluator_focus": directive.get("evaluator_focus", []),
-                },
+                data=workflow_output,
                 metadata={"output_contract": "master_plotter.revision_directive.workflow_output", **self._get_runtime_trace_metadata()},
             )
         except StructuredOutputError as e:

@@ -6,6 +6,8 @@
 import logging
 from typing import Optional
 
+import httpx
+
 from langchain_core.language_models import BaseLanguageModel
 
 from app.config import settings
@@ -76,6 +78,10 @@ def create_llm(
         }
         if base_url:
             kwargs["base_url"] = base_url
+        client = httpx.Client(event_hooks={"response": [_log_llm_error_response]})
+        async_client = httpx.AsyncClient(event_hooks={"response": [_log_llm_error_response_async]})
+        kwargs["client"] = client
+        kwargs["async_client"] = async_client
         return ChatAnthropic(**kwargs)
 
     # 其他所有 provider 都使用 OpenAI 兼容 API
@@ -112,6 +118,58 @@ def _normalize_base_url(base_url: Optional[str]) -> Optional[str]:
         return None
     value = base_url.strip()
     return value or None
+
+
+def _redact_headers(headers: httpx.Headers) -> dict:
+    sensitive_names = {"authorization", "x-api-key", "api-key", "cookie", "set-cookie"}
+    return {
+        key: "<redacted>" if key.lower() in sensitive_names else value
+        for key, value in headers.items()
+    }
+
+
+def _truncate_for_log(text: str, limit: int = 4000) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}...<truncated {len(text) - limit} chars>"
+
+
+def _log_llm_error_response(response: httpx.Response) -> None:
+    if response.status_code < 400:
+        return
+    try:
+        response.read()
+        body = response.text
+    except Exception as exc:
+        body = f"<failed to read response body: {exc}>"
+    logger.error(
+        "LLM HTTP error response: status=%s method=%s url=%s request_headers=%s response_headers=%s body=%s",
+        response.status_code,
+        response.request.method,
+        response.request.url,
+        _redact_headers(response.request.headers),
+        _redact_headers(response.headers),
+        _truncate_for_log(body),
+    )
+
+
+async def _log_llm_error_response_async(response: httpx.Response) -> None:
+    if response.status_code < 400:
+        return
+    try:
+        await response.aread()
+        body = response.text
+    except Exception as exc:
+        body = f"<failed to read response body: {exc}>"
+    logger.error(
+        "LLM HTTP error response: status=%s method=%s url=%s request_headers=%s response_headers=%s body=%s",
+        response.status_code,
+        response.request.method,
+        response.request.url,
+        _redact_headers(response.request.headers),
+        _redact_headers(response.headers),
+        _truncate_for_log(body),
+    )
 
 
 def create_model_factory(

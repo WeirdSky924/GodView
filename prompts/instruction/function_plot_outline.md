@@ -286,12 +286,23 @@ is_system: true
     "ending": {...}
   },
   "villain_arc": {...},
+  "resource_references": [
+    {
+      "name": "具体设定/伏笔/地点/物品/能力名称",
+      "resource_type": "lore/hook/location/item/ability/faction/rule",
+      "reason": "本章为什么需要这个资源",
+      "source_scene": 1,
+      "confidence": "high/medium/low"
+    }
+  ],
   "quality_check": {
     "villain_consistent": true,
     "character_stance_check": true
   }
 }
 ```
+
+`resource_references` 是可选字段，只在本章明确依赖具体命名资源或确实需要新增资源时填写；不要把“能力”“规则”“组织”“伏笔”等普通叙述词当作资源名。如果只是普通剧情描述或泛称，不要制造资源需求。
 
 ## 九、技能调用
 

@@ -71,20 +71,28 @@ class OperationLifecycleService:
         request_hash = self.build_request_hash(request_payload)
         cached = await self.redis.get_json(self._operation_cache_key(request_id))
         if cached and not force_new:
-            return OperationBeginResult(operation=cached, replayed=cached.get("status") in TERMINAL_STATUSES)
+            if self._is_reset_operation(cached):
+                await self.redis.delete(self._operation_cache_key(request_id))
+            else:
+                return OperationBeginResult(operation=cached, replayed=cached.get("status") in TERMINAL_STATUSES)
 
         existing = await self.db.get_operation_request_by_request_id(request_id)
         if existing and not force_new:
-            await self.redis.set_json(
-                self._operation_cache_key(request_id),
-                existing,
-                ttl_seconds=settings.operation_cache_ttl_seconds,
-            )
-            return OperationBeginResult(
-                operation=existing,
-                replayed=existing.get("status") in TERMINAL_STATUSES,
-                deduplicated=existing.get("status") in ACTIVE_STATUSES,
-            )
+            if self._is_reset_operation(existing):
+                original_request_id = request_id
+                request_id = f"{request_id}:reset:{uuid.uuid4().hex}"
+                logger.info("跳过已废弃幂等请求并生成新 request_id: old=%s new=%s", original_request_id, request_id)
+            else:
+                await self.redis.set_json(
+                    self._operation_cache_key(request_id),
+                    existing,
+                    ttl_seconds=settings.operation_cache_ttl_seconds,
+                )
+                return OperationBeginResult(
+                    operation=existing,
+                    replayed=existing.get("status") in TERMINAL_STATUSES,
+                    deduplicated=existing.get("status") in ACTIVE_STATUSES,
+                )
 
         if not force_new and project_id:
             active = await self.db.get_active_operation_request(
@@ -135,6 +143,31 @@ class OperationLifecycleService:
             ttl_seconds=settings.operation_cache_ttl_seconds,
         )
         return OperationBeginResult(operation=operation, lock_token=lock_token)
+
+    @staticmethod
+    def _is_reset_operation(operation: Dict[str, Any]) -> bool:
+        return bool(operation.get("reset_at") or operation.get("superseded_by_request_id") or operation.get("status") == "reset")
+
+    async def reset(self, operation: Dict[str, Any], reason: Optional[str] = None, superseded_by_request_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        request_id = operation.get("request_id")
+        if not request_id:
+            return None
+        reset_operation = await self.db.reset_operation_request(
+            request_id,
+            reason=reason,
+            superseded_by_request_id=superseded_by_request_id,
+        )
+        await self.redis.delete(self._operation_cache_key(request_id))
+        await self.redis.release_lock(
+            self._semantic_lock_key(
+                operation.get("operation_type"),
+                operation.get("project_id"),
+                operation.get("resource_id"),
+                operation.get("request_hash"),
+            ),
+            operation.get("lease_token") or "",
+        )
+        return reset_operation
 
     async def mark_running(self, operation: Dict[str, Any], response_payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         return await self._update_operation(operation, "running", response_payload=response_payload)

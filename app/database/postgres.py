@@ -1968,6 +1968,18 @@ class PostgresDatabase:
         if not resource_name:
             raise ValueError("资源需求缺少 resource_name")
 
+        matched_resource_type = params.get("matched_resource_type")
+        existing_resource = await self._find_exact_requirement_resource(
+            project_id=project_id,
+            requirement_type=requirement_type,
+            resource_name=resource_name,
+        )
+        if existing_resource and not matched_resource_id:
+            matched_resource_id = str(existing_resource["id"])
+            matched_resource_type = existing_resource["resource_type"]
+            params["status"] = "resolved"
+            params["resolution_method"] = "bind_existing"
+
         severity = str(params.get("severity") or "advisory").strip().lower()
         if severity not in {"blocking", "advisory", "optional"}:
             severity = "advisory"
@@ -1997,7 +2009,7 @@ class PostgresDatabase:
             "reason": params.get("reason") or "",
             "suggested_payload": json.dumps(suggested_payload, default=str),
             "matched_resource_id": matched_resource_id,
-            "matched_resource_type": params.get("matched_resource_type"),
+            "matched_resource_type": matched_resource_type,
             "source_excerpt": params.get("source_excerpt") or params.get("reason") or "",
             "source_agent": params.get("source_agent"),
             "source_node_id": params.get("source_node_id") or params.get("node_id"),
@@ -2006,14 +2018,13 @@ class PostgresDatabase:
             "updated_at": params.get("updated_at") or datetime.now(),
             "resolved_at": params.get("resolved_at"),
         }
+        fingerprint_type = self._normalize_requirement_target_type(str(matched_resource_type or requirement_type))
         fingerprint = "|".join([
             project_id,
             str(record["outline_id"] or ""),
             str(record["chapter_num"] or ""),
-            requirement_type,
-            resource_name,
-            str(record["reason"] or ""),
-            str(record["source_node_id"] or ""),
+            fingerprint_type,
+            resource_name.strip().lower(),
         ])
         record["fingerprint"] = fingerprint
         chapter_id_sql = "CAST(:chapter_id AS UUID)" if record.get("chapter_id") else "NULL"
@@ -2040,9 +2051,14 @@ class PostgresDatabase:
             severity = EXCLUDED.severity,
             status = CASE
                 WHEN outline_resource_requirements.status IN ('resolved', 'ignored') THEN outline_resource_requirements.status
+                WHEN EXCLUDED.status = 'resolved' THEN 'resolved'
                 ELSE EXCLUDED.status
             END,
-            reason = EXCLUDED.reason,
+            reason = CASE
+                WHEN outline_resource_requirements.reason = EXCLUDED.reason OR outline_resource_requirements.reason = '' THEN EXCLUDED.reason
+                WHEN EXCLUDED.reason = '' THEN outline_resource_requirements.reason
+                ELSE outline_resource_requirements.reason || '\n' || EXCLUDED.reason
+            END,
             suggested_payload = EXCLUDED.suggested_payload,
             matched_resource_id = EXCLUDED.matched_resource_id,
             matched_resource_type = EXCLUDED.matched_resource_type,
@@ -2050,9 +2066,13 @@ class PostgresDatabase:
             source_agent = EXCLUDED.source_agent,
             source_node_id = EXCLUDED.source_node_id,
             source_execution_id = EXCLUDED.source_execution_id,
-            metadata = EXCLUDED.metadata,
+            metadata = outline_resource_requirements.metadata || EXCLUDED.metadata,
             updated_at = EXCLUDED.updated_at,
-            resolved_at = COALESCE(outline_resource_requirements.resolved_at, EXCLUDED.resolved_at)
+            resolved_at = CASE
+                WHEN outline_resource_requirements.resolved_at IS NOT NULL THEN outline_resource_requirements.resolved_at
+                WHEN EXCLUDED.status = 'resolved' THEN EXCLUDED.updated_at
+                ELSE EXCLUDED.resolved_at
+            END
         RETURNING id
         """
         rows = await self.execute_query(query, record)
@@ -2069,6 +2089,85 @@ class PostgresDatabase:
             saved_ids.append(await self.save_outline_resource_requirement(requirement))
         return saved_ids
 
+    async def _find_exact_requirement_resource(
+        self,
+        project_id: str,
+        requirement_type: str,
+        resource_name: str,
+    ) -> Optional[Dict[str, str]]:
+        """按资源名精确匹配已有资源；只用于避免把已存在资源重复列为待补齐。"""
+        name = str(resource_name or "").strip()
+        if not name:
+            return None
+        normalized_type = str(requirement_type or "").strip().lower()
+        if normalized_type in {"lore", "setting", "continuity", "character_state", "event_rule", "crisis_resolution", "world_rule", "item", "faction", "organization"}:
+            rows = await self.execute_query(
+                """
+                SELECT id FROM lore_entries
+                WHERE project_id = CAST(:project_id AS UUID)
+                  AND lower(trim(title)) = lower(trim(:name))
+                ORDER BY created_at ASC
+                LIMIT 1
+                """,
+                {"project_id": project_id, "name": name},
+            )
+            if rows:
+                return {"id": str(rows[0]["id"]), "resource_type": "lore"}
+        if normalized_type in {"character", "role", "person", "角色", "人物"}:
+            rows = await self.execute_query(
+                """
+                SELECT id FROM characters
+                WHERE project_id = CAST(:project_id AS UUID)
+                  AND lower(trim(name)) = lower(trim(:name))
+                ORDER BY created_at ASC
+                LIMIT 1
+                """,
+                {"project_id": project_id, "name": name},
+            )
+            if rows:
+                return {"id": str(rows[0]["id"]), "resource_type": "character"}
+        if normalized_type in {"hook", "foreshadowing", "plot_hook", "伏笔"}:
+            rows = await self.execute_query(
+                """
+                SELECT id FROM hooks
+                WHERE project_id = CAST(:project_id AS UUID)
+                  AND lower(trim(title)) = lower(trim(:name))
+                ORDER BY created_at ASC
+                LIMIT 1
+                """,
+                {"project_id": project_id, "name": name},
+            )
+            if rows:
+                return {"id": str(rows[0]["id"]), "resource_type": "hook"}
+        if normalized_type in {"location", "region", "place", "地点", "场景地点"}:
+            rows = await self.execute_query(
+                """
+                SELECT r.id FROM regions r
+                JOIN worlds w ON r.world_id = w.id
+                WHERE w.project_id = CAST(:project_id AS UUID)
+                  AND lower(trim(r.name)) = lower(trim(:name))
+                ORDER BY r.created_at ASC
+                LIMIT 1
+                """,
+                {"project_id": project_id, "name": name},
+            )
+            if rows:
+                return {"id": str(rows[0]["id"]), "resource_type": "location"}
+        return None
+
+    def _normalize_requirement_target_type(self, requirement_type: str) -> str:
+        """把资源需求原始类型归并到目标资源库类型。"""
+        normalized = str(requirement_type or "").strip().lower()
+        if normalized in {"role", "person", "角色", "人物"}:
+            return "character"
+        if normalized in {"setting", "continuity", "character_state", "event_rule", "crisis_resolution", "world_rule", "item", "faction", "organization", "设定", "势力", "组织", "道具", "能力", "关系", "关系变化", "角色状态", "连续性", "事件规则", "危机解法", "危机"}:
+            return "lore"
+        if normalized in {"region", "place", "地点", "场景地点"}:
+            return "location"
+        if normalized in {"foreshadowing", "plot_hook", "伏笔"}:
+            return "hook"
+        return normalized
+
     async def get_outline_resource_requirements(
         self,
         project_id: str,
@@ -2077,32 +2176,59 @@ class PostgresDatabase:
         status: Optional[str] = None,
         severity: Optional[str] = None,
         requirement_type: Optional[str] = None,
+        active_outlines_only: bool = True,
     ) -> List[Dict[str, Any]]:
         """查询大纲资源需求。"""
-        conditions = ["project_id = CAST(:project_id AS UUID)"]
+        conditions = ["r.project_id = CAST(:project_id AS UUID)"]
         params: Dict[str, Any] = {"project_id": project_id}
         if outline_id:
-            conditions.append("outline_id = :outline_id")
+            conditions.append("r.outline_id = :outline_id")
             params["outline_id"] = outline_id
         if chapter_num is not None:
-            conditions.append("chapter_num = :chapter_num")
+            conditions.append("r.chapter_num = :chapter_num")
             params["chapter_num"] = chapter_num
         if status:
-            conditions.append("status = :status")
+            conditions.append("r.status = :status")
             params["status"] = status
         if severity:
-            conditions.append("severity = :severity")
+            conditions.append("r.severity = :severity")
             params["severity"] = severity
         if requirement_type:
-            conditions.append("requirement_type = :requirement_type")
-            params["requirement_type"] = requirement_type
+            target_type = self._normalize_requirement_target_type(requirement_type)
+            aliases_by_target = {
+                "character": ["character", "role", "person", "角色", "人物"],
+                "lore": ["lore", "setting", "continuity", "character_state", "event_rule", "crisis_resolution", "world_rule", "item", "faction", "organization", "设定", "势力", "组织", "道具", "能力", "关系", "关系变化", "角色状态", "连续性", "事件规则", "危机解法", "危机"],
+                "location": ["location", "region", "place", "地点", "场景地点"],
+                "hook": ["hook", "foreshadowing", "plot_hook", "伏笔"],
+            }
+            aliases = aliases_by_target.get(target_type)
+            if aliases:
+                placeholders = []
+                for index, alias in enumerate(aliases):
+                    key = f"requirement_type_alias_{index}"
+                    placeholders.append(f":{key}")
+                    params[key] = alias
+                conditions.append(f"lower(r.requirement_type) IN ({', '.join(placeholders)})")
+            else:
+                conditions.append("r.requirement_type = :requirement_type")
+                params["requirement_type"] = requirement_type
+        join_clause = ""
+        if active_outlines_only:
+            join_clause = """
+            JOIN chapter_outlines co
+              ON CAST(co.id AS TEXT) = r.outline_id
+             AND CAST(co.project_id AS TEXT) = CAST(r.project_id AS TEXT)
+             AND co.deleted_at IS NULL
+            """
         query = f"""
-        SELECT * FROM outline_resource_requirements
+        SELECT r.*
+        FROM outline_resource_requirements r
+        {join_clause}
         WHERE {' AND '.join(conditions)}
         ORDER BY
-            chapter_num NULLS LAST,
-            CASE severity WHEN 'blocking' THEN 1 WHEN 'advisory' THEN 2 ELSE 3 END,
-            created_at ASC
+            r.chapter_num NULLS LAST,
+            CASE r.severity WHEN 'blocking' THEN 1 WHEN 'advisory' THEN 2 ELSE 3 END,
+            r.created_at ASC
         """
         return await self.execute_query(query, params)
 
@@ -2454,6 +2580,98 @@ class PostgresDatabase:
         """
         rows = await self.execute_query(query, params)
         return rows[0] if rows else None
+
+    async def supersede_outline_resource_requirements(self, project_id: str, outline_id: str) -> int:
+        """将已删除/失效大纲关联的未完成资源需求标记为过期。"""
+        now = datetime.now()
+        return await self.execute_write(
+            """
+            UPDATE outline_resource_requirements
+            SET status = 'superseded',
+                updated_at = :updated_at,
+                metadata = jsonb_set(
+                    COALESCE(metadata, '{}'::jsonb),
+                    '{superseded_reason}',
+                    to_jsonb(CAST(:superseded_reason AS TEXT)),
+                    true
+                )
+            WHERE project_id = CAST(:project_id AS UUID)
+              AND outline_id = :outline_id
+              AND status IN ('pending', 'in_progress')
+            """,
+            {
+                "project_id": project_id,
+                "outline_id": outline_id,
+                "updated_at": now,
+                "superseded_reason": "outline_deleted",
+            },
+        )
+
+    async def delete_chapter_resource_readiness(self, project_id: str, outline_id: str) -> int:
+        """删除已失效大纲的章节资源 readiness 汇总。"""
+        return await self.execute_write(
+            """
+            DELETE FROM chapter_resource_readiness
+            WHERE project_id = CAST(:project_id AS UUID)
+              AND outline_id = :outline_id
+            """,
+            {"project_id": project_id, "outline_id": outline_id},
+        )
+
+    async def cleanup_orphaned_outline_resource_requirements(self, project_id: str) -> Dict[str, int]:
+        """清理历史遗留的孤儿大纲资源需求与 readiness。"""
+        now = datetime.now()
+        superseded_requirements = await self.execute_write(
+            """
+            UPDATE outline_resource_requirements r
+            SET status = 'superseded',
+                updated_at = :updated_at,
+                metadata = jsonb_set(
+                    COALESCE(r.metadata, '{}'::jsonb),
+                    '{superseded_reason}',
+                    to_jsonb(CAST(:superseded_reason AS TEXT)),
+                    true
+                )
+            WHERE r.project_id = CAST(:project_id AS UUID)
+              AND r.status IN ('pending', 'in_progress')
+              AND (
+                  r.outline_id IS NULL
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM chapter_outlines co
+                      WHERE CAST(co.id AS TEXT) = r.outline_id
+                        AND CAST(co.project_id AS TEXT) = CAST(r.project_id AS TEXT)
+                        AND co.deleted_at IS NULL
+                  )
+              )
+            """,
+            {
+                "project_id": project_id,
+                "updated_at": now,
+                "superseded_reason": "orphaned_or_deleted_outline_cleanup",
+            },
+        )
+        deleted_readiness = await self.execute_write(
+            """
+            DELETE FROM chapter_resource_readiness cr
+            WHERE cr.project_id = CAST(:project_id AS UUID)
+              AND (
+                  cr.outline_id IS NULL
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM chapter_outlines co
+                      WHERE CAST(co.id AS TEXT) = cr.outline_id
+                        AND CAST(co.project_id AS TEXT) = CAST(cr.project_id AS TEXT)
+                        AND co.deleted_at IS NULL
+                  )
+              )
+            """,
+            {"project_id": project_id},
+        )
+        return {
+            "superseded_resource_requirements": max(int(superseded_requirements or 0), 0),
+            "deleted_resource_readiness": max(int(deleted_readiness or 0), 0),
+        }
 
     async def save_event(self, event_data: Dict[str, Any]) -> str:
         """保存工作流/事件 Agent 生成的领域剧情事件。"""
@@ -3143,6 +3361,9 @@ class PostgresDatabase:
 
             operation_trace_updates = [
                 "ALTER TABLE operation_requests ADD COLUMN IF NOT EXISTS trace_id UUID REFERENCES execution_traces(id) ON DELETE SET NULL",
+                "ALTER TABLE operation_requests ADD COLUMN IF NOT EXISTS reset_at TIMESTAMP WITH TIME ZONE",
+                "ALTER TABLE operation_requests ADD COLUMN IF NOT EXISTS reset_reason TEXT",
+                "ALTER TABLE operation_requests ADD COLUMN IF NOT EXISTS superseded_by_request_id TEXT",
                 "CREATE INDEX IF NOT EXISTS idx_operation_requests_trace ON operation_requests(trace_id)",
             ]
             for statement in operation_trace_updates:
@@ -3157,6 +3378,9 @@ class PostgresDatabase:
                 "ALTER TABLE workflow_executions ADD COLUMN IF NOT EXISTS request_id TEXT",
                 "ALTER TABLE workflow_executions ADD COLUMN IF NOT EXISTS request_hash TEXT",
                 "ALTER TABLE workflow_executions ADD COLUMN IF NOT EXISTS director_session_id TEXT",
+                "ALTER TABLE workflow_executions ADD COLUMN IF NOT EXISTS reset_at TIMESTAMP WITH TIME ZONE",
+                "ALTER TABLE workflow_executions ADD COLUMN IF NOT EXISTS reset_reason TEXT",
+                "ALTER TABLE workflow_executions ADD COLUMN IF NOT EXISTS superseded_by_execution_id TEXT",
                 "ALTER TABLE workflow_executions ADD COLUMN IF NOT EXISTS lease_token TEXT",
                 "ALTER TABLE workflow_executions ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMP WITH TIME ZONE",
                 "ALTER TABLE workflow_executions ADD COLUMN IF NOT EXISTS last_heartbeat_at TIMESTAMP WITH TIME ZONE",
@@ -4216,7 +4440,7 @@ class PostgresDatabase:
         director_session_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """获取项目/工作流当前活跃执行。"""
-        conditions = ["project_id = :project_id", "status IN ('pending', 'running', 'paused')"]
+        conditions = ["project_id = :project_id", "status IN ('pending', 'running', 'paused')", "reset_at IS NULL"]
         params: Dict[str, Any] = {"project_id": project_id}
         if workflow_id:
             conditions.append("workflow_id = :workflow_id")
@@ -4245,6 +4469,72 @@ class PostgresDatabase:
         LIMIT 1
         """
         results = await self.execute_query(query, params)
+        return results[0] if results else None
+
+    async def get_director_session_workflow_execution(
+        self,
+        project_id: str,
+        workflow_id: str,
+        director_session_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """获取 Director 会话当前可重置执行，包含失败终态但排除已废弃记录。"""
+        results = await self.execute_query(
+            """
+            SELECT * FROM workflow_executions
+            WHERE project_id = :project_id
+              AND workflow_id = :workflow_id
+              AND director_session_id = :director_session_id
+              AND reset_at IS NULL
+              AND status IN ('pending', 'running', 'paused', 'failed')
+            ORDER BY
+                CASE status
+                    WHEN 'running' THEN 1
+                    WHEN 'paused' THEN 2
+                    WHEN 'pending' THEN 3
+                    WHEN 'failed' THEN 4
+                    ELSE 5
+                END ASC,
+                COALESCE(last_heartbeat_at, completed_at, started_at) DESC,
+                started_at DESC,
+                id DESC
+            LIMIT 1
+            """,
+            {
+                "project_id": project_id,
+                "workflow_id": workflow_id,
+                "director_session_id": director_session_id,
+            },
+        )
+        return results[0] if results else None
+
+    async def reset_workflow_execution(
+        self,
+        execution_id: str,
+        reason: Optional[str] = None,
+        superseded_by_execution_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """废弃当前会话执行，使 active lookup 不再恢复它。"""
+        results = await self.execute_query(
+            """
+            UPDATE workflow_executions
+            SET status = 'cancelled',
+                reset_at = CURRENT_TIMESTAMP,
+                reset_reason = :reason,
+                superseded_by_execution_id = :superseded_by_execution_id,
+                cancel_requested = TRUE,
+                lease_token = NULL,
+                lease_expires_at = NULL,
+                completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
+                error = COALESCE(error, :reason)
+            WHERE id = :execution_id
+            RETURNING *
+            """,
+            {
+                "execution_id": execution_id,
+                "reason": reason,
+                "superseded_by_execution_id": superseded_by_execution_id,
+            },
+        )
         return results[0] if results else None
 
     async def append_workflow_execution_event(
@@ -4304,7 +4594,7 @@ class PostgresDatabase:
                 data[field] = json.dumps(value, default=str)
             elif value is None:
                 data[field] = '{}'
-        for field in ["lease_expires_at", "last_heartbeat_at", "completed_at"]:
+        for field in ["lease_expires_at", "last_heartbeat_at", "completed_at", "reset_at"]:
             if field in data and isinstance(data[field], str):
                 try:
                     data[field] = datetime.fromisoformat(data[field].replace('Z', '+00:00'))
@@ -4320,6 +4610,9 @@ class PostgresDatabase:
         data.setdefault("lease_expires_at", None)
         data.setdefault("last_heartbeat_at", None)
         data.setdefault("completed_at", None)
+        data.setdefault("reset_at", None)
+        data.setdefault("reset_reason", None)
+        data.setdefault("superseded_by_request_id", None)
         id_sql = "CAST(:id AS UUID)" if data.get("id") else "gen_random_uuid()"
         project_id_sql = "CAST(:project_id AS UUID)" if data.get("project_id") else "NULL"
         trace_id_sql = "CAST(:trace_id AS UUID)" if data.get("trace_id") else "NULL"
@@ -4327,12 +4620,14 @@ class PostgresDatabase:
         INSERT INTO operation_requests (
             id, request_id, operation_type, project_id, resource_type, resource_id,
             request_hash, trace_id, status, response_payload, error, lease_token,
-            lease_expires_at, last_heartbeat_at, completed_at, updated_at
+            lease_expires_at, last_heartbeat_at, completed_at, reset_at, reset_reason,
+            superseded_by_request_id, updated_at
         )
         VALUES (
             """ + id_sql + """, :request_id, :operation_type, """ + project_id_sql + """, :resource_type, :resource_id,
             :request_hash, """ + trace_id_sql + """, :status, :response_payload, :error, :lease_token,
-            :lease_expires_at, :last_heartbeat_at, :completed_at, CURRENT_TIMESTAMP
+            :lease_expires_at, :last_heartbeat_at, :completed_at, :reset_at, :reset_reason,
+            :superseded_by_request_id, CURRENT_TIMESTAMP
         )
         ON CONFLICT (request_id) DO UPDATE SET
             trace_id = COALESCE(EXCLUDED.trace_id, operation_requests.trace_id),
@@ -4343,6 +4638,9 @@ class PostgresDatabase:
             lease_expires_at = EXCLUDED.lease_expires_at,
             last_heartbeat_at = EXCLUDED.last_heartbeat_at,
             completed_at = EXCLUDED.completed_at,
+            reset_at = EXCLUDED.reset_at,
+            reset_reason = EXCLUDED.reset_reason,
+            superseded_by_request_id = EXCLUDED.superseded_by_request_id,
             updated_at = CURRENT_TIMESTAMP
         RETURNING id
         """
@@ -4354,6 +4652,34 @@ class PostgresDatabase:
         results = await self.execute_query(
             "SELECT * FROM operation_requests WHERE request_id = :request_id",
             {"request_id": request_id},
+        )
+        return results[0] if results else None
+
+    async def reset_operation_request(
+        self,
+        request_id: str,
+        reason: Optional[str] = None,
+        superseded_by_request_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """废弃幂等请求，使普通 start 不再回放该 request_id。"""
+        results = await self.execute_query(
+            """
+            UPDATE operation_requests
+            SET status = 'reset',
+                reset_at = CURRENT_TIMESTAMP,
+                reset_reason = :reason,
+                superseded_by_request_id = :superseded_by_request_id,
+                lease_token = NULL,
+                lease_expires_at = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE request_id = :request_id
+            RETURNING *
+            """,
+            {
+                "request_id": request_id,
+                "reason": reason,
+                "superseded_by_request_id": superseded_by_request_id,
+            },
         )
         return results[0] if results else None
 

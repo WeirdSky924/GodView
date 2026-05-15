@@ -440,6 +440,18 @@ def _build_resource_supplement_draft(requirement: Dict[str, Any]) -> Dict[str, A
             "summary": suggested_payload.get("summary") or reason,
             "visibility": suggested_payload.get("visibility") or "draft",
         }
+    elif requirement_type in {"hook", "foreshadowing", "plot_hook", "伏笔"}:
+        resource_type = "hook"
+        payload = {
+            **base_payload,
+            "title": resource_name,
+            "description": suggested_payload.get("description") or reason or f"伏笔补全：{resource_name}",
+            "hook_type": suggested_payload.get("hook_type") or "mystery",
+            "status": suggested_payload.get("status") or "planted",
+            "priority": suggested_payload.get("priority") or 3,
+            "plant_context": suggested_payload.get("plant_context") or reason,
+            "resolution_hint": suggested_payload.get("resolution_hint") or "待后续章节回收",
+        }
     elif requirement_type in {"faction", "organization", "势力", "组织"}:
         resource_type = "lore"
         payload = {
@@ -604,7 +616,7 @@ def _normalize_terrain_type(value: Any) -> str:
 
 
 async def _create_confirmed_resource(postgres_db, project_id: str, draft: ConfirmResourceSupplementDraft) -> Dict[str, Any]:
-    """根据用户确认的草案创建最小资源；支持 character / lore / location。"""
+    """根据用户确认的草案创建最小资源；支持 character / lore / location / hook。"""
     import uuid
     from app.models.character import Character
     from app.models.lore import LoreEntry
@@ -694,6 +706,27 @@ async def _create_confirmed_resource(postgres_db, project_id: str, draft: Confir
         except Exception:
             logger.warning("确认创建 location 资源后图谱投影入队失败", exc_info=True)
         return {"resource_type": "location", "resource_id": resource_id, "resource": region_data}
+
+    if resource_type == "hook":
+        hook_payload = {
+            "id": payload.get("id") or str(uuid.uuid4()),
+            "project_id": project_id,
+            "world_id": payload.get("world_id"),
+            "scope_type": payload.get("scope_type") or "project",
+            "title": payload.get("title") or payload.get("name") or "未命名伏笔",
+            "description": payload.get("description") or payload.get("usage_guidance") or "由大纲资源需求补全创建。",
+            "hook_type": payload.get("hook_type") or "mystery",
+            "status": payload.get("status") or "planted",
+            "priority": payload.get("priority") or 3,
+            "related_characters": payload.get("related_characters") or [],
+            "related_locations": payload.get("related_locations") or [],
+            "related_objects": payload.get("related_objects") or [],
+            "plant_context": payload.get("plant_context") or payload.get("description") or payload.get("usage_guidance") or "",
+            "resolution_hint": payload.get("resolution_hint") or "待后续章节回收",
+        }
+        resource_id = await postgres_db.save_hook(hook_payload)
+        hook_payload["id"] = resource_id
+        return {"resource_type": "hook", "resource_id": resource_id, "resource": hook_payload}
 
     raise ValueError(f"暂不支持确认创建资源类型: {draft.resource_type}")
 
@@ -877,6 +910,7 @@ async def list_resource_requirements(
     status: Optional[str] = Query(None, description="需求状态"),
     severity: Optional[str] = Query(None, description="blocking/advisory/optional"),
     requirement_type: Optional[str] = Query(None, description="资源类型"),
+    active_outlines_only: bool = True,
 ):
     """查询大纲资源需求。"""
     from app.api.app import postgres_db
@@ -896,8 +930,32 @@ async def list_resource_requirements(
         status=status,
         severity=severity,
         requirement_type=requirement_type,
+        active_outlines_only=active_outlines_only,
     )
     return {"requirements": requirements, "total": len(requirements)}
+
+
+@router.post("/resource-requirements/cleanup-orphans", response_model=Dict[str, Any])
+async def cleanup_orphaned_resource_requirements(
+    project_id: str = Query(..., description="项目ID"),
+):
+    """清理已删除/不存在大纲残留的资源需求与 readiness。"""
+    from app.api.app import postgres_db
+
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+
+    project_id = _validate_uuid(project_id, "项目 ID", required=True)
+    if not hasattr(postgres_db, "cleanup_orphaned_outline_resource_requirements"):
+        raise HTTPException(status_code=501, detail="当前数据库适配器不支持资源需求清理")
+
+    result = await postgres_db.cleanup_orphaned_outline_resource_requirements(project_id)
+    return {
+        "success": True,
+        "project_id": project_id,
+        **result,
+        "message": f"已清理 {result.get('superseded_resource_requirements', 0)} 条孤儿资源需求，删除 {result.get('deleted_resource_readiness', 0)} 条失效 readiness",
+    }
 
 
 @router.get("/resource-readiness", response_model=Dict[str, Any])
@@ -1481,6 +1539,8 @@ async def delete_outline_by_id(
         "chapter_number": outline.chapter_number,
         "remaining_versions": versions["total"],
         "soft_deleted_chapters": soft_deleted_chapters,
+        "superseded_resource_requirements": int(result.get("superseded_resource_requirements", 0)),
+        "deleted_resource_readiness": int(result.get("deleted_resource_readiness", 0)),
     }
 
 
@@ -1508,6 +1568,8 @@ async def delete_outline(
         raise HTTPException(status_code=404, detail="章节大纲不存在")
 
     soft_deleted_chapters = 0
+    superseded_resource_requirements = 0
+    deleted_resource_readiness = 0
     deleted_ids: List[str] = []
     for outline in targets:
         result = await service.delete_outline(
@@ -1518,6 +1580,8 @@ async def delete_outline(
             raise HTTPException(status_code=500, detail="删除失败")
         deleted_ids.append(outline.id)
         soft_deleted_chapters += int(result.get("soft_deleted_chapters", 0))
+        superseded_resource_requirements += int(result.get("superseded_resource_requirements", 0))
+        deleted_resource_readiness += int(result.get("deleted_resource_readiness", 0))
 
     remaining = await service.get_outline_versions(project_id, chapter_number)
     if soft_delete_generated_chapters:
@@ -1532,6 +1596,8 @@ async def delete_outline(
         "deleted_versions": len(deleted_ids),
         "remaining_versions": remaining["total"],
         "soft_deleted_chapters": soft_deleted_chapters,
+        "superseded_resource_requirements": superseded_resource_requirements,
+        "deleted_resource_readiness": deleted_resource_readiness,
     }
 
 

@@ -10,6 +10,7 @@ import AssistantContextControls from '@/components/assistant/AssistantContextCon
 import { createAssistantSession, getAssistantHistory, type AssistantContextSummary } from '@/api/assistantContext'
 import { getCharacters, type Character } from '@/api/characters'
 import { getLoreList, type LoreEntry } from '@/api/lore'
+import { getHooks } from '@/api/chapters'
 import { getRegions, getWorlds, type Region } from '@/api/worlds'
 import { useProject } from '@/contexts/ProjectContext'
 import { useTheme } from '@/contexts/ThemeContext'
@@ -90,7 +91,7 @@ const STATUS_CONFIG: Record<OutlineStatus, { label: string; color: string }> = {
   rejected: { label: '已拒绝', color: 'bg-red-100 text-red-700' },
 }
 
-type BindableResourceType = 'character' | 'lore' | 'location'
+type BindableResourceType = 'character' | 'lore' | 'location' | 'hook'
 
 type RevisionNotice = {
   approvedOutlineId: string
@@ -145,7 +146,7 @@ export default function Outlines() {
   const [outlineVersions, setOutlineVersions] = useState<OutlineVersionsResponse | null>(null)
   const [loadingVersions, setLoadingVersions] = useState(false)
 
-  const directlyCreatableResourceTypes = ['character', 'lore', 'location']
+  const directlyCreatableResourceTypes = ['character', 'lore', 'location', 'hook']
 
   const getDraftDisplayResourceType = (draft: ResourceSupplementDraft) => formatRequirementTypeFlow(draft)
 
@@ -377,7 +378,7 @@ export default function Outlines() {
     if (!currentProject?.id || resourceDrafts.length === 0) return
     const creatableDrafts = resourceDrafts.filter(isDirectlyCreatableDraft)
     if (creatableDrafts.length === 0) {
-      alert('当前草案暂不包含可直接创建的角色、设定或地点资源')
+      alert('当前草案暂不包含可直接创建的角色、设定、地点或伏笔资源')
       return
     }
     setConfirmingDrafts(true)
@@ -407,6 +408,7 @@ export default function Outlines() {
     if (['character', 'role', '人物', '角色'].includes(type)) return 'character'
     if (['lore', 'setting', '设定'].includes(type)) return 'lore'
     if (['location', 'place', '地点', '场景地点'].includes(type)) return 'location'
+    if (['hook', 'foreshadowing', 'plot_hook', '伏笔'].includes(type)) return 'hook'
     return null
   }
 
@@ -446,6 +448,17 @@ export default function Outlines() {
           subtitle: lore.category,
           description: lore.summary || lore.content,
         })))
+      } else if (resourceType === 'hook') {
+        const hooks = await getHooks(currentProject.id)
+        setBindableResources(hooks
+          .filter(hook => hook.id)
+          .map(hook => ({
+            id: hook.id as string,
+            name: hook.title || hook.name || '未命名伏笔',
+            type: 'hook' as const,
+            subtitle: hook.hook_type || hook.status,
+            description: hook.description || hook.plant_context || hook.resolution_hint,
+          })))
       } else if (resourceType === 'location') {
         const worlds = await getWorlds(currentProject.id)
         const regionGroups = await Promise.all(
@@ -968,7 +981,7 @@ export default function Outlines() {
                 </div>
                 {!isDirectlyCreatableDraft(draft) && (
                   <p className={`text-xs mt-1 ${isDark ? 'text-yellow-300' : 'text-yellow-700'}`}>
-                    当前仅支持直接确认创建 character / lore / location，此草案需后续资源界面处理。
+                    当前仅支持直接确认创建 character / lore / location / hook，此草案需后续资源界面处理。
                   </p>
                 )}
               </div>

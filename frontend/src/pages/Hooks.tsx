@@ -1,7 +1,15 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { Card, Button, Input, TextArea, Modal } from '@/components/ui'
 import PageLayout from '@/components/PageLayout'
+import OutlineRequirementPanel from '@/components/OutlineRequirementPanel'
 import { getHooks, createHook, updateHook, updateHookStatus, deleteHook as deleteHookApi } from '@/api/chapters'
+import {
+  updateOutlineResourceRequirementStatus,
+  type OutlineResourceRequirement,
+} from '@/api/outlines'
+import { formatApiErrorMessage } from '@/api/workflows'
+import { formatRequirementSummary } from '@/utils/resourceRequirementDisplay'
 import { Plus, Flag, CheckCircle, Clock, XCircle, Trash2, Edit, FolderOpen } from 'lucide-react'
 import { useProject } from '@/contexts/ProjectContext'
 import { useTheme } from '@/contexts/ThemeContext'
@@ -58,6 +66,14 @@ export default function Hooks() {
   const [scopeFilter, setScopeFilter] = useState<'all' | 'project' | 'world'>('all')
   const [includeInherited, setIncludeInherited] = useState(true)
   const [openDropdownId, setOpenDropdownId] = useState<string | null>(null)
+  const [pendingRequirement, setPendingRequirement] = useState<OutlineResourceRequirement | null>(null)
+  const [focusedRequirement, setFocusedRequirement] = useState<OutlineResourceRequirement | null>(null)
+  const [requirementRefreshKey, setRequirementRefreshKey] = useState(0)
+  const [searchParams, setSearchParams] = useSearchParams()
+
+  const focusRequirementId = searchParams.get('requirement_id')
+  const shouldAutoCreateFromRequirement = searchParams.get('action') === 'create'
+  const autoOpenedRequirementIdRef = useRef<string | null>(null)
 
   const [formData, setFormData] = useState<CreateHookDTO>({
     title: '',
@@ -104,21 +120,40 @@ export default function Hooks() {
     }
   }, [openDropdownId])
 
-  const openCreateModal = () => {
+  const clearRequirementRecoveryParams = useCallback(() => {
+    if (!searchParams.has('requirement_id') && !searchParams.has('action')) return
+    const next = new URLSearchParams(searchParams)
+    next.delete('requirement_id')
+    next.delete('action')
+    setSearchParams(next, { replace: true })
+  }, [searchParams, setSearchParams])
+
+  const openCreateModal = useCallback((requirement?: OutlineResourceRequirement) => {
     setEditingHook(null)
+    const payload = requirement?.suggested_payload || {}
     const defaultWorldId = selectedWorldId || worlds.find(world => world.is_default)?.id || worlds[0]?.id || ''
+    const priority = payload.priority ? Number(payload.priority) : (requirement?.severity === 'blocking' ? 3 : 1)
+    setPendingRequirement(requirement || null)
     setFormData({
-      title: '',
-      description: '',
-      hook_type: 'custom',
-      priority: 1,
-      scope_type: defaultWorldId ? 'world' : 'project',
-      world_id: defaultWorldId || undefined,
+      title: String(payload.title || payload.name || requirement?.resource_name || ''),
+      description: String(payload.description || payload.plant_context || payload.usage_guidance || requirement?.reason || ''),
+      hook_type: String(payload.hook_type || 'mystery'),
+      priority: Number.isFinite(priority) ? Math.min(Math.max(priority, 1), 3) : 1,
+      scope_type: payload.scope_type ? String(payload.scope_type) : (defaultWorldId ? 'world' : 'project'),
+      world_id: payload.world_id ? String(payload.world_id) : (defaultWorldId || undefined),
     })
     setShowModal(true)
-  }
+  }, [selectedWorldId, worlds])
+
+  useEffect(() => {
+    if (!shouldAutoCreateFromRequirement || !focusedRequirement || showModal || pendingRequirement) return
+    if (autoOpenedRequirementIdRef.current === focusedRequirement.id) return
+    autoOpenedRequirementIdRef.current = focusedRequirement.id
+    openCreateModal(focusedRequirement)
+  }, [shouldAutoCreateFromRequirement, focusedRequirement, showModal, pendingRequirement, openCreateModal])
 
   const openEditModal = (hook: Hook) => {
+    setPendingRequirement(null)
     setEditingHook(hook)
     setFormData({
       title: hook.title,
@@ -150,13 +185,25 @@ export default function Hooks() {
         })
       } else {
         // 新建模式：创建伏笔
-        await createHook(payload)
+        const created = await createHook(payload)
+        if (pendingRequirement && created.id) {
+          await updateOutlineResourceRequirementStatus(pendingRequirement.id, {
+            status: 'resolved',
+            matched_resource_id: created.id,
+            matched_resource_type: 'hook',
+            resolution_method: 'create_resource',
+          })
+          setFocusedRequirement(null)
+          setPendingRequirement(null)
+          setRequirementRefreshKey(value => value + 1)
+          clearRequirementRecoveryParams()
+        }
       }
       await loadHooks()
       setShowModal(false)
     } catch (error) {
       console.error('Failed to save hook:', error)
-      alert('保存失败，请重试')
+      alert(formatApiErrorMessage(error, '保存失败，请重试'))
     }
   }
 
@@ -251,7 +298,7 @@ export default function Hooks() {
       title="伏笔管理"
       description="管理小说中的伏笔埋设与回收"
       actions={
-        <Button onClick={openCreateModal} disabled={!currentProject}>
+        <Button onClick={() => openCreateModal()} disabled={!currentProject}>
           <Plus size={20} className="mr-2" />
           新建伏笔
         </Button>
@@ -264,7 +311,8 @@ export default function Hooks() {
         </div>
       ) : (
         <>
-        <div className="flex flex-col h-[calc(100vh-200px)]">
+        <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_360px] gap-4 h-[calc(100vh-200px)]">
+        <div className="flex flex-col min-h-0">
           {/* 状态筛选 - 固定在顶部 */}
           <div className="flex gap-2 flex-wrap flex-shrink-0 mb-4">
             {[
@@ -435,10 +483,55 @@ export default function Hooks() {
           )}
         </div>
 
+        <div className="min-h-0 overflow-y-auto">
+          {focusedRequirement && (
+            <div className={`mb-3 rounded-lg border p-3 text-sm ${isDark ? 'border-amber-700 bg-amber-900/20 text-amber-100' : 'border-amber-200 bg-amber-50 text-amber-900'}`}>
+              <div className="font-medium">正在补齐启动阻塞伏笔</div>
+              <div className="mt-1">{formatRequirementSummary(focusedRequirement)}</div>
+              <div className="mt-1 text-xs opacity-75">创建或绑定伏笔后，系统会自动把该资源需求标记为已解决并刷新章节 readiness。</div>
+            </div>
+          )}
+          <OutlineRequirementPanel
+            projectId={currentProject.id}
+            focusRequirementId={focusRequirementId}
+            onFocusedRequirementLoaded={setFocusedRequirement}
+            requirementTypes={['hook', 'foreshadowing', 'plot_hook', '伏笔']}
+            maxItems={20}
+            title="大纲待补伏笔"
+            description="来自大纲的伏笔缺口，可预填新建伏笔、绑定已有伏笔或标记处理状态。创建/绑定后会标记需求为已解决。"
+            onCreate={openCreateModal}
+            bindableResources={hooks
+              .filter(hook => hook.id)
+              .map(hook => ({
+                id: hook.id as string,
+                label: hook.title || '未命名伏笔',
+                type: 'hook',
+                description: hook.description || hook.plant_context || hook.resolution_hint,
+              }))}
+            onBound={async () => {
+              await loadHooks()
+              setFocusedRequirement(null)
+              clearRequirementRecoveryParams()
+            }}
+            onRequirementChanged={(requirement, status) => {
+              setRequirementRefreshKey(value => value + 1)
+              if (requirement?.id === focusRequirementId && (status === 'resolved' || status === 'ignored' || status === 'superseded')) {
+                setFocusedRequirement(null)
+                clearRequirementRecoveryParams()
+              }
+            }}
+            refreshKey={requirementRefreshKey}
+          />
+        </div>
+        </div>
+
         {/* 创建/编辑模态框 */}
           <Modal
             isOpen={showModal}
-            onClose={() => setShowModal(false)}
+            onClose={() => {
+              setShowModal(false)
+              setPendingRequirement(null)
+            }}
             title={editingHook ? '编辑伏笔' : '新建伏笔'}
             size="lg"
           >
@@ -521,7 +614,10 @@ export default function Hooks() {
                 rows={4}
               />
               <div className="flex justify-end gap-3 pt-4">
-                <Button variant="secondary" onClick={() => setShowModal(false)}>取消</Button>
+                <Button variant="secondary" onClick={() => {
+                  setShowModal(false)
+                  setPendingRequirement(null)
+                }}>取消</Button>
                 <Button onClick={saveHook}>{editingHook ? '保存修改' : '创建'}</Button>
               </div>
             </div>

@@ -613,6 +613,28 @@ export async function getActiveWorkflowExecution(
   return response.data
 }
 
+export async function resetDirectorSessionWorkflow(request: {
+  projectId: string
+  workflowId: string
+  directorSessionId: string
+  reason?: string
+}): Promise<{
+  success: boolean
+  previous_execution_id?: string | null
+  previous_operation_id?: string | null
+  previous_request_id?: string | null
+  reset_token: string
+  can_start_new: boolean
+}> {
+  const response = await axios.post(`${API_BASE}/workflows/director/session/reset`, {
+    project_id: request.projectId,
+    workflow_id: request.workflowId,
+    director_session_id: request.directorSessionId,
+    reason: request.reason,
+  })
+  return response.data
+}
+
 /**
  * 获取执行状态
  */

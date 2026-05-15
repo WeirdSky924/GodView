@@ -18,6 +18,7 @@ import {
   pauseExecution,
   resumeExecution,
   recoverExecution,
+  resetDirectorSessionWorkflow,
   cancelExecution,
   createWorkflowExecutionEventSource,
   type WorkflowDefinition,
@@ -1044,6 +1045,7 @@ export default function Director() {
   const [operationSummary, setOperationSummary] = useState<WorkflowOperationSummary | null>(null)
   const [operationEvents, setOperationEvents] = useState<WorkflowOperationEvent[]>([])
   const [operationBusy, setOperationBusy] = useState<string | null>(null)
+  const [directorResetToken, setDirectorResetToken] = useState('')
   const pendingSnapshotRef = useRef<{ execution: WorkflowExecution; workflow: WorkflowDefinition | null } | null>(null)
 
   const selectedWorkflow = useMemo(
@@ -1207,7 +1209,7 @@ export default function Director() {
     if (!targetExecutionId) {
       setOperationSummary(null)
       setOperationEvents([])
-      return
+      return null
     }
 
     try {
@@ -1217,8 +1219,10 @@ export default function Director() {
       ])
       setOperationSummary(summary)
       setOperationEvents(events)
+      return summary
     } catch (error) {
       console.error('Failed to refresh workflow operations:', error)
+      return null
     }
   }, [executionId])
 
@@ -2151,6 +2155,10 @@ export default function Director() {
         if (!active || !execution) return
 
         if (getDirectorExecutionSessionId(execution) !== normalizedSessionId) return
+        if (isTerminalExecutionStatus(execution.status)) {
+          localStorage.removeItem(getDirectorStorageKey(currentProject.id, 'execution', normalizedSessionId))
+          return
+        }
 
         const workflow = savedWorkflows.find(item => item.id === execution.workflow_id) || selectedWorkflowRef.current
         if (execution.workflow_id && savedWorkflows.some(item => item.id === execution.workflow_id)) {
@@ -2301,7 +2309,7 @@ export default function Director() {
     setIsExecutionStreamReady(false)
   }
 
-  const resetAll = () => {
+  const clearCurrentWorkflowRunView = useCallback(() => {
     resetWorkflowAgents()
     setLogs([])
     setRuntimeState(null)
@@ -2319,6 +2327,34 @@ export default function Director() {
     setIsConnected(false)
     setIsGenerating(false)
     sessionStartAttempted.current = false
+  }, [currentProject, resetWorkflowAgents, sessionId])
+
+  const resetAll = () => {
+    void handleRefreshWorkflowRun()
+  }
+
+  const handleRefreshWorkflowRun = async () => {
+    if (!currentProject) return addLog('请先选择项目')
+    if (!selectedWorkflowId) return addLog('请先选择工作流')
+    const normalizedSessionId = sessionId.trim()
+    if (!normalizedSessionId) return addLog('请先启动或输入导演会话 ID')
+
+    setOperationBusy('reset')
+    try {
+      const result = await resetDirectorSessionWorkflow({
+        projectId: currentProject.id,
+        workflowId: selectedWorkflowId,
+        directorSessionId: normalizedSessionId,
+        reason: 'director_user_reset',
+      })
+      setDirectorResetToken(result.reset_token)
+      clearCurrentWorkflowRunView()
+      addLog(`🔄 后端已废弃当前会话工作流${result.previous_execution_id ? `：${result.previous_execution_id}` : ''}，可重新生成单章`)
+    } catch (error) {
+      addLog(`❌ 重置失败: ${formatApiErrorMessage(error, '重置失败')}`)
+    } finally {
+      setOperationBusy(null)
+    }
   }
 
   const handleStartAutoMode = () => {
@@ -2470,9 +2506,13 @@ export default function Director() {
 
     const normalizedSessionId = sessionId.trim()
     const targetWordCount = chapterForm.targetWordCount || selectedSingleOutline.target_word_count
-    const requestId = `director:${currentProject.id}:${selectedWorkflowId}:${normalizedSessionId}:${selectedSingleOutline.id}`
+    const requestIdParts = ['director', currentProject.id, selectedWorkflowId, normalizedSessionId]
+    if (directorResetToken) requestIdParts.push(directorResetToken)
+    requestIdParts.push(selectedSingleOutline.id)
+    const requestId = requestIdParts.join(':')
     const initialContext: Record<string, any> = {
       director_session_id: normalizedSessionId,
+      ...(directorResetToken ? { director_reset_token: directorResetToken } : {}),
       chapter_outline_id: selectedSingleOutline.id,
       chapter_outline: selectedSingleOutline,
       chapter_num: selectedSingleOutline.chapter_number,
@@ -2844,13 +2884,23 @@ export default function Director() {
                         {operationSummary?.status || '同步中'} · {isExecutionStreamReady ? 'SSE 已连接' : 'SSE 连接中'}
                       </p>
                     </div>
-                    <button
-                      onClick={() => void refreshWorkflowOperations(executionId)}
-                      className={`p-2 rounded-lg ${isDark ? 'hover:bg-gray-800 text-gray-400' : 'hover:bg-gray-100 text-gray-500'}`}
-                      title="刷新运行状态"
-                    >
-                      <RefreshCw size={15} />
-                    </button>
+                    <div className="flex items-center gap-1">
+                      <button
+                        onClick={() => void refreshWorkflowOperations(executionId)}
+                        className={`p-2 rounded-lg ${isDark ? 'hover:bg-gray-800 text-gray-400' : 'hover:bg-gray-100 text-gray-500'}`}
+                        title="刷新运行状态"
+                      >
+                        <RefreshCw size={15} />
+                      </button>
+                      <button
+                        onClick={() => void handleRefreshWorkflowRun()}
+                        disabled={operationBusy !== null}
+                        className={`p-2 rounded-lg disabled:opacity-50 ${isDark ? 'hover:bg-gray-800 text-gray-400' : 'hover:bg-gray-100 text-gray-500'}`}
+                        title="后端废弃当前运行并允许重新生成"
+                      >
+                        <RotateCcw size={15} />
+                      </button>
+                    </div>
                   </div>
                   {operationSummary?.attention?.[0] && (
                     <p className={`text-xs rounded-lg px-3 py-2 ${isDark ? 'bg-amber-950/30 text-amber-300' : 'bg-amber-50 text-amber-700'}`}>

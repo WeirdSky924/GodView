@@ -12,7 +12,9 @@ from app.api.routes.chapter_outlines import (
     ConfirmResourceSupplementDraft,
     ConfirmResourceSupplementDraftsRequest,
     CreateResourceRequirementRequest,
+    _build_resource_supplement_draft,
     UpdateResourceRequirementStatusRequest,
+    cleanup_orphaned_resource_requirements,
     confirm_resource_supplements,
     create_resource_requirement,
     list_resource_readiness,
@@ -38,7 +40,9 @@ class _RouteFakePostgresDB:
         self.list_requirement_calls = []
         self.list_readiness_calls = []
         self.saved_characters = []
+        self.saved_hooks = []
         self.saved_requirements = []
+        self.cleanup_calls = []
         self.requirement_rows = [{"id": REQUIREMENT_ID}]
         self.updated_requirement = {
             "id": REQUIREMENT_ID,
@@ -66,6 +70,16 @@ class _RouteFakePostgresDB:
         self.list_requirement_calls.append(kwargs)
         return [{"id": REQUIREMENT_ID, **kwargs}]
 
+    async def supersede_outline_resource_requirements(self, project_id, outline_id):
+        return 0
+
+    async def delete_chapter_resource_readiness(self, project_id, outline_id):
+        return 0
+
+    async def cleanup_orphaned_outline_resource_requirements(self, project_id):
+        self.cleanup_calls.append(project_id)
+        return {"superseded_resource_requirements": 4, "deleted_resource_readiness": 2}
+
     async def get_chapter_resource_readiness(self, **kwargs):
         self.list_readiness_calls.append(kwargs)
         return [{"project_id": kwargs["project_id"], "chapter_num": kwargs.get("chapter_num") or 3, "readiness_status": "ready"}]
@@ -84,6 +98,12 @@ class _RouteFakePostgresDB:
         saved = dict(character_data)
         saved.setdefault("id", CHARACTER_ID)
         self.saved_characters.append(saved)
+        return saved["id"]
+
+    async def save_hook(self, hook_data):
+        saved = dict(hook_data)
+        saved.setdefault("id", str(uuid.uuid4()))
+        self.saved_hooks.append(saved)
         return saved["id"]
 
 
@@ -143,7 +163,38 @@ async def test_list_resource_requirements_normalizes_filters_before_db(route_db)
         "status": "pending",
         "severity": "blocking",
         "requirement_type": "character",
+        "active_outlines_only": True,
     }
+
+    await list_resource_requirements(
+        project_id=PROJECT_ID,
+        outline_id=None,
+        chapter_num=None,
+        status="pending",
+        severity=None,
+        requirement_type=None,
+        active_outlines_only=False,
+    )
+    assert route_db.list_requirement_calls[-1]["active_outlines_only"] is False
+
+
+@pytest.mark.asyncio
+async def test_cleanup_orphaned_resource_requirements_calls_db_cleanup(route_db):
+    result = await cleanup_orphaned_resource_requirements(PROJECT_ID)
+
+    assert result["success"] is True
+    assert result["superseded_resource_requirements"] == 4
+    assert result["deleted_resource_readiness"] == 2
+    assert route_db.cleanup_calls == [PROJECT_ID]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_orphaned_resource_requirements_rejects_invalid_project_id(route_db):
+    with pytest.raises(HTTPException) as exc_info:
+        await cleanup_orphaned_resource_requirements("not-a-project-id")
+
+    assert exc_info.value.status_code == 400
+    assert route_db.cleanup_calls == []
 
 
 @pytest.mark.asyncio
@@ -271,6 +322,45 @@ async def test_confirm_resource_supplements_marks_requirement_as_created_resourc
 
 
 @pytest.mark.asyncio
+async def test_confirm_resource_supplements_creates_hook_for_hook_requirement(route_db):
+    route_db.updated_requirement.update({"chapter_num": 1})
+    request = ConfirmResourceSupplementDraftsRequest(
+        project_id=PROJECT_ID,
+        drafts=[
+            ConfirmResourceSupplementDraft(
+                requirement_id=REQUIREMENT_ID,
+                resource_type="hook",
+                draft_payload={"title": "K的真实身份伏笔", "description": "来自大纲伏笔需求"},
+            )
+        ],
+    )
+
+    result = await confirm_resource_supplements(request)
+
+    assert result["success"] is True
+    assert route_db.saved_hooks[-1]["title"] == "K的真实身份伏笔"
+    assert route_db.updated_calls[-1]["matched_resource_type"] == "hook"
+    assert result["created"][0]["resource_type"] == "hook"
+
+
+def test_hook_resource_supplement_draft_targets_hook_library():
+    draft = _build_resource_supplement_draft({
+        "id": REQUIREMENT_ID,
+        "project_id": PROJECT_ID,
+        "outline_id": OUTLINE_ID,
+        "chapter_num": 1,
+        "requirement_type": "hook",
+        "resource_name": "K的真实身份伏笔",
+        "severity": "advisory",
+        "reason": "本章计划埋设该伏笔。",
+    })
+
+    assert draft["resource_type"] == "hook"
+    assert draft["draft_payload"]["title"] == "K的真实身份伏笔"
+    assert draft["draft_payload"]["hook_type"] == "mystery"
+
+
+@pytest.mark.asyncio
 async def test_debug_create_resource_requirement_persists_and_refreshes_readiness(route_db, monkeypatch):
     from app.config import settings
 
@@ -360,6 +450,164 @@ async def test_debug_create_resource_requirement_is_hidden_when_debug_disabled(r
 
     assert exc_info.value.status_code == 404
     assert route_db.saved_requirements == []
+
+
+class _RequirementSaveDB(PostgresDatabase):
+    def __init__(self):
+        self.rows = []
+        self.lore_rows = []
+        self.character_rows = []
+        self.hook_rows = []
+        self.queries = []
+
+    async def execute_query(self, query, params=None):
+        params = params or {}
+        self.queries.append((query, dict(params)))
+        if "SELECT id FROM lore_entries" in query:
+            return list(self.lore_rows)
+        if "SELECT id FROM characters" in query:
+            return list(self.character_rows)
+        if "SELECT id FROM hooks" in query:
+            return list(self.hook_rows)
+        if "SELECT r.id FROM regions" in query:
+            return []
+        if "INSERT INTO outline_resource_requirements" in query:
+            for row in self.rows:
+                if row["fingerprint"] == params["fingerprint"]:
+                    row.update({
+                        "status": "resolved" if params["status"] == "resolved" or row.get("status") == "resolved" else params["status"],
+                        "reason": params["reason"] if not row.get("reason") else f"{row['reason']}\n{params['reason']}" if params["reason"] and params["reason"] not in row["reason"] else row["reason"],
+                        "matched_resource_id": params["matched_resource_id"] or row.get("matched_resource_id"),
+                        "matched_resource_type": params["matched_resource_type"] or row.get("matched_resource_type"),
+                    })
+                    return [{"id": row["id"]}]
+            row = dict(params)
+            self.rows.append(row)
+            return [{"id": params["id"]}]
+        return []
+
+
+@pytest.mark.asyncio
+async def test_db_resource_requirement_fingerprint_merges_same_resource_across_reasons():
+    db = _RequirementSaveDB()
+
+    first_id = await db.save_outline_resource_requirement({
+        "project_id": PROJECT_ID,
+        "outline_id": OUTLINE_ID,
+        "chapter_num": 2,
+        "requirement_type": "continuity",
+        "resource_name": "连续性·林默",
+        "reason": "原因 A",
+        "source_node_id": "master",
+    })
+    second_id = await db.save_outline_resource_requirement({
+        "project_id": PROJECT_ID,
+        "outline_id": OUTLINE_ID,
+        "chapter_num": 2,
+        "requirement_type": "continuity",
+        "resource_name": "连续性·林默",
+        "reason": "原因 B",
+        "source_node_id": "writer",
+    })
+
+    assert second_id == first_id
+    assert len(db.rows) == 1
+    assert db.rows[0]["fingerprint"] == f"{PROJECT_ID}|{OUTLINE_ID}|2|lore|连续性·林默"
+
+
+@pytest.mark.asyncio
+async def test_db_resource_requirement_fingerprint_merges_same_target_type_aliases():
+    db = _RequirementSaveDB()
+
+    first_id = await db.save_outline_resource_requirement({
+        "project_id": PROJECT_ID,
+        "outline_id": OUTLINE_ID,
+        "chapter_num": 2,
+        "requirement_type": "role",
+        "resource_name": "林默",
+        "reason": "原因 A",
+    })
+    second_id = await db.save_outline_resource_requirement({
+        "project_id": PROJECT_ID,
+        "outline_id": OUTLINE_ID,
+        "chapter_num": 2,
+        "requirement_type": "character",
+        "resource_name": "林默",
+        "reason": "原因 B",
+    })
+
+    assert second_id == first_id
+    assert len(db.rows) == 1
+    assert db.rows[0]["fingerprint"] == f"{PROJECT_ID}|{OUTLINE_ID}|2|character|林默"
+
+
+@pytest.mark.asyncio
+async def test_db_resource_requirement_exact_character_alias_match_resolves_instead_of_pending():
+    db = _RequirementSaveDB()
+    db.character_rows = [{"id": CHARACTER_ID}]
+
+    await db.save_outline_resource_requirement({
+        "project_id": PROJECT_ID,
+        "outline_id": OUTLINE_ID,
+        "chapter_num": 2,
+        "requirement_type": "角色",
+        "resource_name": "林默",
+        "severity": "blocking",
+        "status": "pending",
+        "reason": "Agent 误报需要补齐",
+    })
+
+    assert len(db.rows) == 1
+    assert db.rows[0]["status"] == "resolved"
+    assert db.rows[0]["matched_resource_id"] == CHARACTER_ID
+    assert db.rows[0]["matched_resource_type"] == "character"
+
+
+@pytest.mark.asyncio
+async def test_db_resource_requirement_exact_hook_match_resolves_instead_of_pending():
+    db = _RequirementSaveDB()
+    hook_id = str(uuid.uuid4())
+    db.hook_rows = [{"id": hook_id}]
+
+    await db.save_outline_resource_requirement({
+        "project_id": PROJECT_ID,
+        "outline_id": OUTLINE_ID,
+        "chapter_num": 2,
+        "requirement_type": "伏笔",
+        "resource_name": "K的真实身份伏笔",
+        "severity": "blocking",
+        "status": "pending",
+        "reason": "Agent 误报需要补齐",
+    })
+
+    assert len(db.rows) == 1
+    assert db.rows[0]["status"] == "resolved"
+    assert db.rows[0]["matched_resource_id"] == hook_id
+    assert db.rows[0]["matched_resource_type"] == "hook"
+
+
+@pytest.mark.asyncio
+async def test_db_resource_requirement_exact_lore_match_resolves_instead_of_pending():
+    db = _RequirementSaveDB()
+    db.lore_rows = [{"id": LORE_ID}]
+
+    await db.save_outline_resource_requirement({
+        "project_id": PROJECT_ID,
+        "outline_id": OUTLINE_ID,
+        "chapter_num": 2,
+        "requirement_type": "continuity",
+        "resource_name": "连续性·林默",
+        "severity": "blocking",
+        "status": "pending",
+        "reason": "Agent 误报需要补齐",
+    })
+
+    assert len(db.rows) == 1
+    assert db.rows[0]["status"] == "resolved"
+    assert db.rows[0]["matched_resource_id"] == LORE_ID
+    assert db.rows[0]["matched_resource_type"] == "lore"
+    lore_query = next(query for query, _ in db.queries if "SELECT id FROM lore_entries" in query)
+    assert "status" not in lore_query
 
 
 class _RequirementStatusDB(PostgresDatabase):
@@ -528,11 +776,22 @@ class _SaveRequirementDB(PostgresDatabase):
         self.rows = rows
         self.saved_query = None
         self.saved_params = None
+        self.write_query = None
+        self.write_params = None
+        self.write_queries = []
+        self.write_params_list = []
 
     async def execute_query(self, query, params=None):
         self.saved_query = query
         self.saved_params = dict(params or {})
         return list(self.rows)
+
+    async def execute_write(self, query, params=None):
+        self.write_query = query
+        self.write_params = dict(params or {})
+        self.write_queries.append(query)
+        self.write_params_list.append(dict(params or {}))
+        return 3
 
 
 @pytest.mark.asyncio
@@ -555,6 +814,72 @@ async def test_save_outline_resource_requirement_returns_actual_upserted_id():
     assert saved_id == existing_id
     assert "RETURNING id" in db.saved_query
     assert db.saved_params["fingerprint"].startswith(f"{PROJECT_ID}|{OUTLINE_ID}|3|character|缺失角色")
+
+
+@pytest.mark.asyncio
+async def test_list_resource_requirements_filters_to_active_outlines_by_default():
+    db = _SaveRequirementDB([])
+
+    await db.get_outline_resource_requirements(project_id=PROJECT_ID, status="pending")
+
+    assert "JOIN chapter_outlines co" in db.saved_query
+    assert "co.deleted_at IS NULL" in db.saved_query
+    assert "SELECT r.*" in db.saved_query
+
+
+@pytest.mark.asyncio
+async def test_list_resource_requirements_expands_type_aliases_by_target_resource():
+    db = _SaveRequirementDB([])
+
+    await db.get_outline_resource_requirements(project_id=PROJECT_ID, requirement_type="character")
+
+    assert "lower(r.requirement_type) IN" in db.saved_query
+    assert db.saved_params["requirement_type_alias_0"] == "character"
+    assert "role" in db.saved_params.values()
+    assert "角色" in db.saved_params.values()
+
+    await db.get_outline_resource_requirements(project_id=PROJECT_ID, requirement_type="hook")
+    assert "foreshadowing" in db.saved_params.values()
+    assert "伏笔" in db.saved_params.values()
+
+
+@pytest.mark.asyncio
+async def test_list_resource_requirements_can_include_historical_outlines_explicitly():
+    db = _SaveRequirementDB([])
+
+    await db.get_outline_resource_requirements(project_id=PROJECT_ID, status="pending", active_outlines_only=False)
+
+    assert "JOIN chapter_outlines co" not in db.saved_query
+    assert "FROM outline_resource_requirements r" in db.saved_query
+
+
+@pytest.mark.asyncio
+async def test_supersede_outline_resource_requirements_marks_open_rows_only():
+    db = _SaveRequirementDB([])
+
+    count = await db.supersede_outline_resource_requirements(PROJECT_ID, OUTLINE_ID)
+
+    assert count == 3
+    assert "UPDATE outline_resource_requirements" in db.write_query
+    assert "status IN ('pending', 'in_progress')" in db.write_query
+    assert "superseded_reason" in db.write_query
+    assert db.write_params["project_id"] == PROJECT_ID
+    assert db.write_params["outline_id"] == OUTLINE_ID
+
+
+@pytest.mark.asyncio
+async def test_cleanup_orphaned_outline_resource_requirements_targets_deleted_or_missing_outlines():
+    db = _SaveRequirementDB([])
+
+    result = await db.cleanup_orphaned_outline_resource_requirements(PROJECT_ID)
+
+    assert result == {"superseded_resource_requirements": 3, "deleted_resource_readiness": 3}
+    assert "UPDATE outline_resource_requirements r" in db.write_queries[0]
+    assert "r.outline_id IS NULL" in db.write_queries[0]
+    assert "co.deleted_at IS NULL" in db.write_queries[0]
+    assert "DELETE FROM chapter_resource_readiness cr" in db.write_queries[1]
+    assert "cr.outline_id IS NULL" in db.write_queries[1]
+    assert db.write_params_list[0]["project_id"] == PROJECT_ID
 
 
 class _SaveCharacterDB(PostgresDatabase):

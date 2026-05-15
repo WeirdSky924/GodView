@@ -591,6 +591,26 @@ def test_plot_outline_assets_define_golden_three_information_and_tension_balance
             assert marker in content, f"{path} missing marker: {marker}"
 
 
+def test_plot_outline_assets_define_concrete_resource_references_not_generic_keywords():
+    assets = {
+        "prompts/instruction/function_plot_outline.md": [
+            "resource_references",
+            "具体设定/伏笔/地点/物品/能力名称",
+            "不要把“能力”“规则”“组织”“伏笔”等普通叙述词当作资源名",
+        ],
+        "prompts/output/plot_outline_output.md": [
+            "资源引用要具体",
+            "不要把“能力”“规则”“组织”“势力”“伏笔”等普通叙述词当作资源名",
+            "resource_references",
+        ],
+    }
+
+    for path, markers in assets.items():
+        content = Path(path).read_text(encoding="utf-8")
+        for marker in markers:
+            assert marker in content, f"{path} missing marker: {marker}"
+
+
 def test_auxiliary_prompt_assets_define_knowledge_causality_and_resource_safety():
     assets = {
         "prompts/identity/role_character.md": [
@@ -788,6 +808,78 @@ async def test_writer_missing_config_prompt_fails_closed_for_project_runtime(mon
     assert trace["deprecated_sources_used"] == ["WriterAgent._build_md_writer_fallback_prompt"]
     assert "function_writer_character_voice_rewrite" in trace["missing_prompt_ids"]
     assert_render_trace_contract(trace)
+
+
+def test_model_router_logs_anthropic_http_error_body_without_authorization(caplog):
+    import httpx
+    from app.services.model_router import _log_llm_error_response
+
+    request = httpx.Request(
+        "POST",
+        "https://qianfan.baidubce.com/anthropic/coding/v1/messages",
+        headers={"authorization": "Bearer secret-token", "x-trace-id": "trace-1"},
+    )
+    response = httpx.Response(
+        500,
+        request=request,
+        headers={"content-type": "application/json"},
+        json={"error": {"message": "qianfan upstream overloaded", "type": "server_error"}},
+    )
+
+    with caplog.at_level("ERROR", logger="app.services.model_router"):
+        _log_llm_error_response(response)
+
+    log_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "status=500" in log_text
+    assert "qianfan upstream overloaded" in log_text
+    assert "authorization" in log_text
+    assert "<redacted>" in log_text
+    assert "secret-token" not in log_text
+
+
+def test_writer_segment_schema_rejects_blank_content():
+    from pydantic import ValidationError
+
+    from app.models.agent_output_schemas import WriterSegmentSchema
+
+    for blank_content in ("", "   "):
+        with pytest.raises(ValidationError):
+            WriterSegmentSchema.model_validate({"content": blank_content, "word_count": 0})
+
+
+@pytest.mark.asyncio
+async def test_writer_segment_generation_rejects_empty_structured_content(monkeypatch):
+    from app.agents.director.writer import WriterAgent
+    from app.models.agent_output_schemas import WriterSegmentSchema
+    from app.services.structured_llm import StructuredOutputError
+
+    writer = WriterAgent(project_id="project-1")
+    structured_calls = []
+
+    async def fake_call_structured(schema, messages, temperature=0.0, category=None):
+        structured_calls.append((schema, messages[0].content))
+        assert schema is WriterSegmentSchema
+        raise StructuredOutputError(
+            "structured output 多轮修复后仍失败：content must not be blank",
+            schema_name="WriterSegmentSchema",
+            validation_errors={"field": "content", "error": "blank"},
+        )
+
+    async def fail_call_llm(*args, **kwargs):
+        raise AssertionError("Writer segment generation must not fall back to plain text")
+
+    monkeypatch.setattr(writer, "_call_structured", fake_call_structured)
+    monkeypatch.setattr(writer, "_call_llm", fail_call_llm)
+
+    with pytest.raises(StructuredOutputError) as exc_info:
+        await writer._generate_segment_content(
+            segment_prompt="写第 2 段",
+            segment_num=2,
+            target_words=750,
+        )
+
+    assert "content must not be blank" in str(exc_info.value)
+    assert structured_calls == [(WriterSegmentSchema, "写第 2 段")]
 
 
 @pytest.mark.asyncio
@@ -4004,6 +4096,123 @@ def test_master_scene_and_revision_schemas_validate_runtime_artifacts():
     assert evaluator.revision_directive_adherence_check.unresolved_issue_ids == ["issue-1"]
 
 
+@pytest.mark.asyncio
+async def test_master_scene_compilation_returns_contract_fields_at_top_level(monkeypatch):
+    from app.agents.director.master_plotter import MasterPlotterAgent
+    from app.models.agent_output_schemas import MasterScenePlanSchema
+    from app.models.agent_template import AgentType
+    from app.models.workflow_definition import NodeType, WorkflowNode
+    from app.services.workflow_engine import WorkflowEngine
+
+    agent = MasterPlotterAgent(model=None)
+    parsed = MasterScenePlanSchema.model_validate({
+        "plan_id": "plan-1",
+        "chapter_intent": "让读者经历异常捕获",
+        "core_conflict": "是否接受未知协议",
+        "scene_plan": [{
+            "beat_id": "beat-1",
+            "sequence_index": 1,
+            "purpose": "触发协议",
+            "cause": "主角濒死",
+            "trigger": "售卖机亮起",
+            "character_action": "主角伸手触碰屏幕",
+            "sensory_or_environment_feedback": ["屏幕闪烁"],
+            "visible_result": "数据幽灵被撕开",
+            "information_release": ["只释放协议存在"],
+            "transition_to_next": "K 消失",
+            "acceptance_criteria": ["必须有可见触发和后果"],
+        }],
+        "writer_brief": {"must_follow": ["保留协议触发"]},
+        "ending_hook_contract": {"required": True, "acceptance_criteria": ["留下K身份疑问"]},
+        "evaluator_checklist": {"required_beat_ids": ["beat-1"]},
+        "resource_requirements": [],
+    })
+
+    async def fake_config_prompt(*args, **kwargs):
+        return "config"
+
+    async def fake_structured(*args, **kwargs):
+        return parsed
+
+    monkeypatch.setattr(agent, "_get_master_plotter_config_prompt", fake_config_prompt)
+    monkeypatch.setattr(agent, "_call_structured", fake_structured)
+
+    response = await agent._execute_scene_compilation({"chapter_outline": {"title": "捕获"}, "target_word_count": 3000})
+    assert response.success is True
+    assert response.data["plan_id"] == "plan-1"
+    assert response.data["scene_plan"][0]["beat_id"] == "beat-1"
+    assert response.data["writer_brief"]["must_follow"] == ["保留协议触发"]
+    assert response.data["ending_hook_contract"]["required"] is True
+    assert response.data["evaluator_checklist"]["required_beat_ids"] == ["beat-1"]
+    assert response.data["resource_requirements"] == []
+    assert response.data["master_scene_plan"]["plan_id"] == "plan-1"
+
+    engine = WorkflowEngine()
+    contract = engine._resolve_output_contract("master_plotter.scene_plan.workflow_output")
+    validated = engine._validate_contract_payload(
+        contract,
+        response.data,
+        node=WorkflowNode(id="master_scene_compiler", node_type=NodeType.AGENT, agent_type=AgentType.MASTER_PLOTTER.value, label="Master 场景编译器"),
+        response=response,
+    )
+    assert validated["plan_id"] == "plan-1"
+
+
+@pytest.mark.asyncio
+async def test_master_revision_directive_returns_contract_fields_at_top_level(monkeypatch):
+    from app.agents.director.master_plotter import MasterPlotterAgent
+    from app.models.agent_output_schemas import MasterRevisionDirectiveSchema
+    from app.models.agent_template import AgentType
+    from app.models.workflow_definition import NodeType, WorkflowNode
+    from app.services.workflow_engine import WorkflowEngine
+
+    agent = MasterPlotterAgent(model=None)
+    parsed = MasterRevisionDirectiveSchema.model_validate({
+        "revision_id": "rev-1",
+        "revision_attempt": 1,
+        "rewrite_strategy": "scene_rewrite",
+        "issues": [{
+            "issue_id": "issue-1",
+            "failure_type": "outline_transposition",
+            "severity": "blocking",
+            "failed_scene_beat_ids": ["beat-1"],
+            "required_fix": "把概述改成可见行动和后果",
+        }],
+        "writer_revision_brief": {"scope": "beat-1"},
+        "evaluator_focus": ["beat-1 是否完成"],
+        "acceptance_criteria": ["正文必须覆盖 beat-1"],
+    })
+
+    async def fake_config_prompt(*args, **kwargs):
+        return "config"
+
+    async def fake_structured(*args, **kwargs):
+        return parsed
+
+    monkeypatch.setattr(agent, "_get_master_plotter_config_prompt", fake_config_prompt)
+    monkeypatch.setattr(agent, "_call_structured", fake_structured)
+
+    response = await agent._execute_revision_directive({"quality_failure_packet": {"failed_scene_beat_ids": ["beat-1"]}})
+    assert response.success is True
+    assert response.data["revision_id"] == "rev-1"
+    assert response.data["rewrite_strategy"] == "scene_rewrite"
+    assert response.data["issues"][0]["issue_id"] == "issue-1"
+    assert response.data["writer_revision_brief"]["scope"] == "beat-1"
+    assert response.data["evaluator_focus"] == ["beat-1 是否完成"]
+    assert response.data["acceptance_criteria"] == ["正文必须覆盖 beat-1"]
+    assert response.data["master_revision_directive"]["revision_id"] == "rev-1"
+
+    engine = WorkflowEngine()
+    contract = engine._resolve_output_contract("master_plotter.revision_directive.workflow_output")
+    validated = engine._validate_contract_payload(
+        contract,
+        response.data,
+        node=WorkflowNode(id="master_revision_director", node_type=NodeType.AGENT, agent_type=AgentType.MASTER_PLOTTER.value, label="Master 修订导演"),
+        response=response,
+    )
+    assert validated["revision_id"] == "rev-1"
+
+
 def test_writer_style_consistency_template_is_scenario_specific():
     from app.data.system_agent_templates import SYSTEM_AGENT_TEMPLATES, WRITER_STYLE_CONSISTENCY
 
@@ -4017,6 +4226,78 @@ def test_writer_style_consistency_template_is_scenario_specific():
     assert "function_writer_segment_generation" not in prompt_ids
     assert "style_consistency" in WRITER_STYLE_CONSISTENCY.default_prompt_order
     assert "writing_rules" in WRITER_STYLE_CONSISTENCY.default_prompt_order
+
+
+def test_master_plotter_workflow_scene_and_revision_templates_are_scenario_specific():
+    from app.data.system_agent_templates import (
+        MASTER_PLOTTER_WORKFLOW_FORCED_EVENT,
+        MASTER_PLOTTER_WORKFLOW_REVISION_DIRECTOR,
+        MASTER_PLOTTER_WORKFLOW_SCENE_COMPILATION,
+        SYSTEM_AGENT_TEMPLATES,
+    )
+
+    scene_prompt_ids = {
+        slot.prompt_template_id
+        for slot in MASTER_PLOTTER_WORKFLOW_SCENE_COMPILATION.prompt_slots
+        if slot.prompt_template_id
+    }
+    revision_prompt_ids = {
+        slot.prompt_template_id
+        for slot in MASTER_PLOTTER_WORKFLOW_REVISION_DIRECTOR.prompt_slots
+        if slot.prompt_template_id
+    }
+
+    assert MASTER_PLOTTER_WORKFLOW_SCENE_COMPILATION in SYSTEM_AGENT_TEMPLATES
+    assert MASTER_PLOTTER_WORKFLOW_REVISION_DIRECTOR in SYSTEM_AGENT_TEMPLATES
+    assert MASTER_PLOTTER_WORKFLOW_SCENE_COMPILATION.id == "director_master_plotter_workflow_scene_compilation"
+    assert MASTER_PLOTTER_WORKFLOW_REVISION_DIRECTOR.id == "director_master_plotter_workflow_revision_director"
+    assert MASTER_PLOTTER_WORKFLOW_SCENE_COMPILATION.agent_type.value == "master_plotter"
+    assert MASTER_PLOTTER_WORKFLOW_REVISION_DIRECTOR.agent_type.value == "master_plotter"
+    assert MASTER_PLOTTER_WORKFLOW_SCENE_COMPILATION.scenario == "workflow_scene_compilation"
+    assert MASTER_PLOTTER_WORKFLOW_REVISION_DIRECTOR.scenario == "workflow_revision_director"
+    assert MASTER_PLOTTER_WORKFLOW_SCENE_COMPILATION.id != MASTER_PLOTTER_WORKFLOW_FORCED_EVENT.id
+    assert MASTER_PLOTTER_WORKFLOW_REVISION_DIRECTOR.id != MASTER_PLOTTER_WORKFLOW_FORCED_EVENT.id
+    assert "function_master_plotter_chapter_scene_plan" in scene_prompt_ids
+    assert "function_master_plotter_revision_director" in revision_prompt_ids
+    assert "function_master_plotter_forced_event" not in scene_prompt_ids
+    assert "function_master_plotter_forced_event" not in revision_prompt_ids
+    assert "chapter_scene_plan" in MASTER_PLOTTER_WORKFLOW_SCENE_COMPILATION.default_prompt_order
+    assert "revision_director" in MASTER_PLOTTER_WORKFLOW_REVISION_DIRECTOR.default_prompt_order
+
+
+@pytest.mark.asyncio
+async def test_master_plotter_scene_and_revision_runtime_selection_does_not_fallback():
+    from app.data.system_agent_templates import (
+        MASTER_PLOTTER_WORKFLOW_FORCED_EVENT,
+        MASTER_PLOTTER_WORKFLOW_REVISION_DIRECTOR,
+        MASTER_PLOTTER_WORKFLOW_SCENE_COMPILATION,
+    )
+    from app.models.agent_template import AgentType
+    from app.services.agent_template_service import AgentTemplateService
+
+    service = AgentTemplateService()
+    service._cache_valid = True
+    service._templates = {
+        MASTER_PLOTTER_WORKFLOW_FORCED_EVENT.id: MASTER_PLOTTER_WORKFLOW_FORCED_EVENT,
+        MASTER_PLOTTER_WORKFLOW_SCENE_COMPILATION.id: MASTER_PLOTTER_WORKFLOW_SCENE_COMPILATION,
+        MASTER_PLOTTER_WORKFLOW_REVISION_DIRECTOR.id: MASTER_PLOTTER_WORKFLOW_REVISION_DIRECTOR,
+    }
+
+    scene_template = await service.get_template_by_type(AgentType.MASTER_PLOTTER, "workflow_scene_compilation")
+    revision_template = await service.get_template_by_type(AgentType.MASTER_PLOTTER, "workflow_revision_director")
+
+    assert scene_template is not None
+    assert revision_template is not None
+    assert scene_template.id == "director_master_plotter_workflow_scene_compilation"
+    assert revision_template.id == "director_master_plotter_workflow_revision_director"
+    assert scene_template.id != MASTER_PLOTTER_WORKFLOW_FORCED_EVENT.id
+    assert revision_template.id != MASTER_PLOTTER_WORKFLOW_FORCED_EVENT.id
+    assert {slot.prompt_template_id for slot in scene_template.prompt_slots} >= {
+        "function_master_plotter_chapter_scene_plan"
+    }
+    assert {slot.prompt_template_id for slot in revision_template.prompt_slots} >= {
+        "function_master_plotter_revision_director"
+    }
 
 
 @pytest.mark.asyncio
@@ -5632,6 +5913,34 @@ def test_skill_retrieval_decision_prompt_trace_reports_deprecated_fallback(monke
     }
 
 
+def test_director_single_chapter_reset_uses_backend_idempotency_reset():
+    source = Path("frontend/src/pages/Director.tsx").read_text(encoding="utf-8")
+    api_source = Path("frontend/src/api/workflows.ts").read_text(encoding="utf-8")
+    backend_route = Path("app/api/routes/workflows.py").read_text(encoding="utf-8")
+    lifecycle_source = Path("app/services/operation_lifecycle_service.py").read_text(encoding="utf-8")
+    postgres_source = Path("app/database/postgres.py").read_text(encoding="utf-8")
+
+    assert "resetDirectorSessionWorkflow" in source
+    assert "director_reset_token" in source
+    assert "director_run_scope" not in source
+    assert "singleChapterRunScope" not in source
+    assert "forceNewSingleChapterRun" not in source
+    assert "forceNew: forceNewSingleChapterRun" not in source
+    assert "singleChapterRunAttempt" not in source
+    assert "POST" not in source or "force_new" not in source
+    assert "onClick={() => void refreshWorkflowOperations(executionId)}" in source
+    assert "onClick={() => void handleRefreshWorkflowRun()}" in source
+    assert "title=\"后端废弃当前运行并允许重新生成\"" in source
+    assert "workflows/director/session/reset" in api_source
+    assert "DirectorWorkflowResetRequest" in backend_route
+    assert "reset_director_session_workflow" in backend_route
+    assert "reset_operation_request" in lifecycle_source
+    assert "_is_reset_operation" in lifecycle_source
+    assert "reset_operation_request" in postgres_source
+    assert "reset_workflow_execution" in postgres_source
+    assert "reset_at IS NULL" in postgres_source
+
+
 def test_director_auto_write_prompt_uses_md_asset(monkeypatch):
     from app.services.director import DirectorSystem
 
@@ -5863,6 +6172,8 @@ async def test_plot_outline_soft_delete_excludes_stale_versions_and_forces_conte
             ]
             self.stale_projects = []
             self.writes = []
+            self.superseded_requirement_calls = []
+            self.deleted_readiness_calls = []
 
         async def execute_query(self, query, params=None):
             rows = [row for row in self.rows if row["project_id"] == params.get("project_id", "project-1")]
@@ -5881,6 +6192,14 @@ async def test_plot_outline_soft_delete_excludes_stale_versions_and_forces_conte
 
         async def mark_assistant_snapshots_stale(self, project_id, except_snapshot_id=None):
             self.stale_projects.append(project_id)
+            return 1
+
+        async def supersede_outline_resource_requirements(self, project_id, outline_id):
+            self.superseded_requirement_calls.append((project_id, outline_id))
+            return 2
+
+        async def delete_chapter_resource_readiness(self, project_id, outline_id):
+            self.deleted_readiness_calls.append((project_id, outline_id))
             return 1
 
     class FakeSnapshots:
@@ -5909,8 +6228,12 @@ async def test_plot_outline_soft_delete_excludes_stale_versions_and_forces_conte
     result = await service.delete_outline("outline-old")
 
     assert result["success"] is True
+    assert result["superseded_resource_requirements"] == 2
+    assert result["deleted_resource_readiness"] == 1
     assert "outline-old" not in service._outlines_cache
     assert fake_db.rows[0]["deleted_at"] == "now"
+    assert fake_db.superseded_requirement_calls == [("project-1", "outline-old")]
+    assert fake_db.deleted_readiness_calls == [("project-1", "outline-old")]
     assert fake_db.stale_projects == ["project-1"]
     assert fake_snapshots.force_rebuild_calls == [("project-1", None)]
     assert (await service.get_outline("project-1", 1)).id == "outline-current"
@@ -6188,6 +6511,36 @@ def test_outlines_frontend_uses_single_agent_session_and_legacy_first_chapter_ca
     assert "localStorage.removeItem(`plotOutlineAgentSession:${currentProject.id}:${deletedChapter}`)" not in content
     assert "mode: `chapter:${chapterNumber}`" not in content
     assert "plotOutlineAgentSession:${currentProject.id}:${chapterNumber}`" not in content
+
+
+def test_resource_requirement_frontend_routes_hooks_to_hooks_library():
+    utility = Path("frontend/src/utils/resourceRequirementDisplay.ts").read_text(encoding="utf-8")
+    outlines_page = Path("frontend/src/pages/Outlines.tsx").read_text(encoding="utf-8")
+    hooks_page = Path("frontend/src/pages/Hooks.tsx").read_text(encoding="utf-8")
+
+    assert "hook: '伏笔'" in utility
+    assert "hook: 'hook'" in utility
+    assert "? '/hooks'" in utility
+    assert "return '去伏笔库补齐'" in utility
+    assert "type BindableResourceType = 'character' | 'lore' | 'location' | 'hook'" in outlines_page
+    assert "['hook', 'foreshadowing', 'plot_hook', '伏笔'].includes(type)" in outlines_page
+    assert "const hooks = await getHooks(currentProject.id)" in outlines_page
+    assert "matched_resource_type: selected.type" in outlines_page
+    assert "useSearchParams" in hooks_page
+    assert "OutlineRequirementPanel" in hooks_page
+    assert "searchParams.get('action') === 'create'" in hooks_page
+    assert "matched_resource_type: 'hook'" in hooks_page
+    assert "requirementTypes={['hook', 'foreshadowing', 'plot_hook', '伏笔']}" in hooks_page
+    assert "onCreate={openCreateModal}" in hooks_page
+    assert "onBound={async () =>" in hooks_page
+
+
+def test_outline_requirement_panel_dedupes_by_target_type_not_original_alias():
+    panel = Path("frontend/src/components/OutlineRequirementPanel.tsx").read_text(encoding="utf-8")
+
+    assert "getRequirementTargetType(requirement)" in panel
+    assert "String(requirement.resource_name || '').trim().toLowerCase()" in panel
+    assert "requirement.severity || ''" not in panel
 
 
 @pytest.mark.asyncio
@@ -6545,36 +6898,96 @@ async def test_plot_outline_chat_filters_unsaveable_chapters_from_multi_chapter_
 
 
 @pytest.mark.asyncio
-async def test_plot_outline_resource_audit_auto_resolves_existing_lore_and_hook():
+async def test_plot_outline_resource_audit_semantic_references_replace_generic_keywords():
     from app.models.chapter_outline import ChapterOutline, ChapterOutlineStatus, SceneOutline
 
     service = PlotOutlineService()
-    outline = ChapterOutline(
-        id="outline-resource-auto-bind",
-        project_id="project-1",
-        chapter_number=1,
-        title="能力协议",
-        summary="主角在已知地点学习秘法，并触发旧伏笔。",
-        scenes=[SceneOutline(scene_number=1, title="训练", summary="秘法协议被启动", location="已知地点")],
-        hooks_planted=["旧伏笔再次出现"],
-        status=ChapterOutlineStatus.DRAFT,
-    )
     full_context = {
         "characters": [],
         "world_settings": [
             {"id": "lore-location", "title": "已知地点", "priority": "standard", "summary": "地点设定"},
-            {"id": "lore-ability", "title": "秘法协议", "priority": "core", "summary": "能力边界"},
+            {"id": "lore-protocol", "title": "黑箱审判协议", "priority": "core", "summary": "审判边界与触发条件"},
+            {"id": "lore-order", "title": "净化令", "priority": "standard", "summary": "净化行动的公开命令"},
+            {"id": "lore-ambiguous-1", "title": "月影社", "priority": "standard", "summary": "地下组织"},
+            {"id": "lore-ambiguous-2", "title": "月影规约", "priority": "standard", "summary": "地下规则"},
         ],
         "hooks": {"pending": [{"id": "hook-1", "title": "旧伏笔", "description": "待回收"}], "to_resolve": [], "to_plant": []},
         "character_availability_packet": {"availability_by_name": {}, "canonical_name_map": {}},
     }
 
-    requirements = service._build_outline_resource_requirements(outline, full_context, set())
+    generic_outline = ChapterOutline(
+        id="outline-generic-keyword",
+        project_id="project-1",
+        chapter_number=1,
+        title="能力与规则",
+        summary="主角听说这里存在能力、规则、协议和组织，但没有出现具体命名设定。",
+        scenes=[SceneOutline(scene_number=1, title="街谈", summary="众人谈到伏笔但不说具体名称")],
+        status=ChapterOutlineStatus.DRAFT,
+    )
+    generic_requirements = service._build_outline_resource_requirements(generic_outline, full_context, set())
+    assert not [item for item in generic_requirements if str(item.get("resource_name", "")).startswith("第1章")]
+    assert not [item for item in generic_requirements if item.get("matched_resource_type") == "hook"]
 
-    resolved = [item for item in requirements if item["status"] == "resolved"]
-    assert any(item["resource_name"] == "已知地点" and item["matched_resource_type"] == "lore" for item in resolved)
-    assert any(item["resource_name"] == "秘法协议" and item["matched_resource_id"] == "lore-ability" for item in resolved)
-    assert not [item for item in requirements if item["status"] == "pending" and item["resource_name"] in {"已知地点", "第1章能力规则"}]
+    explicit_outline = ChapterOutline(
+        id="outline-explicit-reference",
+        project_id="project-1",
+        chapter_number=2,
+        title="黑箱边缘",
+        summary="主角只看到审判痕迹，不知道完整真相。",
+        quality_metrics={
+            "resource_references": [
+                {"name": "黑箱审判协议", "resource_type": "lore", "reason": "本章的异常审判痕迹来自该协议", "confidence": "high"}
+            ]
+        },
+        scenes=[SceneOutline(scene_number=1, title="旧巷", summary="审判痕迹残留", location="已知地点")],
+        status=ChapterOutlineStatus.DRAFT,
+    )
+    explicit_requirements = service._build_outline_resource_requirements(explicit_outline, full_context, set())
+    assert any(
+        item["status"] == "resolved"
+        and item["resource_name"] == "黑箱审判协议"
+        and item["matched_resource_id"] == "lore-protocol"
+        and item["metadata"]["audit_basis"] == "explicit_resource_reference"
+        for item in explicit_requirements
+    )
+
+    title_match_outline = ChapterOutline(
+        id="outline-title-match",
+        project_id="project-1",
+        chapter_number=3,
+        title="净化令",
+        summary="净化令张贴在巷口，主角只能读到公开条文。",
+        scenes=[SceneOutline(scene_number=1, title="告示", summary="净化令改变街区秩序")],
+        status=ChapterOutlineStatus.DRAFT,
+    )
+    title_match_requirements = service._build_outline_resource_requirements(title_match_outline, full_context, set())
+    assert any(item["matched_resource_id"] == "lore-order" and item["status"] == "resolved" for item in title_match_requirements)
+
+    ambiguous_outline = ChapterOutline(
+        id="outline-ambiguous-reference",
+        project_id="project-1",
+        chapter_number=4,
+        title="月影传闻",
+        summary="主角听见月影传闻。",
+        writing_guide={"resource_references": [{"name": "月影", "resource_type": "lore", "reason": "需要确认月影相关资源"}]},
+        status=ChapterOutlineStatus.DRAFT,
+    )
+    ambiguous_requirements = service._build_outline_resource_requirements(ambiguous_outline, full_context, set())
+    pending = [item for item in ambiguous_requirements if item["resource_name"] == "月影" and item["status"] == "pending"]
+    assert pending
+    assert pending[0]["metadata"]["candidate_matches"]
+
+    hook_outline = ChapterOutline(
+        id="outline-hook-reference",
+        project_id="project-1",
+        chapter_number=5,
+        title="旧伏笔",
+        summary="本章回收一个已命名伏笔。",
+        hooks_resolved=["旧伏笔"],
+        status=ChapterOutlineStatus.DRAFT,
+    )
+    hook_requirements = service._build_outline_resource_requirements(hook_outline, full_context, set())
+    assert any(item["matched_resource_id"] == "hook-1" and item["matched_resource_type"] == "hook" for item in hook_requirements)
 
 
 @pytest.mark.asyncio

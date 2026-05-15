@@ -170,6 +170,7 @@ dmypy.json
 
 # Agent handoff local development docs
 AGENT_HANDOFF.md
+REFACTOR_MAP.md
 AGENT_SESSION_PROMPTS.md
 OPTIMIZATION_BACKLOG.md
 

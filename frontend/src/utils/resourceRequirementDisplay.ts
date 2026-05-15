@@ -46,6 +46,10 @@ const REQUIREMENT_TYPE_LABELS: Record<string, string> = {
   '危机解法': '危机解法',
   crisis: '危机',
   '危机': '危机',
+  hook: '伏笔',
+  foreshadowing: '伏笔',
+  plot_hook: '伏笔',
+  '伏笔': '伏笔',
 }
 
 const TARGET_TYPE_BY_REQUIREMENT: Record<string, string> = {
@@ -81,6 +85,10 @@ const TARGET_TYPE_BY_REQUIREMENT: Record<string, string> = {
   '危机解法': 'lore',
   crisis: 'lore',
   '危机': 'lore',
+  hook: 'hook',
+  foreshadowing: 'hook',
+  plot_hook: 'hook',
+  '伏笔': 'hook',
 }
 
 const RESOLUTION_METHOD_LABELS: Record<string, string> = {
@@ -139,7 +147,13 @@ export function formatRequirementSummary(item?: RequirementLike | null) {
 
 export function getRequirementRecoveryPath(item?: RequirementLike | null) {
   const targetType = getRequirementTargetType(item)
-  const basePath = targetType === 'character' ? '/characters' : targetType === 'location' ? '/world-map' : '/lore'
+  const basePath = targetType === 'character'
+    ? '/characters'
+    : targetType === 'location'
+      ? '/world-map'
+      : targetType === 'hook'
+        ? '/hooks'
+        : '/lore'
   const requirementId = String(item?.id || '').trim()
   if (!requirementId) return basePath
   const params = new URLSearchParams({ requirement_id: requirementId, action: 'create' })
@@ -150,6 +164,7 @@ export function getRequirementRecoveryActionLabel(item?: RequirementLike | null)
   const targetType = getRequirementTargetType(item)
   if (targetType === 'character') return '去角色库补齐'
   if (targetType === 'location') return '去世界地图补齐'
+  if (targetType === 'hook') return '去伏笔库补齐'
   return '去设定库补齐'
 }
 

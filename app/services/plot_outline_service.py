@@ -1081,6 +1081,250 @@ class PlotOutlineService:
 
         return candidates
 
+    def _outline_to_resource_reference_payload(self, outline: ChapterOutline) -> Dict[str, Any]:
+        scenes = []
+        for scene in outline.scenes or []:
+            scenes.append({
+                "scene_number": scene.scene_number,
+                "title": scene.title,
+                "summary": scene.summary,
+                "location": scene.location,
+                "participating_characters": scene.participating_characters,
+                "pov_character": scene.pov_character,
+                "key_events": scene.key_events,
+                "conflict_description": scene.conflict_description,
+                "writing_hints": scene.writing_hints,
+                "hooks_to_plant": scene.hooks_to_plant,
+                "hooks_to_resolve": scene.hooks_to_resolve,
+            })
+        return {
+            "chapter_number": outline.chapter_number,
+            "title": outline.title,
+            "summary": outline.summary,
+            "chapter_goals": outline.chapter_goals,
+            "hooks_planted": outline.hooks_planted,
+            "hooks_resolved": outline.hooks_resolved,
+            "writing_guide": outline.writing_guide or {},
+            "quality_metrics": outline.quality_metrics or {},
+            "scenes": scenes,
+        }
+
+    def _outline_resource_text(self, outline: ChapterOutline) -> str:
+        payload = self._outline_to_resource_reference_payload(outline)
+        parts: List[str] = []
+
+        def collect(value: Any):
+            if value is None:
+                return
+            if isinstance(value, str):
+                text = value.strip()
+                if text:
+                    parts.append(text)
+                return
+            if isinstance(value, dict):
+                for nested in value.values():
+                    collect(nested)
+                return
+            if isinstance(value, list):
+                for nested in value:
+                    collect(nested)
+
+        collect(payload)
+        return "\n".join(parts)
+
+    def _is_generic_resource_reference_name(self, name: str) -> bool:
+        normalized = self._normalize_resource_name(name)
+        generic_names = {
+            "能力", "规则", "协议", "组织", "势力", "伏笔", "秘法", "术式", "法术", "阵法",
+            "神器", "法器", "道具", "物品", "地点", "设定", "资源", "事件", "机制", "系统",
+        }
+        return not normalized or normalized in generic_names or len(normalized) <= 1
+
+    def _normalize_outline_resource_reference(self, raw: Any, default_type: str = "lore") -> Optional[Dict[str, Any]]:
+        if raw is None:
+            return None
+        if isinstance(raw, str):
+            name = self._normalize_resource_name(raw)
+            if self._is_generic_resource_reference_name(name):
+                return None
+            return {
+                "name": name,
+                "resource_type": default_type,
+                "reason": "大纲显式提及该资源。",
+                "source_excerpt": raw,
+                "confidence": "medium",
+            }
+        if not isinstance(raw, dict):
+            return None
+
+        name = self._normalize_resource_name(
+            raw.get("name") or raw.get("title") or raw.get("resource_name") or raw.get("setting") or raw.get("lore")
+        )
+        if self._is_generic_resource_reference_name(name):
+            return None
+        resource_type = str(raw.get("resource_type") or raw.get("type") or raw.get("category") or default_type or "lore").strip().lower()
+        reason = str(raw.get("reason") or raw.get("description") or raw.get("usage") or "大纲显式声明需要该资源。").strip()
+        source_excerpt = str(raw.get("source_excerpt") or raw.get("source_scene") or reason or name).strip()
+        confidence = str(raw.get("confidence") or "medium").strip().lower()
+        return {
+            "name": name,
+            "resource_type": resource_type,
+            "reason": reason,
+            "source_excerpt": source_excerpt,
+            "confidence": confidence,
+        }
+
+    def _collect_explicit_outline_resource_references(self, outline: ChapterOutline) -> List[Dict[str, Any]]:
+        references: List[Dict[str, Any]] = []
+        reference_keys = {
+            "resource_references", "setting_references", "lore_references", "required_settings",
+            "required_lore", "resource_requirements",
+        }
+
+        def collect_from_container(container: Any):
+            if not isinstance(container, dict):
+                return
+            for key in reference_keys:
+                value = container.get(key)
+                if not value:
+                    continue
+                raw_items = value if isinstance(value, list) else [value]
+                for raw in raw_items:
+                    ref = self._normalize_outline_resource_reference(raw, "lore")
+                    if ref:
+                        references.append(ref)
+
+        collect_from_container(outline.writing_guide or {})
+        collect_from_container(outline.quality_metrics or {})
+
+        for hook_text in outline.hooks_planted or []:
+            ref = self._normalize_outline_resource_reference(hook_text, "hook")
+            if ref:
+                ref["reason"] = "本章计划埋设该伏笔。"
+                references.append(ref)
+        for hook_text in outline.hooks_resolved or []:
+            ref = self._normalize_outline_resource_reference(hook_text, "hook")
+            if ref:
+                ref["reason"] = "本章计划回收该伏笔。"
+                references.append(ref)
+        for scene in outline.scenes or []:
+            for hook_text in scene.hooks_to_plant or []:
+                ref = self._normalize_outline_resource_reference(hook_text, "hook")
+                if ref:
+                    ref["reason"] = f"场景 {scene.scene_number} 计划埋设该伏笔。"
+                    references.append(ref)
+            for hook_text in scene.hooks_to_resolve or []:
+                ref = self._normalize_outline_resource_reference(hook_text, "hook")
+                if ref:
+                    ref["reason"] = f"场景 {scene.scene_number} 计划回收该伏笔。"
+                    references.append(ref)
+
+        unique: List[Dict[str, Any]] = []
+        seen = set()
+        for ref in references:
+            key = (ref.get("name", "").lower(), ref.get("resource_type", ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(ref)
+        return unique
+
+    def _extract_outline_related_entities(self, outline: ChapterOutline, references: Optional[List[Dict[str, Any]]] = None) -> List[str]:
+        entities: List[str] = []
+        for name in (outline.character_arcs or {}).keys():
+            entities.append(str(name))
+        for scene in outline.scenes or []:
+            entities.extend(str(name) for name in scene.participating_characters or [])
+            if scene.pov_character:
+                entities.append(str(scene.pov_character))
+            if scene.location:
+                entities.append(str(scene.location))
+        for ref in references or []:
+            if ref.get("name"):
+                entities.append(str(ref["name"]))
+        normalized: List[str] = []
+        seen = set()
+        for entity in entities:
+            name = self._normalize_resource_name(entity)
+            if name and name.lower() not in seen:
+                seen.add(name.lower())
+                normalized.append(name)
+        return normalized
+
+    def _score_lore_candidate_for_outline(
+        self,
+        lore: Dict[str, Any],
+        outline: ChapterOutline,
+        reference: Optional[Dict[str, Any]] = None,
+        related_entities: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        title = self._normalize_resource_name(lore.get("title") or lore.get("name"))
+        if not title:
+            return {"score": 0.0, "reasons": []}
+        outline_text = self._outline_resource_text(outline).lower()
+        ref_name = self._normalize_resource_name((reference or {}).get("name"))
+        ref_text = "\n".join(str((reference or {}).get(key) or "") for key in ("name", "reason", "source_excerpt")).lower()
+        related = {item.lower() for item in related_entities or [] if item}
+        reasons: List[str] = []
+        score = 0.0
+        title_lower = title.lower()
+
+        if ref_name and title_lower == ref_name.lower():
+            score += 1.0
+            reasons.append("exact_reference_title_match")
+        elif ref_name and (title_lower in ref_name.lower() or ref_name.lower() in title_lower):
+            score += 0.78
+            reasons.append("near_reference_title_match")
+        if title_lower in outline_text:
+            score += 0.82
+            reasons.append("title_mentioned_in_outline")
+
+        lore_entities = set()
+        for key in ("keywords", "tags", "related_characters", "related_locations", "related_entities"):
+            value = lore.get(key) or []
+            if isinstance(value, str):
+                value = [value]
+            lore_entities.update(self._normalize_resource_name(item).lower() for item in value if self._normalize_resource_name(item))
+        entity_overlap = sorted(lore_entities & related)
+        if entity_overlap:
+            score += min(0.3, 0.12 * len(entity_overlap))
+            reasons.append(f"related_entity_overlap:{','.join(entity_overlap[:4])}")
+
+        lore_text_parts = [lore.get("summary"), lore.get("content"), lore.get("description")]
+        lore_text = "\n".join(str(part or "") for part in lore_text_parts).lower()
+        phrase_hits = 0
+        for token in re.split(r"[\s,，。；;、：:（）()\[\]{}]+", ref_text):
+            token = token.strip()
+            if len(token) >= 3 and token in lore_text:
+                phrase_hits += 1
+        if phrase_hits:
+            score += min(0.24, 0.08 * phrase_hits)
+            reasons.append("reference_phrase_overlap")
+
+        priority = str(lore.get("priority") or "").lower()
+        if priority in {"constitutional", "core"} and score > 0:
+            score += 0.08
+            reasons.append(f"priority:{priority}")
+
+        return {"score": round(min(score, 1.0), 3), "reasons": reasons}
+
+    def _rank_outline_lore_candidates(
+        self,
+        outline: ChapterOutline,
+        world_settings: List[Dict[str, Any]],
+        reference: Optional[Dict[str, Any]] = None,
+        related_entities: Optional[List[str]] = None,
+        limit: int = 12,
+    ) -> List[Dict[str, Any]]:
+        scored = []
+        for lore in world_settings or []:
+            result = self._score_lore_candidate_for_outline(lore, outline, reference, related_entities)
+            if result["score"] <= 0:
+                continue
+            scored.append({"lore": lore, **result})
+        scored.sort(key=lambda item: item["score"], reverse=True)
+        return scored[:limit]
+
     def _direct_character_action_detected(self, name: str, text: str) -> bool:
         if not name or not text or name not in text:
             return False
@@ -1342,100 +1586,59 @@ class PlotOutlineService:
                 },
             })
 
-        lore_keywords = {
-            "能力": "ability",
-            "秘法": "ability",
-            "术式": "ability",
-            "法术": "ability",
-            "阵法": "ability",
-            "仪式": "event_rule",
-            "规则": "event_rule",
-            "协议": "event_rule",
-            "神器": "item",
-            "法器": "item",
-            "道具": "item",
-            "组织": "faction",
-            "势力": "faction",
-            "伏笔": "hook",
+        outline_text = self._outline_resource_text(outline)
+        explicit_references = self._collect_explicit_outline_resource_references(outline)
+        related_entities = self._extract_outline_related_entities(outline, explicit_references)
+        world_settings = [item for item in full_context.get("world_settings", []) if isinstance(item, dict)]
+        emitted_resource_keys = {
+            (str(item.get("matched_resource_type") or item.get("requirement_type") or ""), str(item.get("resource_name") or "").lower())
+            for item in requirements
         }
-        outline_text = "\n".join([
-            outline.title,
-            outline.summary,
-            *outline.chapter_goals,
-            *outline.hooks_planted,
-            *outline.hooks_resolved,
-            *[scene.summary for scene in outline.scenes],
-            *[event for scene in outline.scenes for event in scene.key_events],
-        ])
-        for keyword, requirement_type in lore_keywords.items():
-            if keyword not in outline_text:
-                continue
-            resource_name = f"第{outline.chapter_number}章{keyword}规则"
-            source_excerpt = self._outline_text_excerpt(outline, keyword)
-            matched_lore = lore_by_name.get(resource_name.lower())
-            if not matched_lore:
-                matched_lore = next(
-                    (
-                        lore_by_name[lore_name]
-                        for lore_name in known_lore
-                        if lore_name and (lore_name in source_excerpt.lower() or keyword in lore_name)
-                    ),
-                    None,
-                )
-            matched_hook = next(
-                (
-                    hook
-                    for hook_title, hook in hooks_by_name.items()
-                    if hook_title and (hook_title in source_excerpt.lower() or keyword in hook_title or hook_title in outline_text.lower())
-                ),
-                None,
-            )
-            if matched_lore and matched_lore.get("id"):
-                requirements.append({
-                    "project_id": outline.project_id,
-                    "outline_id": outline.id,
-                    "chapter_num": outline.chapter_number,
-                    "requirement_type": requirement_type,
-                    "resource_name": matched_lore.get("title") or resource_name,
-                    "severity": "advisory",
-                    "status": "resolved",
-                    "reason": f"第 {outline.chapter_number} 章大纲涉及“{keyword}”相关剧情，已自动绑定既有设定“{matched_lore.get('title') or resource_name}”。",
-                    "source_excerpt": source_excerpt,
-                    "source_agent": "plot_outline.resource_audit",
-                    "source_node_id": "outline_save_audit",
-                    "matched_resource_id": str(matched_lore.get("id")),
-                    "matched_resource_type": "lore",
-                    "metadata": {
-                        "audit_type": "outline_save",
-                        "audit_basis": "outline_text_keyword",
-                        "keyword": keyword,
-                        "auto_resolved": True,
-                    },
-                })
-                continue
-            if matched_hook and matched_hook.get("id"):
-                requirements.append({
-                    "project_id": outline.project_id,
-                    "outline_id": outline.id,
-                    "chapter_num": outline.chapter_number,
-                    "requirement_type": requirement_type,
-                    "resource_name": matched_hook.get("title") or resource_name,
-                    "severity": "advisory",
-                    "status": "resolved",
-                    "reason": f"第 {outline.chapter_number} 章大纲涉及“{keyword}”相关剧情，已自动绑定既有伏笔“{matched_hook.get('title') or resource_name}”。",
-                    "source_excerpt": source_excerpt,
-                    "source_agent": "plot_outline.resource_audit",
-                    "source_node_id": "outline_save_audit",
-                    "matched_resource_id": str(matched_hook.get("id")),
-                    "matched_resource_type": "hook",
-                    "metadata": {
-                        "audit_type": "outline_save",
-                        "audit_basis": "outline_text_keyword",
-                        "keyword": keyword,
-                        "auto_resolved": True,
-                    },
-                })
-                continue
+
+        def append_resolved_lore(requirement_type: str, resource_name: str, matched_lore: Dict[str, Any], score: Dict[str, Any], basis: str, source_excerpt: str):
+            key = ("lore", str(matched_lore.get("title") or resource_name).strip().lower())
+            if key in emitted_resource_keys:
+                return
+            emitted_resource_keys.add(key)
+            requirements.append({
+                "project_id": outline.project_id,
+                "outline_id": outline.id,
+                "chapter_num": outline.chapter_number,
+                "requirement_type": requirement_type,
+                "resource_name": matched_lore.get("title") or resource_name,
+                "severity": "advisory",
+                "status": "resolved",
+                "reason": f"第 {outline.chapter_number} 章大纲明确引用或高置信匹配既有设定“{matched_lore.get('title') or resource_name}”，已自动绑定。",
+                "source_excerpt": source_excerpt,
+                "source_agent": "plot_outline.resource_audit",
+                "source_node_id": "outline_save_audit",
+                "matched_resource_id": str(matched_lore.get("id")),
+                "matched_resource_type": "lore",
+                "metadata": {
+                    "audit_type": "outline_save",
+                    "audit_basis": basis,
+                    "match_score": score.get("score"),
+                    "match_reasons": score.get("reasons") or [],
+                    "auto_resolved": True,
+                },
+            })
+
+        def append_pending_reference(reference: Dict[str, Any], candidates_for_ref: List[Dict[str, Any]]):
+            resource_name = reference.get("name") or "未命名设定"
+            requirement_type = reference.get("resource_type") or "lore"
+            key = (str(requirement_type), str(resource_name).lower())
+            if key in emitted_resource_keys:
+                return
+            emitted_resource_keys.add(key)
+            candidate_metadata = [
+                {
+                    "id": item["lore"].get("id"),
+                    "title": item["lore"].get("title") or item["lore"].get("name"),
+                    "score": item.get("score"),
+                    "reasons": item.get("reasons") or [],
+                }
+                for item in candidates_for_ref[:5]
+            ]
             requirements.append({
                 "project_id": outline.project_id,
                 "outline_id": outline.id,
@@ -1444,22 +1647,92 @@ class PlotOutlineService:
                 "resource_name": resource_name,
                 "severity": "advisory",
                 "status": "pending",
-                "reason": f"第 {outline.chapter_number} 章大纲涉及“{keyword}”相关剧情，建议补充或绑定对应设定，避免写作阶段临场发明规则。",
-                "source_excerpt": source_excerpt,
+                "reason": f"第 {outline.chapter_number} 章大纲显式声明需要资源“{resource_name}”：{reference.get('reason') or '需要用户确认绑定或补充。'}",
+                "source_excerpt": reference.get("source_excerpt") or self._outline_text_excerpt(outline, resource_name),
                 "source_agent": "plot_outline.resource_audit",
                 "source_node_id": "outline_save_audit",
                 "suggested_payload": {
                     "title": resource_name,
                     "category": requirement_type,
                     "priority": "standard",
-                    "content": f"补充第 {outline.chapter_number} 章中“{keyword}”相关剧情的使用边界、限制和与既有设定的关系。",
+                    "content": reference.get("reason") or f"补充第 {outline.chapter_number} 章需要的资源边界和使用方式。",
                 },
                 "metadata": {
                     "audit_type": "outline_save",
-                    "audit_basis": "outline_text_keyword",
-                    "keyword": keyword,
+                    "audit_basis": "explicit_resource_reference",
+                    "reference": reference,
+                    "candidate_matches": candidate_metadata,
+                    "auto_resolved": False,
                 },
             })
+
+        for reference in explicit_references:
+            resource_name = reference.get("name") or ""
+            reference_type = str(reference.get("resource_type") or "lore").lower()
+            source_excerpt = reference.get("source_excerpt") or self._outline_text_excerpt(outline, resource_name)
+
+            if reference_type in {"hook", "foreshadowing"}:
+                matched_hook = hooks_by_name.get(resource_name.lower()) or next(
+                    (hook for hook_title, hook in hooks_by_name.items() if hook_title and (hook_title in resource_name.lower() or resource_name.lower() in hook_title)),
+                    None,
+                )
+                if matched_hook and matched_hook.get("id"):
+                    key = ("hook", str(matched_hook.get("title") or resource_name).lower())
+                    if key not in emitted_resource_keys:
+                        emitted_resource_keys.add(key)
+                        requirements.append({
+                            "project_id": outline.project_id,
+                            "outline_id": outline.id,
+                            "chapter_num": outline.chapter_number,
+                            "requirement_type": "hook",
+                            "resource_name": matched_hook.get("title") or resource_name,
+                            "severity": "advisory",
+                            "status": "resolved",
+                            "reason": f"第 {outline.chapter_number} 章大纲明确引用伏笔“{matched_hook.get('title') or resource_name}”，已自动绑定。",
+                            "source_excerpt": source_excerpt,
+                            "source_agent": "plot_outline.resource_audit",
+                            "source_node_id": "outline_save_audit",
+                            "matched_resource_id": str(matched_hook.get("id")),
+                            "matched_resource_type": "hook",
+                            "metadata": {
+                                "audit_type": "outline_save",
+                                "audit_basis": "explicit_hook_reference",
+                                "reference": reference,
+                                "auto_resolved": True,
+                            },
+                        })
+                    continue
+                append_pending_reference(reference, [])
+                continue
+
+            ranked = self._rank_outline_lore_candidates(outline, world_settings, reference, related_entities)
+            best = ranked[0] if ranked else None
+            if best and best["lore"].get("id") and (best["score"] >= 0.86 or "exact_reference_title_match" in best.get("reasons", [])):
+                append_resolved_lore(
+                    reference_type if reference_type not in {"lore", "setting"} else "lore",
+                    resource_name,
+                    best["lore"],
+                    best,
+                    "explicit_resource_reference",
+                    source_excerpt,
+                )
+            else:
+                append_pending_reference(reference, ranked)
+
+        if not explicit_references:
+            for ranked in self._rank_outline_lore_candidates(outline, world_settings, None, related_entities):
+                lore = ranked["lore"]
+                title = self._normalize_resource_name(lore.get("title") or lore.get("name"))
+                if not title or ranked["score"] < 0.82 or title.lower() not in outline_text.lower() or not lore.get("id"):
+                    continue
+                append_resolved_lore(
+                    "lore",
+                    title,
+                    lore,
+                    ranked,
+                    "semantic_lore_title_match",
+                    self._outline_text_excerpt(outline, title),
+                )
 
         return requirements
 
@@ -2764,6 +3037,23 @@ class PlotOutlineService:
         if outline_id in self._outlines_cache:
             del self._outlines_cache[outline_id]
 
+        superseded_resource_requirements = 0
+        deleted_resource_readiness = 0
+        if outline and self._db:
+            try:
+                if hasattr(self._db, "supersede_outline_resource_requirements"):
+                    superseded_resource_requirements = await self._db.supersede_outline_resource_requirements(
+                        outline.project_id,
+                        outline.id,
+                    )
+                if hasattr(self._db, "delete_chapter_resource_readiness"):
+                    deleted_resource_readiness = await self._db.delete_chapter_resource_readiness(
+                        outline.project_id,
+                        outline.id,
+                    )
+            except Exception as exc:
+                logger.warning("删除大纲后清理资源需求失败: %s", exc)
+
         if outline:
             self._mark_outline_project_dirty(outline.project_id, outline.chapter_number)
             await self._record_outline_delta(
@@ -2778,7 +3068,12 @@ class PlotOutlineService:
                 force_rebuild=True,
             )
 
-        return {"success": True, "soft_deleted_chapters": soft_deleted_chapters}
+        return {
+            "success": True,
+            "soft_deleted_chapters": soft_deleted_chapters,
+            "superseded_resource_requirements": superseded_resource_requirements,
+            "deleted_resource_readiness": deleted_resource_readiness,
+        }
 
     async def approve_outline(self, outline_id: str, approved_by: str) -> Optional[ChapterOutline]:
         """

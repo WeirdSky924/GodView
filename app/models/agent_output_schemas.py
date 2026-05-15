@@ -655,10 +655,17 @@ class WriterContinueSchema(BaseModel):
 class WriterSegmentSchema(BaseModel):
     """分段写作段落输出。"""
 
-    content: str = ""
+    content: str = Field(..., min_length=1)
     word_count: int = 0
     key_points_covered: List[str] = Field(default_factory=list)
     transition_to_next: str = ""
+
+    @field_validator("content")
+    @classmethod
+    def _content_must_not_be_blank(cls, value: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("content must not be blank")
+        return value
 
     model_config = _PERMISSIVE_CONFIG
 

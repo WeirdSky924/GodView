@@ -590,6 +590,7 @@ export async function getOutlineResourceRequirements(
     status?: ResourceRequirementStatus
     severity?: ResourceRequirementSeverity
     requirement_type?: string
+    active_outlines_only?: boolean
     cache?: QueryCacheOptions
   }
 ): Promise<{ requirements: OutlineResourceRequirement[]; total: number }> {
@@ -599,6 +600,7 @@ export async function getOutlineResourceRequirements(
   if (filters?.status) params.set('status', filters.status)
   if (filters?.severity) params.set('severity', filters.severity)
   if (filters?.requirement_type) params.set('requirement_type', filters.requirement_type)
+  if (filters?.active_outlines_only !== undefined) params.set('active_outlines_only', String(filters.active_outlines_only))
   const query = params.toString()
   return await getCachedQuery(
     `outline-resource-requirements:${query}`,

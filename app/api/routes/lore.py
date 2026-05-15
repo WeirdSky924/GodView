@@ -139,11 +139,76 @@ def _serialize_lore_row(row: Dict[str, Any]) -> Dict[str, Any]:
     serialized = dict(row)
     serialized["category"] = normalize_lore_category(row.get("category", "custom")).value
     serialized["priority"] = normalize_lore_priority(row.get("priority", "standard")).value
+    serialized["keywords"] = _parse_json_list(serialized.get("keywords"))
+    serialized["tags"] = _parse_json_list(serialized.get("tags"))
     serialized["related_characters"] = _parse_json_list(serialized.get("related_characters"))
     serialized["related_character_refs"] = _parse_json_list(serialized.get("related_character_refs"))
     serialized["unresolved_character_refs"] = _parse_json_list(serialized.get("unresolved_character_refs"))
+    serialized["related_locations"] = _parse_json_list(serialized.get("related_locations"))
+    serialized["related_items"] = _parse_json_list(serialized.get("related_items"))
     serialized["forbidden_actions"] = _parse_json_list(serialized.get("forbidden_actions"))
     return serialized
+
+
+async def _fetch_lore_for_index(postgres_db: Any, lore_id: str) -> Optional[Dict[str, Any]]:
+    rows = await postgres_db.execute_query(
+        "SELECT * FROM lore_entries WHERE id = CAST(:id AS UUID)",
+        {"id": lore_id},
+    )
+    if not rows:
+        return None
+    return _serialize_lore_row(rows[0])
+
+
+async def _sync_lore_index_after_write(postgres_db: Any, lore_id: str, project_id: str) -> Dict[str, Any]:
+    try:
+        lore = await _fetch_lore_for_index(postgres_db, lore_id)
+        if not lore:
+            warning = f"设定 {lore_id} 已写入但无法读取完整记录用于向量索引"
+            logger.warning(warning)
+            return {"success": False, "warning": warning}
+
+        from app.services.lore_index_service import get_lore_index_service
+
+        content_parts = [lore.get("summary"), lore.get("content")]
+        content = "\n".join(str(part or "").strip() for part in content_parts if str(part or "").strip())
+        success = await get_lore_index_service().index_lore(
+            lore_id=str(lore_id),
+            project_id=str(project_id),
+            title=str(lore.get("title") or ""),
+            content=content,
+            category=str(lore.get("category") or "custom"),
+            priority=str(lore.get("priority") or "standard"),
+            keywords=[str(item) for item in lore.get("keywords") or []],
+            related_characters=[str(item) for item in lore.get("related_characters") or []],
+            related_locations=[str(item) for item in lore.get("related_locations") or []],
+            related_items=[str(item) for item in lore.get("related_items") or []],
+        )
+        if success:
+            return {"success": True}
+        warning = f"设定 {lore_id} 已保存，但向量索引同步失败"
+        logger.warning(warning)
+        return {"success": False, "warning": warning}
+    except Exception as e:
+        warning = f"设定 {lore_id} 已保存，但向量索引同步异常: {e}"
+        logger.warning(warning)
+        return {"success": False, "warning": warning}
+
+
+async def _sync_lore_index_after_delete(lore_id: str, project_id: str) -> Dict[str, Any]:
+    try:
+        from app.services.lore_index_service import get_lore_index_service
+
+        success = await get_lore_index_service().delete_lore(str(lore_id), str(project_id))
+        if success:
+            return {"success": True}
+        warning = f"设定 {lore_id} 已删除，但向量索引删除失败或未连接"
+        logger.warning(warning)
+        return {"success": False, "warning": warning}
+    except Exception as e:
+        warning = f"设定 {lore_id} 已删除，但向量索引删除异常: {e}"
+        logger.warning(warning)
+        return {"success": False, "warning": warning}
 
 
 def _invalidate_plot_outline_context(project_id: Optional[str]):
@@ -273,6 +338,24 @@ async def get_lore_categories():
         {"value": "skill", "label": "技能/能力"},
         {"value": "custom", "label": "自定义"},
     ]
+
+
+@router.post("/reindex", response_model=Dict[str, Any])
+async def reindex_lore(project_id: str = Query(..., description="项目 ID")):
+    """从 PostgreSQL 权威设定库重建设定向量索引。"""
+    from app.api.app import postgres_db
+    from app.services.lore_index_service import get_lore_index_service
+
+    if not postgres_db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+
+    indexed_count = await get_lore_index_service().sync_project_lores(project_id)
+    return {
+        "success": True,
+        "project_id": project_id,
+        "indexed_count": indexed_count,
+        "message": f"项目设定向量索引已同步 {indexed_count} 条",
+    }
 
 
 @router.get("/priorities", response_model=List[Dict[str, str]])
@@ -444,13 +527,18 @@ async def create_lore(lore: LoreEntry):
             operation="create_lore_reference_resolution",
             resolution=reference_resolution.to_dict(),
         )
+        index_sync = await _sync_lore_index_after_write(postgres_db, lore_id, lore.project_id)
         _invalidate_plot_outline_context(lore.project_id)
-        return {
+        response = {
             "success": True,
             "id": lore_id,
             "message": f"设定 '{lore.title}' 创建成功",
             "character_reference_resolution": reference_resolution.to_dict(),
+            "index_sync": index_sync,
         }
+        if not index_sync.get("success"):
+            response["index_warning"] = index_sync.get("warning")
+        return response
     except Exception as e:
         logger.error(f"创建设定失败：{e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -694,6 +782,7 @@ async def update_lore(lore_id: str, lore_update: UpdateLoreDTO):
 
     query = f"UPDATE lore_entries SET {', '.join(update_fields)} WHERE id = CAST(:id AS UUID)"
     await postgres_db.execute_write(query, params)
+    index_sync = await _sync_lore_index_after_write(postgres_db, lore_id, str(project_id))
     if reference_resolution:
         await resolver.persist_lore_resolution(
             lore_id=lore_id,
@@ -713,7 +802,10 @@ async def update_lore(lore_id: str, lore_update: UpdateLoreDTO):
         "success": True,
         "id": lore_id,
         "message": "设定更新成功",
+        "index_sync": index_sync,
     }
+    if not index_sync.get("success"):
+        response["index_warning"] = index_sync.get("warning")
     if reference_resolution:
         response["character_reference_resolution"] = reference_resolution.to_dict()
     return response
@@ -742,16 +834,22 @@ async def delete_lore(lore_id: str):
     if not project_row:
         raise HTTPException(status_code=404, detail="设定不存在")
 
+    project_id = str(project_row[0].get("project_id"))
     await postgres_db.execute_write(
         "DELETE FROM lore_entries WHERE id = CAST(:id AS UUID)",
         {"id": lore_id}
     )
-    _invalidate_plot_outline_context(project_row[0].get("project_id"))
+    index_sync = await _sync_lore_index_after_delete(lore_id, project_id)
+    _invalidate_plot_outline_context(project_id)
 
-    return {
+    response = {
         "success": True,
         "message": f"设定 {lore_id} 已删除",
+        "index_sync": index_sync,
     }
+    if not index_sync.get("success"):
+        response["index_warning"] = index_sync.get("warning")
+    return response
 
 
 @router.post("/search", response_model=List[LoreSearchResult])

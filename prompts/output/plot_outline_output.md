@@ -62,9 +62,20 @@ is_system: true
       "estimated_words": 1000,
       "key_events": ["事件1"]
     }
+  ],
+  "resource_references": [
+    {
+      "name": "具体设定/伏笔/地点/物品/能力名称",
+      "resource_type": "lore/hook/location/item/ability/faction/rule",
+      "reason": "本章为什么需要这个资源",
+      "source_scene": 1,
+      "confidence": "high/medium/low"
+    }
   ]
 }
 ```
+
+`resource_references` 为可选字段，只能填写具体命名资源或明确需要新增的资源；不要把“能力”“规则”“组织”“势力”“伏笔”等普通叙述词当作资源名。
 
 ## 多章大纲格式（黄金三章等）
 
@@ -118,7 +129,8 @@ is_system: true
 9. **黄金三章平衡**：第1-3章必须兼顾读者信息赋予与主动张力来源；不能纯说明无冲突，也不能无因跳到最终反派、国家级秘密、世界级灾难或最高级威胁正面对抗
 10. **冲突规模合法**：黄金三章优先使用 `life_pressure` / `rule_pressure` / `local_anomaly` / `proxy_conflict` / `mainline_edge` 渐进张力；`core_threat` 正面冲突必须有用户授权和完整因果铺垫
 11. **多章用 chapters 数组**：生成多章时，必须用 `{"chapters": [...]}` 格式，每章都要有 chapter_number
-12. **避免截断**：如果内容太长，可以分多次输出，但每次 JSON 都要完整
+12. **资源引用要具体**：只有具体命名的设定、伏笔、地点、物品、能力、组织或规则才写入 `resource_references`；泛称和普通叙述词不得制造资源需求
+13. **避免截断**：如果内容太长，可以分多次输出，但每次 JSON 都要完整
 
 ### 角色知识边界与因果链输出示例
 

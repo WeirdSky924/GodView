@@ -286,8 +286,9 @@ class QdrantDatabase:
 
     # ==================== 向量搜索 ====================
 
-    async def search_similar(
+    async def search_similar_in_collection(
         self,
+        collection_name: str,
         query_vector: List[float],
         limit: int = 5,
         score_threshold: float = 0.7,
@@ -321,7 +322,7 @@ class QdrantDatabase:
 
         # 搜索
         results = self._client.query_points(
-            collection_name=self.collection_name,
+            collection_name=collection_name,
             query=query_vector,
             query_filter=query_filter,
             limit=limit,
@@ -343,6 +344,41 @@ class QdrantDatabase:
 
         return formatted_results
 
+    async def search_similar(
+        self,
+        query_vector: List[float],
+        limit: int = 5,
+        score_threshold: float = 0.7,
+        filter_conditions: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        return await self.search_similar_in_collection(
+            self.collection_name,
+            query_vector,
+            limit=limit,
+            score_threshold=score_threshold,
+            filter_conditions=filter_conditions,
+        )
+
+    async def search_by_text_in_collection(
+        self,
+        collection_name: str,
+        query_text: str,
+        limit: int = 5,
+        filter_conditions: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        if not self.embedding_service:
+            logger.warning("未配置 Embedding 服务，无法通过文本搜索")
+            return []
+
+        embedding = await self.embedding_service.embed_text(query_text)
+
+        return await self.search_similar_in_collection(
+            collection_name,
+            query_vector=embedding,
+            limit=limit,
+            filter_conditions=filter_conditions,
+        )
+
     async def search_by_text(
         self,
         query_text: str,
@@ -360,15 +396,9 @@ class QdrantDatabase:
         Returns:
             List: 搜索结果
         """
-        if not self.embedding_service:
-            logger.warning("未配置 Embedding 服务，无法通过文本搜索")
-            return []
-
-        # 生成嵌入
-        embedding = await self.embedding_service.embed_text(query_text)
-
-        return await self.search_similar(
-            query_vector=embedding,
+        return await self.search_by_text_in_collection(
+            self.collection_name,
+            query_text=query_text,
             limit=limit,
             filter_conditions=filter_conditions,
         )
@@ -736,9 +766,9 @@ class QdrantDatabase:
         }
 
         if embedding:
-            return await self.insert_vector(embedding, payload, lore_id)
+            return await self._insert_vector_to_collection(self.COLLECTION_LORE, embedding, payload, lore_id)
         else:
-            return await self.insert_text(content, payload, lore_id)
+            return await self._insert_text_to_collection(self.COLLECTION_LORE, content, payload, lore_id)
 
     async def search_lore(
         self,
@@ -772,7 +802,8 @@ class QdrantDatabase:
         if priority:
             filter_conditions["priority"] = priority
 
-        return await self.search_similar(
+        return await self.search_similar_in_collection(
+            self.COLLECTION_LORE,
             query_vector=query_embedding,
             limit=limit,
             filter_conditions=filter_conditions,
@@ -805,7 +836,8 @@ class QdrantDatabase:
         if category:
             filter_conditions["category"] = category
 
-        return await self.search_by_text(
+        return await self.search_by_text_in_collection(
+            self.COLLECTION_LORE,
             query_text=query_text,
             limit=limit,
             filter_conditions=filter_conditions,

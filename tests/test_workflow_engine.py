@@ -20,6 +20,34 @@ from app.services.workflow_replay_export_service import WorkflowReplayExportServ
 from tests.workflow_test_fakes import FakeAgentResponse, FakeDiscussionDB
 
 
+def test_workflow_resource_requirements_dedupe_same_resource_across_reasons():
+    engine = WorkflowEngine()
+    execution = WorkflowExecution(
+        id="exec-1",
+        workflow_id="workflow-1",
+        project_id="project-1",
+    )
+    execution.context.update({"chapter_num": 2, "chapter_outline_id": "outline-1"})
+    node = WorkflowNode(id="master", node_type=NodeType.AGENT, agent_type="master_plotter", label="Master")
+
+    updates = engine._normalize_workflow_resource_requirements(
+        {
+            "resource_requirements": [
+                {"requirement_type": "continuity", "resource_name": "连续性·林默", "severity": "blocking", "reason": "原因 A"},
+                {"requirement_type": "continuity", "resource_name": "连续性·林默", "severity": "advisory", "reason": "原因 B"},
+            ]
+        },
+        execution,
+        node,
+    )
+
+    requirements = updates["pending_resource_requirements"]
+    assert len(requirements) == 1
+    assert requirements[0]["resource_name"] == "连续性·林默"
+    assert "原因 A" in requirements[0]["reason"]
+    assert "原因 B" in requirements[0]["reason"]
+
+
 class TestWorkflowValidation:
     def setup_method(self):
         self.engine = WorkflowEngine()
@@ -641,6 +669,196 @@ class TestWorkflowExecution:
         assert "租约已过期" in execution.error
         assert execution.context["stale_execution_history"][0]["operation"] == "inspect"
         assert execution.resume_cursor["stale_operation"] == "inspect"
+
+    def test_retry_branch_exit_does_not_block_initial_writer_path(self):
+        workflow = WorkflowDefinition(
+            id="wf-retry-branch",
+            project_id="test-project",
+            name="retry branch",
+            nodes=[
+                WorkflowNode(id="start", node_type=NodeType.START, label="开始", position={}),
+                WorkflowNode(id="master_scene_compiler", node_type=NodeType.AGENT, agent_type="master_plotter", label="Master", position={}),
+                WorkflowNode(id="writer", node_type=NodeType.AGENT, agent_type="writer", label="Writer", position={}),
+                WorkflowNode(id="evaluator", node_type=NodeType.AGENT, agent_type="evaluator", label="Evaluator", position={}),
+                WorkflowNode(id="condition_quality", node_type=NodeType.CONDITION, label="质量门", position={}),
+                WorkflowNode(id="master_revision_director", node_type=NodeType.AGENT, agent_type="master_plotter", label="Revision", position={}),
+                WorkflowNode(id="end", node_type=NodeType.END, label="结束", position={}),
+            ],
+            edges=[
+                WorkflowEdge(id="e1", source="start", target="master_scene_compiler"),
+                WorkflowEdge(id="e2", source="master_scene_compiler", target="writer"),
+                WorkflowEdge(id="e3", source="writer", target="evaluator"),
+                WorkflowEdge(id="e4", source="evaluator", target="condition_quality"),
+                WorkflowEdge(id="e5", source="condition_quality", target="end", condition={"result": "pass"}),
+                WorkflowEdge(id="e6", source="condition_quality", target="master_revision_director", condition={"result": "retry"}),
+                WorkflowEdge(id="e7", source="master_revision_director", target="writer"),
+            ],
+        )
+        execution = WorkflowExecution(workflow_id=workflow.id, project_id="test-project")
+        for node in workflow.nodes:
+            execution.node_states[node.id] = NodeExecutionState(node_id=node.id)
+        predecessors = self.engine._build_predecessor_graph(workflow)
+
+        assert predecessors["writer"] == ["master_scene_compiler"]
+        assert self.engine._get_ready_nodes(workflow, execution, predecessors, {"start", "master_scene_compiler"}) == ["writer"]
+
+    @pytest.mark.asyncio
+    async def test_parallel_failed_node_stops_before_downstream_end(self):
+        workflow = WorkflowDefinition(
+            id="wf-parallel-failure",
+            project_id="test-project",
+            name="并行失败测试",
+            nodes=[
+                WorkflowNode(id="start", node_type=NodeType.START, label="开始", position={}),
+                WorkflowNode(id="good_agent", node_type=NodeType.AGENT, agent_type="writer", label="成功 Agent", position={}),
+                WorkflowNode(id="bad_agent", node_type=NodeType.AGENT, agent_type="master_plotter", label="失败 Agent", position={}),
+                WorkflowNode(id="end", node_type=NodeType.END, label="结束", position={}),
+            ],
+            edges=[
+                WorkflowEdge(id="e1", source="start", target="good_agent"),
+                WorkflowEdge(id="e2", source="start", target="bad_agent"),
+                WorkflowEdge(id="e3", source="good_agent", target="end"),
+                WorkflowEdge(id="e4", source="bad_agent", target="end"),
+            ],
+        )
+        execution = WorkflowExecution(
+            id="exec-parallel-failure",
+            workflow_id=workflow.id,
+            project_id="test-project",
+            status=WorkflowStatus.RUNNING,
+        )
+        for node in workflow.nodes:
+            execution.node_states[node.id] = NodeExecutionState(node_id=node.id)
+        self.engine._executions[execution.id] = execution
+
+        async def _fake_execute_node_with_merge(execution_arg, node, predecessors, workflow_arg, db=None):
+            state = execution_arg.node_states[node.id]
+            state.started_at = datetime.now()
+            state.completed_at = datetime.now()
+            if node.id == "bad_agent":
+                state.status = NodeStatus.FAILED
+                state.error = "structured contract failed"
+                state.output_data = {}
+            else:
+                state.status = NodeStatus.COMPLETED
+                state.output_data = {"node_id": node.id}
+
+        async def _fake_broadcast(*args, **kwargs):
+            pass
+
+        async def _fake_mark_terminal(*args, **kwargs):
+            pass
+
+        async def _fake_export(*args, **kwargs):
+            return None
+
+        self.engine._execute_node_with_merge = _fake_execute_node_with_merge
+        self.engine._broadcast_status = _fake_broadcast
+        self.engine._mark_operation_terminal = _fake_mark_terminal
+        self.engine._export_execution_replay_markdown = _fake_export
+
+        await self.engine._run_workflow(execution.id, workflow)
+
+        assert execution.status == WorkflowStatus.FAILED
+        assert execution.error == "structured contract failed"
+        assert execution.node_states["bad_agent"].status == NodeStatus.FAILED
+        assert execution.node_states["good_agent"].status == NodeStatus.COMPLETED
+        assert execution.node_states["end"].status == NodeStatus.PENDING
+
+    @pytest.mark.asyncio
+    async def test_failed_predecessor_blocks_linear_downstream_and_end(self):
+        workflow = WorkflowDefinition(
+            id="wf-linear-failure",
+            project_id="test-project",
+            name="线性失败阻断测试",
+            nodes=[
+                WorkflowNode(id="start", node_type=NodeType.START, label="开始", position={}),
+                WorkflowNode(id="bad_agent", node_type=NodeType.AGENT, agent_type="master_plotter", label="失败 Agent", position={}),
+                WorkflowNode(id="writer", node_type=NodeType.AGENT, agent_type="writer", label="写作", position={}),
+                WorkflowNode(id="end", node_type=NodeType.END, label="结束", position={}),
+            ],
+            edges=[
+                WorkflowEdge(id="e1", source="start", target="bad_agent"),
+                WorkflowEdge(id="e2", source="bad_agent", target="writer"),
+                WorkflowEdge(id="e3", source="writer", target="end"),
+            ],
+        )
+        execution = WorkflowExecution(
+            id="exec-linear-failure",
+            workflow_id=workflow.id,
+            project_id="test-project",
+            status=WorkflowStatus.RUNNING,
+        )
+        for node in workflow.nodes:
+            execution.node_states[node.id] = NodeExecutionState(node_id=node.id)
+        self.engine._executions[execution.id] = execution
+
+        async def _fake_execute_node_with_merge(execution_arg, node, predecessors, workflow_arg, db=None):
+            state = execution_arg.node_states[node.id]
+            state.started_at = datetime.now()
+            state.completed_at = datetime.now()
+            if node.id == "bad_agent":
+                state.status = NodeStatus.FAILED
+                state.error = "provider failed"
+            else:
+                state.status = NodeStatus.COMPLETED
+                state.output_data = {"node_id": node.id}
+
+        async def _fake_broadcast(*args, **kwargs):
+            pass
+
+        async def _fake_mark_terminal(*args, **kwargs):
+            pass
+
+        async def _fake_export(*args, **kwargs):
+            return None
+
+        self.engine._execute_node_with_merge = _fake_execute_node_with_merge
+        self.engine._broadcast_status = _fake_broadcast
+        self.engine._mark_operation_terminal = _fake_mark_terminal
+        self.engine._export_execution_replay_markdown = _fake_export
+
+        await self.engine._run_workflow(execution.id, workflow)
+
+        assert execution.status == WorkflowStatus.FAILED
+        assert execution.error == "provider failed"
+        assert execution.node_states["bad_agent"].status == NodeStatus.FAILED
+        assert execution.node_states["writer"].status == NodeStatus.PENDING
+        assert execution.node_states["end"].status == NodeStatus.PENDING
+
+    @pytest.mark.asyncio
+    async def test_running_execution_heartbeat_extends_lease_before_node_completes(self):
+        execution = WorkflowExecution(
+            workflow_id="test-wf",
+            project_id="test-project",
+            status=WorkflowStatus.RUNNING,
+            request_id="request-1",
+            node_states={"master": NodeExecutionState(node_id="master", status=NodeStatus.RUNNING)},
+            lease_expires_at=datetime.now() - timedelta(seconds=5),
+            last_heartbeat_at=datetime.now() - timedelta(seconds=65),
+        )
+        saved = []
+        heartbeats = []
+
+        class FakeDB:
+            async def get_operation_request_by_request_id(self, request_id):
+                return {"request_id": request_id}
+
+        class FakeOperationService:
+            async def heartbeat(self, operation):
+                heartbeats.append(operation)
+
+        async def fake_save(execution_arg, db=None):
+            saved.append((execution_arg.last_heartbeat_at, execution_arg.lease_expires_at))
+
+        self.engine._save_execution_to_db = fake_save
+        before = datetime.now()
+        await self.engine._heartbeat_running_execution(execution, FakeDB(), FakeOperationService(), 60)
+
+        assert execution.last_heartbeat_at >= before
+        assert execution.lease_expires_at > datetime.now() + timedelta(seconds=50)
+        assert saved
+        assert heartbeats == [{"request_id": "request-1"}]
 
     def test_inspect_execution_staleness_reports_safe_actions(self):
         execution = WorkflowExecution(
@@ -1268,6 +1486,73 @@ class TestWorkflowExecution:
         assert execution.resume_cursor["recovered_node_id"] == "writer"
         assert broadcasts[0]["event_type"] == "workflow_recovery_started"
         assert broadcasts[0]["data"]["recovery_attempt"] == 1
+        assert started == [{"execution_id": execution.id, "workflow_id": workflow.id}]
+
+    @pytest.mark.asyncio
+    async def test_recover_failed_terminal_node_retries_nearest_upstream_agent(self):
+        workflow = WorkflowDefinition(
+            id="wf-terminal-recovery",
+            project_id="test-project",
+            name="终态恢复测试",
+            nodes=[
+                WorkflowNode(id="start", node_type=NodeType.START, label="开始", position={"x": 0, "y": 0}),
+                WorkflowNode(id="writer", node_type=NodeType.AGENT, agent_type="writer", label="写作", position={"x": 0, "y": 100}),
+                WorkflowNode(id="save", node_type=NodeType.END, label="保存", position={"x": 0, "y": 200}),
+            ],
+            edges=[
+                WorkflowEdge(id="e1", source="start", target="writer"),
+                WorkflowEdge(id="e2", source="writer", target="save"),
+            ],
+        )
+        execution = WorkflowExecution(
+            id="exec-terminal-recovery",
+            workflow_id=workflow.id,
+            project_id="test-project",
+            status=WorkflowStatus.FAILED,
+            current_node="save",
+            error="save failed",
+            completed_at=datetime.now(),
+            node_states={
+                "start": NodeExecutionState(node_id="start", status=NodeStatus.COMPLETED, output_data={"status": "started"}),
+                "writer": NodeExecutionState(node_id="writer", status=NodeStatus.COMPLETED, output_data={"chapter_content": "old draft"}, retry_count=0),
+                "save": NodeExecutionState(node_id="save", status=NodeStatus.FAILED, output_data={"chapter_id": "old"}, error="save failed"),
+            },
+            context={
+                "node_outputs": {
+                    "start": {"status": "started"},
+                    "writer": {"chapter_content": "old draft"},
+                    "save": {"chapter_id": "old"},
+                },
+                "latest_node_output": {"node_id": "save", "chapter_id": "old"},
+            },
+        )
+        self.engine._executions[execution.id] = execution
+        started = []
+
+        async def _fake_get_workflow(workflow_id, db=None):
+            return workflow
+
+        async def _fake_broadcast(execution_id, event_type, data):
+            pass
+
+        def _fake_start(execution_id, workflow_arg, db=None):
+            started.append({"execution_id": execution_id, "workflow_id": workflow_arg.id})
+
+        self.engine.get_workflow = _fake_get_workflow
+        self.engine._broadcast_status = _fake_broadcast
+        self.engine._start_workflow_task = _fake_start
+
+        result = await self.engine.recover_failed_workflow(execution.id, reason="retry_real_llm")
+
+        assert result["recovered_node_id"] == "writer"
+        assert result["reset_node_ids"] == ["save", "writer"]
+        assert execution.current_node == "writer"
+        assert execution.node_states["writer"].status == NodeStatus.PENDING
+        assert execution.node_states["writer"].output_data == {}
+        assert execution.node_states["writer"].retry_count == 1
+        assert execution.node_states["save"].status == NodeStatus.PENDING
+        assert set(execution.context["node_outputs"].keys()) == {"start"}
+        assert "latest_node_output" not in execution.context
         assert started == [{"execution_id": execution.id, "workflow_id": workflow.id}]
 
     @pytest.mark.asyncio

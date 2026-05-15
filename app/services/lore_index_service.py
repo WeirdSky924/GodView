@@ -150,6 +150,28 @@ class LoreIndexService:
             for entity_id, lore_ids in self._relation_index[project_id].items():
                 lore_ids.discard(lore_id)
 
+    async def delete_lore(self, lore_id: str, project_id: Optional[str] = None) -> bool:
+        """从 Qdrant 与内存索引中移除设定索引。PostgreSQL 仍是权威数据源。"""
+        try:
+            qdrant = self._get_qdrant_db()
+            if not qdrant:
+                logger.warning("Qdrant 未连接，跳过设定向量删除")
+                if project_id:
+                    self.remove_from_memory_index(str(project_id), str(lore_id))
+                return False
+
+            success = await qdrant.delete_lore_entry(str(lore_id))
+            if project_id:
+                self.remove_from_memory_index(str(project_id), str(lore_id))
+            if not success:
+                logger.warning(f"删除设定向量索引未完成: lore_id={lore_id}, project_id={project_id}")
+            return bool(success)
+        except Exception as e:
+            logger.error(f"删除设定索引失败: {e}")
+            if project_id:
+                self.remove_from_memory_index(str(project_id), str(lore_id))
+            return False
+
     async def search_by_keywords(
         self,
         project_id: str,

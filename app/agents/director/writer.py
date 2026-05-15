@@ -700,6 +700,35 @@ class WriterAgent(BaseAgent):
         parts.append(f"【输出 JSON Schema】\n{output_schema}")
         return "\n\n".join(part for part in parts if part)
 
+    async def _generate_segment_content(
+        self,
+        *,
+        segment_prompt: str,
+        segment_num: int,
+        target_words: int,
+    ) -> str:
+        """Generate one segmented chapter chunk through the structured JSON contract only."""
+        segment_parsed = await self._call_structured(
+            WriterSegmentSchema,
+            messages=[HumanMessage(content=segment_prompt)],
+            temperature=0.75,
+            category=UsageCategory.CHAPTER,
+        )
+        segment_result = segment_parsed.model_dump()
+        segment_content = self._as_text(segment_result.get("content", ""))
+        if segment_content.strip():
+            return segment_content
+        raise StructuredOutputError(
+            f"Writer 第 {segment_num} 段 structured 输出 content 为空，违反 WriterSegmentSchema 业务契约",
+            schema_name="WriterSegmentSchema",
+            validation_errors={
+                "field": "content",
+                "error": "empty_content",
+                "segment_num": segment_num,
+                "target_words": target_words,
+            },
+        )
+
     def _build_writer_segment_task_notes(
         self,
         task_kind: str,
@@ -1007,25 +1036,17 @@ class WriterAgent(BaseAgent):
                 config_prompt=writer_config_prompt,
             )
 
-            # 生成该段 (structured)
-            try:
-                segment_parsed = await self._call_structured(
-                    WriterSegmentSchema,
-                    messages=[HumanMessage(content=segment_prompt)],
-                    temperature=0.75,
-                    category=UsageCategory.CHAPTER,
-                )
-                segment_result = segment_parsed.model_dump()
-                segment_content = segment_result.get("content", "")
-            except StructuredOutputError as e:
-                logger.warning(f"分段 structured 失败，降级纯文本: {e}")
-                segment_response = await self._call_llm(
-                    messages=[HumanMessage(content=segment_prompt)], temperature=0.75,
-                    category=UsageCategory.CHAPTER
-                )
-                segment_content = segment_response
-
+            segment_content = await self._generate_segment_content(
+                segment_prompt=segment_prompt,
+                segment_num=segment_num,
+                target_words=segment_target,
+            )
             segment_words = await self._count_words_async(segment_content)
+            if segment_words <= 0:
+                raise StructuredOutputError(
+                    f"Writer 第 {segment_num} 段生成空内容，停止分段流程，避免保存 0 字段落",
+                    schema_name="WriterSegmentSchema",
+                )
             all_content.append(segment_content)
             total_words += segment_words
 

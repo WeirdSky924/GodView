@@ -306,6 +306,15 @@ class WorkflowRuntimeFixtureCleanupRequest(BaseModel):
     cleanup_token: str
 
 
+class DirectorWorkflowResetRequest(BaseModel):
+    """Director 会话工作流重置请求。"""
+
+    project_id: str
+    workflow_id: str
+    director_session_id: str
+    reason: Optional[str] = None
+
+
 def _format_sse(event_name: str, payload: Dict[str, Any]) -> str:
     return f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
@@ -410,6 +419,28 @@ async def get_active_execution(
     if not row:
         return {"success": True, "execution": None}
     return {"success": True, "execution": row}
+
+
+@router.post("/director/session/reset", response_model=Dict[str, Any])
+async def reset_director_session_workflow(request: DirectorWorkflowResetRequest):
+    """废弃 Director 当前会话工作流执行和幂等记录，允许后续重新启动新任务线。"""
+    engine = get_workflow_engine()
+    db = get_db()
+    if not db:
+        raise HTTPException(status_code=503, detail="数据库未连接")
+    try:
+        return await engine.reset_director_session_workflow(
+            project_id=request.project_id,
+            workflow_id=request.workflow_id,
+            director_session_id=request.director_session_id,
+            db=db,
+            reason=request.reason,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.error("重置 Director 会话工作流失败: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"重置失败：{exc}")
 
 
 @router.get("/executions/{execution_id}", response_model=Dict[str, Any])

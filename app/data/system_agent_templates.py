@@ -1385,6 +1385,7 @@ MASTER_PLOTTER_WORKFLOW_PLOT_ADVANCE = _template_with_prompt_slots(
     order=["originality", "role_definition", "function_spec", "advance_decision", "output_format"],
 )
 
+
 MASTER_PLOTTER_WORKFLOW_FORCED_EVENT = _template_with_prompt_slots(
     DIRECTOR_MASTER_PLOTTER,
     template_id="director_master_plotter_workflow_forced_event",
@@ -1402,6 +1403,44 @@ MASTER_PLOTTER_WORKFLOW_FORCED_EVENT = _template_with_prompt_slots(
         ),
     ],
     order=["originality", "role_definition", "function_spec", "forced_event"],
+)
+
+MASTER_PLOTTER_WORKFLOW_SCENE_COMPILATION = _template_with_prompt_slots(
+    DIRECTOR_MASTER_PLOTTER,
+    template_id="director_master_plotter_workflow_scene_compilation",
+    name="Director Master Plotter 场景编译模板",
+    description="总编剧在章节写作前把绑定大纲编译成 Writer 可执行、Evaluator 可验收的场景计划模板",
+    scenario="workflow_scene_compilation",
+    tags=["director", "master_plotter", "workflow", "scene", "compilation", "chapter_planning"],
+    slots=[
+        PromptSlot(
+            slot_name="chapter_scene_plan",
+            description="章节场景编译：把大纲事实转成可执行场景 beat、Writer brief 和 Evaluator 验收标准",
+            prompt_template_id="function_master_plotter_chapter_scene_plan",
+            required=True,
+            priority=88,
+        ),
+    ],
+    order=["originality", "role_definition", "function_spec", "chapter_scene_plan", "output_format"],
+)
+
+MASTER_PLOTTER_WORKFLOW_REVISION_DIRECTOR = _template_with_prompt_slots(
+    DIRECTOR_MASTER_PLOTTER,
+    template_id="director_master_plotter_workflow_revision_director",
+    name="Director Master Plotter 修订导演模板",
+    description="总编剧在质量门失败后把 Evaluator/Gate 证据转成 Writer 可执行修订指令的场景模板",
+    scenario="workflow_revision_director",
+    tags=["director", "master_plotter", "workflow", "revision", "quality_gate"],
+    slots=[
+        PromptSlot(
+            slot_name="revision_director",
+            description="修订导演：失败聚类、重写策略、保留/替换清单和复评标准",
+            prompt_template_id="function_master_plotter_revision_director",
+            required=True,
+            priority=89,
+        ),
+    ],
+    order=["originality", "role_definition", "function_spec", "revision_director", "output_format"],
 )
 
 WRITER_REWRITE_BY_REVIEW = DIRECTOR_WRITER.model_copy(
@@ -1846,6 +1885,8 @@ SYSTEM_AGENT_TEMPLATES = [
     MASTER_PLOTTER_WORKFLOW_CHAPTER_PLANNING,
     MASTER_PLOTTER_WORKFLOW_PLOT_ADVANCE,
     MASTER_PLOTTER_WORKFLOW_FORCED_EVENT,
+    MASTER_PLOTTER_WORKFLOW_SCENE_COMPILATION,
+    MASTER_PLOTTER_WORKFLOW_REVISION_DIRECTOR,
     MASTER_PLOTTER_WORKFLOW_DISCUSSION_OPENING,
     MASTER_PLOTTER_WORKFLOW_DISCUSSION_SUMMARY,
     MASTER_PLOTTER_WORKFLOW_SCENE_DIRECTION,

@@ -74,8 +74,14 @@ const statusLabels: Record<ResourceRequirementStatus, string> = {
 function uniqueRequirements(requirements: OutlineResourceRequirement[]) {
   const seen = new Set<string>()
   return requirements.filter(requirement => {
-    if (seen.has(requirement.id)) return false
-    seen.add(requirement.id)
+    const key = [
+      requirement.outline_id || '',
+      requirement.chapter_num || '',
+      getRequirementTargetType(requirement),
+      String(requirement.resource_name || '').trim().toLowerCase(),
+    ].join('|')
+    if (seen.has(key)) return false
+    seen.add(key)
     return true
   })
 }
