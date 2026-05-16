@@ -2073,6 +2073,90 @@ class TestWorkflowExecution:
         assert execution.context["chapter_saved_payload"]["revision_directive_id"] == "rev-1"
         assert db.chapters and (tmp_path / db.chapters[0]["content_path"]).read_text(encoding="utf-8") == "第二版正文"
 
+    def test_condition_retry_to_new_revision_target_resets_completed_downstream_nodes(self):
+        workflow = WorkflowDefinition(
+            id="wf-master-reset-regression",
+            project_id="project-reset-regression",
+            name="Master revision reset regression",
+            nodes=[
+                WorkflowNode(id="start", node_type=NodeType.START, label="开始"),
+                WorkflowNode(id="writer", node_type=NodeType.AGENT, agent_type="writer", label="Writer"),
+                WorkflowNode(id="evaluator", node_type=NodeType.AGENT, agent_type="evaluator", label="Evaluator"),
+                WorkflowNode(id="condition_quality", node_type=NodeType.CONDITION, label="质量门"),
+                WorkflowNode(id="master_revision_director", node_type=NodeType.AGENT, agent_type="master_plotter", label="Master修订"),
+                WorkflowNode(id="end", node_type=NodeType.END, label="结束"),
+            ],
+            edges=[
+                WorkflowEdge(source="start", target="writer"),
+                WorkflowEdge(source="writer", target="evaluator"),
+                WorkflowEdge(source="evaluator", target="condition_quality"),
+                WorkflowEdge(source="condition_quality", target="end", condition={"result": "pass"}),
+                WorkflowEdge(source="condition_quality", target="master_revision_director", condition={"result": "retry"}),
+                WorkflowEdge(source="master_revision_director", target="writer"),
+            ],
+        )
+        execution = WorkflowExecution(
+            workflow_id=workflow.id,
+            project_id=workflow.project_id,
+            context={
+                "node_outputs": {
+                    "start": {"status": "started"},
+                    "writer": {"chapter_content": "old draft"},
+                    "evaluator": {"quality_passed": False},
+                    "condition_quality": {"condition_result": False},
+                },
+                "latest_node_output": {"node_id": "condition_quality", "condition_result": False},
+                "evaluation_feedback": {"issues": ["动机断裂"], "suggestions": ["重写动机"]},
+                "retry_message": "动机断裂\n重写动机",
+                "revision_notes": ["重写动机"],
+                "quality_failure_packet": {"failed_scene_beat_ids": ["beat-1"]},
+                "retry_history": [{"attempt": 1, "feedback": {"issues": ["动机断裂"]}}],
+                "revision_history": [{"attempt": 1, "condition_node_id": "condition_quality"}],
+                "quality_gate_history": [{"attempt": 1, "passed": False}],
+                "chapter_draft_payload": {"content_checksum": "old-draft-checksum"},
+                "chapter_content": "old draft",
+                "pending_chapter_save": True,
+            },
+            node_states={
+                "start": NodeExecutionState(node_id="start", status=NodeStatus.COMPLETED, output_data={"status": "started"}),
+                "writer": NodeExecutionState(node_id="writer", status=NodeStatus.COMPLETED, output_data={"chapter_content": "old draft"}),
+                "evaluator": NodeExecutionState(node_id="evaluator", status=NodeStatus.COMPLETED, output_data={"quality_passed": False}),
+                "condition_quality": NodeExecutionState(node_id="condition_quality", status=NodeStatus.COMPLETED, output_data={"condition_result": False}),
+                "master_revision_director": NodeExecutionState(node_id="master_revision_director", status=NodeStatus.PENDING),
+                "end": NodeExecutionState(node_id="end", status=NodeStatus.PENDING),
+            },
+        )
+        completed_nodes = {"start", "writer", "evaluator", "condition_quality"}
+
+        next_node_id = "master_revision_director"
+        assert self.engine._is_condition_retry_target(workflow, "condition_quality", next_node_id) is True
+        reset_nodes = self.engine._get_goto_reset_nodes(workflow, "condition_quality", next_node_id)
+        self.engine._reset_nodes_for_goto(
+            execution,
+            completed_nodes,
+            reset_nodes,
+            "test retry reset",
+        )
+
+        assert reset_nodes == {"writer", "evaluator", "condition_quality", "master_revision_director"}
+        assert completed_nodes == {"start"}
+        assert execution.node_states["writer"].status == NodeStatus.PENDING
+        assert execution.node_states["evaluator"].status == NodeStatus.PENDING
+        assert execution.node_states["condition_quality"].status == NodeStatus.PENDING
+        assert execution.node_states["master_revision_director"].status == NodeStatus.PENDING
+        assert execution.context["node_outputs"] == {"start": {"status": "started"}}
+        assert "latest_node_output" not in execution.context
+        assert execution.context["evaluation_feedback"] == {"issues": ["动机断裂"], "suggestions": ["重写动机"]}
+        assert execution.context["retry_message"] == "动机断裂\n重写动机"
+        assert execution.context["revision_notes"] == ["重写动机"]
+        assert execution.context["quality_failure_packet"] == {"failed_scene_beat_ids": ["beat-1"]}
+        assert execution.context["retry_history"] == [{"attempt": 1, "feedback": {"issues": ["动机断裂"]}}]
+        assert execution.context["revision_history"] == [{"attempt": 1, "condition_node_id": "condition_quality"}]
+        assert execution.context["quality_gate_history"] == [{"attempt": 1, "passed": False}]
+        assert execution.context["chapter_draft_payload"] == {"content_checksum": "old-draft-checksum"}
+        assert execution.context["chapter_content"] == "old draft"
+        assert execution.context["pending_chapter_save"] is True
+
     def test_deterministic_chapter_style_gate_blocks_overblown_ai_prose(self):
         engine = WorkflowEngine()
         chapter_content = (

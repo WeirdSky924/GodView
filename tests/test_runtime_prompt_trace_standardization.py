@@ -810,6 +810,16 @@ async def test_writer_missing_config_prompt_fails_closed_for_project_runtime(mon
     assert_render_trace_contract(trace)
 
 
+def test_model_router_anthropic_does_not_leak_http_clients_into_model_kwargs(monkeypatch):
+    from app.services.model_router import create_llm
+
+    model = create_llm(provider="anthropic", model="claude-sonnet-4-6", api_key="test-key")
+
+    assert getattr(model, "model_kwargs", {}) == {}
+    assert not hasattr(model, "client")
+    assert not hasattr(model, "async_client")
+
+
 def test_model_router_logs_anthropic_http_error_body_without_authorization(caplog):
     import httpx
     from app.services.model_router import _log_llm_error_response
@@ -5939,6 +5949,36 @@ def test_director_single_chapter_reset_uses_backend_idempotency_reset():
     assert "reset_operation_request" in postgres_source
     assert "reset_workflow_execution" in postgres_source
     assert "reset_at IS NULL" in postgres_source
+
+
+def test_director_restores_session_id_input_before_execution_hydration():
+    source = Path("frontend/src/pages/Director.tsx").read_text(encoding="utf-8")
+
+    assert "key: 'workflow' | 'execution' | 'session'" in source
+    assert "localStorage.getItem(getDirectorStorageKey(currentProject.id, 'session'))" in source
+    assert "setSessionId(storedSessionId.trim())" in source
+    assert "localStorage.setItem(getDirectorStorageKey(currentProject.id, 'session'), sessionId.trim())" in source
+    assert "if (!currentProject || savedWorkflows.length === 0 || !selectedWorkflowId || !sessionId.trim()) return" in source
+
+
+def test_director_replayed_execution_events_do_not_mutate_live_log_or_cards():
+    source = Path("frontend/src/pages/Director.tsx").read_text(encoding="utf-8")
+
+    assert "if (payload?.replayed === true)" in source
+    assert "return true\n    }\n\n    if (eventType === 'execution_snapshot')" in source
+    assert "yield _format_sse(\"workflow_event\", replay_event)" in Path("app/api/routes/workflows.py").read_text(encoding="utf-8")
+
+
+def test_director_duplicate_agent_type_nodes_use_node_scoped_cards():
+    director_source = Path("frontend/src/pages/Director.tsx").read_text(encoding="utf-8")
+    hook_source = Path("frontend/src/hooks/useWorkflowAgents.ts").read_text(encoding="utf-8")
+
+    assert "duplicate_agent_type: sameTypeNodeCount > 1" in director_source
+    assert "if (data.duplicate_agent_type && data.node_id)" in director_source
+    assert "return `agent_node:${data.node_id}`" in director_source
+    assert "const agentTypeCounts = new Map<string, number>()" in hook_source
+    assert "const agentKey = getWorkflowAgentKey(node, duplicateAgentTypes)" in hook_source
+    assert "return `agent_node:${node.id}`" in hook_source
 
 
 def test_director_auto_write_prompt_uses_md_asset(monkeypatch):

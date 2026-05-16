@@ -181,6 +181,7 @@ function resolveAgentKey(data: {
   label?: string
   node_type?: string
   node_id?: string
+  duplicate_agent_type?: boolean
 }): string | null {
   const normalizedAgent = normalizeAgentIdentifier(data.agent)
   const normalizedAgentType = normalizeAgentIdentifier(data.agent_type)
@@ -189,12 +190,12 @@ function resolveAgentKey(data: {
     return `scene_performance:${data.node_id}`
   }
 
-  if (normalizedAgent === 'character' && data.label) {
+  if ((normalizedAgent === 'character' || normalizedAgentType === 'character') && data.label) {
     return `character:${data.label}`
   }
 
-  if (normalizedAgentType === 'character' && data.label) {
-    return `character:${data.label}`
+  if (data.duplicate_agent_type && data.node_id) {
+    return `agent_node:${data.node_id}`
   }
 
   if (normalizedAgent) {
@@ -233,6 +234,7 @@ function getAgentStateKey(data: {
   label?: string
   node_type?: string
   node_id?: string
+  duplicate_agent_type?: boolean
 }): string | null {
   const preferredKey = resolveAgentKey(data)
   if (preferredKey) {
@@ -323,11 +325,15 @@ function getNodeDataFromWorkflowExecution(
   workflow: WorkflowDefinition | null,
 ) {
   const workflowNode = workflow?.nodes.find((node) => node.id === nodeId)
+  const sameTypeNodeCount = workflowNode?.agent_type
+    ? workflow?.nodes.filter((node) => node.node_type === 'agent' && node.agent_type === workflowNode.agent_type).length || 0
+    : 0
   return {
     agent_type: workflowNode?.agent_type,
     label: workflowNode?.label,
     node_type: workflowNode?.node_type,
     node_id: nodeId,
+    duplicate_agent_type: sameTypeNodeCount > 1,
     execution_id: execution.id,
   }
 }
@@ -404,7 +410,7 @@ function getPreferredWorkflowId(workflows: WorkflowDefinition[], currentWorkflow
   return workflows[0]?.id || ''
 }
 
-function getDirectorStorageKey(projectId: string, key: 'workflow' | 'execution', sessionId?: string): string {
+function getDirectorStorageKey(projectId: string, key: 'workflow' | 'execution' | 'session', sessionId?: string): string {
   const sessionScope = sessionId?.trim()
   return sessionScope
     ? `godview.director.${projectId}.${sessionScope}.${key}`
@@ -1342,6 +1348,10 @@ export default function Director() {
     const eventType = payload?.type
     const eventData = payload?.data || payload
 
+    if (payload?.replayed === true) {
+      return true
+    }
+
     if (eventType === 'execution_snapshot') {
       applyWorkflowExecutionSnapshot(eventData as WorkflowExecution, selectedWorkflowRef.current)
       return true
@@ -2105,6 +2115,19 @@ export default function Director() {
   useEffect(() => { loadWorkflows() }, [loadWorkflows])
   useEffect(() => { loadChapterOutlines() }, [loadChapterOutlines, outlineRefreshNonce])
   useEffect(() => { if (sessionId.trim()) loadRuntimePanels() }, [sessionId, runtimeRefreshNonce])
+
+  useEffect(() => {
+    if (!currentProject || sessionId.trim()) return
+    const storedSessionId = localStorage.getItem(getDirectorStorageKey(currentProject.id, 'session')) || ''
+    if (storedSessionId.trim()) {
+      setSessionId(storedSessionId.trim())
+    }
+  }, [currentProject, sessionId])
+
+  useEffect(() => {
+    if (!currentProject || !sessionId.trim()) return
+    localStorage.setItem(getDirectorStorageKey(currentProject.id, 'session'), sessionId.trim())
+  }, [currentProject, sessionId])
 
   useEffect(() => {
     if (!currentProject || !selectedWorkflowId || !sessionId.trim()) return

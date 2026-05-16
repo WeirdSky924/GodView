@@ -63,8 +63,7 @@ import {
   AlertCircle,
 } from 'lucide-react'
 
-// 注册自定义节点类型（必须用 useMemo 包裹，否则 ReactFlow 会重新渲染）
-const nodeTypes: NodeTypes = useMemo(() => ({
+const nodeTypes: NodeTypes = {
   agent: AgentNode,
   condition: ConditionNode,
   parallel: ParallelNode,
@@ -73,7 +72,7 @@ const nodeTypes: NodeTypes = useMemo(() => ({
   start: AgentNode,
   end: AgentNode,
   input: AgentNode,
-}), [])
+}
 
 interface WorkflowEditorProps {
   projectId: string

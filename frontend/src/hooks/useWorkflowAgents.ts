@@ -4,7 +4,7 @@
  */
 
 import { useState, useEffect, useCallback, useMemo } from 'react'
-import { type WorkflowDefinition } from '@/api/workflows'
+import { type WorkflowDefinition, type WorkflowNode } from '@/api/workflows'
 import {
   type WorkflowNodeTypes,
   getWorkflowNodeTypes,
@@ -80,18 +80,41 @@ function getAgentDescription(agentType: string | undefined, label: string | unde
 /**
  * 从工作流节点提取唯一的 Agent 类型
  */
+function getWorkflowAgentKey(node: WorkflowNode, duplicateAgentTypes: Set<string>): string {
+  if (node.agent_type === 'character') {
+    return `character:${node.label || node.id}`
+  }
+  if (node.agent_type && duplicateAgentTypes.has(node.agent_type)) {
+    return `agent_node:${node.id}`
+  }
+  return node.agent_type || node.id
+}
+
 function extractAgentsFromWorkflow(workflow: WorkflowDefinition, agentLabelMap: Map<string, string>): AgentStatus[] {
   const agentMap = new Map<string, AgentStatus>()
+  const agentTypeCounts = new Map<string, number>()
+
+  for (const node of workflow.nodes) {
+    if (node.node_type === 'agent' && node.agent_type) {
+      agentTypeCounts.set(node.agent_type, (agentTypeCounts.get(node.agent_type) || 0) + 1)
+    }
+  }
+  const duplicateAgentTypes = new Set(
+    Array.from(agentTypeCounts.entries())
+      .filter(([, count]) => count > 1)
+      .map(([agentType]) => agentType),
+  )
 
   for (const node of workflow.nodes) {
     // Agent 节点
     if (node.node_type === 'agent' && node.agent_type) {
       const agentType = node.agent_type
-      const agentKey = agentType === 'character' ? `character:${node.label}` : agentType
+      const agentKey = getWorkflowAgentKey(node, duplicateAgentTypes)
 
       if (!agentMap.has(agentKey)) {
         const defaults = AGENT_DEFAULTS[agentType] || { icon: '🤖', color: 'gray' }
-        const name = getAgentLabel(agentType, node.label, agentLabelMap)
+        const baseName = getAgentLabel(agentType, node.label, agentLabelMap)
+        const name = duplicateAgentTypes.has(agentType) && node.label ? node.label : baseName
         const description = getAgentDescription(agentType, node.label, agentLabelMap)
 
         agentMap.set(agentKey, {

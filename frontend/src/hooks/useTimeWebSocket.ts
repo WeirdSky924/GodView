@@ -122,7 +122,7 @@ export function useTimeWebSocket({
         // 初始连接信息
         break
 
-      case 'time_update':
+      case 'time_update': {
         const update: TimeUpdateResult = message.data
         setCurrentTime(update.current_time)
         setTimeScale(update.time_scale)
@@ -132,6 +132,7 @@ export function useTimeWebSocket({
         // 通知时间更新
         onTimeUpdate?.(update)
         break
+      }
 
       case 'time_info':
         // 时间信息更新

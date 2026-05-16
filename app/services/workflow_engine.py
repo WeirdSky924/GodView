@@ -1003,6 +1003,18 @@ class WorkflowEngine:
         reset_nodes = reachable_from_target & can_reach_source
         return reset_nodes or {target_node_id}
 
+    def _is_condition_retry_target(
+        self,
+        workflow: WorkflowDefinition,
+        source_node_id: str,
+        target_node_id: str,
+    ) -> bool:
+        """Return whether the selected condition edge is an explicit retry branch."""
+        for edge in workflow.edges:
+            if edge.source == source_node_id and edge.target == target_node_id:
+                return (edge.condition or {}).get("result") == "retry"
+        return False
+
     def _reset_nodes_for_goto(
         self,
         execution: WorkflowExecution,
@@ -1011,6 +1023,15 @@ class WorkflowEngine:
         reason: str,
     ) -> None:
         """重置回跳路径上的节点，确保后续节点会重新执行。"""
+        node_outputs = execution.context.get("node_outputs")
+        if isinstance(node_outputs, dict):
+            for node_id in node_ids:
+                node_outputs.pop(node_id, None)
+
+        latest_output = execution.context.get("latest_node_output")
+        if isinstance(latest_output, dict) and latest_output.get("node_id") in node_ids:
+            execution.context.pop("latest_node_output", None)
+
         for node_id in node_ids:
             completed_nodes.discard(node_id)
             state = execution.node_states.get(node_id)
@@ -2595,10 +2616,10 @@ class WorkflowEngine:
                                 continue
                             completed_nodes.add(nid)
 
-                            # 检查条件分支的 goto
+                            # 检查条件分支的 goto/retry
                             if node.node_type == NodeType.CONDITION:
                                 next_node_id = self._get_next_node(nid, execution, workflow)
-                                if next_node_id and next_node_id in completed_nodes:
+                                if next_node_id and (next_node_id in completed_nodes or self._is_condition_retry_target(workflow, nid, next_node_id)):
                                     goto_target = next_node_id
                                     goto_source_node = nid
                                     logger.info(f"并行执行中检测到条件分支 goto: {nid} -> {next_node_id}")
@@ -2700,8 +2721,8 @@ class WorkflowEngine:
                         if node.node_type == NodeType.CONDITION:
                             next_node_id = self._get_next_node(node_id, execution, workflow)
                             if next_node_id:
-                                # 检查是否是 goto（retry 到已完成的节点）
-                                if next_node_id in completed_nodes:
+                                # 检查是否是 goto/retry；retry 分支必须重置目标和后续已完成节点，即使目标本身尚未完成。
+                                if next_node_id in completed_nodes or self._is_condition_retry_target(workflow, node_id, next_node_id):
                                     # 初始化 goto 重试计数
                                     if "goto_retry_counts" not in execution.context:
                                         execution.context["goto_retry_counts"] = {}

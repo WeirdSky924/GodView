@@ -78,10 +78,6 @@ def create_llm(
         }
         if base_url:
             kwargs["base_url"] = base_url
-        client = httpx.Client(event_hooks={"response": [_log_llm_error_response]})
-        async_client = httpx.AsyncClient(event_hooks={"response": [_log_llm_error_response_async]})
-        kwargs["client"] = client
-        kwargs["async_client"] = async_client
         return ChatAnthropic(**kwargs)
 
     # 其他所有 provider 都使用 OpenAI 兼容 API
